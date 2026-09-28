@@ -1093,6 +1093,19 @@ def build_shots_for_chunk(client, bible: dict, outline: dict, chunk: dict, shots
     out = [s for s in shots if isinstance(s, dict)]
     if out:
         _cache_put(cache_dir, "shots", prompt, {"shots": out})
+    # P2-1：扫描本块 LLM 原始产出的字段漂移（report-only，不阻断）。
+    # 漂移会被下方 _norm_shots 静默修正/截断——这里显式记账，让「模型又越界了」可见，
+    # 并把汇总写进 events（随 metadata.truncation_events 落盘可查）。空产出则跳过。
+    drift = audit_shots_structure(out, bible, tag=label)
+    if drift:
+        _kinds = {}
+        for _f in drift:
+            _kinds[_f["kind"]] = _kinds.get(_f["kind"], 0) + 1
+        logger.warning("%s 分镜字段漂移 %d 处：%s", label, len(drift), _kinds)
+        if events is not None:
+            events.append({"label": label, "event": "field_drift",
+                           "count": len(drift), "kinds": _kinds,
+                           "findings": drift[:12]})
     return out
 
 
@@ -1398,6 +1411,95 @@ def _has_meaningful_dlg(raw, chars: list) -> bool:
         if _DLGM_SUBSTANTIVE_RE.search(str(line.get("text") or "")):
             return True
     return False
+
+
+# ===================== P2-1 分镜结构审计（report-only，借鉴 CineGen response_schema 思路，按本架构落地）=====================
+# 服务 venv 无 jsonschema 且不在 requirements.txt，不能引新依赖；_norm_shots 已对漂移做**容错修补**
+#（截断超长按 / 回落默认 / 结构修正），真正缺口是「漂移不可见」——字段超长按 [:200] 静默截断丢内容、
+# dialogue 结构错了被悄悄修掉、说话人名对不上 bible 会被下游 tts 落到 NARRATION，用户拿不到任何信号。
+# 故此处做**纯标准库、只读、不阻断**的结构审计：扫一遍 LLM 原始产出，把会被 _norm_shots 静默修正/
+# 截断的点显式记成 finding（供 metadata 追踪 + 日志），口径与 P0-2 软告警一致。
+_AUDIT_MAX_FINDINGS = 40   # 单块最多记多少条，防某块字段全飘刷爆 metadata
+_AUDIT_LEN_LIMITS = {      # 与 _norm_shots 的截断上限**同口径**：超过即「内容会被静默截断」
+    "description": 200,
+    "visual_detail": 400,
+    "edit_reason": 50,
+    "audio_cues": 60,
+    "first_frame": 40,
+    "last_frame": 40,
+    "motion": 30,
+}
+
+
+def audit_shots_structure(raw_shots, bible: dict, tag: str = "") -> list:
+    """扫描 LLM 原始分镜产出，返回**会被 _norm_shots 静默修正/截断**的漂移 finding 列表。
+
+    - 纯标准库、只读、无 LLM、无 I/O；不改动 raw_shots，不阻断生成（report-only）。
+    - finding 形状：{"kind": …, "detail": …, "shot_idx": int|None}。
+      常见 kind：
+        · beat_off_whitelist：beat 越出 _BEAT_WHITELIST（会被 _norm_beat 归一到「触发」，模型意图丢失）
+        · unknown_speaker：dialogue.speaker 不在 bible 角色表（下游 tts 会落到 NARRATION 兜底）
+        · unknown_cast：characters_in_shot / items_in_shot 引用了 bible 里没有的名字（会被过滤丢弃）
+        · field_overflow：某字符串字段超过 _norm_shots 截断上限（内容会被静默截断）
+        · field_type_drift：某字段类型不符（description/dialogue 等），会被 str()/normalize 强制修
+    """
+    shots = [s for s in (raw_shots or []) if isinstance(s, dict)]
+    if not shots:
+        return []
+    bible = bible or {}
+    char_names = {str(c.get("name") or "").strip()
+                  for c in (bible.get("characters") or []) if isinstance(c, dict)}
+    item_names = {str(i.get("name") or "").strip()
+                  for i in (bible.get("items") or []) if isinstance(i, dict)}
+    findings: list = []
+
+    def _add(kind: str, detail: str, idx):
+        if len(findings) < _AUDIT_MAX_FINDINGS:
+            findings.append({"kind": kind, "detail": detail, "shot_idx": idx, "tag": tag})
+
+    for idx, s in enumerate(shots):
+        # 1) beat 越出白名单（会被 _norm_beat 归一到默认「触发」）
+        beat_raw = str(s.get("beat") or "").strip()
+        if beat_raw and beat_raw not in _BEAT_WHITELIST:
+            _add("beat_off_whitelist", f"镜#{idx + 1} beat=「{beat_raw[:12]}」越出白名单，"
+                                       f"将被归一为「{_DEFAULT_BEAT}」", idx)
+        # 2) dialogue.speaker 不在角色表（下游 tts 落到 NARRATION 兜底）
+        dlg = s.get("dialogue")
+        if isinstance(dlg, list):
+            for d in dlg:
+                sp = str((d.get("speaker") if isinstance(d, dict) else "") or "").strip()
+                if sp and char_names and sp not in char_names:
+                    _add("unknown_speaker", f"镜#{idx + 1} 台词说话人「{sp[:12]}」不在角色表，"
+                                             f"将被 tts 落到旁白兜底", idx)
+                    break
+        elif isinstance(dlg, (str, dict)) and str(dlg or "").strip():
+            _add("field_type_drift", f"镜#{idx + 1} dialogue 类型为 {type(dlg).__name__}"
+                                     f"（应为数组），将被结构修正", idx)
+        # 3) characters_in_shot / items_in_shot 引用 bible 之外的名字（会被过滤丢弃）
+        cast = s.get("characters_in_shot")
+        if isinstance(cast, list):
+            unknown = [str(x).strip() for x in cast
+                       if str(x).strip() and char_names and str(x).strip() not in char_names]
+            if unknown:
+                _add("unknown_cast", f"镜#{idx + 1} 出场角色 {unknown[:4]} 不在角色表，将被过滤", idx)
+        itms = s.get("items_in_shot")
+        if isinstance(itms, list):
+            unknown = [str(x).strip() for x in itms
+                       if str(x).strip() and item_names and str(x).strip() not in item_names]
+            if unknown:
+                _add("unknown_cast", f"镜#{idx + 1} 物品 {unknown[:4]} 不在物品表，将被过滤", idx)
+        # 4) 字符串字段超 _norm_shots 截断上限（内容会被静默截断）
+        for field, limit in _AUDIT_LEN_LIMITS.items():
+            val = s.get(field)
+            if isinstance(val, str) and len(val) > limit:
+                _add("field_overflow", f"镜#{idx + 1} {field} 长 {len(val)} 字 > 上限 {limit}，"
+                                       f"将被截断", idx)
+            elif val is not None and not isinstance(val, str) and field in (
+                    "description", "edit_reason", "audio_cues"):
+                # description 等应为字符串；模型偶尔给 dict/list → 会被 str() 强转
+                _add("field_type_drift", f"镜#{idx + 1} {field} 类型为 {type(val).__name__}"
+                                           f"（应为字符串）", idx)
+    return findings
 
 
 def _norm_shots(raw_shots: list, bible: dict, episodes: int, start_id: int = 1) -> list:
