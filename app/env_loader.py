@@ -24,6 +24,18 @@ logger = logging.getLogger(__name__)
 # 项目根目录（app/ 的上一级）
 PROJECT_ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
+# 数据根目录（可写）。
+#   默认 = 项目根（源码树里就地读写，开发/浏览器版行为完全不变）。
+#   设置 MJSCXT_DATA_DIR 后可把全部「可写数据」重定向到独立目录：
+#   output/、novels/、各 *_config.json、.secret_key、secrets.enc、tasks.db、.env。
+#   只读资源（workflows/、locales/、app/static）仍留在 PROJECT_ROOT_DIR。
+#   桌面独立 exe 用它把数据写到用户可写目录（避免 Program Files 只读）。
+PROJECT_DATA_DIR = os.path.abspath(
+    os.environ.get("MJSCXT_DATA_DIR") or PROJECT_ROOT_DIR
+)
+# 数据根一旦确定即固定（同 PROJECT_ROOT_DIR 语义），供 .env 加载使用
+_DATA_ROOT_FIXED = PROJECT_DATA_DIR
+
 _LOADED = False
 
 
@@ -48,12 +60,15 @@ def _parse_env_file(path: str) -> None:
 
 
 def load_project_env(force: bool = False) -> str:
-    """加载项目根目录 .env（幂等）。返回 .env 路径（不存在则返回空串）。"""
+    """加载 .env（幂等）。优先数据根（MJSCXT_DATA_DIR），缺失则回退源根。
+
+    返回实际加载的 .env 路径（都不存在则返回空串）。
+    """
     global _LOADED
     if _LOADED and not force:
-        return os.path.join(PROJECT_ROOT_DIR, ".env")
+        return _resolve_env_path()
     _LOADED = True
-    env_path = os.path.join(PROJECT_ROOT_DIR, ".env")
+    env_path = _resolve_env_path()
     if not os.path.isfile(env_path):
         return ""
     # 优先用 python-dotenv（正确处理引号、转义、多行）
@@ -69,6 +84,15 @@ def load_project_env(force: bool = False) -> str:
         logger.warning(f"python-dotenv 加载失败，改用内置解析器：{e}")
         _parse_env_file(env_path)
         return env_path
+
+
+def _resolve_env_path() -> str:
+    """.env 定位：数据根优先，源根兜底（覆盖便携/安装两种布局）。"""
+    if PROJECT_DATA_DIR != PROJECT_ROOT_DIR:
+        cand = os.path.join(PROJECT_DATA_DIR, ".env")
+        if os.path.isfile(cand):
+            return cand
+    return os.path.join(PROJECT_ROOT_DIR, ".env")
 
 
 def env(key: str, default: str = "") -> str:

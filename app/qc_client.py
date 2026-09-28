@@ -42,8 +42,12 @@ import asset_prompt_kit
 
 logger = logging.getLogger(__name__)
 
-# 项目根目录（定位加密密钥库 output/secrets.enc 与主密钥 .secret_key）
-_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+# 数据根目录（定位加密密钥库 output/secrets.enc 与主密钥 .secret_key）。
+# 走 env_loader.PROJECT_DATA_DIR（MJSCXT_DATA_DIR 守卫，默认=源根，行为不变）。
+try:
+    from env_loader import PROJECT_DATA_DIR as _PROJECT_ROOT
+except Exception:  # noqa: BLE001  兜底：env_loader 未就绪时退回源根
+    _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 # P2-T3（审计 T-3）：qc_config 落盘此前三处（save_config / set_endpoint /
 # reset_endpoint）都用**固定 `.tmp`** 且模块无锁 —— 两个线程同时 save_config

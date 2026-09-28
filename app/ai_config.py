@@ -41,8 +41,13 @@ import secret_store
 
 logger = logging.getLogger(__name__)
 
-# 项目根目录（用于定位加密密钥库 output/secrets.enc 与主密钥 .secret_key）
-_ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+# 数据根目录（定位加密密钥库 output/secrets.enc 与主密钥 .secret_key）。
+# 走 env_loader.PROJECT_DATA_DIR（MJSCXT_DATA_DIR 守卫，默认=源根，行为不变）；
+# 安装版（Program Files 只读）设 MJSCXT_DATA_DIR 后密钥库落可写目录。
+try:
+    from env_loader import PROJECT_DATA_DIR as _ROOT_DIR
+except Exception:  # noqa: BLE001  兜底：env_loader 未就绪时退回源根
+    _ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 
 def _store():

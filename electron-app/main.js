@@ -115,6 +115,33 @@ async function detectPython() {
 }
 
 // ---------------------------------------------------------------------------
+// 后端布局：独立 exe vs 开发
+// ---------------------------------------------------------------------------
+// 打包态（app.isPackaged）= 前后端都自包含：electron-builder 的 extraResources
+//   里带一份「嵌入式 Python + app 源码 + workflows + 前端静态」，spawn 它自带的
+//   python，并把可写数据目录指向 Electron userData（Program Files 只读）。
+// 开发态（npm start）= 前后端分离：用本机 venv 跑项目源码，数据落源根（可写）。
+function resolveBackendLayout() {
+  if (app.isPackaged) {
+    const res = process.resourcesPath; // extraResources 落点（打包态只读，可写数据另指 userData）
+    const exeName = process.platform === 'win32' ? 'python.exe' : 'python';
+    return {
+      pythonExe: path.join(res, 'python', exeName),
+      servePy: path.join(res, 'app', 'serve.py'),
+      dataDir: app.getPath('userData'), // 可写
+      cwd: res,
+    };
+  }
+  // 开发态：沿用 config（项目根 + 本机 venv），不设 MJSCXT_DATA_DIR（源根可写）
+  return {
+    pythonExe: null, // 交给 detectPython() 解析本机 venv
+    servePy: path.join(config.projectRoot, 'app', 'serve.py'),
+    dataDir: null,
+    cwd: config.projectRoot,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // 日志环形缓冲
 // ---------------------------------------------------------------------------
 
@@ -244,32 +271,43 @@ async function startBackend() {
   backend.starting = true;
   backend.reused = false;
   try {
-    const warnings = validateProjectRoot(config.projectRoot);
+    const layout = resolveBackendLayout();
+    const warnings = app.isPackaged
+      ? []
+      : validateProjectRoot(config.projectRoot);
     for (const w of warnings) console.warn(w);
 
-    const python = await detectPython();
+    // 打包态用自带的嵌入式 Python；开发态探测本机 venv
+    const python = layout.pythonExe || await detectPython();
+    if (!fs.existsSync(layout.servePy)) {
+      throw new Error(`找不到后端入口 ${layout.servePy}（请确认已运行 build:win 打包或项目路径正确）`);
+    }
     const { port, reuse } = await resolvePort();
     if (reuse) {
-      // 浏览器版已占用 5000 且健康 → 直接复用，不 spawn
+      // 已有健康实例（例如浏览器版）占用 → 直接复用，不 spawn
       backend.reused = true;
       backend.port = port;
       backend.starting = false;
       return backend;
     }
-    const servePy = path.join(config.projectRoot, 'app', 'serve.py');
     logLines.length = 0;
     backend.port = port;
-    backend.child = spawn(python, [servePy], {
-      cwd: config.projectRoot,
+    const childEnv = {
+      ...process.env,
+      APP_HOST: '127.0.0.1',
+      APP_PORT: String(port),
+      PYTHONUNBUFFERED: '1',
+      // 不手动转发 COMFYUI_* / MJSCXT_* —— 应用自带 env_loader 会读 .env
+    };
+    // 可写数据目录：打包态指向 userData（Program Files 只读），开发态不设（源根可写）
+    if (layout.dataDir) {
+      fs.mkdirSync(layout.dataDir, { recursive: true });
+      childEnv.MJSCXT_DATA_DIR = layout.dataDir;
+    }
+    backend.child = spawn(python, [layout.servePy], {
+      cwd: layout.cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: {
-        ...process.env,
-        APP_HOST: '127.0.0.1',
-        APP_PORT: String(port),
-        PYTHONUNBUFFERED: '1',
-        // 注意：不手动转发 COMFYUI_* / MJSCXT_* —— 应用自带 env_loader 会读 .env
-      },
-      // Windows 上不在单独控制台里闪一个终端
+      env: childEnv,
       windowsHide: true,
     });
     backend.child.stdout.on('data', (d) => pushLog('out', d));

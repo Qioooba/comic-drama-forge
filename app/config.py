@@ -12,7 +12,7 @@ import logging
 import os
 
 # 环境加载与项目根目录统一由 env_loader 负责（导入即生效，避免模块导入顺序导致 .env 未加载）
-from env_loader import PROJECT_ROOT_DIR, env as _env, env_int as _env_int  # noqa: E402
+from env_loader import PROJECT_ROOT_DIR, PROJECT_DATA_DIR, env as _env, env_int as _env_int  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -146,22 +146,23 @@ LLM_PROVIDER = _env("LLM_PROVIDER", "anthropic")  # anthropic or workbuddy
 DEPLOY_PROFILE = _env("DEPLOY_PROFILE", "16G")
 
 # ===================== 输出目录（须先于各产物子目录定义） =====================
-PROJECT_OUTPUT_DIR = os.path.join(PROJECT_ROOT_DIR, "output")
+# 可写数据一律落数据根（MJSCXT_DATA_DIR 守卫，默认=源根）；只读资源仍留源根。
+PROJECT_OUTPUT_DIR = os.path.join(PROJECT_DATA_DIR, "output")
 
 # ===================== 小说上传与 LLM 配置路径 =====================
 # 小说上传目录（原始文件 + 解析后的标准化文本 + 元数据索引）
-NOVELS_DIR = os.path.join(PROJECT_ROOT_DIR, "novels")
+NOVELS_DIR = os.path.join(PROJECT_DATA_DIR, "novels")
 
 # 自定义 LLM API 配置（base_url / api_key / model 持久化，api_key 不明文回显）
-LLM_CONFIG_PATH = os.path.join(PROJECT_ROOT_DIR, "llm_config.json")
+LLM_CONFIG_PATH = os.path.join(PROJECT_DATA_DIR, "llm_config.json")
 
 # AI 质检配置（总开关 / 图片·视频独立开关 / 模型 / 判定标准 / 最大重试次数）
-QC_CONFIG_PATH = os.path.join(PROJECT_ROOT_DIR, "qc_config.json")
+QC_CONFIG_PATH = os.path.join(PROJECT_DATA_DIR, "qc_config.json")
 QC_DIR = os.path.join(PROJECT_OUTPUT_DIR, "qc")   # 质检与重试历史 + 视频抽帧
 QC_CHECK_INTERVAL = 3          # 生成任务状态里质检阶段的轮询提示间隔（秒，仅前端用）
 
 # 视频水印配置（C 项：默认关闭；支持文案/图片、位置、字号、透明度、边距、全视频移动模式）
-WATERMARK_CONFIG_PATH = os.path.join(PROJECT_ROOT_DIR, "watermark_config.json")
+WATERMARK_CONFIG_PATH = os.path.join(PROJECT_DATA_DIR, "watermark_config.json")
 WATERMARK_DIR = os.path.join(PROJECT_OUTPUT_DIR, "watermark")   # 带水印视频产物目录
 
 # P0-4 持久化任务队列（SQLite）：任务全生命周期落盘，支持断点续跑
@@ -170,7 +171,7 @@ TASK_QUEUE_CONCURRENCY = _env_int("TASK_QUEUE_CONCURRENCY", 1)   # 单 GPU 建�
 TASK_UNIT_MIN_BYTES = _env_int("TASK_UNIT_MIN_BYTES", 1024)      # 单元产物视为有效的最小字节数
 
 # 统一「AI 设置」：文本分析 / 质检 / 对话总控 三个相互独立的模型模块（各自 base_url / api_key / model）
-AI_CONFIG_PATH = os.path.join(PROJECT_ROOT_DIR, "ai_config.json")
+AI_CONFIG_PATH = os.path.join(PROJECT_DATA_DIR, "ai_config.json")
 AI_MODULES = ("text", "qc", "chat")
 
 # 小说解析与转换参数

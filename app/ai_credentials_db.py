@@ -50,8 +50,15 @@ logger = logging.getLogger(__name__)
 # 隔离测试若只重指向 `qc_client._PROJECT_ROOT` / `ai_config._ROOT_DIR` 而漏掉这里，
 # 会把测试用的假凭证写进**用户真实的** output/tasks.db（2026-09-23 已实测踩到：
 # qc 模块被写成 probe.example/v1 + 假钥，事后按真实旧槽值修复）。
+# 默认根走 env_loader.PROJECT_DATA_DIR（MJSCXT_DATA_DIR 守卫，默认=源根，行为不变）；
+# 安装版（Program Files 只读）设 MJSCXT_DATA_DIR 后 tasks.db / 密钥库落可写目录。
+try:
+    from env_loader import PROJECT_DATA_DIR as _DEFAULT_CRED_ROOT
+except Exception:  # noqa: BLE001  兜底
+    _DEFAULT_CRED_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+# MJSCXT_CRED_ROOT 仍为最高优先级（测试/CI 隔离），未设才落数据根。
 _PROJECT_ROOT = os.path.abspath(
-    os.getenv("MJSCXT_CRED_ROOT") or os.path.join(os.path.dirname(__file__), ".."))
+    os.getenv("MJSCXT_CRED_ROOT") or _DEFAULT_CRED_ROOT)
 _DB_PATH = os.getenv("MJSCXT_CRED_DB") or os.path.join(_PROJECT_ROOT, "output", "tasks.db")
 
 # 三个 AI 模块（与 ai_config.MODULES 对齐；qc 即质检视觉模型）
