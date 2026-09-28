@@ -95,6 +95,29 @@ def _ordered_shot_files(videos_dir: str, ep: int) -> List[str]:
 
 # ===================== 音轨工具（H3 出片音轨策略见 config：H3_EMIT_AUDIO / H3_STRIP_AUDIO） =====================
 
+def _filter_existing_segments(video_files: List[str]) -> tuple:
+    """A2：拼接**前置校验**（借鉴 Huobao ``services/ffmpeg-merge.ts``）——拆分可拼片段与缺失片段。
+
+    为什么必须在拼接之前做：目录/记录里的路径可能指向已被清理、或未生成完的文件
+    （重生成覆盖、清理临时文件、跨设备拷贝都会造成），直接交给 ffmpeg 只会得到
+    「No such file or directory」这类**晦涩报错**；而成片链路的 ``-shortest`` 又会把
+    缺失造成的时长差**静默截掉尾部**，用户完全拿不到「哪几镜缺片」的可操作信息。
+
+    Returns:
+        ``(valid, missing)`` —— ``valid`` 为存在且**非空**的文件（保持原顺序，供部分拼接），
+        ``missing`` 为缺失或 0 字节的片段（调用方应显式列出其镜号）。
+    """
+    valid: List[str] = []
+    missing: List[str] = []
+    for p in list(video_files or []):
+        try:
+            ok = os.path.isfile(p) and os.path.getsize(p) > 0
+        except OSError:
+            ok = False          # 权限/路径异常一律按缺失处理，不让它炸掉整集拼接
+        (valid if ok else missing).append(p)
+    return valid, missing
+
+
 def probe_media(path: str) -> Dict:
     """ffprobe 读取媒体信息（含视频/音频流清单），任何异常都落到 info.error，不抛出"""
     info = {"path": os.path.abspath(path) if path else "", "ok": False,
@@ -620,6 +643,7 @@ class VideoPostProcessor:
 
     def generate_final_video(self, script_path: str, project_name: str,
                              episode_no=None) -> str:
+        """（A2 拼接前置校验见模块级 :func:`_filter_existing_segments`）"""
         """生成最终视频（**按集**合成：第 1 集平铺、第 2 集起 epNN/）
 
         审计 S4 修复：
@@ -648,6 +672,23 @@ class VideoPostProcessor:
         video_files = _ordered_shot_files(videos_dir, ep)
         if not video_files:
             logger.warning(f"没有找到第 {ep} 集的视频片段：{videos_dir}")
+            return ""
+
+        # ---- A2 拼接前置校验（借鉴 Huobao ``ffmpeg-merge.ts``）----
+        # 历史痛点：目录里的路径可能指向已被清理/未生成完的文件，直接交给 ffmpeg 只会得到
+        # 「No such file or directory」这类晦涩报错；而成片链路的 ``-shortest`` 又会把
+        # 缺失造成的时长差**静默截掉尾部**，用户拿不到「哪几镜缺片」的可操作信息。
+        # 这里先把缺失/空片段挑出来**显式列出镜号**，再**允许部分拼接**（跳过缺失段、
+        # 按镜号顺序拼已生成的），既不整集失败、也不静默截尾。
+        video_files, _missing = _filter_existing_segments(video_files)
+        if _missing:
+            logger.warning(
+                "第 %s 集成片：%d 个镜头片段缺失或为空 → 已跳过（部分拼接）。"
+                "缺失片段：%s。请重新生成这些镜头，或接受当前部分成片。",
+                ep, len(_missing),
+                "、".join(os.path.basename(m) for m in _missing[:20]))
+        if not video_files:
+            logger.error("第 %s 集所有镜头片段均缺失或为空，无法拼接：%s", ep, videos_dir)
             return ""
 
         # 合并视频
