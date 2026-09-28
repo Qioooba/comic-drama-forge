@@ -274,11 +274,11 @@
     ]
    },
    "widgets_values": [
-    "minimaxH3Singularity_prunedInt8-d8a59c68df78.safetensors",
+    "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
     "default"
    ],
    "widgets_values_named": {
-    "unet_name": "minimaxH3Singularity_prunedInt8-d8a59c68df78.safetensors",
+    "unet_name": "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
     "weight_dtype": "default"
    }
   },
@@ -490,11 +490,11 @@
     ]
    },
    "widgets_values": [
-    "minimaxH3Singularity_prunedInt8-d8a59c68df78.safetensors",
+    "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
     "default"
    ],
    "widgets_values_named": {
-    "unet_name": "minimaxH3Singularity_prunedInt8-d8a59c68df78.safetensors",
+    "unet_name": "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
     "weight_dtype": "default"
    }
   },
