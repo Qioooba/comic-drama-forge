@@ -712,6 +712,48 @@ def _ctx_line(ctx, key: str) -> str:
     return (v + "\n") if v else ""
 
 
+def _ctx_asset_names_block(ctx) -> str:
+    """P3 名称归一化去重：把「已登记资产名单」投影进 ②汇总 prompt。
+
+    取 ``continuity_ctx['bible']``（项目级设定库，A① 持久化）里已锁定的角色/物品/场景规范名，
+    让 LLM 在汇总时**复用这些规范名**、不要另造近名（如已有「古月方源」就别再写「方源」，
+    否则下游会重复生成参考图）。纯 prompt-only：不新增 import（``continuity.py`` 已
+    ``import novel_to_script``，反向会循环导入），也不动 ``align_script_assets`` 的确定性
+    兜底（它仍是最后一道归一闸，本块只是让 LLM 在前置阶段就收敛到规范名）。
+
+    ``ctx`` 为 None / 无 ``bible`` / 名单全空时返回空串 —— 首集（无跨集上下文）行为零变化。
+    """
+    if not isinstance(ctx, dict):
+        return ""
+    bible = ctx.get("bible")
+    if not isinstance(bible, dict):
+        return ""
+
+    def _names(key):
+        rows = []
+        for r in (bible.get(key) or []):
+            if isinstance(r, dict):
+                nm = str(r.get("name") or "").strip()
+                if nm:
+                    rows.append(nm)
+        return rows[:12]
+
+    chars, items, scenes = _names("characters"), _names("items"), _names("scenes")
+    if not (chars or items or scenes):
+        return ""
+    lines = ["【已登记资产名单（跨集锁定，必须复用规范名、禁止另造近名）】"]
+    if chars:
+        lines.append("角色：" + "、".join(chars))
+    if items:
+        lines.append("物品：" + "、".join(items))
+    if scenes:
+        lines.append("场景：" + "、".join(scenes))
+    lines.append("硬约束：characters[].name / items[].name / scenes[].name 若与上方名单指向同一对象，"
+                 "必须逐字复制该规范名（含姓氏/全称，不得写简称或去姓别名）；"
+                 "只有原文出现名单之外的确凿新对象时才新增条目，且不得与已有近名重复。")
+    return "\n".join(lines)
+
+
 def build_bible(client, outlines: list, novel_title: str, style: str, episodes: int,
                 target_shots: int, events: list = None, continuity_ctx: dict = None,
                 cache_dir: str = "") -> dict:
@@ -741,6 +783,7 @@ def build_bible(client, outlines: list, novel_title: str, style: str, episodes: 
 【集数】{episodes} 集  【预计总镜头数】{target_shots}
 【分段提炼结果】
 {json.dumps(digest, ensure_ascii=False)}
+{_ctx_asset_names_block(continuity_ctx)}
 【输出要求】严格只输出一个 JSON 对象，不要 markdown 代码块、不要解释文字，结构如下：
 {{
   "title": "剧名（4-12 字）",
