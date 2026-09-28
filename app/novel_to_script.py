@@ -761,6 +761,42 @@ def _ctx_asset_names_block(ctx) -> str:
     return "\n".join(lines)
 
 
+def _prev_tail_block(prev_chunk: dict, prev_outline: dict) -> str:
+    """P1-2 长文「接缝重叠」注入（借鉴 ViMax novel_compressor 的 overlap 思路，
+    按本系统架构落地为「集内相邻块接缝上下文」）。
+
+    写第 i 块分镜时，注入**上一块（i-1）的结尾**：已 LLM 提炼好的剧情摘要 + 末 2 条
+    情节要点 + 末场景。让 LLM 知道「上段发生到哪了」，使本块开头能**承接**而非
+    凭空重启——治「章节衔接硬 / 长文丢主线」（相邻块各自独立写、互不知道对方结尾）。
+
+    纯 prompt-only、零新增 LLM 调用：上块 outline 在 ① 提炼阶段已生成，此处只取用。
+    向后兼容：``prev_chunk`` / ``prev_outline`` 为 None（首块 i=0、或递归子块不传）时
+    返回空串 → prompt 不出现该段、行为与旧版完全一致。
+
+    关键措辞：这是**衔接锚点，不是重演指令**——显式要求「承接上段结尾，勿重演上段
+    已发生的事件」（与「上一集已发生事件禁止重演」同口径，避免 LLM 把上段再写一遍）。
+    """
+    if not isinstance(prev_chunk, dict) and not isinstance(prev_outline, dict):
+        return ""
+    lines = []
+    summary = str((prev_outline or {}).get("summary") or "").strip()
+    beats = list((prev_outline or {}).get("key_beats") or [])
+    tail_beats = beats[-2:] if beats else []
+    prev_title = str((prev_chunk or {}).get("title") or "上一段")
+    if summary or tail_beats:
+        lines.append(f"【承接上段（{prev_title}结尾）——只用于让本段开头衔接自然，"
+                     "切勿重演上段已发生的事件】")
+        if summary:
+            lines.append("上段剧情摘要：" + summary)
+        if tail_beats:
+            lines.append("上段最后情节要点：" + "；".join(
+                str(b).strip() for b in tail_beats if str(b).strip()))
+        prev_loc = str((prev_chunk or {}).get("to_chapter") or "").strip()
+        if prev_loc:
+            lines.append("上段所在章节：第" + prev_loc + "章")
+    return "\n".join(lines)
+
+
 def build_bible(client, outlines: list, novel_title: str, style: str, episodes: int,
                 target_shots: int, events: list = None, continuity_ctx: dict = None,
                 cache_dir: str = "") -> dict:
@@ -885,8 +921,12 @@ def _fallback_bible(outlines: list, novel_title: str, style: str) -> dict:
 def build_shots_for_chunk(client, bible: dict, outline: dict, chunk: dict, shots_target: int,
                           events: list = None, depth: int = 0,
                           continuity_ctx: dict = None, cache_dir: str = "",
-                          shots_hard_cap: int = 0) -> list:
+                          shots_hard_cap: int = 0, prev_tail: str = "") -> list:
     """③ 单块写分镜（截断时自动提高 max_tokens；仍截断则把该块再二分后合并）
+
+    prev_tail（P1-2 接缝重叠）：上一块的「结尾上下文」预渲染文本（由调用方经
+    :func:`_prev_tail_block` 构造），非空时注入 prompt 让本块开头**承接**上段而非
+    凭空重启。默认 ""（首块 / 递归子块 / 旧调用方）→ prompt 不出现该段，零变化。
 
     continuity_ctx 非空时（跨集连贯性方案 A②③ / C⑦⑧）：注入上集摘要卡、衔接契约、
     项目级风格指南、人物口吻词典、金句保留清单与运镜术语表。
@@ -953,7 +993,7 @@ def build_shots_for_chunk(client, bible: dict, outline: dict, chunk: dict, shots
     prompt = f"""【任务】为漫剧《{bible.get('title') or ''}》的「{chunk.get('title')}」（第 {chunk['index']}/{chunk['total']} 段）编写分镜：至少 {shots_target} 个、上限 {shots_cap} 个。把下方原文**压缩提炼**成可拍摄的镜头，只保留推动剧情的关键情节（冲突/转折/关键动作/金句），纯背景铺陈直接删去、勿逐句照搬。
 {REWRITE_RULES.format(chars_per_shot=CHARS_PER_SHOT)}
 【全剧风格】{bible.get('style') or ''}　【画面风格指南】{_ctx_block(continuity_ctx, 'style_guide_text') or (bible.get('production_notes') or {}).get('style_guide') or ''}
-{_ctx_line(continuity_ctx, 'prev_block')}{_ctx_line(continuity_ctx, 'bible_block')}{_ctx_line(continuity_ctx, 'contract_block')}{_ctx_line(continuity_ctx, 'style_block')}{_ctx_line(continuity_ctx, 'camera_block')}【可用角色】{json.dumps(char_brief, ensure_ascii=False)}
+{_ctx_line(continuity_ctx, 'prev_block')}{_ctx_line(continuity_ctx, 'bible_block')}{_ctx_line(continuity_ctx, 'contract_block')}{_ctx_line(continuity_ctx, 'style_block')}{_ctx_line(continuity_ctx, 'camera_block')}{prev_tail}【可用角色】{json.dumps(char_brief, ensure_ascii=False)}
 【可用物品】{json.dumps(item_brief, ensure_ascii=False)}
 【可用场景】{json.dumps(scene_brief, ensure_ascii=False)}
 【本段原文（先压缩提炼：只保留冲突/转折/关键动作/金句，纯背景铺陈直接删去，勿逐句照搬）】
@@ -1690,13 +1730,20 @@ def convert_novel_to_script(client, novel_meta: dict, novel_text: str, style: st
     all_shots = []
     for i, chunk in enumerate(sampled):
         per_chunk = estimate_shots_for_chars(chunk.get("char_count") or len(chunk.get("text") or ""))
+        # P1-2 接缝重叠（借 ViMax overlap 思路、按本架构落地）：i>0 时把「上一块结尾」
+        # （已 LLM 提炼的 outline，零新增调用）注入本块，让开头承接上段而非凭空重启；
+        # i=0（首块）→ prev_chunk/prev_outline 均 None → prev_tail="" → prompt 不出现该段（零变化）。
+        _prev_chunk = sampled[i - 1] if i > 0 else None
+        _prev_outline = (outlines[i - 1] or {}) if i > 0 else None
+        _prev_tail = _prev_tail_block(_prev_chunk, _prev_outline)
         report("shots", len(sampled) + 2 + i, total_steps,
                f"编写第 {chunk['index']} 块分镜（{chunk.get('title')}，{per_chunk} 镜）…",
                int(70 + (i + 1) / total_steps * 25))
         try:
             all_shots.extend(build_shots_for_chunk(client, bible, outlines[i] or {"summary": "", "key_beats": []},
                                                    chunk, per_chunk,
-                                                   events=cache_events, cache_dir=cache_dir))
+                                                   events=cache_events, cache_dir=cache_dir,
+                                                   prev_tail=_prev_tail))
         except LLMGatewayUnavailable as e:
             # 网关问题不是「这一块运气不好」，重试无用 —— 见 _gateway_down_fallback 说明
             fb = _gateway_down_fallback(e, chunk, per_chunk, bible, all_shots)
@@ -2310,12 +2357,19 @@ def convert_chapter_to_script(client, novel_meta: dict, novel_text: str, chapter
                             f"（内容未丢，建议人工润色）")
             logger.warning(f"第 {chunk['index']} 子块缺少提炼结果，已兜底 {len(fb)} 镜")
             continue
+        # P1-2 接缝重叠（借 ViMax overlap 思路、按本架构落地）：i>0 时把「上一子块结尾」
+        # 注入本块，让开头承接上段。上一子块 = sampled[i-1]，其 outline 按 index 取；
+        # i=0 → 上子块 None → prev_tail="" → prompt 不出现该段（零变化）。
+        _prev_chunk = sampled[i - 1] if i > 0 else None
+        _prev_outline = outline_by_chunk.get(_prev_chunk["index"]) if _prev_chunk else None
+        _prev_tail = _prev_tail_block(_prev_chunk, _prev_outline)
         try:
             all_shots.extend(build_shots_for_chunk(client, bible, ol, chunk, per_chunk,
                                                    events=trunc_events,
                                                    continuity_ctx=continuity_ctx,
                                                    cache_dir=cache_dir,
-                                                   shots_hard_cap=per_chunk_cap))
+                                                   shots_hard_cap=per_chunk_cap,
+                                                   prev_tail=_prev_tail))
         except LLMTruncatedError as e:
             fb = _fallback_shots_for_chunk(chunk, per_chunk, bible)
             all_shots.extend(fb)
