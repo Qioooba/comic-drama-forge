@@ -41,6 +41,8 @@ from config import (
     H3_EMIT_AUDIO,
     CONFLICT_NEGATIVE_TOKENS,
     ENABLE_BLOCKING_ANNOTATION,
+    H3_ENABLE_REFINE,
+    COMFYUI_INPUT_DIR,
 )
 # 模板路径一律走 resolve_workflow_path()（项目内优先，回落 ComfyUI 目录）。
 # COMFYUI_WORKFLOWS_DIR 在本模块内已不再直接使用，但**必须保留为模块属性**：
@@ -2573,6 +2575,84 @@ class ComfyUIClient:
             cache[key] = val
         return val
 
+    def _drop_missing_director_refs(self, wf: dict, seg_ref_names, seg_audio_names,
+                                    seg_count: int) -> None:
+        """提交前校验 Director timeline 声明的参考图/音频是否已落到 ComfyUI ``input/``。
+
+        根因竞态：``_upload_h3_director_ref`` 走 HTTP 上传（``upload_image``），返回的是
+        成功后的相对名；但插件 ``_load_refs`` 在**采样那一刻**才按 ``imageFile`` 去
+        ``input/`` 读文件。若个别文件上传成功响应已返回、磁盘落盘仍有极小窗口，
+        插件首采会读不到 tensor → 误报「gen segment #N ... has no reference media」。
+        该 warning 不致命（下一段/重采图已就位即恢复），但会误导排查。
+
+        本方法在 ``queue_prompt`` **之前**做就地校验：逐段核对 ``timeline_data`` 里
+        声明的每段 ``imageFile`` / ``audioFile`` 是否真实存在于
+        ``COMFYUI_INPUT_DIR`` 下；缺失的从该段摘掉并记日志。插件读到的是
+        「实际在位的图」，不再有「声明了却没图」的段 → 彻底消除该竞态告警。
+
+        安全性：
+        - 整次提交的 ref 全缺 → 上游已有 S12 红线（``not any(seg_ref_names)`` 直接抛
+          RuntimeError 拒提），不会走到这里；本方法只处理「个别段个别文件缺」，摘掉后
+          仍保留有图的段，非首段靠段间引导钉尾帧，影响有限（与上游 empty_idx 口径一致）。
+        - 正常情况（全部就位）本方法是 no-op，零行为变更。
+        """
+        director = next((nd for nd in wf.get("nodes", []) if nd.get("class_type") == "MiniMaxH3Director"
+                         or nd.get("type") == "MiniMaxH3Director"), None)
+        if not director:
+            return
+        named = director.get("widgets_values_named") or {}
+        raw = named.get("timeline_data")
+        if not raw:
+            return
+        try:
+            tl = json.loads(raw)
+        except Exception:
+            return
+        segs_tl = tl.get("segments") or []
+        base = COMFYUI_INPUT_DIR
+        if not base or not os.path.isdir(base):
+            return  # 拿不到 input 目录（远端 ComfyUI 场景）则不校验，保持原行为
+        changed = False
+        for i, seg in enumerate(segs_tl):
+            keep_refs = []
+            for r in (seg.get("refs") or []):
+                if not isinstance(r, dict):
+                    keep_refs.append(r)
+                    continue
+                rel = str(r.get("imageFile") or r.get("fileName") or "").replace("\\", "/").strip()
+                if not rel:
+                    keep_refs.append(r)
+                    continue
+                if os.path.isfile(os.path.join(base, rel.replace("/", os.sep))):
+                    keep_refs.append(r)
+                else:
+                    changed = True
+                    if i < len(seg_ref_names):
+                        seg_ref_names[i] = [k for k in seg_ref_names[i]
+                                             if k not in (r.get("imageFile"), r.get("fileName"))] or seg_ref_names[i]
+                    logger.warning(
+                        "[H3-Director] 段%d 参考图 %s 尚未就位于 %s，已摘除（避免误报无参考媒体）",
+                        i + 1, rel, base)
+            seg["refs"] = keep_refs
+            keep_aud = []
+            for a in (seg.get("refAudios") or []):
+                if not isinstance(a, dict):
+                    keep_aud.append(a)
+                    continue
+                rel = str(a.get("audioFile") or a.get("fileName") or "").replace("\\", "/").strip()
+                if not rel:
+                    keep_aud.append(a)
+                    continue
+                if os.path.isfile(os.path.join(base, rel.replace("/", os.sep))):
+                    keep_aud.append(a)
+                else:
+                    changed = True
+                    logger.warning(
+                        "[H3-Director] 段%d 参考音频 %s 尚未就位于 %s，已摘除", i + 1, rel, base)
+            seg["refAudios"] = keep_aud
+        if changed:
+            director["widgets_values_named"]["timeline_data"] = json.dumps(tl, ensure_ascii=False)
+
     def _generate_h3_sequence_director(
         self, segs: List[dict], *, tpl_path: str, tpl_name: str,
         filename_prefix: str = "comic_drama/episode",
@@ -2710,7 +2790,14 @@ class ComfyUIClient:
             # 所以 CreateVideo 的 audio 输入不会悬空。
             # "source" = 用段级 refAudios 参考音频（见上）。
             audio_mode=_eff_audio_mode,
-            export_mode=export_mode)
+            export_mode=export_mode,
+            # 二采开关（2026-09-28 用户定档默认关）：关 = 裁二采专属模型链 +
+            # 断 Director.refine 输入，Director.images 落一采帧；画质由 FlashVSR 超分补。
+            enable_refine=H3_ENABLE_REFINE)
+
+        # 提交前校验参考图/音频是否已落到 ComfyUI input/：消除「图未落地首采误报
+        # no reference media」的竞态（详见 _drop_missing_director_refs）。正常全就位时 no-op。
+        self._drop_missing_director_refs(wf, seg_ref_names, seg_audio_names, n)
 
         if save_build_to:
             os.makedirs(os.path.dirname(save_build_to), exist_ok=True)

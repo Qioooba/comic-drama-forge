@@ -435,6 +435,13 @@ H3_SFX_DIR = os.path.join(PROJECT_OUTPUT_DIR, "sfx")   # 分离产物：output/s
 #   False = 维持旧行为（H3 不出人声，配音统一后期 dub_mix 混音）。
 H3_AUDIO_SOURCE = _env_bool("H3_AUDIO_SOURCE", False)
 
+# H3 视频二采（MiniMaxH3DirectorRefine）开关（2026-09-28 用户拍板：默认关）：
+#   False = 构建时裁掉二采专属模型链 + 断开 Director.refine 输入，Director.images
+#           自动落一采帧；画质改由 FlashVSR 超分环节承担（见 ENABLE_UPSCALE）。
+#           8GB 显存跑二采吃力，故默认关。
+#   True  = 维持完整二采链（1088×720 latent 补采样）。
+H3_ENABLE_REFINE = _env_bool("H3_ENABLE_REFINE", False)
+
 # AI 对话（创作总控）：多轮对话历史 + 已生效的项目创作设定
 AI_CHAT_DIR = os.path.join(PROJECT_OUTPUT_DIR, "ai_chat")
 AI_CHAT_HISTORY_PATH = os.path.join(AI_CHAT_DIR, "chat_history.json")

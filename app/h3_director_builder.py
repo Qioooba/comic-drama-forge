@@ -486,6 +486,68 @@ class H3DirectorBuilder:
                             dropped.append(n["id"])
         return sorted(set(dropped))
 
+    def _drop_refine_chain(self, wf: dict) -> List[int]:
+        """关闭二采：裁掉二采专属模型链 + 断开 Director.refine 输入（2026-09-28 新增）。
+
+        为什么能安全裁：模板里一采链（node 1/16/14/39/53/41 → Director）与二采链
+        （node 54→55→60→63→62→{33,38} → Director.refine）是**两条独立分支**，共享
+        的只有 Director 本体与其 model/video_vae/audio_vae/clip 输入。判「专属」= 该
+        节点**所有出边**都指向 Refine 或已判专属的上游（迭代不动点），一采链节点的
+        出边指向 Director 本体所以不会被误纳。
+
+        插件侧行为已核实（ComfyUI_MiniMaxH3_Director/nodes/director.py +
+        director/refine_pack.py）：refine 输入未接线时 ``normalize_refine_pack`` 返回
+        None → ``refine_will_sample=False`` → 二采整段跳过，Director ``images`` 输出
+        自动落一采帧 → 成片链（CreateVideo/DLSS/SaveVideo）一行不用改；被裁的专属
+        链成孤儿，ComfyUI 从输出反向溯源时不执行、不加载二采 UNET/Lora、不占显存。
+        """
+        refine = next((n for n in wf["nodes"] if n.get("type") == "MiniMaxH3DirectorRefine"), None)
+        if refine is None:
+            return []  # 模板本无二采节点，无需处理
+        links = wf.get("links") or []
+
+        def node_out_link_ids(nid):
+            """节点的有效出边 link id（links 表 ∩ outputs[].links 声明；无声明则全出边）。"""
+            all_out = {l[0] for l in links
+                       if isinstance(l, (list, tuple)) and len(l) >= 5 and l[1] == nid}
+            n = next((x for x in wf["nodes"] if x.get("id") == nid), None)
+            decl = set()
+            for o in ((n or {}).get("outputs") or []):
+                if isinstance(o, dict):
+                    decl.update(x for x in (o.get("links") or []) if x is not None)
+            return decl & all_out if decl else all_out
+
+        # 迭代不动点：从 Refine 反向扩——「出边全指向 dead」的节点判专属
+        dead = {refine["id"]}
+        changed = True
+        while changed:
+            changed = False
+            for n in wf["nodes"]:
+                nid = n.get("id")
+                if nid in dead or n.get("type") in ("MiniMaxH3Director", "SaveVideo",
+                                                     "CreateVideo", "NvidiaDLSSFrameInterpolation",
+                                                     "DLSSNR_Video", "PreviewAny"):
+                    continue
+                out_ids = node_out_link_ids(nid)
+                if not out_ids:
+                    continue  # 源头节点（无出边/未知）不动
+                targets = {l[3] for l in links
+                            if isinstance(l, (list, tuple)) and len(l) >= 5
+                            and l[0] in out_ids}
+                if targets and targets <= dead:
+                    dead.add(nid)
+                    changed = True
+        self._remove_nodes(wf, sorted(dead))
+        # 兜底：把 Director.refine 输入置空（_remove_nodes 一般已清，防「悬空输入」误报）
+        director = next((n for n in wf["nodes"] if n.get("type") == "MiniMaxH3Director"), None)
+        if director is not None:
+            for s in (director.get("inputs") or []):
+                if isinstance(s, dict) and s.get("name") == "refine":
+                    s["link"] = None
+        logger.info("Director：二采已关闭（裁二采专属链 %s，Director.images 落一采帧；"
+                    "画质改由 FlashVSR 超分承担）", sorted(dead))
+        return sorted(dead)
+
     @staticmethod
     def _input_source(node: dict, links: List[list], input_name: str):
         """返回某输入连线的 (origin_id, origin_slot)，没有则 None。"""
@@ -854,7 +916,8 @@ class H3DirectorBuilder:
               audio_mode: str = "generate",
               export_mode: str = "all",
               live_tae_preview: bool = False,
-              align_accel_chain: bool = True) -> Tuple[dict, dict]:
+              align_accel_chain: bool = True,
+              enable_refine: bool = True) -> Tuple[dict, dict]:
         """注入一条 timeline，返回 ``(ui_workflow, layout)``。
 
         segments: ``[{"prompt": str, "duration": 秒, "name": str,
@@ -959,6 +1022,14 @@ class H3DirectorBuilder:
 
         if refine is not None:
             self._strip_pseudo_widgets(refine)
+
+        # ---- 二采开关（2026-09-28 用户定档：8GB 显存跑二采太吃力，画质改用 FlashVSR 超分补） ----
+        # enable_refine=False 时只断开 Director 的 refine 输入连线：插件源码确认
+        # （normalize_refine_pack 未接线返回 None → refine_will_sample=False），
+        # 二采整段跳过、Director.images 输出自动落一采帧，二采专属模型链成孤儿不被执行。
+        if refine is not None and not bool(enable_refine):
+            self._drop_refine_chain(wf)
+            refine = None  # layout 的 refine_node 随之报 None（二采关）
 
         # ---- 「一采」那路 SaveVideo ----
         save_video_pre = None
