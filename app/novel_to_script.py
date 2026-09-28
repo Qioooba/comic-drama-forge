@@ -378,7 +378,17 @@ REWRITE_RULES = (
     "在画面中的位置与状态变化（如「纸币被折叠/展开/递出/攥紧」），"
     "让道具成为观众追踪情感或信任弧线的视觉线索；"
     "同一道具全段出现 ≥ 2 次时，在首次出现的镜头 description 末尾加「（视觉锚点）」标注，"
-    "后续每次出现的镜头 description 末尾加「（视觉锚点·第 N 次）」，N 从 2 起算。"
+    "后续每次出现的镜头 description 末尾加「（视觉锚点·第 N 次）」，N 从 2 起算。\n"
+    "11) 【节拍识别·节奏分层】先判断本段属于哪种叙事节拍，再把节拍落成镜头切分与时长：\n"
+    "    · 节拍四段：开场（建立情境/人物/悬念）→ 触发（矛盾出现/目标确立）→ 高潮（冲突爆发/反转/关键动作，"
+    "      全段情绪与张力的最高点）→ 收尾（结果落地/钩子留白/接下一段）；本段不一定四段齐全，按原文实际节奏取舍。\n"
+    "    · 节拍边界**强制切段**：从一个节拍切换到下一个节拍（尤其进入/离开「高潮」）处，"
+    "      镜头边界必须落在节拍切换点上——绝不让「高潮爆发」与「收尾」挤在同一镜内，"
+    "      也不让铺垫（开场/触发）与高潮并镜。\n"
+    "    · 爆点镜时长加成：处于「高潮」节拍的镜头（冲突爆发/反转/关键动作/金句落点）"
+    "      应取该档位**上限附近**的时长（节奏上需要停留，让观众看清动作与反应）；"
+    "      「触发/开场/收尾」等过渡与铺垫镜则取较短时长，快切推进。"
+    "      具体档位由程序按本镜内容自动估算，你只需把高潮镜的画面信息写足、把过渡镜写紧凑。"
 )
 
 
@@ -901,7 +911,7 @@ def build_shots_for_chunk(client, bible: dict, outline: dict, chunk: dict, shots
 【本段剧情摘要】{outline.get('summary', '')}
 【本段情节要点】{json.dumps(outline.get('key_beats') or [], ensure_ascii=False)}
 【输出要求】严格只输出一个 JSON 对象，不要 markdown 代码块、不要解释文字，结构如下：
-{{"shots": [{{"camera": "景别+运镜（必须取自上方运镜术语表，如 中景跟拍/特写推入，10 字以内）", "location": "所属场景名（必须来自可用场景）", "description": "画面内容描述（80 字以内，只写人物动作过程与关键构图：谁做了什么、怎么做的、在画面什么位置；外貌衣着/环境光线只在推动剧情或首次出场时写，不逐句铺陈，禁止写背景陈述/世界观/来历评述）", "visual_detail": "画面补充细节（可选；当 description 之外还有更细的关键动作过程/环境细节时写在这里，80 字以内；没有多余细节时写空字符串）", "dialogue": [{{"speaker": "说话角色名（必须与可用角色完全一致）", "text": "该角色台词（≤30 字；原文对话尽量原样保留；角色的自语/心声写成该角色本人的台词）"}}], "emotion": "情绪（8 字以内）", "edit_reason": "剪辑动机（15字以内，为什么切到这一镜/承担什么叙事功能，如：用背影暂缓解释/情绪停在等待而非眼泪/道具回环推进信任弧线）", "audio_cues": "音效/配乐提示（60 字以内，只写环境音/音效/配乐，不写人声）", "characters_in_shot": ["出场角色名"], "items_in_shot": ["出场物品名"]}}]}}
+{{"shots": [{{"camera": "景别+运镜（必须取自上方运镜术语表，如 中景跟拍/特写推入，10 字以内）", "location": "所属场景名（必须来自可用场景）", "description": "画面内容描述（80 字以内，只写人物动作过程与关键构图：谁做了什么、怎么做的、在画面什么位置；外貌衣着/环境光线只在推动剧情或首次出场时写，不逐句铺陈，禁止写背景陈述/世界观/来历评述）", "visual_detail": "画面补充细节（可选；当 description 之外还有更细的关键动作过程/环境细节时写在这里，80 字以内；没有多余细节时写空字符串）", "dialogue": [{{"speaker": "说话角色名（必须与可用角色完全一致）", "text": "该角色台词（≤30 字；原文对话尽量原样保留；角色的自语/心声写成该角色本人的台词）"}}], "emotion": "情绪（8 字以内）", "edit_reason": "剪辑动机（15字以内，为什么切到这一镜/承担什么叙事功能，如：用背影暂缓解释/情绪停在等待而非眼泪/道具回环推进信任弧线）", "beat": "叙事节拍（本镜所处节拍，只填「开场」「触发」「高潮」「收尾」四值之一；拿不准填「触发」）", "audio_cues": "音效/配乐提示（60 字以内，只写环境音/音效/配乐，不写人声）", "characters_in_shot": ["出场角色名"], "items_in_shot": ["出场物品名"]}}]}}
 【禁止输出 prompt_h3 字段】视频提示词由程序在生成阶段按 H3 规范自动构建（它会结合当次实际传入的参考图，生成 subject_definitions / summary / retention_analysis / detailed_description / overall_soundscape / non_diegetic_music 六段）。你在剧本阶段并不知道最终配几张参考图，写出来的英文提示词缺少 <Picture N> 标签，反而会覆盖规范提示词导致出片偏离设定。因此**不要写 prompt_h3、不要写英文提示词**；把画面信息全部写进 description 即可。
 【台词要求】dialogue 必须是数组，数组元素为 {{"speaker": 角色名, "text": 台词}}；speaker 必须精确等于「可用角色」中的名字，禁止写“旁白/众人”等未登记角色；无台词的镜头 dialogue 写 []（空数组），禁止写成字符串或 null。角色的心理活动改写成该角色**本人**的自语台词时，speaker 仍写角色名（不要写成「旁白」，本系统没有旁白角色）。dialogue **只承载**：原文对话、以及原文明确心理活动/独白改写的第一人称自语——第三人称叙述与背景补叙**禁止**写成任何角色开口的台词（改写规则 8）。
 【台词预算（防成片截断）】单个镜头的 dialogue **合计不超过 {speech_budget} 字**（≈6.7 秒配音）。台词过多时**先精简冗余语气词与重复表述**，仍超预算才拆成相邻镜头——配音是按镜头时间轴铺的，单镜台词超出镜头时长会被成片尾部静默截掉。
@@ -1055,6 +1065,23 @@ _ACTION_MARKERS = (
     "施法", "结印", "御剑", "掐诀", "催动", "爆发", "猛冲", "疾驰",
 )
 
+# ---- 叙事节拍（改写规则 11，P1 节拍识别切段）----
+#: 节拍四段白名单。模型输出越界/未识别值一律归一到「触发」（最通用的中性节拍）。
+_BEAT_WHITELIST = ("开场", "触发", "高潮", "收尾")
+_DEFAULT_BEAT = "触发"
+#: 「高潮」节拍镜的画面停留加成（秒）：爆点镜需要停留让观众看清动作与反应，
+#: 故在基准时长上额外加成、把时长向档位上限（SHOT_DURATION_MAX=12）顶住。
+#: ⚠️ 不加到全局 SHOT_DURATION_MAX（QC 侧 SHOT_DURATION_MAX_OK 共用同口径）——
+#: 加成只抬高 required/estimate，最终仍被 estimate_shot_duration 夹在 [MIN, MAX]，
+#: 所以是「更常贴着 12s 上限」而非突破上限，不会引入 QC「时长过长」误报。
+BEAT_CLIMAX_BONUS_SEC = 2.0
+
+
+def _norm_beat(raw) -> str:
+    """把模型给的节拍值归一到四值白名单；空/越界值取默认「触发」。"""
+    v = str(raw or "").strip()
+    return v if v in _BEAT_WHITELIST else _DEFAULT_BEAT
+
 
 def required_shot_duration(shot: dict) -> float:
     """该镜头「装得下内容」所需的时长（秒），**不封顶**。
@@ -1084,7 +1111,9 @@ def required_shot_duration(shot: dict) -> float:
         action_hits = sum(1 for kw in _ACTION_MARKERS if kw in desc)
         if action_hits:
             action_sec = min(1.5, 0.4 + action_hits * 0.15)
-    return SHOT_DURATION_SILENT + speak_sec + desc_sec + action_sec
+    # 节拍加成（P1）：高潮/爆点镜额外停留，让节奏分层落地；不影响过渡镜的快切。
+    beat_bonus = BEAT_CLIMAX_BONUS_SEC if str(shot.get("beat") or "").strip() == "高潮" else 0.0
+    return SHOT_DURATION_SILENT + speak_sec + desc_sec + action_sec + beat_bonus
 
 
 def estimate_shot_duration(shot: dict) -> float:
@@ -1348,6 +1377,9 @@ def _norm_shots(raw_shots: list, bible: dict, episodes: int, start_id: int = 1) 
             # edit_reason：剪辑动机（「为什么切到这一镜/承担什么叙事功能」，改写规则 9 新增字段）。
             # 它不解释给观众，是给构图与取舍的依据。限长 50 字（防模型越界输出塞一长段）。
             "edit_reason": str(s.get("edit_reason") or "").strip()[:50],
+            # beat：叙事节拍（开场/触发/高潮/收尾），改写规则 11 新增。
+            # 只保留四值白名单，越界/未识别值归一到「触发」；供下游节奏分层与时长加成取用。
+            "beat": _norm_beat(s.get("beat")),
             "audio_cues": str(s.get("audio_cues") or "").strip()[:60],
             # 视频提示词：**剧本阶段不再信任模型自写的文本**。
             # 历史缺陷：这里原样保留模型写的「英文画面描述（60 词以内）」，一句无
