@@ -2056,6 +2056,78 @@ def estimate_shots_for_chars(char_count) -> int:
     return max(SHOTS_PER_CHUNK_MIN, int(math.ceil(n / float(CHARS_PER_SHOT))))
 
 
+def propose_chapter_split(chapter: dict, text: str = "",
+                          max_sec: int = None, fixed_parts: int = None,
+                          max_shots: int = None) -> dict:
+    """P2-2 渐进式分集 + 人会确认——把 :func:`split_chapter_for_episodes` 包装成
+    一份「分集断点提议」payload，供用户**在触发整集渲染前逐条核对**，而非盲信任自动
+    切章（整集 H3 连续渲染 7 小时资源红线，误切代价极高）。
+
+    纯确定性、无 LLM、无 I/O；与底层 :func:`split_chapter_for_episodes` 完全同源
+    （切点吸附语义边界、时长口径走 EPISODE_PLAN_SEC_PER_SHOT 实测密度），
+    只是把「切点落在原文哪里 + 每集约几镜几秒 + 是否超红线」摊平给人看。
+
+    Args 与 :func:`split_chapter_for_episodes` 一致，另加：
+      - text：完整正文（仅用于取每个单元切点前后的原文预览；为空时 preview=""，不影响切分）。
+      - preview_chars：每单元边界前后取的原文预览字符数（默认 30，足够看清切点语义）。
+
+    返回 dict（含 4 个核心键，前端可整块消费）：
+      {
+        "needs_confirm": True/False,    # parts>1 或 fixed_parts>1 即需人确认（默认 1 集不触发）
+        "message": str,                  # 一句话人类可读建议（含每集时长/上限红线）
+        "units": [                       # 每个单元的切点细节，按 part 升序
+          {
+            "part": int, "start": int, "end": int, "char_count": int,
+            "preview": str,             # 切点前后原文（前后各 preview_chars，越界自动截短）
+            "est_shots": int,           # 按 EPISODE_PLAN_CHARS_PER_SHOT 实测密度预估
+            "est_sec": float,           # 预估成片秒数（EPISODE_PLAN_SEC_PER_SHOT 口径）
+            "over_redline": bool,       # est_shots > MAX_SHOTS_PER_EPISODE（单集资源红线）
+          }, …
+        ],
+      }
+    """
+    seg = text or ""
+    raw_units = split_chapter_for_episodes(chapter, text=seg, max_shots=max_shots,
+                                            fixed_parts=fixed_parts, max_sec=max_sec)
+    # 每个单元：切点前后原文预览（越界自动截短）+ 预估镜数/秒数 + 红线标记
+    preview_chars = 30
+    units: list = []
+    for u in raw_units:
+        s, e = int(u["start"]), int(u["end"])
+        pv_lo = seg[max(0, s - preview_chars): s]
+        pv_hi = seg[e: e + preview_chars] if seg else ""
+        est_shots = plan_shots_for_chars(int(u.get("char_count") or 0))
+        est_sec = estimate_episode_sec(est_shots)
+        units.append({
+            "part": int(u["part"]), "start": s, "end": e,
+            "char_count": int(u.get("char_count") or 0),
+            "preview": pv_lo + pv_hi,
+            "est_shots": est_shots, "est_sec": round(est_sec, 1),
+            "over_redline": est_shots > MAX_SHOTS_PER_EPISODE,
+        })
+    total_parts = int(raw_units[0]["parts"]) if raw_units else 1
+    over = [u for u in units if u["over_redline"]]
+    over_total = (len(over) / len(units)) if units else 0.0
+    total_est_sec = round(sum(u["est_sec"] for u in units), 1)
+    if total_parts > 1:
+        # 拆集了 → 人需逐条确认「切点是否合理、每集时长是否可接受」
+        msg = (f"本章 {len(seg) if seg else int(chapter.get('char_count') or 0)} 字，"
+               f"按默认口径拆成 {total_parts} 集（每集预计 "
+               f"{(total_est_sec / total_parts) / 60.0:.1f} 分钟，单集上限 "
+               f"{EPISODE_MAX_SEC / 60.0:.0f} 分钟）；"
+               f"共 {len(over)} 集预估超 {MAX_SHOTS_PER_EPISODE} 镜红线。"
+               f"请逐条核对每个单元切点（单元间原文无重叠、无丢失）后再生成。")
+    else:
+        msg = f"本章预估 1 集（约 {total_est_sec / 60.0:.1f} 分钟）" \
+              + ("；超过单集时长上限，建议手动拆 2 集" if over else "")
+    return {
+        "needs_confirm": total_parts > 1,
+        "total_parts": total_parts,
+        "units": units,
+        "message": msg,
+    }
+
+
 def estimate_episode_shots(char_count) -> int:
     """按**章字数**预估整集镜头数（不读正文；口径必须与 convert_chapter_to_script 对齐）。
 
