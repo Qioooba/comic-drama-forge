@@ -1878,6 +1878,23 @@ class ComfyUIClient:
             content_lines.append(f"Location: {location}.")
         if desc:
             content_lines.append(f"Action and content: {desc}{SHOT_ACTION_SUFFIX}")
+        # ---------- P0-1：首帧/末帧/运动 三段结构（借鉴 ViMax / CineGen）----------
+        # 给模型「运动起点 → 终点 → 运动类型」的显式锚点，减少动作画崩。
+        # 字段缺失（旧剧本/模型未输出）时整段不出现，回落单段 description，零变化。
+        _ff = str(shot.get("first_frame") or "").strip()
+        _lf = str(shot.get("last_frame") or "").strip()
+        _mo = str(shot.get("motion") or "").strip()
+        if _ff:
+            content_lines.append(
+                f"STARTING FRAME (static snapshot before motion): {_ff}.")
+        if _lf:
+            content_lines.append(
+                f"ENDING FRAME (state after motion): {_lf}.")
+        if _mo:
+            content_lines.append(
+                "MOTION (strictly separate camera movement — push-in / pull-out / "
+                "pan / track / follow / tilt — from movement within the frame — "
+                f"character or object action): {_mo}.")
         if _dlg_text(shot.get("dialogue")):
             # 只给说话状态与口型提示，严禁把台词文本写进提示词（模型会把台词当画面字幕画出来）
             content_lines.append(
