@@ -305,30 +305,69 @@ def _emotion_instruct(emotion: str, char_desc: str = "") -> str:
     return f"{desc}；{hint}".strip("；， ").strip("；") if desc else hint
 
 
+def _pool_gender(ch: dict) -> str:
+    """角色池分配时的性别判据：按 voice_style/appearance/personality/name 文本线索猜性别。
+
+    与旧实现同源（guess_gender 命中女声线索词则 female，否则 male），抽成独立 helper
+    供「预分配池位」与「建表」两处共用，保证口径一致。
+    """
+    hint = " ".join(str(ch.get(k) or "") for k in
+                    ("voice_style", "appearance", "personality", "name", "description"))
+    return "female" if guess_gender(hint) == "female" else "male"
+
+
+def _assign_pool_speakers(needs_pool: Dict[str, str]) -> Dict[str, str]:
+    """把「需要池分配」的角色映射到确定性的 speaker（**与输入顺序无关**）。
+
+    P2-3 修复：旧实现按角色在输入列表里**出现的先后**递增取模（``pool[used_count % len(pool)]``），
+    导致同一角色跨集/跨 bible 列表顺序变化时落到不同 speaker（音色漂移）。这里改为：
+    每个性别组内**按角色名排序**后取第 k 位，第 k 个男性恒取 ``MALE_POOL[k % len(MALE_POOL)]``、
+    第 k 个女性恒取 ``FEMALE_POOL[k % len(FEMALE_POOL)]`` —— 只取决于「本性别组里我排第几」，
+    与「谁先谁后」无关，跨集恒稳。
+
+    ``needs_pool``：``{角色名: "male"|"female"}``（仅**未**显式绑定 speaker 的角色；
+    显式 tts_voice/speaker 由调用方在取用本结果前剔除）。返回 ``{角色名: speaker}``。
+    """
+    male_names = sorted(n for n, g in needs_pool.items() if g == "male")
+    female_names = sorted(n for n, g in needs_pool.items() if g == "female")
+    out: Dict[str, str] = {}
+    for k, nm in enumerate(male_names):
+        out[nm] = MALE_POOL[k % len(MALE_POOL)]
+    for k, nm in enumerate(female_names):
+        out[nm] = FEMALE_POOL[k % len(FEMALE_POOL)]
+    return out
+
+
 def default_voice_map(characters: List[dict], project: str = "", episode: int = 1) -> Dict:
     """按剧本角色生成默认音色映射：同角色固定 speaker + seed（全剧一致）
 
-    优先采用角色自带的 tts_voice / speaker 字段；否则按性别线索从音色池顺序分配。
+    优先采用角色自带的 tts_voice / speaker 字段；否则按性别线索从音色池**确定性**分配
+    （P2-3：池位按「性别组内按名字排序的第几位」取模，与输入顺序无关，跨集恒稳）。
     """
-    used_male, used_female = 0, 0
-    chars: Dict[str, Dict] = {}
+    # 去重（按名字，首次出现为准）+ 收集显式绑定 / 需池分配名单
+    ordered: Dict[str, dict] = {}
     for idx, ch in enumerate(characters or []):
-        name = str(ch.get("name") or f"角色{idx + 1}")
-        if name in chars:
+        if not isinstance(ch, dict):
             continue
+        name = str(ch.get("name") or f"角色{idx + 1}")
+        if name not in ordered:
+            ordered[name] = ch
+
+    # 预分配：未显式绑定合法 speaker 的角色进入池分配（按性别组名字排序取模，顺序无关）
+    needs_pool: Dict[str, str] = {}
+    for name, ch in ordered.items():
+        explicit = str(ch.get("tts_voice") or ch.get("speaker") or "").strip()
+        if explicit not in SPEAKER_KEYS:
+            needs_pool[name] = _pool_gender(ch)
+    pool_speakers = _assign_pool_speakers(needs_pool)
+
+    chars: Dict[str, Dict] = {}
+    for name, ch in ordered.items():
         explicit = str(ch.get("tts_voice") or ch.get("speaker") or "").strip()
         if explicit in SPEAKER_KEYS:
             speaker = explicit
         else:
-            hint = " ".join(str(ch.get(k) or "") for k in
-                            ("voice_style", "appearance", "personality", "name", "description"))
-            pool = FEMALE_POOL if guess_gender(hint) == "female" else MALE_POOL
-            i = used_female if pool is FEMALE_POOL else used_male
-            speaker = pool[i % len(pool)]
-            if pool is FEMALE_POOL:
-                used_female += 1
-            else:
-                used_male += 1
+            speaker = pool_speakers.get(name, SPEAKER_KEYS[0])
         voice_style = str(ch.get("voice_style") or "").strip()
         chars[name] = {
             "mode": "preset",
