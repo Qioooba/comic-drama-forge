@@ -654,10 +654,11 @@ def extract_chunk_outline(client, chunk: dict, novel_title: str,
 {{
   "summary": "本段剧情摘要，120 字以内",
   "characters": [{{"name": "人物名", "role": "主角/配角/反派", "gender": "性别，只填「男」或「女」（必须按原文称谓/代词推断给出）", "appearance": "外貌与服装，35 字以内", "personality": "性格，20 字以内"}}],
-  "items": [{{"name": "物品名", "category": "武器/法宝/道具/服饰", "appearance": "外观，30 字以内"}}],
+  "items": [{{"name": "物品名", "category": "武器/法宝/道具/服饰", "appearance": "外观，30 字以内", "importance": "重要/临时。判定三问（任一答案为「是」即判临时、宁缺勿滥）：①删掉它剧情还成立吗？②它只是随手用的日常物品吗？③它只是场景陈设吗？只有推动剧情且后续会反复出现/被反复指认的关键道具才判「重要」"}}],
   "scenes": [{{"name": "场景名", "location": "地点类型", "appearance": "环境特征，30 字以内"}}],
   "key_beats": ["按原文顺序列出本段关键情节节点，每条 30 字以内，最多 12 条（分镜阶段会读取完整原文，这里只做索引，不要逐句复述、不要写成英文）"]
-}}"""
+}}
+【道具三问过滤】items 最多输出 3 条（宁缺勿滥）：只保留通过三问的重要道具（见上方 importance 判定），临时道具一律不进 items。"""
     label = f"outline#{chunk.get('index')}"
     hit = _cache_get(cache_dir, "outline", prompt, events, label)
     if hit is not None and hit.get("_chunk"):
@@ -718,8 +719,9 @@ def build_bible(client, outlines: list, novel_title: str, style: str, episodes: 
             "摘要": o.get("summary", ""),
             "人物": [{"name": c.get("name"), "role": c.get("role"), "gender": c.get("gender"), "appearance": c.get("appearance")}
                      for c in (o.get("characters") or [])[:6] if isinstance(c, dict)],
-            "物品": [{"name": i.get("name"), "category": i.get("category"), "appearance": i.get("appearance")}
-                     for i in (o.get("items") or [])[:6] if isinstance(i, dict)],
+            "物品": [{"name": i.get("name"), "category": i.get("category"), "appearance": i.get("appearance"),
+                     "importance": i.get("importance", "")}
+                    for i in (o.get("items") or [])[:3] if isinstance(i, dict)],
             "场景": [{"name": s.get("name"), "appearance": s.get("appearance")}
                      for s in (o.get("scenes") or [])[:6] if isinstance(s, dict)],
             "情节要点": (o.get("key_beats") or [])[:5],
@@ -735,11 +737,11 @@ def build_bible(client, outlines: list, novel_title: str, style: str, episodes: 
   "theme": "一句话主题/卖点（30 字以内）",
   "style": "{style}",
   "characters": [{{"name": "姓名", "gender": "性别，只允许「男」或「女」两个值；必须按原文的人物称谓/代词/姓名线索推断后明确给出，禁止留空或写「未知」", "age": "年龄", "identity": "身份/阵营（15 字以内）", "appearance": "外貌（含发色/瞳色/标志特征，**必须包含性别（如「女性」「男子」）**，60 字以内；若上方设定库已锁定则该字段必须与锁定值逐字一致）", "outfit": "本集服装状态（20 字以内，与上集结尾一致；若本集确有换装必须体现原因）", "personality": "性格（30 字以内）", "voice_style": "配音风格（15 字以内）", "reference_prompt_zh": "中文参考图提示词：角色三视图设定图，60 字以内，**必须写明角色性别（如开头写「女性角色，」「男性角色，」）**，只写画面可见的具体特征——发色发型、瞳色、脸型、服装款式与材质配色、标志配饰、三视图版式（**必须写明「正面、侧面、背面三张全身视图横排，从头到脚完整入画、同一角色身高比例一致」**，不要写成半身/胸像）；**严禁写任何风格词/画风词/质量词**（如「国漫」「3D渲染」「电影级」「高清」「精致」）", "reference_prompt_en": "English prompt for a character reference sheet with three full-body views (front, side, back laid out horizontally, head-to-toe, consistent body proportions), under 45 words, must explicitly state the character's gender (e.g. 'a woman,' / 'a man,'), comma-separated CONCRETE visual keywords (hair color and style, eye color, face shape, outfit material and colors, signature accessories, view layout). It MUST be an accurate translation of reference_prompt_zh. Never romanize Chinese concepts into invented pinyin (「国漫」 must become 'Chinese animated style', NOT 'xuanxuan'); never write style or quality words — the program appends them"}}],
-  "items": [{{"name": "物品名", "category": "武器/法宝/道具/服饰", "appearance": "外观（50 字以内）", "owner": "持有人", "importance": "重要/临时（重要=后续章节会重复出现或推动剧情，临时=仅本集使用），只输出重要道具", "reference_prompt_zh": "中文参考图提示词，50 字以内，只写形制、材质、颜色、纹样与磨损状态；**严禁写风格词/画风词/质量词**", "reference_prompt_en": "English prompt for an item prop sheet, under 40 words, comma-separated concrete visual keywords (shape, material, color, pattern, wear). Accurate translation of reference_prompt_zh; no invented pinyin, no style or quality words"}}],
+  "items": [{{"name": "物品名", "category": "武器/法宝/道具/服饰", "appearance": "外观（50 字以内）", "owner": "持有人", "importance": "重要/临时。判定三问（任一答案为「是」即判临时）：①删掉它剧情还成立吗？②它只是随手用的日常物品吗？③它只是场景陈设吗？", "reference_prompt_zh": "中文参考图提示词，50 字以内，只写形制、材质、颜色、纹样与磨损状态；**严禁写风格词/画风词/质量词**", "reference_prompt_en": "English prompt for an item prop sheet, under 40 words, comma-separated concrete visual keywords (shape, material, color, pattern, wear). Accurate translation of reference_prompt_zh; no invented pinyin, no style or quality words"}}],
   "scenes": [{{"name": "场景名", "location": "地点类型", "appearance": "环境与氛围（60 字以内）", "reference_prompt_zh": "中文参考图提示词，50 字以内，只写空间结构、建筑形制、时间天气、光源方向与色调；**严禁写风格词/画风词/质量词**（且不要出现人物）", "reference_prompt_en": "English prompt for an environment concept art sheet, under 40 words, comma-separated concrete visual keywords (spatial layout, architecture, time of day and weather, light direction, color palette, no people). Accurate translation of reference_prompt_zh; no invented pinyin, no style or quality words"}}],
   "production_notes": {{"style_guide": "画面与叙事风格说明（60 字以内）"}}
 }}
-【硬性约束】characters 最多 6 个（只保留主要角色，按戏份排序）；items 最多 5 个；scenes 最多 6 个；不要输出示例里的占位文字。若上方提供了「项目级设定库」，则已登记角色的 name / gender / appearance / personality 必须与该库完全一致（禁止改名、禁止改性别、禁止改外观），只允许更新 outfit（当前服装状态）。
+【硬性约束】characters 最多 6 个（只保留主要角色，按戏份排序）；items 最多 3 个（**宁缺勿滥**，本集 0-3 个都可：只有通过三问过滤的重要道具才保留——①删掉它剧情还成立吗？②只是随手用的日常物品吗？③只是场景陈设吗？任一答案为「是」即剔除；临时道具不得进 items）；scenes 最多 6 个；不要输出示例里的占位文字。若上方提供了「项目级设定库」，则已登记角色的 name / gender / appearance / personality 必须与该库完全一致（禁止改名、禁止改性别、禁止改外观），只允许更新 outfit（当前服装状态）。
 【风格红线·重要变更】风格词由**程序在生成前统一追加**（幂等，不会重复），不再由你写。因此 characters / items / scenes 三个数组里每一条 reference_prompt_zh 与 reference_prompt_en **都不得自行写风格词、画风词或质量词**——自己写了会导致风格在提示词里出现两遍（实测就是「中国古风玄幻漫剧风格。风格：中国古风玄幻漫剧，画面精致…」这种重复），属于不合格输出。你只需专注描述画面里看得见的具体特征，把风格判断交给程序。
 【格式红线】直接以 {{ 作为输出的第一个字符；严禁输出任何推理过程、思考草稿、英文说明、markdown 代码块标记或前后缀解释文字；整个 JSON 输出控制在 1200 字以内（字段描述能短则短）。"""
     # 断点缓存：命中则跳过模型汇总（未命中时行为与加缓存前完全一致）。
@@ -795,13 +797,13 @@ def _fallback_bible(outlines: list, novel_title: str, style: str) -> dict:
         for c in (o.get("characters") or [])[:6]:
             if isinstance(c, dict):
                 _pick(c, chars, ["identity", "gender", "appearance", "outfit", "personality", "voice_style"])
-        for i in (o.get("items") or [])[:6]:
+        for i in (o.get("items") or [])[:3]:
             if isinstance(i, dict):
                 _pick(i, items, ["category", "appearance", "owner"])
         for s in (o.get("scenes") or [])[:6]:
             if isinstance(s, dict):
                 _pick(s, scenes, ["location", "appearance"])
-    out_chars, out_items, out_scenes = (list(chars.values())[:6], list(items.values())[:5],
+    out_chars, out_items, out_scenes = (list(chars.values())[:6], list(items.values())[:3],
                                         list(scenes.values())[:6])
     # 兜底路径同样要带风格：否则一旦 bible 汇总失败，资产提示词又回到「零风格词」老样子
     eff = style_kit.normalize_style(style)
@@ -875,7 +877,7 @@ def build_shots_for_chunk(client, bible: dict, outline: dict, chunk: dict, shots
         for c in (bible.get("characters") or [])[:6] if isinstance(c, dict)
     ]
     item_brief = [{"name": i.get("name"), "appearance": (i.get("appearance") or "")[:30]}
-                  for i in (bible.get("items") or [])[:5] if isinstance(i, dict)]
+                  for i in (bible.get("items") or [])[:3] if isinstance(i, dict)]
     scene_brief = [{"name": s.get("name"), "appearance": (s.get("appearance") or "")[:40]}
                    for s in (bible.get("scenes") or [])[:6] if isinstance(s, dict)]
     _hard = int(shots_hard_cap or 0)
@@ -1564,7 +1566,7 @@ def convert_novel_to_script(client, novel_meta: dict, novel_text: str, style: st
     characters = _norm_list(bible.get("characters"), 8,
                             ["name", "age", "gender", "appearance", "personality", "voice_style",
                              "reference_prompt_zh", "reference_prompt_en"])
-    items = _norm_list(bible.get("items"), 6,
+    items = _norm_list(bible.get("items"), 3,
                        ["name", "category", "appearance", "owner", "importance",
                         "reference_prompt_zh", "reference_prompt_en"])
     scenes = _norm_list(bible.get("scenes"), 8,
@@ -2169,7 +2171,7 @@ def convert_chapter_to_script(client, novel_meta: dict, novel_text: str, chapter
     characters = _norm_list(bible.get("characters"), 8,
                             ["name", "age", "gender", "identity", "appearance", "outfit", "personality",
                              "voice_style", "reference_prompt_zh", "reference_prompt_en"])
-    items = _norm_list(bible.get("items"), 6,
+    items = _norm_list(bible.get("items"), 3,
                        ["name", "category", "appearance", "owner", "importance",
                         "reference_prompt_zh", "reference_prompt_en"])
     scenes = _norm_list(bible.get("scenes"), 8,
