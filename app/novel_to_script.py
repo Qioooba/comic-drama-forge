@@ -153,6 +153,7 @@ SHOT_FIELDS_DEFAULT = {
     "duration": 5,
     "camera": "中景",
     "location": "",
+    "scene_lighting": "",
     "description": "",
     "dialogue": [],
     "dialogue_text": "",
@@ -791,7 +792,7 @@ def build_bible(client, outlines: list, novel_title: str, style: str, episodes: 
   "style": "{style}",
   "characters": [{{"name": "姓名", "gender": "性别，只允许「男」或「女」两个值；必须按原文的人物称谓/代词/姓名线索推断后明确给出，禁止留空或写「未知」", "age": "年龄", "identity": "身份/阵营（15 字以内）", "appearance": "外貌（含发色/瞳色/标志特征，**必须包含性别（如「女性」「男子」）**，60 字以内；若上方设定库已锁定则该字段必须与锁定值逐字一致）", "outfit": "本集服装状态（20 字以内，与上集结尾一致；若本集确有换装必须体现原因）", "personality": "性格（30 字以内）", "voice_style": "配音风格（15 字以内）", "reference_prompt_zh": "中文参考图提示词：角色三视图设定图，60 字以内，**必须写明角色性别（如开头写「女性角色，」「男性角色，」）**，只写画面可见的具体特征——发色发型、瞳色、脸型、服装款式与材质配色、标志配饰、三视图版式（**必须写明「正面、侧面、背面三张全身视图横排，从头到脚完整入画、同一角色身高比例一致」**，不要写成半身/胸像）；**严禁写任何风格词/画风词/质量词**（如「国漫」「3D渲染」「电影级」「高清」「精致」）", "reference_prompt_en": "English prompt for a character reference sheet with three full-body views (front, side, back laid out horizontally, head-to-toe, consistent body proportions), under 45 words, must explicitly state the character's gender (e.g. 'a woman,' / 'a man,'), comma-separated CONCRETE visual keywords (hair color and style, eye color, face shape, outfit material and colors, signature accessories, view layout). It MUST be an accurate translation of reference_prompt_zh. Never romanize Chinese concepts into invented pinyin (「国漫」 must become 'Chinese animated style', NOT 'xuanxuan'); never write style or quality words — the program appends them"}}],
   "items": [{{"name": "物品名", "category": "武器/法宝/道具/服饰", "appearance": "外观（50 字以内）", "owner": "持有人", "importance": "重要/临时。判定三问（任一答案为「是」即判临时）：①删掉它剧情还成立吗？②它只是随手用的日常物品吗？③它只是场景陈设吗？", "reference_prompt_zh": "中文参考图提示词，50 字以内，只写形制、材质、颜色、纹样与磨损状态；**严禁写风格词/画风词/质量词**", "reference_prompt_en": "English prompt for an item prop sheet, under 40 words, comma-separated concrete visual keywords (shape, material, color, pattern, wear). Accurate translation of reference_prompt_zh; no invented pinyin, no style or quality words"}}],
-  "scenes": [{{"name": "场景名", "location": "地点类型", "appearance": "环境与氛围（60 字以内）", "reference_prompt_zh": "中文参考图提示词，50 字以内，只写空间结构、建筑形制、时间天气、光源方向与色调；**严禁写风格词/画风词/质量词**（且不要出现人物）", "reference_prompt_en": "English prompt for an environment concept art sheet, under 40 words, comma-separated concrete visual keywords (spatial layout, architecture, time of day and weather, light direction, color palette, no people). Accurate translation of reference_prompt_zh; no invented pinyin, no style or quality words"}}],
+  "scenes": [{{"name": "场景名", "location": "地点类型", "appearance": "环境与氛围（60 字以内）", "scene_lighting": "该场景的**统一光影基调**（30 字以内）：整个场景所有镜头共享的主光源/时间/色温（如「黄昏暖调逆光」「冷蓝月光」「正午顶光」），用于消除同场景内逐镜光影漂移；无明确光源倾向时写「自然漫射光」。此字段只写光影，不写风格词/画风词/质量词，也不要出现人物", "reference_prompt_zh": "中文参考图提示词，50 字以内，只写空间结构、建筑形制、时间天气、光源方向与色调；**严禁写风格词/画风词/质量词**（且不要出现人物）", "reference_prompt_en": "English prompt for an environment concept art sheet, under 40 words, comma-separated concrete visual keywords (spatial layout, architecture, time of day and weather, light direction, color palette, no people). Accurate translation of reference_prompt_zh; no invented pinyin, no style or quality words"}}],
   "production_notes": {{"style_guide": "画面与叙事风格说明（60 字以内）"}}
 }}
 【硬性约束】characters 最多 6 个（只保留主要角色，按戏份排序）；items 最多 3 个（**宁缺勿滥**，本集 0-3 个都可：只有通过三问过滤的重要道具才保留——①删掉它剧情还成立吗？②只是随手用的日常物品吗？③只是场景陈设吗？任一答案为「是」即剔除；临时道具不得进 items）；scenes 最多 6 个；不要输出示例里的占位文字。若上方提供了「项目级设定库」，则已登记角色的 name / gender / appearance / personality 必须与该库完全一致（禁止改名、禁止改性别、禁止改外观），只允许更新 outfit（当前服装状态）。
@@ -1340,6 +1341,14 @@ def _norm_shots(raw_shots: list, bible: dict, episodes: int, start_id: int = 1) 
     scenes = [s.get("name") for s in (bible.get("scenes") or []) if isinstance(s, dict)]
     chars = [c.get("name") for c in (bible.get("characters") or []) if isinstance(c, dict)]
     items = [i.get("name") for i in (bible.get("items") or []) if isinstance(i, dict)]
+    # P4-A 场景共享光影：把「场景名 → 该场景统一光影基调」建成映射，落到每个镜头上。
+    # 同场景所有镜头共享同一 base，下游 comfyui_client 光影推断时优先用它，消除场景内逐镜漂移。
+    # 旧剧本 / bible 无 scene_lighting 字段 → 映射值为空串，下游走原有逐镜+情绪兜底（零变化）。
+    scene_light_map = {
+        str(s.get("name") or "").strip(): str(s.get("scene_lighting") or "").strip()
+        for s in (bible.get("scenes") or [])
+        if isinstance(s, dict) and str(s.get("name") or "").strip()
+    }
     # 风格：镜头级落一次 style，下游（分镜图 / 视频提示词）才有值可用。
     # 历史缺陷：这里不写 style，导致 comfyui_client 里 shot.get("style", "3D动漫渲染")
     # 永远回落硬编码默认值 —— 用户与总控敲定的风格一个镜头都传不到。
@@ -1394,6 +1403,9 @@ def _norm_shots(raw_shots: list, bible: dict, episodes: int, start_id: int = 1) 
             "duration": 5,
             "camera": str(s.get("camera") or "中景").strip()[:20] or "中景",
             "location": loc,
+            # P4-A 场景共享光影：按解析后的 loc 取该场景统一光影基调（同场景镜头同源，
+            # 消除逐镜漂移）。旧剧本 loc 未命中或场景无该字段 → 空串，下游走逐镜/情绪兜底。
+            "scene_lighting": scene_light_map.get(loc, ""),
             # description：限长 200 字（前端展示与 prompt 体量控制用）。
             # 但画面细节不丢：原始描述若超长，把超出的部分拆进 visual_detail（分镜图/视频
             # 提示词会把它并回画面主体）。历史缺陷：description 截断 200 字后剩余细节
@@ -1645,7 +1657,7 @@ def convert_novel_to_script(client, novel_meta: dict, novel_text: str, style: st
                        ["name", "category", "appearance", "owner", "importance",
                         "reference_prompt_zh", "reference_prompt_en"])
     scenes = _norm_list(bible.get("scenes"), 8,
-                        ["name", "location", "appearance", "reference_prompt_zh", "reference_prompt_en"])
+                        ["name", "location", "appearance", "scene_lighting", "reference_prompt_zh", "reference_prompt_en"])
     if not characters:
         raise LLMError("模型未返回有效角色设定，转换中止")
     # 风格：以调用方传入的 style 为准 + 确定性补写（模型不得自写风格，统一由此收尾）
@@ -2250,7 +2262,7 @@ def convert_chapter_to_script(client, novel_meta: dict, novel_text: str, chapter
                        ["name", "category", "appearance", "owner", "importance",
                         "reference_prompt_zh", "reference_prompt_en"])
     scenes = _norm_list(bible.get("scenes"), 8,
-                        ["name", "location", "appearance", "reference_prompt_zh", "reference_prompt_en"])
+                        ["name", "location", "appearance", "scene_lighting", "reference_prompt_zh", "reference_prompt_en"])
     if not characters:
         raise LLMError("模型未返回有效角色设定，转换中止")
     # 风格：以调用方传入的 style 为准（模型的返回值可能是自我发挥，用户意图优先）

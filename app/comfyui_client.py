@@ -1678,6 +1678,16 @@ class ComfyUIClient:
     def _extract_light_hint(shot: dict) -> str:
         """从镜头描述/情绪里抽取光影引导；无命中返回空串（不强行加光影）。
 
+        三级优先（2026-09-28 P4-A 场景共享光影）：
+        1. 本镜光源词（``_LIGHT_KEYWORDS``，最具体）——画面明写「闪电/烛光/黄昏」等；
+        2. 场景共享光影（``shot["scene_lighting"]``，治场景内逐镜漂移）——同场景所有
+           无具体光源词的镜头统一吃这一档基线，避免忽冷忽热；
+        3. 情绪兜底（``_LIGHT_EMOTION_FALLBACK``，最弱）。
+
+        第 1 档命中即返回（最具体优先：画面明写的光源压过场景基线，允许单镜特写例外）；
+        场景光影与情绪兜底都做幂等（提示语首段已在画面文本里则不重复追加）。
+        旧剧本 / 无 ``scene_lighting`` 字段的镜头 → 第 2 档为空，行为与旧版完全一致。
+
         幂等：若命中的光影提示语（或它的首段短语）已经出现在文本里，说明画面细节
         已承载光源，不再重复追加。
         """
@@ -1695,6 +1705,11 @@ class ComfyUIClient:
         for kw, hint in ComfyUIClient._LIGHT_KEYWORDS:
             if kw in text:
                 return "" if ComfyUIClient._light_hint_covered(hint, text) else hint
+        # P4-A 场景共享光影（第二档）：无具体光源词的镜头统一落到场景基线，消除场景内漂移。
+        # 命中场景基线即返回（不再走情绪兜底）——同场景光线一致性优先于单镜情绪泛化。
+        scene_light = str(shot.get("scene_lighting") or "").strip()
+        if scene_light:
+            return "" if ComfyUIClient._light_hint_covered(scene_light, text) else scene_light
         emotion = str(shot.get("emotion") or "").strip()
         for kw, hint in ComfyUIClient._LIGHT_EMOTION_FALLBACK:
             if kw in emotion:
