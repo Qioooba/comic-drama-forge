@@ -22,4 +22,10 @@ contextBridge.exposeInMainWorld('mjscxt', {
     setProjectRoot: (root) => ipcRenderer.invoke('config:setProjectRoot', root),
     get: () => ipcRenderer.invoke('config:get'),
   },
+  // 更新系统（纯数据，不弹窗；菜单「检查更新」走独立通道）
+  updater: {
+    check: () => ipcRenderer.invoke('updater:check'),
+    applyResource: () => ipcRenderer.invoke('updater:applyResource'),
+    applyFull: () => ipcRenderer.invoke('updater:applyFull'),
+  },
 });

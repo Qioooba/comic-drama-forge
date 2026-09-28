@@ -49,11 +49,13 @@
       "target": [
         {
           "target": "nsis",
-          "arch": ["x64"]
+          "arch": ["x64"],
+          "artifactName": "漫剧工坊-Setup-${version}.${ext}"
         },
         {
           "target": "portable",
-          "arch": ["x64"]
+          "arch": ["x64"],
+          "artifactName": "漫剧工坊-Portable-${version}.${ext}"
         }
       ],
       "requestedExecutionLevel": "asInvoker"

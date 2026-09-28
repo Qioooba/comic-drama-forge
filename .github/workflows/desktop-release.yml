@@ -1,0 +1,168 @@
+# 漫剧工坊 桌面版发布流水线（GitHub Actions）
+# 触发：打 tag v1.2.3 自动发；或手动 workflow_dispatch 指定 version。
+# 产物（与 electron-app/update-config.js 的 ASSET 命名严格对齐）：
+#   漫剧工坊-Portable-<v>.exe   整包（含嵌入式 Python + 后端 + 前端）
+#   resources-<v>.zip          资源增量包（app/workflows/locales，不含 Python）
+#   SHA256SUMS.txt             两个资产的 sha256 清单（updater 强校验用）
+# 发 Release（draft=false，公开仓库匿名可下载）。
+
+name: Desktop Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（如 1.2.3）'
+        required: true
+        default: '1.0.0'
+
+# 同时只跑一个发布作业；新触发取消旧的（避免重复发 Release）
+concurrency:
+  group: desktop-release
+  cancel-in-progress: true
+
+jobs:
+  build-win:
+    runs-on: windows-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    # 版本号：tag 触发取 tag 去 v；手动触发取 input
+    steps:
+      - name: Resolve version
+        id: ver
+        run: |
+          $v = "${{ github.event.inputs.version }}";
+          if ($v -eq "" -or $null -eq $v) {
+            $v = "${{ github.ref_name }}";
+          }
+          # 去掉前缀 v
+          $v = $v -replace '^v','';
+          Write-Output "version=$v" >> $env:GITHUB_OUTPUT;
+        shell: pwsh
+
+      - uses: actions/checkout@v4
+
+      # 把发布版本写进 electron-app/package.json（updater 的 currentVersion 读它）
+      - name: Write version to package.json
+        working-directory: electron-app
+        run: |
+          $v = "${{ steps.ver.outputs.version }}";
+          $p = "package.json";
+          $j = Get-Content $p -Raw | ConvertFrom-Json;
+          $j.version = $v;
+          $j | ConvertTo-Json -Depth 10 | Set-Content $p -Encoding utf8;
+          Write-Output "package.json version -> $v"
+        shell: pwsh
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: npm install
+        working-directory: electron-app
+        run: npm install
+
+      # 收集后端源码 + workflows + locales 到 _backend（不含 python）
+      - name: Pack backend resources
+        working-directory: electron-app
+        run: node pack_backend.js
+
+      # 烘焙嵌入式 Python（embeddable）到 _backend/python，并装后端依赖
+      - name: Bake embedded Python
+        working-directory: electron-app
+        run: |
+          $pyVer = "3.13.12";
+          $zip = "python-$pyVer-embed-amd64.zip";
+          Invoke-WebRequest "https://www.python.org/ftp/python/$pyVer/$zip" -OutFile $zip;
+          $dst = "_backend\python";
+          if (Test-Path $dst) { Remove-Item -Recurse -Force $dst; }
+          New-Item -ItemType Directory -Path $dst | Out-Null;
+          Expand-Archive $zip -DestinationPath $dst -Force;
+          # 放开 site-packages（embeddable 默认禁用 import site）
+          $pth = Get-ChildItem $dst -Filter "*.pth" | Select-Object -First 1;
+          $content = Get-Content $pth.FullName;
+          $content = $content -replace '#import site','import site';
+          Set-Content $pth.FullName ($content -join "`n");
+          Add-Content $pth.FullName "Lib\site-packages";
+          # get-pip
+          Invoke-WebRequest "https://bootstrap.pypa.io/get-pip.py" -OutFile "get-pip.py";
+          & $dst\python.exe get-pip.py --no-warn-script-location;
+          # 装后端依赖（不含 torch/opencv，推理在 ComfyUI 侧）
+          & $dst\python.exe -m pip install --no-warn-script-location -r "..\app\requirements.txt";
+          & $dst\python.exe -c "import flask, waitress, cryptography, openai, anthropic; print('backend deps ok')"
+        shell: pwsh
+
+      # 打 Windows 便携包（electron-builder，产物名 漫剧工坊-Portable-<v>.exe）
+      - name: Build portable exe
+        working-directory: electron-app
+        run: npx electron-builder --win portable --x64
+
+      # 打资源增量包（app/workflows/locales，不含 python）
+      - name: Build resources zip
+        working-directory: electron-app
+        run: |
+          $v = "${{ steps.ver.outputs.version }}";
+          Compress-Archive -Path "_backend\app","_backend\workflows","_backend\locales" -DestinationPath "dist\resources-$v.zip" -Force;
+        shell: pwsh
+
+      # 生成 SHA256SUMS.txt
+      - name: Write SHA256SUMS.txt
+        working-directory: electron-app/dist
+        run: |
+          $v = "${{ steps.ver.outputs.version }}";
+          $files = @("漫剧工坊-Portable-$v.exe","resources-$v.zip");
+          $lines = @();
+          foreach ($f in $files) {
+            $h = (Get-FileHash $f -Algorithm SHA256).Hash.ToLower();
+            $lines += ("{0}  {1}" -f $h, $f);
+          }
+          Set-Content "SHA256SUMS.txt" ($lines -join "`n") -Encoding utf8;
+        shell: pwsh
+
+      - name: List dist artifacts
+        working-directory: electron-app/dist
+        run: |
+          Get-ChildItem -File | ForEach-Object { "{0}  {1} bytes" -f $_.Name, $_.Length }
+        shell: pwsh
+
+      - name: Upload dist artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-dist
+          path: electron-app/dist
+
+  # 发 Release（公开仓库，匿名可下载）。草稿=false。
+  release:
+    needs: build-win
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: desktop-dist
+          path: dist
+
+      - name: List downloaded files
+        run: |
+          find dist -maxdepth 1 -type f -printf '%f  %s bytes\n'
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v${{ needs.build-win.outputs.version }}
+          name: "漫剧工坊 桌面版 ${{ needs.build-win.outputs.version }}"
+          draft: false
+          prerelease: false
+          generate_release_notes: false
+          files: |
+            dist/漫剧工坊-Portable-${{ needs.build-win.outputs.version }}.exe
+            dist/resources-${{ needs.build-win.outputs.version }}.zip
+            dist/SHA256SUMS.txt

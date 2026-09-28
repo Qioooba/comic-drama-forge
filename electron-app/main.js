@@ -17,6 +17,8 @@ const net = require('node:net');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const updater = require('./updater');
+const updateConfig = require('./update-config');
 
 // ---------------------------------------------------------------------------
 // 常量
@@ -123,13 +125,18 @@ async function detectPython() {
 // 开发态（npm start）= 前后端分离：用本机 venv 跑项目源码，数据落源根（可写）。
 function resolveBackendLayout() {
   if (app.isPackaged) {
-    const res = process.resourcesPath; // extraResources 落点（打包态只读，可写数据另指 userData）
+    const res = process.resourcesPath; // 安装区（只读）：python + app + workflows + locales
     const exeName = process.platform === 'win32' ? 'python.exe' : 'python';
+    // 资源镜像（userData 下可写）：启动时由 seedResourceMirror() 从安装区播种，
+    // 资源增量更新会覆盖它 → 后端实际读镜像里的 app/serve.py，增量重启后即刻生效。
+    const mirror = resourceMirrorDir();
+    const mirrorServe = path.join(mirror, 'app', 'serve.py');
+    const useMirror = fs.existsSync(mirrorServe);
     return {
-      pythonExe: path.join(res, 'python', exeName),
-      servePy: path.join(res, 'app', 'serve.py'),
-      dataDir: app.getPath('userData'), // 可写
-      cwd: res,
+      pythonExe: path.join(res, 'python', exeName), // python 归整包管理，永远走安装区
+      servePy: useMirror ? mirrorServe : path.join(res, 'app', 'serve.py'),
+      dataDir: app.getPath('userData'), // 可写数据区（output/novels/*.config.json/密钥）
+      cwd: useMirror ? mirror : res,
     };
   }
   // 开发态：沿用 config（项目根 + 本机 venv），不设 MJSCXT_DATA_DIR（源根可写）
@@ -222,6 +229,158 @@ async function resolvePort() {
     return { port, reuse: false };
   }
   return { port: DEFAULT_PORT, reuse: false };
+}
+
+// ---------------------------------------------------------------------------
+// 更新系统（GitHub 公开仓库 · 匿名下载）
+// ---------------------------------------------------------------------------
+// 安装模型：
+//   · 安装区 resourcesPath（extraResources）= 只读：python + app + workflows + locales
+//   · 可写数据区 userData = output/novels/*.config.json/.secret_key/secrets.enc
+//   · 资源镜像 userData/resource-mirror = 可写的 workflows/app/locales 副本（后端实际读这里）
+// 两种更新：
+//   资源增量：下载 resources-x.y.z.zip（不含 python）→ 校验 → 覆盖镜像 → 重启后端生效。体积小、不打断数据。
+//   整包：下载 Portable exe → 校验 → spawn bootstrapper 替换安装区并自重启。
+// 触发：启动检查一次 + 每 24h 后台轮询 + 菜单「检查更新」手动。
+const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24h
+
+function resourceMirrorDir() {
+  return path.join(app.getPath('userData'), 'resource-mirror');
+}
+
+// 首次运行：把安装区 resourcesPath/{app,workflows,locales} 播种到可写镜像。
+// 已存在且非空则跳过（增量更新会另行覆盖）。不播种 python（python 归整包管理，运行时用安装区）。
+function seedResourceMirror() {
+  if (!app.isPackaged) return null; // 开发态直接用项目根，无镜像
+  const res = process.resourcesPath;
+  const mirror = resourceMirrorDir();
+  for (const sub of ['app', 'workflows', 'locales']) {
+    const src = path.join(res, sub);
+    const dst = path.join(mirror, sub);
+    if (!fs.existsSync(src)) continue;
+    if (!fs.existsSync(dst)) {
+      fs.mkdirSync(path.dirname(dst), { recursive: true });
+      fs.cpSync(src, dst, { recursive: true });
+      console.log(`[更新] 播种资源镜像 ${sub} -> ${dst}`);
+    }
+  }
+  return mirror;
+}
+
+// 更新编排结果（交给 UI 展示 / IPC 回传）
+async function checkForUpdatesNow(manual) {
+  const current = updateConfig.currentVersion();
+  let info;
+  try {
+    info = await updater.checkForUpdates(current);
+  } catch (e) {
+    const msg = `检查更新失败：${e.message}`;
+    console.warn(msg);
+    if (manual) await dialog.showMessageBox(undefined, {
+      type: 'warning', title: '检查更新', message: msg, buttons: ['好'],
+    });
+    return { checked: true, update: false, error: msg };
+  }
+  if (!info.update) {
+    if (manual) await dialog.showMessageBox(undefined, {
+      type: 'info', title: '检查更新',
+      message: `当前已是最新版本（${info.current}）`,
+      detail: `GitHub 最新版本：${info.latest}`, buttons: ['好'],
+    });
+    return { checked: true, ...info };
+  }
+  // 有更新：询问用户走哪种
+  const opts = {
+    type: 'info', title: '发现新版本',
+    message: `新版本 ${info.latest}（当前 ${info.current}）`,
+    detail: [
+      '· 资源增量更新：仅更新工作流/前端/后端代码（不含 Python 运行时），体积小，保留你的密钥与数据。',
+      '· 整包更新：下载完整 Portable 应用（含 Python 运行时），体积约 200MB+。',
+      '',
+      '两种都会自动 SHA256 校验。资源增量需重启后端生效。',
+    ].join('\n'),
+    buttons: ['资源增量', '整包', '暂不更新'], defaultId: 0,
+  };
+  const { response } = await dialog.showMessageBox(undefined, opts);
+  if (response === 0) return runResourceUpdate(info, manual);
+  if (response === 1) return runFullUpdate(info, manual);
+  return { checked: true, ...info, update: false, skipped: true };
+}
+
+// 资源增量：下载 zip + SHA256SUMS 校验 → 覆盖镜像 → 重启后端
+async function runResourceUpdate(info, manual) {
+  const mirror = resourceMirrorDir();
+  const destDir = path.join(app.getPath('userData'), 'update-cache');
+  let shaSums = '';
+  try {
+    const rel = await updater.fetchLatestRelease();
+    const sumAsset = (rel.assets || []).find((a) => a.name === updateConfig.ASSET.sha256sums);
+    if (sumAsset) shaSums = await (await fetch(sumAsset.url, { headers: { 'User-Agent': 'mjscxt' } })).text();
+  } catch { /* 清单缺失则跳过强校验（仍下载） */ }
+  try {
+    await updater.downloadAndUnpackResources(info.latest, info.assets, shaSums, destDir, mirror,
+      (f) => { if (manual) console.log(`资源增量下载 ${(f * 100).toFixed(0)}%`); });
+    console.log('[更新] 资源增量已覆盖镜像，重启后端生效');
+    const status = await stopBackend().then(startBackend).then(() => backendStatus());
+    await dialog.showMessageBox(undefined, {
+      type: 'info', title: '更新完成',
+      message: `资源已更新到 ${info.latest}，后端已重启。`,
+      detail: status && status.reused ? '（端口复用了已有实例）' : '',
+      buttons: ['好'],
+    });
+    return { checked: true, ...info, applied: 'resource' };
+  } catch (e) {
+    await dialog.showMessageBox(undefined, {
+      type: 'error', title: '资源增量更新失败',
+      message: e.message, buttons: ['好'],
+    });
+    return { checked: true, ...info, applied: 'resource', error: e.message };
+  }
+}
+
+// 整包：下载 Portable exe + 校验 → 用户确认后才 spawn 接管替换 → 本进程退出
+async function runFullUpdate(info, manual) {
+  const destDir = path.join(app.getPath('userData'), 'update-cache');
+  let shaSums = '';
+  try {
+    const rel = await updater.fetchLatestRelease();
+    const sumAsset = (rel.assets || []).find((a) => a.name === updateConfig.ASSET.sha256sums);
+    if (sumAsset) shaSums = await (await fetch(sumAsset.url, { headers: { 'User-Agent': 'mjscxt' } })).text();
+  } catch { /* 清单缺失则跳过强校验 */ }
+  try {
+    // 只下载 + 校验，先不 spawn；把接管时机留给用户确认后
+    const { localPath } = await updater.applyFullPortable(info.latest, info.assets, shaSums, destDir,
+      (f) => { if (manual) console.log(`整包下载 ${(f * 100).toFixed(0)}%`); },
+      false);
+    const { response } = await dialog.showMessageBox(undefined, {
+      type: 'info', title: '整包已下载',
+      message: `新版本 ${info.latest} 已下载并通过校验。`,
+      detail: `临时文件：${localPath}\n选择「立即更新」将启动它完成替换并重启应用；选「稍后」则保持现状。`,
+      buttons: ['立即更新', '稍后'],
+    });
+    if (response !== 0) {
+      // 稍后：不 spawn、不退出；bootstrapper 已下载好，下次可再次触发
+      return { checked: true, ...info, applied: 'full', deferred: true };
+    }
+    await stopBackend();
+    updater.spawnPortable(localPath); // bootstrapper detached 接管
+    app.quit();
+    return { checked: true, ...info, applied: 'full' };
+  } catch (e) {
+    await dialog.showMessageBox(undefined, {
+      type: 'error', title: '整包更新失败', message: e.message, buttons: ['好'],
+    });
+    return { checked: true, ...info, applied: 'full', error: e.message };
+  }
+}
+
+// 自动检查：启动一次 + 每 24h；静默（manual=false 不弹「无更新」框）
+let autoCheckTimer = null;
+function scheduleAutoChecks() {
+  checkForUpdatesNow(false);
+  if (autoCheckTimer) clearInterval(autoCheckTimer);
+  autoCheckTimer = setInterval(() => { checkForUpdatesNow(false); }, UPDATE_CHECK_INTERVAL_MS);
+  autoCheckTimer.unref();
 }
 
 // ---------------------------------------------------------------------------
@@ -473,6 +632,30 @@ function registerIpc() {
   );
   ipcMain.handle('backend:log', (_e, n = 100) => tailLog(Math.max(1, Number(n) || 100)));
   ipcMain.handle('backend:status', () => backendStatus());
+
+  // 更新系统：纯数据返回（不弹窗），由 UI 决定如何展示；菜单项仍走 checkForUpdatesNow(true)
+  ipcMain.handle('updater:check', async () => {
+    const current = updateConfig.currentVersion();
+    try {
+      return { ok: true, ...(await updater.checkForUpdates(current)) };
+    } catch (e) {
+      return { ok: false, error: String(e.message || e) };
+    }
+  });
+  ipcMain.handle('updater:applyResource', async () => {
+    const current = updateConfig.currentVersion();
+    const info = await updater.checkForUpdates(current);
+    if (!info.update) return { ok: false, error: '已是最新版本' };
+    const r = await runResourceUpdate(info, false);
+    return { ok: true, ...r };
+  });
+  ipcMain.handle('updater:applyFull', async () => {
+    const current = updateConfig.currentVersion();
+    const info = await updater.checkForUpdates(current);
+    if (!info.update) return { ok: false, error: '已是最新版本' };
+    const r = await runFullUpdate(info, false);
+    return { ok: true, ...r };
+  });
   ipcMain.handle('config:get', () => ({ ...config, configPath: configPath() }));
   ipcMain.handle('config:setProjectRoot', async (_e, root) => {
     root = String(root || '').trim();
@@ -549,7 +732,22 @@ function buildMenu() {
     { role: 'editMenu' },
     { role: 'viewMenu' },
     { role: 'windowMenu' },
-    { role: 'help' },
+    {
+      label: '帮助',
+      submenu: [
+        { label: '检查更新', click: () => checkForUpdatesNow(true) },
+        { type: 'separator' },
+        { label: '关于漫剧工坊', click: () => {
+          const win = BrowserWindow.getAllWindows()[0];
+          dialog.showMessageBox(win || undefined, {
+            type: 'info', title: '关于',
+            message: '漫剧工坊',
+            detail: `版本 ${updateConfig.currentVersion()}（zdljh/mjscxt）`,
+            buttons: ['好'],
+          });
+        } },
+      ],
+    },
   ];
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
@@ -571,6 +769,8 @@ if (!gotLock) {
   });
 
   app.whenReady().then(async () => {
+    // 先播种资源镜像（打包态），后端布局才会指到可写镜像而非只读安装区
+    seedResourceMirror();
     registerIpc();
     buildMenu();
     // 后端与窗口并行：先起窗口（指向端口），后端就绪后 reload，避免首屏白屏死等
@@ -580,6 +780,8 @@ if (!gotLock) {
         win.loadURL(`http://127.0.0.1:${b.port}/`);
       }
     });
+    // 启动检查一次 + 每 24h 后台轮询（静默，不弹「无更新」框）
+    scheduleAutoChecks();
   });
 
   // 退出前：SIGINT → 等 10s → taskkill 兜底（仅我们 spawn 的子进程）
