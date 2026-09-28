@@ -9065,6 +9065,83 @@ def _salvage_episode_script(path: str, episode_no: int):
     }
 
 
+@app.route('/api/novels/<novel_id>/split-plan', methods=['GET'])
+def api_novel_split_plan(novel_id):
+    """P2-2 渐进分集 + 人会确认：返回「分集断点提议」payload，供用户在触发整集渲染前
+    逐条核对「这章拆 N 集 / 每个切点落在原文哪句 / 每集约几镜几秒 / 是否超单集红线」。
+
+    与生产口径**逐字同源**：底层都是 ``novel_to_script.split_chapter_for_episodes``
+    （生产走 ``autopilot.episode_units`` 逐章调用它；本路由直接复用其结果再算预估/红线/切点
+    预览），因此「提议」与「实际生成」的集数/切点完全一致，不会提议说 1 集、真生成拆 3 集。
+    纯只读（不触发任何 LLM/生成），可反复查询。
+
+    query params（均可选）:
+      - max_sec：单集时长上限（秒），默认 ``EPISODE_MAX_SEC``（180）
+      - fixed_parts：每章最低拆几集（默认 1＝不强制）
+      - max_shots：单集镜数兜底上限（默认 MAX_SHOTS_PER_EPISODE＝78）
+
+    返回：{"success", "novel_id", "chapter_count", "total_episodes",
+           "needs_confirm_chapters": [章号…], "episodes_per_chapter": [章号…],
+           "chapters": [{index,title,char_count,units:[{part,start,end,char_count,
+           preview,est_shots,est_sec,over_redline}],needs_confirm,total_parts,message}…]}
+    """
+    try:
+        meta = get_novel(NOVELS_DIR, novel_id)
+    except NovelParseError as e:
+        return jsonify({"success": False, "error": str(e)}), 404
+    all_chapters, text = autopilot.chapters_and_text(meta)
+    if not all_chapters:
+        return jsonify({"success": False,
+                       "error": "该小说未识别到章节标记，无法按章分集"}), 400
+    # ⭐ 与生产路径**逐字对齐**（P2-2 正确性核心）：生产 ``autopilot.episode_units`` 调
+    #    ``split_chapter_for_episodes(ch, text, fixed_parts=...)`` 时**不传 max_sec / max_shots**
+    #    （两者取模块默认），只透传 fixed_parts。故默认 query（不带参数）时三者全 None，
+    #    「提议」≡「实际生成」，绝不会提议说 1 集、真生成拆 3 集。仅当用户显式 query 指定
+    #    某项时才用自定义值（预览「把单集上限调到 N 秒会拆几集」）。
+    def _opt_int(key):
+        raw = request.args.get(key)
+        if raw in (None, '', '0'):
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+    max_sec = _opt_int('max_sec')
+    max_shots = _opt_int('max_shots')
+    fixed_parts = _opt_int('fixed_parts')
+    chapters_out = []
+    needs_confirm_idxs = []
+    episodes_per_chapter = []
+    total_episodes = 0
+    for ch in all_chapters:
+        # 与生产 episode_units 同源：默认 max_sec/fixed_parts/max_shots 口径一致
+        proposal = novel_to_script.propose_chapter_split(
+            ch, text, max_sec=max_sec, fixed_parts=fixed_parts, max_shots=max_shots)
+        proposal["index"] = ch.get("index")
+        proposal["title"] = ch.get("title")
+        proposal["char_count"] = ch.get("char_count")
+        total_episodes += int(proposal.get("total_parts") or 1)
+        episodes_per_chapter.append({
+            "chapter_index": ch.get("index"),
+            "title": ch.get("title"),
+            "total_parts": int(proposal.get("total_parts") or 1),
+        })
+        if proposal.get("needs_confirm"):
+            needs_confirm_idxs.append(ch.get("index"))
+        chapters_out.append(proposal)
+    return jsonify({
+        "success": True,
+        "novel_id": novel_id,
+        "chapter_count": len(all_chapters),
+        "total_episodes": total_episodes,
+        "needs_confirm_chapters": needs_confirm_idxs,
+        "episodes_per_chapter": episodes_per_chapter,
+        "params": {"max_sec": max_sec, "max_shots": max_shots,
+                   "fixed_parts": fixed_parts},
+        "chapters": chapters_out,
+    })
+
+
 def _episode_units_for_chapters(novel_meta: dict, chapters: list) -> list:
     """把「用户选中的章」展开成**拍摄单元**（超长章会拆成多集）。
 
