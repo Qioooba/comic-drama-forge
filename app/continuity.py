@@ -38,6 +38,11 @@ from novel_to_script import (
 # 原文覆盖率校验（④⑤：逐句核对是否被镜头承载 + 低于阈值自动补生成；只增不改，不删原文）
 import coverage as coverage_mod
 
+# P0-2 全局一致性契约 + 跨镜头校验器（借鉴 penshot；纯确定性、无 LLM、软告警不动重写）
+# ⚠️ 放在模块尾部导入（与 coverage_mod 同模式）：continuity_contract 只依赖标准库，
+#    不 import 本模块，无循环导入风险；此处顶层 import 即可（离线 import 已验证）。
+import continuity_contract as cc_contract
+
 logger = logging.getLogger(__name__)
 
 # ===================== 常量 =====================
@@ -1742,6 +1747,12 @@ def convert_chapter_with_continuity(client, novel_meta: dict, novel_text: str, c
     # ---- 6.5) 集内台词近似重复检测（C⑥/D⑨ 确定性规则，命中按 high 级触发局部重写）
     merge_dedup_issues(validation, script, int(episode_no))
 
+    # ---- 6.6) P0-2 全局一致性契约 + 跨镜头校验（借鉴 penshot；纯确定性软告警）
+    # ⚠️ 只把 low 级 issue 追加进 validation 桶 + 更新 issue_stats["low"]，**不动**
+    #    rewrite_needed / rewrite_shot_ids —— 角色 gap / 场景跳切不是改单镜能修的，
+    #    进 LLM 局部重写反而可能改坏；这里是「可见地报告、由人/下游决策」的软告警。
+    cc_contract.merge_contract_issues(validation, script, bible, int(episode_no))
+
     # ---- 7) 金句落位校验（C⑦）
     quote_check = check_quotes_in_script(continuity_dir, project_key, script, episode_no)
     validation["quotes"] = quote_check
@@ -1785,6 +1796,8 @@ def convert_chapter_with_continuity(client, novel_meta: dict, novel_text: str, c
                                              episode_no, events=events, rule_issues=rule_issues)
             validation["quotes"] = check_quotes_in_script(continuity_dir, project_key, script, episode_no)
             merge_dedup_issues(validation, script, int(episode_no))
+            # P0-2 契约软告警随重写后的新 shots 重新扫一遍（同样只追加 low、不动重写闸门）。
+            cc_contract.merge_contract_issues(validation, script, bible, int(episode_no))
         rewrite_info["rounds"] = rounds
 
     # ---- 8.5) 原文覆盖率校验（④⑤：逐句核对原文章节是否被镜头/台词/旁白承载；不足自动补生成，只增不删）
