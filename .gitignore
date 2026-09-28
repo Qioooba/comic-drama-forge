@@ -133,3 +133,8 @@ nul
 # 大文件构建产物（超过 GitHub 100MB 限制，禁止入库）
 electron-app/electron-v33-official.zip
 *.zip
+
+# ===================== 便携打包产物（体积大，不入库；脚本/批处理照提交） =====================
+# make_package.py 的中间 staging 与最终 zip 是生成件，可重跑重建
+packaging/_dist/
+packaging/*.zip

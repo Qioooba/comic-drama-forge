@@ -1,0 +1,46 @@
+========================================
+ 漫剧工坊 便携版 · 环境准备清单
+========================================
+本便携包 = 应用层（Flask 后端 + Web 界面 + 依赖安装脚本）。
+下列 4 项由用户自备，包内不含（体积/凭据原因）：
+
+【1】Python 3.11+（仅安装依赖时需要，约 1 分钟）
+    - 安装后双击「安装依赖.bat」即可（会建 环境\venv 并装包）
+    - 安装时务必勾选 "Add Python to PATH"
+
+【2】ComfyUI + 模型权重（图像/视频生成引擎，必需）
+    - ComfyUI 本体（推荐便携版 ComfyUI_Portable 或标准安装）
+    - 模型权重 *.safetensors / *.ckpt 放 ComfyUI 的 models 目录
+      （分镜 Qwen-Image、H3 视频、FlashVSR 超分等，按本机显存档位选）
+    - 启动 ComfyUI 服务（默认 http://127.0.0.1:8188）
+
+【3】ffmpeg / ffprobe（音频合成/质检/超分后处理，必需）
+    - 方式A：装系统级 ffmpeg 并加入 PATH
+    - 方式B：放 bin\ffmpeg\ffmpeg.exe（+ffprobe.exe）到本包内，
+      「启动.bat」会自动检测并设置 MJSCXT_FFMPEG
+
+【4】API 密钥（可选，不配则纯离线模式不可用 LLM 剧本/质检）
+    - 复制 .env.example 为 .env，填入：
+      COMFYUI_ROOT=  ComfyUI 安装根目录（便携版如 D:\ComfyUI_portable\ComfyUI\ComfyUI）
+      COMFYUI_URL=   ComfyUI 服务地址
+      MJSCXT_API_KEY_TEXT / _CHAT / _QC = 你的 LLM 密钥
+    - .env 缺失时应用可启动（内置默认值），但生成类功能不可用
+
+---- 配置说明（.env 关键项）----
+    DEPLOY_PROFILE=8G|16G|server   显存档案（8G 显存选 8G）
+    MJSCXT_AUTOPILOT=1|0           无人值守托管（默认 1）
+    APP_PORT=5000                  Web 服务端口
+    H3_ENABLE_REFINE=0|1           H3 视频二采开关（默认 0，8G 显存建议关）
+
+---- 启动顺序 ----
+    1) 装 Python → 双击「安装依赖.bat」（一次性）
+    2) 启动 ComfyUI（自备）
+    3) 双击「启动.bat」 → 浏览器打开 http://127.0.0.1:5000
+
+---- 数据目录 ----
+    novels\   小说源文件（放这里）
+    output\   生成产物（图/视频/超分）与项目索引（自动创建）
+
+---- 安全提醒 ----
+    切勿把本机 .env / .secret_key / output\secrets.enc 复制给他人分发
+    （含 API 密钥与加密主密钥；分发包内已排除这些文件）
