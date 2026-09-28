@@ -23,6 +23,7 @@ import time
 import copy
 import shutil
 import random
+import hashlib
 import logging
 import threading
 import requests
@@ -34,14 +35,22 @@ from typing import Dict, List, Optional, Any, Tuple, Sequence
 # NameError: name 'Sequence' is not defined（实测）。别删这个导入。
 
 from config import (
-    COMFYUI_URL, COMFYUI_WORKFLOWS_DIR, COMFYUI_OUTPUT_DIR,
+    COMFYUI_URL, COMFYUI_OUTPUT_DIR,
+    resolve_workflow_path,
     PROJECT_OUTPUT_DIR, WORKFLOW_TEMPLATE, MULTIVIEW_CONFIG,
     H3_EMIT_AUDIO,
     CONFLICT_NEGATIVE_TOKENS,
+    ENABLE_BLOCKING_ANNOTATION,
 )
+# 模板路径一律走 resolve_workflow_path()（项目内优先，回落 ComfyUI 目录）。
+# COMFYUI_WORKFLOWS_DIR 在本模块内已不再直接使用，但**必须保留为模块属性**：
+# .workbuddy/test 下的守卫（如 verify_style_injection.py）会通过
+# `comfyui_client.COMFYUI_WORKFLOWS_DIR` 取用，删掉会让那些守卫 AttributeError。
+from config import COMFYUI_WORKFLOWS_DIR  # noqa: F401
 from dialogue_utils import (dialogue_text as _dlg_text, format_line as _dlg_line,
                             dialogue_speaker as _dlg_speaker)
 from h3_episode_builder import H3EpisodeBuilder
+import h3_director_builder
 import style_kit
 import h3_prompt_kit
 
@@ -374,6 +383,50 @@ def _ref_label_body(raw, index: int) -> str:
     return text
 
 
+# ===================== 3D 导演台「构图基准图」协议（2026-09-27） =====================
+# 分镜生成前先用服务端 3D 渲染器出一张站位/机位基准图（app/te_3d_render.py），
+# 作为 <image1> 喂给 Qwen-Image-2.1。这是 TE MAN 官方推荐用法：3D 站位定构图、
+# 设定图定身份。
+#
+# ⚠️ 与「设定图」的语义差别必须写清楚，否则模型会把人偶的外观当成身份基准：
+#    · <image1> 只负责**构图**（人数 / 左右 / 前后 / 朝向 / 景别 / 机位角度）；
+#    · 人偶的灰彩色身体、无面头部、体块比例**一律不得**被复刻；
+#    · 角色/道具是否像设定，只看后面的设定图。
+BLOCKING_REF_MARK = "3D导演台构图基准"
+#: 带构图基准图时追加的协议段（官方 Attribute Disentanglement：每张图职责单一）
+COMPOSITION_BASELINE_SECTION = (
+    "COMPOSITION BASELINE: <image{pos}> is a 3D blocking reference (plain coloured, "
+    "faceless mannequins on a dark background). Copy ONLY its composition: how many "
+    "figures there are, who stands on the left / right, their relative depth order and "
+    "facing direction, the shot size (framing) and the camera angle. Replace those "
+    "mannequins with the characters referenced by the other images, drawn with their own "
+    "real appearance. Do NOT copy the mannequin bodies, their flat colours or their "
+    "faceless heads, and do NOT turn any character into a mannequin. "
+    # ⚠️ 实测（2026-09-27）：基准图是近黑背景 + 有限地面网格，远景时上下各留出
+    # 一大片平坦深色区；不说清楚模型会把它当**信箱黑边**照抄（shot_01 上下各一条
+    # 黑带、画面只剩中间约一半高度）。基准图里没有真实环境，必须显式声明留白不算画框。
+    "Its large flat empty areas (the dark sky and the bare ground beyond the grid) are "
+    "standing-room padding, NOT part of the frame: repaint them as this shot's real "
+    "environment, and never reproduce them as black bars, letterbox borders, frames or "
+    "flat colour blocks."
+)
+
+#: 分镜图光学/材质段（2026-09-28 画质提升）。
+#: 背景：分镜提示词此前**系统性缺画质/光学/材质词** —— 无景深、无次表面散射、
+#: 无皮肤/毛发/布料材质描述，输出图扁平、塑料感、细节量低。
+#: ⚠️ 措辞必须是**可执行的具体光学/材质描述**；masterpiece / 8k / 超高清
+#: 类空词会被 prompt_qc._QUALITY_FLUFF 判为无信息量并剥掉，写了也白写。
+CINEMATOGRAPHY_SECTION = (
+    "CINEMATOGRAPHY: cinematic depth of field with a shallow focal plane and "
+    "soft bokeh in the out-of-focus background; natural skin subsurface "
+    "scattering with visible fine pore and fabric-level texture; individual "
+    "hair strands catching the key light; cloth weave and material grain "
+    "clearly readable; volumetric light shafts and drifting atmospheric "
+    "haze; physically plausible shadow falloff with soft contact shadows; "
+    "restrained film grain; clean highlight roll-off without clipping."
+)
+
+
 def _ref_label_purpose(body: str) -> str:
     """把中文职责正文转成官方英文职责短语（识别不到就原样保留，由模型自行理解）"""
     text = str(body or "").strip()
@@ -510,7 +563,7 @@ class ComfyUIClient:
 
     def load_workflow(self, workflow_file: str, return_meta: bool = False):
         """加载工作流文件并转换为 API prompt 格式"""
-        workflow_path = os.path.join(COMFYUI_WORKFLOWS_DIR, workflow_file)
+        workflow_path = resolve_workflow_path(workflow_file)
         with open(workflow_path, "r", encoding="utf-8-sig") as f:   # 兼容 UTF-8 BOM
             wf = json.load(f)
         return self.to_api(wf, return_meta=return_meta)
@@ -1647,8 +1700,16 @@ class ComfyUIClient:
         return ""
 
     @staticmethod
-    def build_storyboard_prompt(shot: dict, ref_labels: List[str] = None) -> str:
+    def build_storyboard_prompt(shot: dict, ref_labels: List[str] = None,
+                                has_blocking_image: bool = False) -> str:
         """按镜头剧情描述构建分镜图（Qwen-Image-2.1 多参考图编辑）提示词。
+
+        :param has_blocking_image: 本次参考图里**已含** 3D 导演台构图基准图
+            （``app/te_3d_render.py`` 渲染的 ``<image1>``）。为 True 时**不再**注入文字
+            「Blocking — …」空间锚点行：构图已由基准图逐像素给定，再叠一条文字版
+            只会在「文字说左、图说右」时制造矛盾（文字是软约束，模型可能二选一）。
+            基准图缺失/渲染失败时该参数为 False，行为与旧版完全一致。
+
 
         ## 为什么改成官方 <imageN> 协议（2026-09-25）
 
@@ -1677,6 +1738,8 @@ class ComfyUIClient:
 
           TASK            → 这一镜要生成的画面（含景别/机位硬约束，最靠前）
           PRIMARY CANVAS  → <image1> 作主要画布
+          COMPOSITION BASELINE → 带 3D 导演台站位基准图时，声明「只照它的构图摆」
+                           （2026-09-27；不带基准图时整段不出现）
           IDENTITY        → 身份锚点（指向 <imageN>，不复述五官）
           REFERENCE ROLES → 每张参考图各自的职责（<image2> 只提供 X）
           SCENE / ACTION  → 场景、动作、说话状态、情绪
@@ -1726,6 +1789,7 @@ class ComfyUIClient:
         if ref_labels:
             identity_lines = []
             role_lines = []
+            blocking_pos = 0      # <imageN> 里「3D 导演台构图基准图」的位置（0 = 没带）
             # ⚠️ **必须按位置重新编号**：官方协议里 ``<imageN>`` 的 N 就是「输入顺序」
             # （``images.image_N`` 槽位序号），不是 label 里写的那个数字。label 由
             # app._allocate_storyboard_refs 生成时可能带「预留槽位号」（例如角色占 1-3、
@@ -1735,6 +1799,11 @@ class ComfyUIClient:
             for pos, raw in enumerate(ref_labels, start=1):
                 lab = _ref_label_body(raw, pos)
                 if not lab:
+                    continue
+                if BLOCKING_REF_MARK in lab:
+                    # 构图基准图单独走 COMPOSITION BASELINE 段（见下）：它的职责是
+                    # 「照这个构图摆」，用 "use only for X" 的常规句式表达力度不够。
+                    blocking_pos = pos
                     continue
                 # 身份锚点：官方句式 “Preserve the exact identity from <imageN>.”
                 if "身份锚点" in lab:
@@ -1748,7 +1817,12 @@ class ComfyUIClient:
                     role_lines.append(
                         f"Use <image{pos}> only for {_ref_label_purpose(lab)}.")
             body = [f"PRIMARY CANVAS: Use <image1> as the primary canvas"
-                    f"{' and identity anchor' if identity_lines else ''}."]
+                    f"{' and identity anchor' if identity_lines and not blocking_pos else ''}."]
+            if blocking_pos:
+                # 构图基准在最前时，<image1> 是**构图基准图**、不是身份锚点 —— 必须显式
+                # 声明，否则模型会把人偶当成「要保留身份的人」。
+                body[0] += (" It defines the framing and the spatial layout of the frame, "
+                            "not any character's appearance.")
             if identity_lines:
                 body.append("IDENTITY: " + " ".join(identity_lines))
             if role_lines:
@@ -1760,6 +1834,8 @@ class ComfyUIClient:
                     "Each referenced character must keep its own individual identity; "
                     "do not merge facial features, hairstyles or costumes between them.")
             sections.append("\n".join(body))
+            if blocking_pos:
+                sections.append(COMPOSITION_BASELINE_SECTION.format(pos=blocking_pos))
         else:
             sections.append(
                 "PRIMARY CANVAS: No reference image is provided for this shot. "
@@ -1793,6 +1869,22 @@ class ComfyUIClient:
                 f"and subtle expression changes.")
         if shot.get("emotion"):
             content_lines.append(f"Emotion and mood: {shot['emotion']}.")
+        # ---------- 程序化站位（TE MAN 3D导演台，软约束）----------
+        # 把 shot 的角色站位/机位/景别结构化翻译成一条空间锚点行（Blocking — …），
+        # 增强分镜图构图稳定性。这是**软约束**：不新增协议段、不改变 TASK/PRESERVE
+        # 硬约束，只追加一条 content 行；关闭开关时行为与旧版完全一致。
+        # ⚠️ has_blocking_image=True 时**跳过**：构图基准图已把站位/机位逐像素给定，
+        #    再叠一条文字版反而会在「文字说左、图说右」时与基准图打架（本段是软约束，
+        #    模型可能二选一 → 基准图白渲）。
+        if ENABLE_BLOCKING_ANNOTATION and not has_blocking_image:
+            try:
+                import te_3d_director  # noqa: PLC0415
+                _blocking = te_3d_director.block_annotation(shot)
+                if _blocking:
+                    content_lines.append(_blocking)
+            except Exception as _be:  # noqa: BLE001 - 站位注入失败绝不影响分镜生成
+                logger.warning("镜头 %s 站位锚点注入失败（忽略）：%s",
+                               shot.get("shot_id"), _be)
         if content_lines:
             sections.append("SCENE AND ACTION:\n" + "\n".join(content_lines))
 
@@ -1804,15 +1896,24 @@ class ComfyUIClient:
         if light_hint:
             sections.append(f"LIGHTING: {light_hint}.")
 
+        # ---------- CINEMATOGRAPHY（光学/材质，2026-09-28 画质提升）----------
+        # 只写具体光学与材质描述；空词会被 prompt_qc 剥掉（见常量处注释）。
+        sections.append(CINEMATOGRAPHY_SECTION)
+
         # ---------- STYLE ----------
         # 风格与画幅：一律以镜头自带 style 为准（不硬编码国漫）。
         # ⚠️ 画幅（aspect ratio）**不进正文** —— 属于 generation parameter，由工作流
         #    尺寸节点与参考图画幅落实（官方 Rewriter 也把 wh_ratio 单独返回）。
+        # ⚠️ 2026-09-28 画质提升：with_tail 由 False 翻回 **True** —— 分镜提示词此前
+        #    系统性丢了 STYLE 质量尾（style_kit._QUALITY_TAIL_EN = "highly detailed,
+        #    delicate lighting, stable composition, no distortion"），输出图细节量低。
+        #    注意：prompt_qc._QUALITY_FLUFF 原先含 "highly detailed" 会把它剥掉，
+        #    已同步把该词移出 fluff（见 prompt_qc._QUALITY_FLUFF 处注释），两处必须同改。
         shot_style = style_kit.normalize_style(shot.get("style"))
         style_clause = ""
         if shot_style:
             style_clause = style_kit.style_suffix_en(
-                shot_style, with_tail=False) if hasattr(style_kit, "style_suffix_en") else ""
+                shot_style, with_tail=True) if hasattr(style_kit, "style_suffix_en") else ""
         if style_clause:
             sections.append(f"STYLE: {style_clause}.")
         else:
@@ -1979,8 +2080,19 @@ class ComfyUIClient:
                     f"分镜参考图槽位多于参考图（{len(slots)} 槽 / {len(uploaded)} 张）："
                     f"{key} 复用主角锚点图 {src}（已登记 slot_duplicates）")
             else:
-                # 大槽位模板（Qwen-Image-2.1 9 槽）：尾部空槽位留空，不复用、不塞图。
-                api_prompt[load_id]["inputs"]["image"] = ""
+                # 大槽位模板（Qwen-Image-2.1 9 槽）：尾部空槽位**删除**，不复用、不塞图。
+                # ⚠️ 不能 `image=""`（旧实现）：LoadImageOutput 的 image 是 **required**
+                #    输入，空串会走 `VideoFromFile('')` → `av.open('')`，PyAV 把空路径
+                #    解析成 ComfyUI input 目录 → `av.error.PermissionError`
+                #    （实测 38 个 execution_error，分镜图全灭）。正确做法是**删节点 +
+                #    断连线**：从工作流里拿掉该 LoadImageOutput 节点，并从正向编辑节点
+                #    删除对应的 `images.image_N` 输入键（该键是 autogrow optional，
+                #    删掉不会触发 missing_required）。
+                api_prompt.pop(load_id, None)
+                if node_id and key:
+                    _pos_node = api_prompt.get(node_id) or {}
+                    _pos_inputs = _pos_node.get("inputs") or {}
+                    _pos_inputs.pop(key, None)
                 slot_cleared.append(key)
                 continue
             ctype = api_prompt[load_id].get("class_type")
@@ -2032,6 +2144,8 @@ class ComfyUIClient:
         qc_style: str = "",
         max_retries: int = 2,
         qc_stop_cb=None,
+        seg_audios: List[List[str]] = None,
+        audio_mode: str = None,
     ) -> dict:
         """H3 整集视频生成（N 段一个工作流，原生 H3ContinuousSeamlessJoinV14 衔接）
         + 整片 QC 门控。
@@ -2088,6 +2202,8 @@ class ComfyUIClient:
                     timeout_per_segment=timeout_per_segment,
                     template_file=template_file,
                     size=size,
+                    seg_audios=seg_audios,
+                    audio_mode=audio_mode,
                 )
             except RuntimeError as e:
                 # S12：确定性输入错误（如某段无可用参考图被拒绝提交）——
@@ -2201,17 +2317,26 @@ class ComfyUIClient:
                              timeout_per_segment: int = 900,
                              template_file: str = None,
                              save_build_to: str = None,
-                             size=None) -> dict:
+                             size=None,
+                             seg_audios: List[List[str]] = None,
+                             audio_mode: str = None) -> dict:
         """H3 多段一次生成：**工作流段数 = len(segments)**，一个分镜对应一段。
 
-        与 generate_video 的差异（修复"每个分镜跑了 10 段"）：
-        - 旧实现固定加载「10 段无缝拼接」模板，并把 10 段 Text Multiline 全部写成同一提示词，
-          于是一个分镜产出的是 10 段同内容拼接的长视频（约 72s），既费时又不符合单镜时长。
-        - 本方法按调用方给定的段数**动态重建工作流**（第 4 集 22 段、第 5 集 44 段），
-          逐段独立注入 提示词 / 时长 / 参考图，段间仍由 H3ContinuousSeamlessJoinV14 保持无缝。
+        两条实现路径（按**模板结构**自动分流，见 `_use_director_builder`）：
+
+        * **Director 路径**（模板含 ``MiniMaxH3Director``，2026-09-27 起为默认）：
+          一个``MiniMaxH3Director`` 节点吃整条 ``timeline_data``，段间衔接由插件原生
+          「段间引导」承担（上一段尾部 22 帧钉进下一段 conditioning 后裁掉前缀），
+          外接 ``MiniMaxH3DirectorRefine`` 做二采。参考图走 ``segment.refs``。
+        * **连续拼接路径**（旧模板）：按段数**重建整张图**，段间由
+          ``H3ContinuousSeamlessJoinV14`` 做 latent 级无缝续接。
 
         segments: [{"prompt": str, "duration": float, "reference_images": [本地绝对路径, ...],
                     "name": str}]  —— 元素顺序 = 工作流段顺序
+        seg_audios: 可选，逐段**本地音频绝对路径**列表（``seg_audios[i]`` 服务 ``segments[i]``）。
+                    非空时 audio_mode 默认切 ``source``（H3 用参考音频驱动口型/节奏），
+                    音频写进 ``segment.refAudios``。
+        audio_mode: 可选显式指定 ``generate|mute|source``；None 时自动推导。
         timeout:  总超时（秒）；None 时按 1200 + timeout_per_segment × 段数 估算
         timeout_per_segment: 单段预估耗时（默认 900s，用于总超时兜底）
         save_build_to: 可选，把重建后的 UI 工作流落盘（便于复现/排障）
@@ -2221,8 +2346,18 @@ class ComfyUIClient:
         if not segs:
             raise ValueError("generate_h3_sequence: segments 不能为空")
         n = len(segs)
-        tpl_name = template_file or WORKFLOW_TEMPLATE["h3_video"]
-        tpl_path = os.path.join(COMFYUI_WORKFLOWS_DIR, tpl_name)
+        tpl_name = template_file or self._default_h3_template()
+        tpl_path = resolve_workflow_path(tpl_name)
+
+        # ---- 分流：Director 模板 / 旧连续拼接模板 ----
+        if self._use_director_builder(tpl_path):
+            return self._generate_h3_sequence_director(
+                segs, tpl_path=tpl_path, tpl_name=tpl_name,
+                filename_prefix=filename_prefix, emit_audio=emit_audio, seed=seed,
+                timeout=timeout, timeout_per_segment=timeout_per_segment,
+                save_build_to=save_build_to, size=size,
+                seg_audios=seg_audios, audio_mode=audio_mode)
+
         builder = H3EpisodeBuilder(tpl_path)
         default_duration = float((segs[0] or {}).get("duration") or 5.0)
         wf, layout = builder.build(n, duration=default_duration,
@@ -2335,15 +2470,352 @@ class ComfyUIClient:
                 "timeout": timeout, "template": tpl_name,
                 "validate_report": report}
 
+    # ================= H3 · Director 路径（2026-09-27 起为默认） =================
+
+    #: 参考图上传到 ComfyUI input 下的子目录（带内容哈希前缀，杜绝跨集同名覆盖）
+    H3_DIRECTOR_REF_SUBDIR = "mscxt_h3_refs"
+
+    @staticmethod
+    def _default_h3_template() -> str:
+        """未显式指定 template_file 时的 H3 模板名（跟随 ``MJSCXT_H3_BUILDER`` 回退）。
+
+        ⚠️ 必须与 ``_use_director_builder`` 同源：若只让分流函数回退而模板名不回退，
+        ``H3EpisodeBuilder`` 会拿到 Director 模板 → 抛「模板中未找到 H3 段实例」，
+        回退开关就是个假的。
+        """
+        override = str(os.environ.get("MJSCXT_H3_BUILDER") or "").strip().lower()
+        if override in ("legacy", "old", "episode", "continuous", "join"):
+            return (WORKFLOW_TEMPLATE.get("h3_video_legacy")
+                    or WORKFLOW_TEMPLATE["h3_video"])
+        return WORKFLOW_TEMPLATE["h3_video"]
+
+    @staticmethod
+    def _use_director_builder(tpl_path: str) -> bool:
+        """模板是否走 Director 插件路径？
+
+        判定顺序：环境变量 ``MJSCXT_H3_BUILDER``（``director`` / ``legacy``）显式覆盖
+        → 否则看模板**结构**（``h3_director_builder.is_director_template``，绝不看文件名）。
+
+        为什么要留开关：Director 工作流与旧连续拼接工作流的**段间衔接机制完全不同**
+        （插件原生「段间引导」vs ``H3ContinuousSeamlessJoinV14`` latent 交接）。
+        出问题时需要能一键退回旧路径做对照，而不必改代码。
+        """
+        override = str(os.environ.get("MJSCXT_H3_BUILDER") or "").strip().lower()
+        if override in ("legacy", "old", "episode", "continuous", "join"):
+            logger.info("H3 构建路径被 MJSCXT_H3_BUILDER=%s 强制为「旧连续拼接」", override)
+            return False
+        if override in ("director", "new"):
+            logger.info("H3 构建路径被 MJSCXT_H3_BUILDER=%s 强制为「Director」", override)
+            return True
+        return h3_director_builder.is_director_template(tpl_path)
+
+    def _upload_h3_director_ref(self, local_path: str,
+                                cache: Dict[str, Optional[str]] = None) -> Optional[str]:
+        """上传一张参考图到 ComfyUI ``input/mscxt_h3_refs/``，返回可写进 ``imageFile`` 的相对名。
+
+        ⚠️ 必须带**路径哈希前缀**：``upload_image`` 默认用 basename 且 ``overwrite=true``，
+        不同集的 ``shot_01.png`` 会互相覆盖 → 后面所有镜头参考图全串成同一张
+        （跨集连跑时是静默错，比报错难查得多）。
+        """
+        key = os.path.normpath(os.path.abspath(local_path))
+        if cache is not None and key in cache:
+            return cache[key]
+        base = os.path.basename(key) or "ref.png"
+        stem, ext = os.path.splitext(base)
+        if not ext:
+            ext = ".png"
+        tag = hashlib.md5(key.encode("utf-8", "ignore")).hexdigest()[:12]
+        name = f"{self.H3_DIRECTOR_REF_SUBDIR}/{stem}_{tag}{ext}"
+        try:
+            val = self.upload_image(key, name=name, image_type="input")
+        except Exception as e:  # noqa: BLE001 - 单张失败不该毁掉整次提交
+            logger.warning(f"[H3-Director] 参考图上传失败 {key}: {e}")
+            val = None
+        if cache is not None:
+            cache[key] = val
+        return val
+
+    def _upload_h3_director_audio(self, local_path: str,
+                                  cache: Dict[str, Optional[str]] = None) -> Optional[str]:
+        """上传一段参考音频到 ComfyUI ``input/mscxt_h3_refs/``，返回写进 ``audioFile`` 的相对名。
+
+        与 ``_upload_h3_director_ref`` 对称：同样带路径哈希前缀防跨镜同名覆盖。
+        音频走 ``/upload/image`` 端点（ComfyUI 的通用 input 文件上传，不校验 MIME），
+        但 content-type 用音频类型避免误导。
+        """
+        key = os.path.normpath(os.path.abspath(local_path))
+        if cache is not None and key in cache:
+            return cache[key]
+        base = os.path.basename(key) or "audio.wav"
+        stem, ext = os.path.splitext(base)
+        if not ext:
+            ext = ".wav"
+        tag = hashlib.md5(key.encode("utf-8", "ignore")).hexdigest()[:12]
+        name = f"{self.H3_DIRECTOR_REF_SUBDIR}/{stem}_{tag}{ext}"
+        ctype = "audio/wav" if ext.lower() in (".wav",) else (
+            "audio/mpeg" if ext.lower() == ".mp3" else "audio/flac")
+        try:
+            url = f"{self.base_url}/upload/image"
+            with open(key, "rb") as f:
+                files = {"image": (name.split("/")[-1], f, ctype)}
+                data = {"overwrite": "true", "type": "input",
+                        "subfolder": self.H3_DIRECTOR_REF_SUBDIR}
+                resp = requests.post(url, files=files, data=data, timeout=120)
+                resp.raise_for_status()
+                result = resp.json()
+                uploaded = result.get("name", name.split("/")[-1])
+                sub = result.get("subfolder") or self.H3_DIRECTOR_REF_SUBDIR
+                val = f"{sub}/{uploaded}" if sub else uploaded
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[H3-Director] 参考音频上传失败 {key}: {e}")
+            val = None
+        if cache is not None:
+            cache[key] = val
+        return val
+
+    def _generate_h3_sequence_director(
+        self, segs: List[dict], *, tpl_path: str, tpl_name: str,
+        filename_prefix: str = "comic_drama/episode",
+        emit_audio: bool = None, seed: int = None,
+        timeout: int = None, timeout_per_segment: int = 900,
+        save_build_to: str = None, size=None,
+        continuity: bool = True, continuity_overlap: int = None,
+        export_mode: str = None, ref_max_size: int = None,
+        seg_audios: Optional[List[List[str]]] = None,
+        audio_mode: str = None) -> dict:
+        """Director 路径实现：一条 ``timeline_data`` 承载 N 段，返回结构对齐旧路径。
+
+        与旧连续拼接路径的**语义差异（务必知道）**：
+
+        * 段间衔接由插件原生「段间引导」完成（上一段尾 ``continuityOverlapFrames``
+          帧钉进下一段 conditioning 后裁掉前缀），**必须串行**。
+        * 参考图是**逐段**的（``segment.refs``）。``prompt_batch`` 时插件强制
+          ``editMode=segment``，逐段 refs 才生效（``gen_timeline.py:392/529``）——
+          这正是「每个镜头用自己的分镜图」得以成立的地方；``global.refs`` 只作为
+          可选公共底图（``commonEnabled=true`` 时才 merge）。
+        * 帧数用插件同一套换算（``max(5, round(sec*fps))`` → 17k+5 网格），
+          因此 ``timeline.totalFrames`` 诚实等于各段实际帧数之和。
+        """
+        n = len(segs)
+        emit_audio = H3_EMIT_AUDIO if emit_audio is None else bool(emit_audio)
+        fps_env = str(os.environ.get("MJSCXT_H3_FPS") or "").strip()
+        try:
+            fps = float(fps_env) if fps_env else float(h3_director_builder.FPS_DEFAULT)
+        except (TypeError, ValueError):
+            fps = float(h3_director_builder.FPS_DEFAULT)
+        if fps <= 0:
+            fps = float(h3_director_builder.FPS_DEFAULT)
+
+        # ---------------- 参考图：逐段解析 + 上传 ----------------
+        # 同一个本地路径（跨镜共用同一张角色锚点图很常见）只上传一次。
+        up_cache: Dict[str, Optional[str]] = {}
+        seg_ref_names: List[List[str]] = []
+        empty_idx: List[int] = []
+        for i, seg in enumerate(segs):
+            names: List[str] = []
+            seen: set = set()
+            for img in (seg.get("reference_images") or []):
+                local = self.resolve_local_path(img)
+                if not local or not os.path.exists(local):
+                    if img:
+                        logger.warning(f"[H3-Director] 段{i + 1} 参考图不可用，已跳过: {img}")
+                    continue
+                dkey = os.path.normcase(os.path.normpath(os.path.abspath(local)))
+                if dkey in seen:      # 同段内重复引用同一张图只留一份
+                    continue
+                seen.add(dkey)
+                val = self._upload_h3_director_ref(local, up_cache)
+                if val:
+                    names.append(val)
+            if not names:
+                empty_idx.append(i)
+            seg_ref_names.append(names)
+
+        # S12 同源红线：整次提交一张参考图都没有 → 必然退化成纯文本生成（外观不可控），
+        # 或被迫沿用模板示例图（人物污染）。两种结果都不可接受，直接拒绝提交。
+        if not any(seg_ref_names):
+            raise RuntimeError(
+                f"H3(Director) 整次提交（{n} 段）没有任何可用参考图，已拒绝提交"
+                f"（S12：无参考图=角色外观不可控，模板示例图会污染角色）。"
+                f"请补齐 reference_images 后重试。"
+            )
+        for i in empty_idx:
+            logger.warning(
+                "[H3-Director] 段%d(%s) 无可用参考图 → 该段退化为纯文本生成"
+                "（段间引导仍会钉住上一段尾帧，非首段影响有限）",
+                i + 1, segs[i].get("name") or f"seg{i + 1}")
+
+        # ---------------- 参考音频：逐段上传（audioMode=source 时驱动口型/节奏） ----------------
+        # 音频来源优先级：seg["dub_audios"]（段自带配音路径）> seg_audios 参数（逐段列表）。
+        # 同 seg_refs 一样带路径哈希前缀，跨镜共用同一句配音时不重复上传。
+        audio_cache: Dict[str, Optional[str]] = {}
+        seg_audio_names: List[List[str]] = []
+        for i in range(n):
+            _src = list((segs[i].get("dub_audios") or []) or [])
+            if not _src and seg_audios is not None and i < len(seg_audios):
+                _src = list(seg_audios[i] or [])
+            names: List[str] = []
+            seen_audio: set = set()
+            for ap in _src:
+                local = self.resolve_local_path(ap)
+                if not local or not os.path.exists(local):
+                    if ap:
+                        logger.warning(f"[H3-Director] 段{i + 1} 参考音频不可用，已跳过: {ap}")
+                    continue
+                akey = os.path.normcase(os.path.normpath(os.path.abspath(local)))
+                if akey in seen_audio:
+                    continue
+                seen_audio.add(akey)
+                val = self._upload_h3_director_audio(local, audio_cache)
+                if val:
+                    names.append(val)
+            seg_audio_names.append(names)
+
+        # ---------------- 尺寸 / 连续引导 / 导出 ----------------
+        w = h = None
+        if size:
+            try:
+                w, h = int(size[0]), int(size[1])
+            except (TypeError, ValueError, IndexError):
+                logger.warning(f"[H3-Director] 画幅入参非法，改用模板值: {size!r}")
+                w = h = None
+        if continuity_overlap is None:
+            ov_env = str(os.environ.get("MJSCXT_H3_CONTINUITY_OVERLAP") or "").strip()
+            continuity_overlap = (int(ov_env) if ov_env.isdigit()
+                                  else h3_director_builder.CONTINUITY_OVERLAP_DEFAULT)
+        export_mode = (export_mode or os.environ.get("MJSCXT_H3_EXPORT_MODE")
+                       or "all").strip().lower()
+        if export_mode not in ("all", "segments"):
+            logger.warning(f"[H3-Director] 未知 exportMode={export_mode}，回落 all")
+            export_mode = "all"
+
+        builder = h3_director_builder.H3DirectorBuilder(tpl_path)
+        # audio_mode 优先级：显式传入 > 有段级参考音频（seg_audios 非空）→ "source" >
+        #   emit_audio → "generate" / "mute"。
+        #   "source" = H3 用 refAudios 里的参考音频驱动口型/节奏（逐镜 QwenTTS 配音）。
+        _eff_audio_mode = audio_mode
+        if _eff_audio_mode is None:
+            if any(seg_audio_names):
+                _eff_audio_mode = "source"
+            else:
+                _eff_audio_mode = "generate" if emit_audio else "mute"
+        wf, layout = builder.build(
+            segs, seg_refs=seg_ref_names, seg_audios=seg_audio_names,
+            width=w, height=h, frame_rate=fps, seed=seed,
+            filename_prefix=filename_prefix,
+            continuity=bool(continuity), continuity_overlap=continuity_overlap,
+            ref_max_size=ref_max_size,
+            # emit_audio=False → mute：插件直接跳过音频 VAE 解码（8GB 显存下省一趟解码），
+            # 仍返回**静音** AUDIO 对象（插件 executor 明说 "silent AUDIO output"），
+            # 所以 CreateVideo 的 audio 输入不会悬空。
+            # "source" = 用段级 refAudios 参考音频（见上）。
+            audio_mode=_eff_audio_mode,
+            export_mode=export_mode)
+
+        if save_build_to:
+            os.makedirs(os.path.dirname(save_build_to), exist_ok=True)
+            with open(save_build_to, "w", encoding="utf-8") as f:
+                json.dump(wf, f, ensure_ascii=False)
+            layout["build_path"] = save_build_to
+        logger.info(
+            f"H3(Director) 工作流已就绪：{n} 段 / {layout['total_frames']} 帧"
+            f"（{layout['duration_sec']}s）/ 二采 {'开' if layout.get('refine_node') else '关'} / "
+            f"节点 {layout['node_total']} 连线 {layout['link_total']}")
+
+        # ---------------- 落 API 并自检 ----------------
+        api_prompt, meta = self.to_api(wf, return_meta=True)
+
+        # 音频策略：与旧路径同一套「断开末端封装节点的音频输入」实现。
+        # Director 的成片链路是 CreateVideo ← MiniMaxH3Director.audio，同属 mux 类型集合，
+        # 因此这一个函数两条路径通用（mute 已让插件产出静音轨，这里再断开是双保险）。
+        # ⚠️ audio_mode=source 时**不**断开：参考音频要进 H3 驱动口型，断开会丢音轨。
+        audio_changed: List[str] = []
+        if _eff_audio_mode != "source" and not emit_audio:
+            audio_changed = self.strip_h3_audio_inputs(api_prompt)
+            if audio_changed:
+                logger.info(f"H3(Director) 音轨已断开（生成阶段不出声）: {audio_changed}")
+            else:
+                logger.warning("H3(Director) 音轨断开未命中任何节点（成片可能仍带音轨），"
+                               "请检查工作流是否变更")
+
+        report = self.validate_api_prompt(api_prompt)
+        if report["unknown_types"] or report["missing_required"] or report["dangling_links"]:
+            logger.warning(f"H3(Director) 提交前自检异常: "
+                           f"{json.dumps(report, ensure_ascii=False)[:400]}")
+        if report.get("unexpected_inputs"):
+            # 伪控件没剥干净时会落到这里（含 control_after_generate / minimax_director_ui）
+            logger.warning(f"H3(Director) 存在未声明输入（可能含前端伪控件）: "
+                           f"{report['unexpected_inputs'][:8]}")
+
+        seg_report: List[dict] = []
+        for i, info in enumerate(layout.get("segments") or []):
+            seg_report.append({
+                **info,
+                "inst": info.get("index"),
+                "duration": info.get("duration_sec"),
+                "prompt_head": (segs[i].get("prompt") or "")[:60],
+                "refs": [{"slot": f"ref_image_{j}", "src": src, "value": name}
+                         for j, (src, name) in enumerate(
+                             zip(segs[i].get("reference_images") or [], seg_ref_names[i]))],
+                "ref_count_used": len(seg_ref_names[i]),
+                "audios": seg_audio_names[i],
+                "audio_count_used": len(seg_audio_names[i]),
+            })
+
+        timeout = timeout or int(1200 + timeout_per_segment * n)
+        logger.info(f"H3(Director) 提交：{n} 段，总超时 {timeout}s（单段预估 {timeout_per_segment}s），"
+                    f"段间引导 {'开' if layout.get('continuity') else '关'}"
+                    f"（{layout.get('continuity_overlap_frames')} 帧）")
+        prompt_id = self.queue_prompt(api_prompt)
+        history = self.wait_for_completion(prompt_id, timeout=timeout)
+        files = self.get_output_files(history, ".mp4")
+
+        audio_check = []
+        if files:
+            from video_postprocess import probe_media
+            for f in files:
+                m = probe_media(f)
+                audio_check.append({"file": f, "has_audio": m.get("has_audio"),
+                                    "audio_streams": m.get("audio_streams"),
+                                    "video_streams": m.get("video_streams"),
+                                    "error": m.get("error")})
+
+        return {"prompt_id": prompt_id, "files": files, "history": history,
+                "segment_count": n, "segments": seg_report, "layout": layout,
+                "meta": meta, "seed": seed, "emit_audio": bool(emit_audio),
+                "audio_disconnected": audio_changed, "audio_check": audio_check,
+                "timeout": timeout, "template": tpl_name,
+                "validate_report": report,
+                # ---- Director 专属字段（报表 / 守卫用）----
+                "builder": "director",
+                "timeline_total_frames": layout.get("total_frames"),
+                "timeline_duration_sec": layout.get("duration_sec"),
+                "continuity": layout.get("continuity"),
+                "continuity_overlap_frames": layout.get("continuity_overlap_frames"),
+                "export_mode": layout.get("export_mode"),
+                "audio_mode": layout.get("audio_mode"),
+                "refs": layout.get("refs"),
+                "segment_refs": layout.get("segment_refs"),
+                "segment_audios": layout.get("segment_audios")}
+
     @staticmethod
     def _h3_picture_defs(char_refs: List[dict], scene_refs: List[dict],
-                         storyboard_ref: dict = None):
+                         storyboard_ref: dict = None, end_frame_ref: dict = None,
+                         item_refs: List[dict] = None):
         """把参考图列表映射成 H3 的 ``(<Picture N>, 用途说明)`` 与 ``<Subject N>`` 定义
 
         语义约定：
             storyboard_ref 非空 → <Picture 1> = 分镜图（构图/景别/机位/人物姿态基准）
-                                  <Picture 2> = 主角外观锚点
+                                  其后 = 本镜出场角色三视图（每人一张）+ 物品 + 场景
             否则                 → <Picture 1..n> = 角色外观锚点，其后为场景环境参考
+            end_frame_ref 非空   → 追加 <Picture K> = 结束帧（尾帧），keyframe 模式用，
+                                  让 Ref2VA 在首帧与尾帧之间插值（FL2V 首尾一致的软手段）
+
+        2026-09-27 扩展：``char_refs`` 不再截断到 ``[:2]``，本镜**所有**出场角色
+        每人一张三视图独立锚点；``item_refs`` 新增物品锚点（形状/材质/配色）。
+        分镜图（<Picture 1>）仍是构图基准，但角色身份/外观改由各自的三视图锚点
+        独立锁定（分镜图只承载构图/机位/姿态，不再当「唯一外观锚点」）——
+        解决「配角外观缺失/串味」与「物品走样」的质检重灾区。
 
         ⚠️ ``subjects`` 里的 ``picture`` 字段是给 ``h3_prompt_kit`` 用的**归属声明**：
         ``<Subject N> is X in <Picture M>`` 与 retention_analysis 的保留项措辞
@@ -2358,41 +2830,84 @@ class ComfyUIClient:
             return str(ref.get("appearance") or ref.get("description")
                        or ref.get("reference_prompt_zh") or "").strip()[:120]
 
+        def _next_label() -> str:
+            return f"<Picture {len(picture_defs) + 1}>"
+
         if storyboard_ref:
             sb_name = storyboard_ref.get("name") or "本镜头分镜图"
+            # <Picture 1> = 分镜图（仅构图/机位/姿态基准）；角色外观改由各自三视图锚点锁定。
             picture_defs.append((
                 "<Picture 1>",
-                f"该镜头的分镜图（{sb_name}），定义本镜的构图、景别、机位、环境与人物姿态"))
-            main = (char_refs or [{}])[0]
-            if main.get("name"):
+                f"该镜头的分镜图（{sb_name}），定义本镜的构图、景别、机位、环境与人物姿态基准"))
+            # 本镜出场角色：每人一张三视图锚点（不再截断 [:2]），Subject 归属各自 <Picture M>。
+            for ref in (char_refs or []):
+                name = ref.get("name", f"角色{len(subjects) + 1}")
+                label = _next_label()
                 picture_defs.append((
-                    "<Picture 2>",
-                    f"{main.get('name')} 的外观参考，定义其五官、发型、服装与画风，"
-                    f"必须与 <Picture 1> 保持同一人物"))
-            for ref in (char_refs or [])[:1]:
-                subjects.append({"name": ref.get("name", "主角"),
-                                 "appearance": _appearance(ref),
-                                 "picture": "<Picture 2>" if picture_defs else "<Picture 1>"})
+                    label,
+                    f"{name} 的三视图设定图，定义其面部身份、发型、体型、服装与画风，"
+                    f"并作为其出场镜头的身份锚点"))
+                subjects.append({"name": name, "appearance": _appearance(ref),
+                                 "picture": label})
+            # 本镜物品：形状/材质/配色锚点（Subject 归属，走「材质/配色」保留语义）。
+            for ref in (item_refs or []):
+                name = ref.get("name", f"物品{len(subjects) + 1}")
+                label = _next_label()
+                picture_defs.append((
+                    label,
+                    f"物品「{name}」的设定图，定义其形状、材质与配色"))
+                subjects.append({"name": name, "appearance": _appearance(ref),
+                                 "picture": label})
+            # 场景：环境/氛围锚点（放在主体之后）。
+            for ref in (scene_refs or []):
+                name = ref.get("name", f"场景{len(picture_defs) + 1}")
+                picture_defs.append((
+                    _next_label(),
+                    f"{name} 的环境参考，定义场景结构、材质氛围与光照基调"))
+            if end_frame_ref:
+                # ⭐ 尾帧参考图（keyframe 模式）：追加 <Picture K> = 结束帧，
+                # 用于 Ref2VA 在首帧与尾帧之间插值（FL2V 首尾一致的软手段，2026-09-26）。
+                picture_defs.append((
+                    _next_label(),
+                    end_frame_ref.get("desc") or
+                    "该镜头的尾帧（结束画面），定义本镜结束时的构图、人物姿态与表情，"
+                    "最后一帧必须落在本图上"))
             return picture_defs, subjects
 
-        for ref in (char_refs or [])[:2]:
+        for ref in (char_refs or []):
             name = ref.get("name", f"角色{len(picture_defs) + 1}")
-            label = f"<Picture {len(picture_defs) + 1}>"
+            label = _next_label()
             picture_defs.append((
                 label,
                 f"{name} 的外观参考，定义其五官、发型、服装与画风，"
                 f"并作为其出场镜头的构图锚点"))
             subjects.append({"name": name, "appearance": _appearance(ref),
                              "picture": label})
+        for ref in (item_refs or []):
+            name = ref.get("name", f"物品{len(picture_defs) + 1}")
+            label = _next_label()
+            picture_defs.append((
+                label,
+                f"物品「{name}」的设定图，定义其形状、材质与配色"))
+            subjects.append({"name": name, "appearance": _appearance(ref),
+                             "picture": label})
         for ref in (scene_refs or [])[:1]:
             name = ref.get("name", f"场景{len(picture_defs) + 1}")
             picture_defs.append((
-                f"<Picture {len(picture_defs) + 1}>",
+                _next_label(),
                 f"{name} 的环境参考，定义场景结构、材质氛围与光照基调"))
+        if end_frame_ref:
+            picture_defs.append((
+                _next_label(),
+                end_frame_ref.get("desc") or
+                "该镜头的尾帧（结束画面），定义本镜结束时的构图、人物姿态与表情，"
+                "最后一帧必须落在本图上"))
         return picture_defs, subjects
 
     def resolve_h3_prompt(self, shot: dict, char_refs: List[dict],
-                          scene_refs: List[dict], storyboard_ref: dict = None) -> str:
+                          scene_refs: List[dict], storyboard_ref: dict = None,
+                          end_frame_ref: dict = None,
+                          item_refs: List[dict] = None) -> str:
         """生成期**权威**的 H3 提示词入口（修「薄英文顶掉结构化构建器」）
 
         择优规则：
@@ -2405,10 +2920,20 @@ class ComfyUIClient:
         ``<Picture N>`` 标签告诉模型每张参考图的用途；而剧本阶段的 LLM 根本
         不知道最终配了几张图，只能写出一句无标签的裸英文 —— 实测全项目 200+
         镜头的结构化提示词数量为 0，出片与设定严重不符。
+
+        end_frame_ref：可选，尾帧参考图信息（keyframe 模式），含 ``desc`` 用途说明；
+        传入时把尾帧声明为 <Picture K> 并在提示词末拍锚定结束帧（FL2V 首尾一致）。
+        item_refs：可选，本镜物品参考图（形状/材质/配色锚点，2026-09-27 扩展）。
         """
         shot = shot or {}
-        picture_defs, subjects = self._h3_picture_defs(char_refs, scene_refs, storyboard_ref)
+        picture_defs, subjects = self._h3_picture_defs(char_refs, scene_refs,
+                                                       storyboard_ref, end_frame_ref,
+                                                       item_refs)
         style = h3_prompt_kit.style_of(shot)
+        # 尾帧标签：end_frame_ref 存在时，它是 picture_defs 里最后一张图
+        end_label = ""
+        if end_frame_ref and picture_defs:
+            end_label = picture_defs[-1][0]
         if not picture_defs:
             built = h3_prompt_kit.build_base(shot, "T2VA", style=style)
             existing = str(shot.get("prompt_h3") or "").strip()
@@ -2422,22 +2947,33 @@ class ComfyUIClient:
             return h3_prompt_kit.clamp_h3_prompt(
                 existing if verdict["valid"] else h3_prompt_kit.merge_detail(built, existing))
         return h3_prompt_kit.clamp_h3_prompt(
-            h3_prompt_kit.resolve(shot, picture_defs, subjects, style=style))
+            h3_prompt_kit.resolve(shot, picture_defs, subjects, style=style,
+                                  end_frame_ref=end_label))
 
     def _build_h3_prompt(self, shot: dict, char_refs: List[dict], scene_refs: List[dict],
-                         storyboard_ref: dict = None) -> str:
+                         storyboard_ref: dict = None, end_frame_ref: dict = None,
+                         item_refs: List[dict] = None) -> str:
         """构建规范 H3 Ref2VA 提示词（无条件重建，忽略剧本里的既有 prompt_h3）
 
         需要一个「干净重建」的调用点时用它（例如风格纠偏重试）；日常生成请用
         :meth:`resolve_h3_prompt`，后者会优先尊重已合规的既有提示词。
+
+        end_frame_ref：可选，尾帧参考图信息（keyframe 模式），含 ``desc`` 用途说明。
+        item_refs：可选，本镜物品参考图（形状/材质/配色锚点，2026-09-27 扩展）。
         """
         shot = shot or {}
-        picture_defs, subjects = self._h3_picture_defs(char_refs, scene_refs, storyboard_ref)
+        picture_defs, subjects = self._h3_picture_defs(char_refs, scene_refs,
+                                                       storyboard_ref, end_frame_ref,
+                                                       item_refs)
         style = h3_prompt_kit.style_of(shot)
+        end_label = ""
+        if end_frame_ref and picture_defs:
+            end_label = picture_defs[-1][0]
         if not picture_defs:
             # A-5 加固：本方法同样不经过 resolve()，且被 app.py 4 处直接调用
             #（2057/2068/3715/3733），同一类"超长提示词被服务端静默截断"的口子。
             return h3_prompt_kit.clamp_h3_prompt(
                 h3_prompt_kit.build_base(shot, "T2VA", style=style))
         return h3_prompt_kit.clamp_h3_prompt(
-            h3_prompt_kit.build_ref2va(shot, picture_defs, subjects, style=style))
+            h3_prompt_kit.build_ref2va(shot, picture_defs, subjects, style=style,
+                                       end_frame_ref=end_label))

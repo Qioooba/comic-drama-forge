@@ -1230,7 +1230,10 @@
     "subKeyframesHint": "镜头首尾帧",
     "episode": "集次",
     "episodeN": "第 {n} 集",
-    "chapterN": "第 {n} 章"
+    "chapterN": "第 {n} 章",
+    "episodeGenerate": "整集生成视频",
+    "episodeGenerateStarted": "整集视频生成已启动（{total} 镜）",
+    "episodeGenerateFailed": "整集视频生成启动失败"
   },
   "toolLabel": {
     "apply_creative_settings": "套用创作设定",

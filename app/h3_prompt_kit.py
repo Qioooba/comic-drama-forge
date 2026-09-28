@@ -342,7 +342,8 @@ def build_soundscape(shot: dict, scene_hint: str = "") -> str:
 
     ⚠️ 历史实现结尾固定写「全程无解说、无旁白念白」，本意是防旁白，但副作用是
     在同一段里同时出现「台词」与「无念白」两种相反信号，模型可能因此把台词
-    降级成画外音（口不动）。现改为只在**确实没有台词**时才声明无旁白。
+    降级成画外音（口不动）。现改为只在**确实没有台词**时，用官方句式声明
+    「no one speaks / no voice-over」。
     """
     loc = str(shot.get("location") or scene_hint or "").strip()
     sfx = _clean_sfx(shot.get("audio_cues") or "")
@@ -361,18 +362,18 @@ def build_soundscape(shot: dict, scene_hint: str = "") -> str:
         parts.append("a quiet ambient room tone, with breathing and fabric rustle clearly audible")
     body = ", ".join(parts).rstrip("。；;，,")
     if lines:
-        said = _strip_end(lines[-1].get("text"))[:12]
+        # 2026-09-26：⚠️ 此前这里把台词前 12 字写成「The echo of "台词"」，导致台词
+        # 内容在提示词里出现**两次**（detailed_description 的 <d>台词</d> + 此处 echo
+        # 引用）—— H3 把两处都当台词念，实测「同一句台词被反复念」（用户反馈）。
+        # 手跑模板虽然也写 echo，但只取台词末尾 2 字关键词、风险低；此处前 12 字几乎
+        # 是完整台词、风险高。现彻底去掉台词引用，只保留「说话声混入环境音」的空间感
+        # —— 台词本体只留在 detailed_description 的 <d> 标签里（单一事实来源）。
         where = loc or "the scene"
-        if said:
-            tail = (f'The echo of "{said}" lingers for a moment before dissolving into the '
-                    f'ambient tone; the spoken voice spreads naturally through {where}, '
-                    f'synced to the lip movement.')
-        else:
-            tail = (f"The spoken voice spreads naturally through {where}, synced to the "
-                    f"lip movement, the echo dissolving into the ambient tone.")
+        tail = (f"The spoken voice carries clearly through {where}, synced to the lip "
+                f"movement, and sits naturally on top of the ambient tone.")
         return f"{body}. {tail}"
-    return (f"{body}. No narration or voice-over throughout; the sound rises and falls "
-            f"naturally with the camera movement.")
+    return (f"{body}. No one speaks and there is no voice-over narration throughout; "
+            f"only the ambient sound described above is heard, with no spoken words.")
 
 
 def build_music(shot: dict, style: str = "") -> str:
@@ -492,36 +493,36 @@ def _guess_voice(form: str) -> str:
 
 def _spoken_clause(lines: Sequence[Dict[str, str]], slots: Dict[str, str],
                    speak_lead: str = "") -> str:
-    """把台词渲染成**本地模板同格式**的 H3 台词句
+    """把「谁在说话」渲染成 I2V 提示词的**口型动作句**（不含台词原文）
 
-    本地手跑模板（``H3信号10段测试001.json``）的写法是::
+    ⚠️ 2026-09-26 P0-1「口型与画面分离」：本系统的配音走**独立 QwenTTS 后期合成**
+    （H3 自带音轨的人声还会被 HDEMUCS 分离剔除），所以 I2V 阶段**不需要、也不应该**
+    把台词原文 ``<d>[Chinese] …</d>`` 写进提示词。历史实现写台词原文有三个实测副作用：
 
-        She holds still, breathing slowly, and then speaks — a clear, resonant
-        female voice with sharp regal timbre and unwavering pitch, at a measured
-        declarative rate (S1): <d>[Chinese] 我，穆兰圣女……</d> She closes her lips
-        after the final word.
+    1. **同一句被反复念** —— 台词在 ``detailed_description`` 的 ``<d>台词</d>`` 与
+       ``overall_soundscape`` 的 echo 两处出现，H3 把两处都当台词念（用户实测反馈）。
+    2. **口型与真实配音错位** —— H3 按台词文本驱动唇形，但真正出声的是后期 QwenTTS，
+       两者文字/节奏对不上，观众看到嘴在「念 A」听到的却是「B」。
+    3. **台词被画成字幕** —— 提示词里出现台词文本，H3 更倾向于把它画进画面。
 
-    历史实现写成 ``(S1) 说：[Chinese] 台词。对白的口型、语气与情绪必须与台词语义一致。``，
-    与本地格式有本质差别，会导致两个问题：
-
-    1. **人物不开口** —— 旧写法只声明「说」，没有「开口/口型开合」的动作描述，
-       H3 倾向只出配音、不做唇部动画（实测现象）。
-    2. 中文指令「说：」夹在英文描述里，与模板的英文语境不一致。
-
-    现按模板改为：先写英语「开口说话」动作 + 音色语速，再用 ``(SN): <d>[Chinese] 台词</d>``
-    包住台词，最后补一句「说完合上嘴唇」收口。
+    业界成熟做法（可灵/即梦/本地 Ref2VA 工作流）正是 I2V 阶段不喂台词文本：
+    提示词只负责「谁、什么语气、开口说多久」，具体念什么交给配音层。
+    故本函数改为：只写**开口说话的物理动作 + 音色 + 语速**，并标注「口型随说话自然开合」，
+    不再输出任何台词原文；台词本体只在 :func:`tts_client.build_dub_plan` 的配音链路里消费。
     """
     spoken: List[str] = []
     for ln in lines:
         text = str(ln.get("text") or "").strip()
         if not text:
             continue
-        tag = lang_tag(text) or "Chinese"
         speaker = str(ln.get("speaker") or "").strip()
         slot = slots.get(speaker, "")
-        who = f"({slot}): " if slot else ""
+        who = f"({slot}) " if slot else ""
         lead = speak_lead or _SPEAK_LEAD.get(_guess_voice(speaker), "") or _SPEAK_LEAD[""]
-        spoken.append(f"{lead} {who}<d>[{tag}] {text}</d>")
+        # ⭐ 关键：只描述「开口说话」，不写台词原文。用「口型随说话自然开合、与台词语义
+        #    一致」替代 `<d>台词</d>`，既保留驱动嘴型的信号，又不引入台词文本。
+        spoken.append(
+            f"{lead} {who}with the lips moving naturally in sync with the spoken words")
     if not spoken:
         return ""
     return " ".join(spoken) + " After the final word the lips close and the mouth returns to a still, closed position."
@@ -687,7 +688,8 @@ def _style_opening(style: str) -> str:
 
 
 def build_detailed_description(shot: dict, duration: float, style: str = "",
-                               picture_refs: Optional[Dict[str, str]] = None) -> str:
+                               picture_refs: Optional[Dict[str, str]] = None,
+                               end_frame_ref: str = "") -> str:
     """``detailed_description``：按 ``[Shot N]`` 逐节拍写画面（本地模板同格式）
 
     与本地手跑模板（``H3信号10段测试001.json``）对齐的要点：
@@ -695,8 +697,8 @@ def build_detailed_description(shot: dict, duration: float, style: str = "",
     - **首句写全片风格**（``The target video uses … style … bokeh.``），景别用英文短语。
     - 首镜用 ``[Shot 1]``，**后续镜用 ``At MM:SS.mmm, the camera cuts to ...``** 起头，
       时间码内嵌在句子里（不再是「[Shot N] 00:03.500 中景：」）。
-    - 无台词的镜头必须**显式写 ``No dialogue``** —— 留空会让模型自行「补台词」，
-      进而把台词画成字幕；模板里每个无台词节拍都明确标注。
+    - 无台词的镜头必须**显式写「no one speaks / no voice-over」** —— 留空会让模型
+      自行「补台词」或把画面描述念成画外音；模板里每个无台词节拍都明确标注。
     - 结尾**不再追加**「画面中严禁出现任何文字、字幕…」这类中文禁令：模板里没有，
       而且它本身就在提示词里引入了「字幕/文字」这两个词，反而更容易诱发字幕。
     - **运镜必须显式写进画面句**（2026-09-25 补）：``camera`` 字段是「景别+运镜」复合词
@@ -710,6 +712,7 @@ def build_detailed_description(shot: dict, duration: float, style: str = "",
     lines = dialogue_lines(shot.get("dialogue"))
     slots = speaker_slots(lines)
     picture_refs = picture_refs or {}
+    end_frame_ref = str(end_frame_ref or "").strip()
 
     # 构图基准声明只挂在首节拍，后续节拍不必重复
     first_ref = "<Picture 1>" if "<Picture 1>" in picture_refs else ""
@@ -746,9 +749,24 @@ def build_detailed_description(shot: dict, duration: float, style: str = "",
         if idx == len(beats) and spoken:
             line = head + clause + " " + spoken
         else:
-            # 无台词节拍显式标注，避免模型自补台词 → 画成字幕
-            line = head + clause + " No dialogue."
+            # 无台词节拍显式标注「无人说话、无画外音」，防止模型把画面描述念成旁白。
+            # ⚠️ 2026-09-27 对齐官方：旧「No dialogue.」太弱（模型会理解成「这幕没对话」，
+            #    于是改用画外音复述画面/背景），改为官方「no one speaks / no voice-over」。
+            line = head + clause + " No one in the frame speaks; there is no voice-over narration."
         out.append(line)
+
+    # ⭐ 尾帧软锚定（Ref2VA 首尾一致的关键，2026-09-26）：
+    # Ref2VA 对参考图是软约束，没有「最后一帧=尾帧图」的硬保证。为逼近首尾一致，
+    # 在末拍之后显式声明「本段最后一帧必须落在尾帧参考图的构图与姿态上」——
+    # 给时间轴末端一个明确落点，配合 FL2V Turbo LoRA 拉首尾一致性。
+    # ⚠️ 只挂在尾帧参考图确实存在的镜头；无尾帧时绝不凭空写（否则会诱发模型
+    #    自行脑补一个"结束帧"，反而引入漂移）。
+    if end_frame_ref:
+        out.append(
+            f"End state: the final frame of this shot must land exactly on the "
+            f"composition, framing, character pose and expression shown in "
+            f"{end_frame_ref}; the camera movement and action settle into that exact "
+            f"end image as the clip closes.")
 
     return "\n".join(out)
 
@@ -901,7 +919,7 @@ def segment_shot(shot: dict, duration, max_sec: float = None) -> List[dict]:
 
 def _retention_analysis(picture_defs: Sequence[Tuple[str, str]],
                         subjects: Sequence[Dict[str, str]], style: str = "",
-                        shots: str = "") -> str:
+                        shots: str = "", end_frame_ref: str = "") -> str:
     """``retention_analysis``：逐主体声明必须保留的外观项（英文句式）
 
     模板写法::
@@ -921,6 +939,18 @@ def _retention_analysis(picture_defs: Sequence[Tuple[str, str]],
         item = appearance or "their facial features, hairstyle and costume"
         lines.append(f"<Subject {i}> {name}{appear}: fully_preserved - {item}, all "
                      f"retained without change.")
+        # ⭐ P1「锁脸」（2026-09-26）：显式列举**面部身份关键点**，把「脸」锁定到参考图。
+        # 历史只写 appearance（角色描述，常偏服装/气质），脸部的保留被一句「all retained」
+        # 含糊带过 —— 长序列里脸型/五官会缓慢漂移（用户反馈「角色变形」）。
+        # 业界锁脸（IP-Adapter / InstantID 的思路）核心就是「身份指向参考图、不复述」，
+        # 这里在不引入新模型的前提下，把「五官几何必须锁定参考图」说死，并**禁止**
+        # 用文字重述五官（一旦重述，模型会用文字去"重新画"一张脸，反而漂移）。
+        lines.append(
+            f"<Subject {i}> {name} facial identity lock: the face shape, hairline, "
+            f"eyebrow shape, eye shape, nose shape, lip shape and overall facial "
+            f"geometry must stay identical to {sub.get('picture') or '<Picture 1>'}; "
+            f"do not redraw or re-describe the facial features from text — copy them "
+            f"exactly from the reference image.")
     # ⚠️ 参考图要按**用途**分开写保留项：主体参考图管「costume / palette / hairstyle」，
     # 场景参考图管「scene structure / materials / lighting」。若不分流，场景图也会被
     # 写成「the costume … follow the reference image exactly」——语义错位的假声明。
@@ -946,6 +976,14 @@ def _retention_analysis(picture_defs: Sequence[Tuple[str, str]],
     # （实测视频生成出了字幕）。故删掉该行，改用「必须保留」的正向表述。
     lines.append("Composition, aspect ratio, character appearance and scene structure "
                  "stay consistent from shot to shot, keeping the sequence continuous.")
+    # ⭐ 尾帧保留声明（2026-09-26）：尾帧参考图是「结束帧」而非「外观锚点」，
+    # 其保留项语义与主体/场景图不同 —— 要保留的是「末帧构图与姿态」，
+    # 而不是「服装/材质」。故单独写一条，避免落入上方 is_env 分流被误写成场景材质。
+    if end_frame_ref:
+        lines.append(
+            f"{end_frame_ref} is the end-frame reference for this shot: fully_preserved - "
+            f"the final frame of the generated clip must match its composition, framing, "
+            f"character pose and expression exactly, with no drift.")
     return "\n".join(lines)
 
 
@@ -982,8 +1020,15 @@ def build_summary(shot: dict, duration: float, subjects: Sequence[Dict[str, str]
 
 def build_ref2va(shot: dict, picture_defs: Sequence[Tuple[str, str]],
                  subjects: Sequence[Dict[str, str]] = (), duration: Any = None,
-                 style: str = "") -> str:
-    """构建 Ref2VA 六段式提示词（有参考图时使用）"""
+                 style: str = "", end_frame_ref: str = "") -> str:
+    """构建 Ref2VA 六段式提示词（有参考图时使用）
+
+    end_frame_ref：可选，尾帧参考图的标签（如 ``<Picture 2>``）。提供时：
+    - ``detailed_description`` 末拍追加 end-state 锚定句（最后一帧必须落在尾帧）；
+    - ``retention_analysis`` 追加尾帧保留声明。
+    用于 keyframe 模式把「首帧 + 尾帧」两张图喂进 Ref2VA 后，用提示词把
+    首尾一致性拉回来（Ref2VA 对参考图是软约束，需显式声明，2026-09-26）。
+    """
     shot = shot or {}
     dur = duration if duration is not None else (shot.get("duration") or 5)
     try:
@@ -991,6 +1036,7 @@ def build_ref2va(shot: dict, picture_defs: Sequence[Tuple[str, str]],
     except (TypeError, ValueError):
         dur_f = 5.0
     pic_map = {label: desc for label, desc in picture_defs}
+    end_frame_ref = str(end_frame_ref or "").strip()
 
     # retention_analysis 里声明「本段出现在哪些镜头」，与模板 ``(appears in [Shot 1]…)``
     # 同构。单次调用只知道这一个 shot，故按节拍数折算（单节拍即 [Shot 1]）。
@@ -1001,8 +1047,9 @@ def build_ref2va(shot: dict, picture_defs: Sequence[Tuple[str, str]],
         ("subject_definitions", _subject_definitions(list(picture_defs), list(subjects), style)),
         ("summary", build_summary(shot, dur_f, subjects)),
         ("retention_analysis", _retention_analysis(list(picture_defs), list(subjects),
-                                                    style, shots)),
-        ("detailed_description", build_detailed_description(shot, dur_f, style, pic_map)),
+                                                    style, shots, end_frame_ref)),
+        ("detailed_description", build_detailed_description(shot, dur_f, style, pic_map,
+                                                            end_frame_ref)),
         ("overall_soundscape", build_soundscape(shot)),
         ("non_diegetic_music", build_music(shot, style)),
     ]
@@ -1096,7 +1143,7 @@ def merge_detail(prompt: str, detail: str) -> str:
 
 def resolve(shot: dict, picture_defs: Sequence[Tuple[str, str]] = (),
             subjects: Sequence[Dict[str, str]] = (), duration: Any = None,
-            style: str = "") -> str:
+            style: str = "", end_frame_ref: str = "") -> str:
     """生成期择优：合规的既有 ``prompt_h3`` 直接用，否则用构建器重建
 
     这是修「薄英文提示词把结构化构建器整个顶掉」的落点：
@@ -1108,7 +1155,8 @@ def resolve(shot: dict, picture_defs: Sequence[Tuple[str, str]] = (),
     existing = str(shot.get("prompt_h3") or "").strip()
 
     if picture_defs:
-        built = build_ref2va(shot, picture_defs, subjects, duration=duration, style=style)
+        built = build_ref2va(shot, picture_defs, subjects, duration=duration, style=style,
+                             end_frame_ref=end_frame_ref)
     else:
         built = build_base(shot, "T2VA", duration=duration, style=style)
 

@@ -171,6 +171,30 @@ def atomic_write_json(path: str, data, *, indent: int = 2) -> None:
         raise
 
 
+def atomic_write_bytes(path: str, data: bytes) -> None:
+    """原子写二进制（图片 / 视频封面等）：唯一临时名 + flush/fsync + os.replace 重试。
+
+    与 :func:`atomic_write_json` 的差异：不做 ``.bak`` 快照（二进制产物通常可由上游
+    重算，留一份同体积副本不划算），但保留「唯一临时名 + 先落盘再 replace」的原子语义。
+    失败语义：先尽力删除临时文件，然后**原样抛出**。
+    """
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.{os.urandom(3).hex()}.tmp"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        _atomic_replace(tmp, path)
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError as e:
+            logger.debug("清理临时文件失败（忽略）：%s", e)
+        raise
+
+
 # =====================================================================
 # 三态严格读取
 # =====================================================================

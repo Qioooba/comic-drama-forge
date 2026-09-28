@@ -82,11 +82,24 @@ _CLASS_HINTS: dict = {
     "拥挤": "精简画面元素，避免过度拥挤。",
     "人物数量": "严格按分镜要求的人物数量绘制，不增减人。",
     "多余人": "移除画面中多余的人物或物体。",
+    "文字": "画面中不得出现任何文字、字幕或水印。",
+    "水印": "画面中不得出现任何文字、字幕或水印。",
+    "字幕": "画面中不得出现任何文字、字幕或水印。",
     "武器": "严格还原参考图中的武器造型与细节。",
     "剑": "严格还原参考图中的剑/武器造型，不得变形或换款。",
     "风格": "严格采用目标风格的画风、渲染方式与配色，不得偏离为其他风格。",
     "画风": "严格采用目标风格的画风、渲染方式与配色，不得偏离为其他风格。",
 }
+
+# ⚠️ 历史缺陷：_MATCH_RULES / _CLASS_HINTS 曾长期是死代码（定义了没引用），
+# 「按缺陷类别给通用修正建议」的泛化职责一直没人承担 —— 质检缺陷文案
+# （「构图不平」「透视处理欠佳」）几乎不出现在新镜头的生成提示词里，
+# 词面召回命中不了 → 同类问题换个镜头再犯防不住（教训库 197 条仅 14 条被召回过）。
+# 现由 PromptMemory.category_hints 接回：按「近窗口高频缺陷类别」注入通用修正建议。
+
+#: 允许注入类别建议的环节（kind 白名单）。类别建议全是**图像域**的修正话术
+# （「调整构图」「修正手部结构」），audio / script 等文本域环节注入属于串味。
+_CATEGORY_HINT_KINDS = {"storyboard", "asset", "keyframe", "video", "prompt"}
 
 # 每条经验最多存活条数（防止无限膨胀）
 _MAX_LESSONS = 2000
@@ -712,6 +725,23 @@ class PromptMemory:
         "TASK:", "Generate a single storyboard frame",
         "FRAMING (must be strictly followed)", "FRAMING (not specified",
         "CAMERA ANGLE (must be strictly followed)",
+        # ---- 分镜光学/材质段（2026-09-28 画质提升）----
+        # ⚠️ 必须登记**正文**（不只是段标签）：同批的 COMPOSITION BASELINE 也是登记
+        #    多个正文片段。只登记 "CINEMATOGRAPHY:" 时 479 字符正文原样残留 ——
+        #    两条不同分镜提示词的 Dice 相似度被同向抬高 +0.1289（0.7298→0.8587），
+        #    召回失去区分度。
+        # ⚠️ 本组必须与 comfyui_client.CINEMATOGRAPHY_SECTION 保持同步：改一段要改两处；
+        #    漂移会让相似度剥离退化（历史缺陷）。
+        #    守卫 .workbuddy/test/verify_aspect_default_16x9.py 断言剥离残留 < 全长 10%。
+        "CINEMATOGRAPHY:",
+        "cinematic depth of field with a shallow focal plane and soft bokeh in the out-of-focus background",
+        "natural skin subsurface scattering with visible fine pore and fabric-level texture",
+        "individual hair strands catching the key light",
+        "cloth weave and material grain clearly readable",
+        "volumetric light shafts and drifting atmospheric haze",
+        "physically plausible shadow falloff with soft contact shadows",
+        "restrained film grain",
+        "clean highlight roll-off without clipping",
         "PRIMARY CANVAS:", "Use <image1> as the primary canvas",
         "and identity anchor", "No reference image is provided for this shot",
         "Generate the frame purely from the SCENE AND ACTION and STYLE descriptions below",
@@ -720,6 +750,14 @@ class PromptMemory:
         "do NOT redraw or re-describe the face",
         "REFERENCE ROLES:", "only for", "Do not merge or transfer attributes",
         "Each referenced character must keep its own individual identity",
+        # ---- 3D 导演台构图基准图段（2026-09-27）----
+        # ⚠️ 必须登记：否则「带基准图」与「不带基准图」的同一镜指纹不同，
+        #    教训召回会互相认不出（历史同类问题见上方 2026-09-25 注释）。
+        "COMPOSITION BASELINE:", "is a 3D blocking reference",
+        "Copy ONLY its composition", "Replace those mannequins with the characters",
+        "Do NOT copy the mannequin bodies",
+        "It defines the framing and the spatial layout of the frame",
+        "3D导演台构图基准",
         "SCENE AND ACTION:", "Location:", "Action and content:",
         "Speaking state:", "is quietly saying one short line",
         "shown only as natural lip movement and subtle expression changes",
@@ -779,6 +817,65 @@ class PromptMemory:
                 hit += 1
         return min(2.0 * hit / (len(a) + len(b)), 0.95)
 
+    # ---------- 高频类别预防建议（类别级泛化召回） ----------
+    #: 近窗口内同类别教训 >= 此数才注入该类别的预防建议。
+    #: 太小（=1）会把偶发缺陷当系统性问题，每个提示词都被塞满建议；太大对冷启动不敏感。
+    CATEGORY_HINT_MIN = 3
+    #: 统计「高频类别」的时间窗口（天）：只看近期教训，久远问题由衰减机制自然退出。
+    CATEGORY_HINT_RECENT_DAYS = 30
+    #: 单次最多注入的类别建议条数（控制提示词膨胀）。
+    CATEGORY_HINT_MAX = 3
+
+    @staticmethod
+    def _rule_hits(text: str) -> List[str]:
+        """缺陷文本命中的规则关键词（按 ``_MATCH_RULES`` 优先级收集全部命中）。"""
+        t = _norm(text)
+        if not t:
+            return []
+        return [r for r in _MATCH_RULES if r in t]
+
+    def category_hints(self, kind: str, max_hints: Optional[int] = None) -> List[str]:
+        """按「近窗口高频缺陷类别」召回**类别级**预防建议（跨镜头泛化）。
+
+        与 `suggestions()`（按提示词相似度召回**具体**教训）互补：具体教训只对
+        同/相似提示词有效；这里统计近期教训的缺陷类别频次，命中阈值的高频类别
+        直接注入 ``_CLASS_HINTS`` 的通用修正建议 —— 相当于把「高频缺陷的修正」
+        **动态固化**进每次生成的提示词，且随教训库自动更新：哪类问题修好了、
+        近期频次掉下去，对应建议自动消失，不需要手工改提示词骨架。
+
+        只统计 ``kind`` 同环节的教训（跨项目累计——构图/透视这类是模型级系统性
+        问题，不局限单一项目）；建议文本为通用话术，不含风格名，跨项目/跨风格
+        注入无「串味」风险。
+        """
+        cap = self.CATEGORY_HINT_MAX if max_hints is None else max(0, int(max_hints))
+        if cap <= 0:
+            return []
+        cutoff = (datetime.now() - timedelta(days=self.CATEGORY_HINT_RECENT_DAYS)
+                  ).isoformat(timespec="seconds")
+        with self._lock:
+            lessons = list(self._lessons)
+        counts: dict = {}
+        for l in lessons:
+            if l.get("kind") and l.get("kind") != kind:
+                continue
+            if not (l.get("issues") or l.get("reason")):
+                continue      # 空教训不参与统计
+            ts = str(l.get("ts") or "")
+            if ts and ts < cutoff:
+                continue      # 只看近期：过期类别由衰减机制负责
+            text = " ".join(str(x) for x in (l.get("issues") or [])) + " " + str(l.get("reason") or "")
+            for cat in set(self._rule_hits(text)):
+                if cat in _CLASS_HINTS:
+                    counts[cat] = counts.get(cat, 0) + 1
+        hints: List[str] = []
+        for cat, n in sorted(counts.items(), key=lambda x: (-x[1], x[0])):
+            if n < self.CATEGORY_HINT_MIN:
+                break         # 频次降序 → 后面只会更少
+            hints.append(_CLASS_HINTS[cat])
+            if len(hints) >= cap:
+                break
+        return hints
+
     # 景别词（长词在前，先匹配长词避免「远景」被「大远景」截走）
     _FRAMINGS = ("大远景", "远景", "全景", "中景", "近景", "中近景", "特写", "大特写")
 
@@ -831,14 +928,32 @@ class PromptMemory:
 
         style：本次生成的目标风格。仅用于替换建议里的 ``{style}`` 占位符，
         保证「严格采用 X 风格」里的 X 永远是**当前项目**的风格。
+
+        除历史教训外，还会叠加 ``category_hints``（高频缺陷类别的预防建议，
+        仅限 ``_CATEGORY_HINT_KINDS`` 图像域环节）：历史教训按提示词相似度
+        召回、只对同/相似提示词有效；类别建议按频次触发、跨镜头泛化，
+        两块去重后分开标注来源。
         """
         hints = self.suggestions(kind, prompt, project, max_hints, style=style)
-        if not hints:
-            return prompt
+        cat_hints: List[str] = []
+        if kind in _CATEGORY_HINT_KINDS:
+            try:
+                cat_hints = self.category_hints(kind)
+            except Exception as e:  # noqa: BLE001 - 类别建议失败不影响历史召回
+                logger.warning("高频类别预防建议生成失败（忽略）：%s", e)
+        # 与历史建议去重（同一句话既当过具体缺陷又命中间类别时只保留一处）
+        seen_norms = {_norm(h) for h in hints if (h or "").strip()}
+        cat_hints = [h for h in cat_hints
+                     if (h or "").strip() and _norm(h) not in seen_norms]
         safe = [(h or "").strip() for h in hints if (h or "").strip()]
-        if not safe:
+        catsafe = [(h or "").strip() for h in cat_hints if (h or "").strip()]
+        if not safe and not catsafe:
             return prompt
-        suffix = "\n【历史质检修正建议（请务必遵守）】\n" + "\n".join(f"  {i+1}. {h}" for i, h in enumerate(safe))
+        suffix = ""
+        if safe:
+            suffix += "\n【历史质检修正建议（请务必遵守）】\n" + "\n".join(f"  {i+1}. {h}" for i, h in enumerate(safe))
+        if catsafe:
+            suffix += "\n【高频缺陷预防建议（请务必遵守）】\n" + "\n".join(f"  {i+1}. {h}" for i, h in enumerate(catsafe))
         return prompt + suffix
 
     # ---------- 衰减过时记忆（原增强版能力，折入） ----------

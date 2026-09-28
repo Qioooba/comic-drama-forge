@@ -45,6 +45,12 @@ UPSTREAM_UNAVAILABLE_MARKERS = (
 GATEWAY_FAILFAST_THRESHOLD = 2      # 连续 N 次「上游不可用」→ 熔断
 GATEWAY_CIRCUIT_COOLDOWN_SEC = 600  # 熔断冷却时长；期间直接快速失败
 GATEWAY_UNAVAILABLE_MAX_ATTEMPTS = 1  # 判定为「上游不可用」后允许的尝试次数（远端=1，不重试）
+# ---- 远端**读超时**的独立重试额度（2026-09-25 新增，与上面的 fail-fast 区分开）----
+# 背景（实测）：远端网关的偶发挂起表现为「连得上、但响应读到超时」，此时上游往往是好的，
+# 一次就放弃会让整集白烧（第 1 集实测即此坑：仅 1 次 ReadTimeout 就整集中止）。
+# 但也不能无限等 —— 单次超时本身已是 LLM_REQUEST_TIMEOUT(1200s)=20 分钟，
+# 故最多额外再给 1 次，总等待上界 2×20 分钟，不至于像旧逻辑那样 3 次打满。
+TIMEOUT_MAX_ATTEMPTS = 2
 
 # 网络层异常：requests 的封装类型 + 标准库 socket 层。
 # ⚠️ 只写 requests.exceptions.Timeout / ConnectionError 是不够的：`socket.timeout` 在
@@ -165,6 +171,24 @@ def _is_upstream_unavailable(status: int, body: str) -> bool:
         return False
     low = (body or "").lower()
     return any(m in low for m in UPSTREAM_UNAVAILABLE_MARKERS)
+
+
+def _is_timeout_error(e) -> bool:
+    """区分「读超时」与「连不上」。
+
+    - 超时（Timeout / socket.timeout）：连接已建立、上游在响应，只是慢或偶发挂起 ——
+      **值得再试一次**，一次就放弃会白烧整集（第 1 集实测坑）。
+    - 其他（ConnectionError / DNS / 拒绝连接 / ChunkedEncodingError）：链路本身不通，
+      重试无用 → 保持 fail-fast。
+
+    ⚠️ 必须先判 Timeout 再判 OSError：Python 3.10+ 的 `socket.timeout` 就是内置
+    `TimeoutError`（OSError 子类），`requests.exceptions.Timeout` 也继承自 OSError，
+    顺序反了会把超时误判成「连不上」而退回旧的 fail-fast 行为。
+    """
+    if isinstance(e, (requests.exceptions.Timeout, TimeoutError)):
+        return True
+    name = type(e).__name__
+    return name in ("Timeout", "ReadTimeout", "ConnectTimeout", "TimeoutError")
 
 
 def gateway_circuit_state(base_url: str) -> dict:
@@ -491,8 +515,26 @@ class LLMClient:
                 resp = None
                 # 远端超时/连不上 = 「网关不可用」的典型形态（实测上游没算力时会挂到超时）
                 if not local:
-                    upstream_bad = True
-                    upstream_detail = f"{type(e).__name__}: {e}"
+                    # ⚠️ 2026-09-25 实测修正：**超时与连接失败必须分开**。
+                    # 旧逻辑把两者一律判成 upstream_bad=True 并 break，于是远端只要
+                    # **一次** ReadTimeout（read timeout=1200 要等满 20 分钟）就整集中止 ——
+                    # 实测第 1 集即此坑：日志「LLM 请求瞬时失败（第 1/3 次）：ReadTimeout」
+                    # 之后紧接 ERROR「第1集生成失败…已尝试 1/3 次」，那个 1/3 是假的，
+                    # 根本没发生第 2、3 次重试。
+                    # 而「连不上」（ConnectionError / DNS / 拒绝连接）才是真的打完没用，
+                    # 保持 fail-fast；「连上了但响应慢/偶尔挂死」值得**再给一次**机会 ——
+                    # 上游偶发挂起是这类网关的常态，一次就放弃会把整集白白烧掉。
+                    if _is_timeout_error(e):
+                        # 超时：允许额外一次重试（仅一次，避免 2×20 分钟地等）
+                        if idx >= TIMEOUT_MAX_ATTEMPTS:
+                            upstream_bad = True
+                            upstream_detail = f"{type(e).__name__}: {e}"
+                        else:
+                            logger.warning(
+                                "远端读超时（第 %d/%d 次），再重试一次：%s", idx, attempts, e)
+                    else:
+                        upstream_bad = True
+                        upstream_detail = f"{type(e).__name__}: {e}"
                 logger.warning(f"LLM 请求瞬时失败（第 {idx}/{attempts} 次）：{e}")
                 if upstream_bad:
                     break

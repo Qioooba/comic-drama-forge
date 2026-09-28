@@ -219,6 +219,205 @@ _CANON_CLAUSE_RE = re.compile(
 
 
 # --------------------------------------------------------------------------- #
+# 性别（2026-09-28）：资产图性别画反的兜底
+# --------------------------------------------------------------------------- #
+# 真因：角色「三百年旧怨女子」（名字明确是女性）出的资产图却是**男性形象**（短发男性
+# 脸型体格）。逐环取证：剧本 schema 里没有 gender 字段、appearance 与 reference_prompt_zh
+# 的字段说明都只要求写发色/瞳色/服装（不要求写性别），本模块 grep「性别|gender|女性|男性」
+# 零命中 → 整条链路**一个性别标记都没有**；名字里的「女子」又不进提示词（提示词只吃
+# appearance 类字段）→ 文生图模型只能自由发挥。
+#
+# 本层是**兜底**（L2）：存量剧本 / 模型漏写 / 历史 bible 都没有 gender 字段，必须能从
+# name / identity 推断。⚠️ 推断不出时**绝不注入** —— 宁可没有，也不要瞎猜一个性别。
+#: 扮相 / 服装词：**判性别前先剔除** —— 「男装」「女装」「女扮男装」本身不含性别信息
+#: （女性角色照样可以「身着男装」），留着会污染判定。
+_GENDER_ZH_CAMOUFLAGE_RE = re.compile(r"女扮男装|男扮女装|扮男装|扮女装|男装|女装|中性")
+
+#: 明确的性别**主体词**（全词）。⚠️ **绝不能含裸单字「女」「男」**：实测
+#: ``{"gender":"女","appearance":"身着男装，束发，腰悬长刀，眉目清冷"}`` 会因为「男装」
+#: 里的「男」命中裸字判据 → 被判成「已有性别词」→ 跳过注入 → **女性角色被反向推成男性**
+#: （正是本次 bug 的同类翻版）。
+_GENDER_ZH_FEMALE_RE = re.compile(r"女性|女子|女的|少女|妇人|夫人|老妪|姑娘|女孩")
+_GENDER_ZH_MALE_RE = re.compile(r"男人|男性|男子|少年|公子|老者|老翁")
+
+#: 全词性别主体词合集（幂等判据 B 与 name / identity 线索**共用同一口径**）。
+#: ⚠️ 旧版含裸「女」「男」，被 QA 实测打穿，勿回退。
+_GENDER_ZH_RE = re.compile(
+    r"女性|女子|女的|少女|妇人|夫人|老妪|姑娘|女孩|男人|男性|男子|少年|公子|老者|老翁")
+
+#: 「显式性别标记」—— 本模块注入的形式（``性别：女``），幂等判据 A，最可靠。
+_GENDER_ZH_MARK_RE = re.compile(r"性别\s*[:：]\s*([男女])")
+
+#: 英文侧同义判据。⚠️ 必须带**词边界**：否则 ``woman`` 里的 ``man``、``female`` 里的
+#: ``male`` 会被误判成男性 —— 这正是「女性角色被画成男性」在英文侧的翻版。
+_GENDER_EN_FEMALE_RE = re.compile(
+    r"(?<![A-Za-z])(?:female|woman|women|girl|lady|ladies)(?![A-Za-z])", re.IGNORECASE)
+_GENDER_EN_MALE_RE = re.compile(
+    r"(?<![A-Za-z])(?:male|man|men|boy|gentleman|gentlemen)(?![A-Za-z])", re.IGNORECASE)
+_GENDER_EN_RE = re.compile(
+    r"(?<![A-Za-z])(?:female|woman|women|girl|lady|ladies"
+    r"|male|man|men|boy|gentleman|gentlemen)(?![A-Za-z])", re.IGNORECASE)
+
+#: 英文侧的扮相 / 服装短语（作用同 :data:`_GENDER_ZH_CAMOUFLAGE_RE`）：
+#: ``in male attire`` 描述的是**女性角色的男装打扮**，不能当成「已有性别词」。
+_GENDER_EN_CAMOUFLAGE_RE = re.compile(
+    r"(?<![A-Za-z])(?:cross[\s-]?dressing|in male (?:attire|clothing|disguise)"
+    r"|in female (?:attire|clothing|disguise)|androgynous)(?![A-Za-z])", re.IGNORECASE)
+
+#: 注入到「锁定设定条款」开头的中文性别标记（须为最终字符串的字面子串）
+_GENDER_ZH_PREFIX = "性别："
+
+#: ``gender`` 字段的**白名单精确匹配表**（归一化后做**相等**比较，不做子串匹配）
+_GENDER_WORDS_FEMALE = frozenset(
+    ("女", "女性", "女子", "女的", "少女", "姑娘", "女孩", "妇人", "夫人",
+     "female", "woman", "women", "girl", "lady", "ladies"))
+_GENDER_WORDS_MALE = frozenset(
+    ("男", "男性", "男子", "男人", "少年", "公子", "male", "man", "men",
+     "boy", "gentleman", "gentlemen"))
+
+
+def _strip_gender_camouflage(text: str) -> str:
+    """剔除中文扮相 / 服装词（判性别前先跑这一步）。"""
+    return _GENDER_ZH_CAMOUFLAGE_RE.sub("", str(text or ""))
+
+
+def _strip_gender_camouflage_en(text: str) -> str:
+    """剔除英文扮相 / 服装短语（判性别前先跑这一步）。"""
+    return _GENDER_EN_CAMOUFLAGE_RE.sub("", str(text or ""))
+
+
+def normalize_gender(raw) -> str:
+    """把**整个值就是一个性别词**的写法归一成 ``"女"`` / ``"男"`` / ``""``。
+
+    ⚠️ 必须**精确匹配**而不是子串匹配（QA 实测）：``"human"`` 会因含 ``"man"`` 被判成
+    男性、``"womanizer"`` 会因含 ``"woman"`` 被判成女性 —— 与 :func:`gender_en` 的
+    词边界口径保持一致。认不出就返回 ``""``（绝不瞎猜）。
+    """
+    s = re.sub(r"[\s　:：,，。;；、]+", "", str(raw or "")).lower()
+    if s.startswith("性别"):
+        s = s[2:]
+    if not s:
+        return ""
+    if s in _GENDER_WORDS_FEMALE:
+        return "女"
+    if s in _GENDER_WORDS_MALE:
+        return "男"
+    return ""
+
+
+def gender_marked(text: str) -> bool:
+    """文本里是否**已经写明**性别（幂等判据，中英通吃）。
+
+    两条**任一**命中即算已写明：
+      A 显式标记「性别：X」（本模块注入的形式，或人写的中文标记）；
+      B 全词性别主体词（女性 / 男子 / 少女…）—— **绝不含裸单字「女」「男」**。
+    判定前先剔除「男装 / 女装 / 女扮男装 / in male attire」这类**扮相词**。
+    """
+    t = str(text or "")
+    if _GENDER_ZH_MARK_RE.search(t):
+        return True
+    if _GENDER_ZH_RE.search(_strip_gender_camouflage(t)):
+        return True
+    return bool(_GENDER_EN_RE.search(_strip_gender_camouflage_en(t)))
+
+
+def gender_zh(text: str) -> str:
+    """从中文文本推断性别：``"女"`` / ``"男"`` / ``""``。
+
+    顺序：① 显式标记「性别：X」→ ② 剔除扮相词后的全词性别主体词（女性线索优先）。
+    """
+    t = str(text or "")
+    m = _GENDER_ZH_MARK_RE.search(t)
+    if m:
+        return m.group(1)
+    t = _strip_gender_camouflage(t)
+    if _GENDER_ZH_FEMALE_RE.search(t):
+        return "女"
+    if _GENDER_ZH_MALE_RE.search(t):
+        return "男"
+    return ""
+
+
+def gender_en(text: str) -> str:
+    """从英文文本推断性别（词边界安全：``a woman`` 判为女，不会被 ``man`` 抢走）。"""
+    t = _strip_gender_camouflage_en(str(text or ""))
+    if _GENDER_EN_FEMALE_RE.search(t):
+        return "女"
+    if _GENDER_EN_MALE_RE.search(t):
+        return "男"
+    return ""
+
+
+def infer_gender(char: dict) -> str:
+    """推断角色性别：``"女"`` / ``"男"`` / ``""``。
+
+    优先级（2026-09-28）：① ``gender`` 字段（剧本 schema 已要求必须给出，**白名单精确匹配**）
+    → ② ``name``（「三百年旧怨女子」这类称谓线索）→ ③ ``identity``。
+    name / identity 都只认**全词**线索（见 :data:`_GENDER_ZH_RE`）—— 裸单字「男」「女」会
+    误伤（QA 实测：``identity="女主角的师兄"`` 被裸「女」判成女性、``"男主的师妹"`` 被裸
+    「男」判成男性）。全部失败返回 ``""`` —— **推断不出就不注入，绝不瞎猜**。
+    """
+    if not isinstance(char, dict):
+        return ""
+    g = normalize_gender(char.get("gender"))
+    if g:
+        return g
+    g = gender_zh(str(char.get("name") or ""))
+    if g:
+        return g
+    return gender_zh(str(char.get("identity") or ""))
+
+
+def gender_hint(char: dict) -> str:
+    """质检上下文用的性别标记：``"性别：女"`` / ``"性别：男"`` / ``""``。"""
+    g = infer_gender(char)
+    return f"{_GENDER_ZH_PREFIX}{g}" if g else ""
+
+
+def ensure_gender_en(char: dict) -> bool:
+    """确保 ``reference_prompt_en`` 带性别词（``female`` / ``male``）。返回是否改动。
+
+    幂等判据是 :func:`gender_marked`（词边界 + 剔除 ``in male attire`` 这类扮相短语）。
+    en 只用于展示（生成链路只吃 zh），补上是为了人工复核 / 前端也能看到性别。
+    """
+    if not isinstance(char, dict):
+        return False
+    en = str(char.get("reference_prompt_en") or "")
+    if not en or gender_marked(en):
+        return False
+    g = infer_gender(char)
+    if not g:
+        return False
+    char["reference_prompt_en"] = ("female character, " if g == "女" else "male character, ") + en
+    return True
+
+
+def ensure_prompt_gender(prompt: str, char: dict) -> str:
+    """保证**出图提示词**里写明性别（与 :func:`gender_hint` 口径一致）。
+
+    解决一处**不对称**（QA 实测）：``reference_prompt_zh`` 为空时 ``ensure_canon_clause``
+    无处落条款（zh 为空直接返回 False）→ 生成侧提示词一个性别标记都没有，而质检侧
+    ``gender_hint`` 仍返回「性别：女」→ **生成无约束、质检按性别判** → 反复判不过重画。
+    这里在生成入口兜底补齐，保证「hint 说女，则 prompt 里必须有女」；prompt 为空时返回
+    ``"性别：女"`` 这个**可用的最小值**。幂等：prompt 已有性别（任意写法）则原样返回。
+    """
+    p = str(prompt or "")
+    g = infer_gender(char)
+    if not g:
+        return p
+    if gender_marked(p):
+        # 已有性别词：与推断结果**一致**（或读不出具体性别）→ 原样返回（幂等、不加冗余）；
+        # ⚠️ **冲突**（如 hint=女 而 prompt 里写着「男性」）时**权威值必须显式出现在最前**：
+        # 否则模型面对两条互斥指令又会随机倒向一边、质检必然抓到另一边 —— 正是本次 bug
+        # 的死循环成因。这里只**前置**权威标记，不改写 LLM 写的正文（改写风险更大）。
+        stated = gender_zh(p) or gender_en(p)
+        if not stated or stated == g:
+            return p
+    prefix = f"{_GENDER_ZH_PREFIX}{g}；"
+    return (prefix + p) if p else prefix.rstrip("；")
+
+
+# --------------------------------------------------------------------------- #
 # 取值抽取
 # --------------------------------------------------------------------------- #
 def _hair_parts(text: str) -> Tuple[str, str, int, int]:
@@ -442,6 +641,13 @@ def canon_clause_text(char: dict) -> str:
     body = body.rstrip("。，,;； ").replace("。", "，")
     if not body:
         return ""
+    # 性别兜底（2026-09-28）：appearance 里已有**明确性别词**才跳过（幂等）。
+    # ⚠️ 判据必须走 gender_marked（全词 + 先剔除「男装/女装」这类扮相词），**绝不能用
+    # 裸单字「女」「男」**：实测 {"gender":"女","appearance":"身着男装，束发，腰悬长刀"}
+    # 会因为「男装」里的「男」被判成"已有性别词"→ 跳过注入 → 女性角色被反向推成男性。
+    g = infer_gender(char)
+    if g and not gender_marked(body):
+        body = f"{_GENDER_ZH_PREFIX}{g}；{body}"
     return f"{_CANON_CLAUSE_MARKER}（必须严格遵守）：{body}"
 
 
@@ -540,6 +746,7 @@ def align_character(char: dict) -> Dict[str, dict]:
     # 实测林清雪 appearance 的「眉间朱砂」没被写进参考提示词，而她那 10 个出场镜头
     # 里有 8 个的 description 都写了朱砂（→ 质检口径要求它），资产图必然没有。
     ensure_canon_clause(char)
+    ensure_gender_en(char)
     return plan
 
 

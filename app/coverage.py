@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""原文覆盖率校验 + 遗漏自动补生成（小说 → 剧本「不得删减原文」的守门人）
+"""原文覆盖率校验 + 遗漏自动补生成（小说 → 剧本「压缩提炼仍保留情节」的守门人）
 
 设计要点
 --------
@@ -17,9 +17,9 @@
       修饰细节有多少字落入镜头）。正文字符总长 = 各正文单元长度之和，不再用含换行空行的
       原始文本长度做分母（旧口径分子只统计正文单元，分母含空白，即使 100% 承载也只能到 ~90%）。
    另附 literal_ratio（gram 字面措辞保留度）作为「原文措辞是否以画面/旁白原样保留」的诊断证据。
-4. 补生成触发（v2 收紧）：只要遗漏清单非空（仍有未承载的正文单元）就补生成，直到遗漏清零或
-   用尽 max_rounds 轮；阈值仅用于判定「细节级（字级）是否达标」，不再以「覆盖率达阈值即放行」
-   放过少量长句遗漏。
+4. 补生成触发（v3 压缩提炼）：仅当**情节级覆盖率低于阈值**时补生成，且最多 1 轮；
+   纯背景补叙/环境描写由判定层判 covered=true（不算遗漏），不再为凑字面覆盖率补出空镜。
+   阈值默认 0.70（原 0.95），只考核「情节单元」是否被承载，明确不覆盖纯环境描写。
 5. 结果落盘：output/continuity/<项目键>/episodes/第N集_覆盖率.json，
    同时写回剧本 script["metadata"]["coverage"]，供前端直接展示覆盖率与遗漏清单。
 """
@@ -243,11 +243,11 @@ def _judge_units(client, shots, units, ids, events=None, label: str = "coverage"
             "【任务】逐条核对下列【原文片段】是否已被【本集剧本镜头】承载。\n"
             "【判定口径】允许体裁形式改写：心理描写→角色自语台词或画面神态、叙述→画面动作描述、"
             "环境描写→画面与音效、对话→台词；只要该片段的情节、信息、人物、情绪在镜头中被表达出来，"
-            "即算「已承载」；只有当该片段内容在镜头里完全找不到对应（被删除、被跳过、被概括压缩掉）"
-            "时才判「未承载」。\n"
-            "【细节零删减口径】若该片段的关键修饰细节（外貌/衣着、动作过程、心理活动、环境光线与器物"
-            "声响）在镜头（description / visual_detail / dialogue / audio_cues）中完全没有体现，"
-            "仅保留了主干情节，也应判「未承载」。\n"
+            "即算「已承载」。\n"
+            "【压缩提炼口径（重要）】本剧剧本是「压缩提炼」而非「逐句照搬」：纯背景补叙、纯环境描写、"
+            "世界观/势力背景交代等**不推进剧情**的片段，允许被删去或仅一笔带过，这类片段**应判 "
+            "covered=true（不算遗漏）**。只有当该片段承载了推动剧情的冲突/转折/关键动作/金句，"
+            "却在镜头里完全找不到对应（被删除、被跳过）时，才判「未承载」。\n"
             "【注意】本系统不产出旁白：原文里的背景补叙与环境描写应当靠画面（description / "
             "visual_detail）承载，心理活动靠角色自语台词或神态动作承载。因此**不要**因为"
             "「没有旁白」而判未承载，只看画面与台词里有没有对应表达。\n\n"
@@ -551,10 +551,11 @@ def run_coverage_check(client, chapter_text, script, episode_no=None, threshold=
                        max_rounds: int = 1, use_llm: bool = True, events=None,
                        continuity_dir: str = None, project_key: str = None,
                        save: bool = True, detail_threshold=None) -> dict:
-    """覆盖率校验主流程：校验 → 遗漏非空即补生成 → 复检 → 落盘 + 写回剧本 metadata
+    """覆盖率校验主流程：校验 → 情节级不足才补生成 → 复检 → 落盘 + 写回剧本 metadata
 
-    v2 收紧：触发条件为「遗漏清单非空」（仍有未承载正文单元），而非「覆盖率达阈值」；
-    阈值仅用于细节级（字级）达标判定，避免 96% 覆盖率下 5 条长句遗漏被放行。
+    v3 压缩提炼口径：触发补生成的条件是「情节级覆盖率低于阈值」（而非「遗漏清单非空」）。
+    纯背景补叙/环境描写已由判定层判 covered=true（不算遗漏），少量漏掉的次要单元不会
+    触发补生成，避免为「凑字面覆盖率」补出一堆无台词的静态空镜。
     """
     thr = float(threshold if threshold is not None else DEFAULT_THRESHOLD)
     dthr = float(detail_threshold if detail_threshold is not None else DETAIL_THRESHOLD)
@@ -567,7 +568,9 @@ def run_coverage_check(client, chapter_text, script, episode_no=None, threshold=
     history, supplement_rounds = [], 0
     report = check_coverage(client, chapter_text, script, threshold=thr, use_llm=use_llm, events=events)
 
-    while report.get("missing_ids") and supplement_rounds < rounds_cap:
+    while (report.get("missing_ids")
+           and report.get("plot_coverage", 0) < thr
+           and supplement_rounds < rounds_cap):
         supplement_rounds += 1
         prev_missing = len(report.get("missing_ids") or [])
         if events:

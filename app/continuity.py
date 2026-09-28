@@ -72,7 +72,7 @@ CROSS_CHECK_CATEGORIES = ["角色一致性", "剧情因果", "时间地点", "�
 
 REWRITE_MIN_INTERVAL = 0  # 同集重写次数上限（1 次，避免无限循环）
 MAX_REWRITE_ROUNDS = 1
-COVERAGE_MAX_ROUNDS = 3   # 原文覆盖率不足时的自动补生成轮次上限（多轮补足，直到达标或用尽轮次）
+COVERAGE_MAX_ROUNDS = 1   # 原文覆盖率不足时的自动补生成轮次上限（压缩提炼后只补 1 轮，避免补出大量空镜）
 
 
 # ===================== 基础读写 =====================
@@ -217,7 +217,7 @@ def _norm_name(name) -> str:
 
 def _locked_character_keys() -> tuple:
     """角色锁定字段：姓名 / 身份 / 外观 / 性格 / 称谓（跨集不再改动）"""
-    return ("name", "identity", "appearance", "personality", "titles")
+    return ("name", "gender", "identity", "appearance", "personality", "titles")
 
 
 def merge_bible_from_episode(continuity_dir: str, project_key: str, script: dict,
@@ -1113,6 +1113,7 @@ def _render_bible_block(bible: dict) -> str:
             continue
         chars.append({
             "name": c.get("name"),
+            "性别": c.get("gender") or "",
             "身份": c.get("identity") or c.get("role") or "",
             "外观（锁定，禁止改动）": c.get("appearance") or "",
             "当前服装状态": c.get("current_outfit") or "",
@@ -1131,6 +1132,7 @@ def _render_bible_block(bible: dict) -> str:
     return ("【项目级设定库（跨集锁定，禁止改名/改外观，人物身份与外观必须与此完全一致）】\n"
             "硬性要求：characters[].name 必须逐字复制设定库中的「name」（含姓氏，禁止简称/去姓，"
             "如设定库为「古月方源」，则剧本中一律写「古月方源」，不得写「方源」）；"
+            "gender 必须与设定库「性别」完全一致（禁止改写性别）；"
             "appearance 必须使用设定库锁定文本；outfit/current_outfit 默认沿用设定库「当前服装状态」，"
             "仅当本集剧情明确发生换装时才可变化，且在画面或台词中说明原因。\n"
             f"角色：{json.dumps(chars, ensure_ascii=False)}\n"

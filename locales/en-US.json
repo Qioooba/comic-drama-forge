@@ -1230,7 +1230,10 @@
     "subKeyframesHint": "Shot start/end frames",
     "episode": "Episode",
     "episodeN": "Ep {n}",
-    "chapterN": "Ch. {n}"
+    "chapterN": "Ch. {n}",
+    "episodeGenerate": "Generate whole episode",
+    "episodeGenerateStarted": "Episode video generation started ({total} shots)",
+    "episodeGenerateFailed": "Failed to start episode video generation"
   },
   "toolLabel": {
     "apply_creative_settings": "Apply creative settings",

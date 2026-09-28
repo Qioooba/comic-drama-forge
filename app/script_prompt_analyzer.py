@@ -130,7 +130,7 @@ def build_shot_prompt(script: dict, shot: dict, ref_mode: str = "character_scene
 出场角色：{json.dumps(chars, ensure_ascii=False)}
 出场物品：{json.dumps(items, ensure_ascii=False)}
 【prompt_h3 结构要求】必须严格按下面**六段**排版，段名逐字一致、顺序不可调换，缺一不可。
-⚠️ **六段正文一律用英文书写**（与本地手跑模板一致）；角色的中文名、台词原文、场景中文名
+⚠️ **六段正文一律用英文书写**（与本地手跑模板一致）；角色的中文名、场景中文名
 按模板惯例**原样嵌入英文句子里**，不要转写成拼音/罗马字。
 subject_definitions:
 <Picture 1> is the reference image defining the appearance, costume and style of 角色名, and serves as the composition anchor for their on-screen shots: <该参考图的用途说明>
@@ -154,16 +154,21 @@ detailed_description:
 随后逐节拍写画面。**首镜**用 `[Shot 1] <英文景别短语>: …`（如 `A medium shot:` / `A close-up:`），
 **后续镜**用 `At MM:SS.mmm, the camera cuts to <小写英文景别>: …`（时间码内嵌句中、景别在句中压小写）。
 时长超过 6 秒时拆成 2~3 个节拍，总时长必须等于 {duration} 秒。
-台词必须写成模板格式：先写英语「开口说话」动作 + 音色语速，再包住台词原文：
-`… and then speaks — a clear female voice at a measured spoken rate (S1): <d>[Chinese] 台词原文</d> After the final word the lips close and the mouth returns to a still, closed position.`
-（语言标记按原文语言，中文写 Chinese。⚠️ 只写「说：」而**不带「开口说话」的动作描述**，
-模型只会配音、画面里人物嘴唇不动 —— 这句话是驱动口型的关键，不可省。）
-**没有台词**的节拍必须显式写 `No dialogue.`，否则模型会自补台词并画成字幕。
+台词必须写成模板格式：先写英语「开口说话」动作 + 音色语速 + 说话人槽位，
+再用「口型随说话自然开合」保留驱动嘴型的信号 —— **不要写台词原文**（2026-09-26 P0-1：
+配音走独立 QwenTTS 后期合成，H3 自带人声还会被 HDEMUCS 剔除，写台词原文会导致同一句被
+反复念、口型与真实配音错位、台词被画成字幕）：
+`… and then speaks — a clear female voice at a measured spoken rate (S1) with the lips moving naturally in sync with the spoken words After the final word the lips close and the mouth returns to a still, closed position.`
+（⚠️ 只写「说：」而**不带「开口说话」的动作描述**，模型只会配音、画面里人物嘴唇不动 ——
+这句话是驱动口型的关键，不可省。）
+**没有台词**的节拍必须显式写「no one speaks / no voice-over」
+（如 `No one in the frame speaks; there is no voice-over narration.`），
+否则模型会自补台词并画成字幕、或把画面描述念成画外音。
 
 overall_soundscape:
 一段连贯**英文**散文，按时间顺序描述全程环境音、动作音与非语言人声（角色听得到的声音）。
 有台词时顺带描述台词的音色与混响，再次确认「人物确实在说话」；只在**确实无台词**时才声明
-「No narration or voice-over throughout」。
+「no one speaks / no voice-over」。
 
 non_diegetic_music:
 **默认直接写 `N/A`**（模板 10 段里 9 段都是 N/A，配乐交由后期处理）。

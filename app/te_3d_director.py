@@ -1,0 +1,622 @@
+"""TE MAN 3D导演台 · scene_json 程序化生成器
+
+把漫剧剧本里每镜的「人物站位 / 机位 / 景别」结构化信息，翻译成 TE_3D_Director
+自定义节点认得的 ``scene_json``（version=4 协议），并派生出一条可读的
+``composition_prompt``（构图提示词）。
+
+## 背景（2026-09-26 逆向结论，勿再重查）
+
+TE MAN 的 ``TE_3D_Director`` 节点（ComfyUI 自定义节点，``.pyd`` 二进制、无 Python 源码）
+本质是**手动 3D 拖拽面板**，但它保存/回读的 ``scene_json`` 是纯 JSON 字符串。
+前端 ``te_3d_director.js`` 的 ``serializeScene()`` 固定产出如下结构（version=4）：
+
+    {
+      "version": 4,
+      "aspect": "9:16",              # 16:9 / 9:16 / 1:1 / 4:3 / 3:4 / 21:9 / 自由
+      "viewCamera": ...,             # 导演视角相机状态（可缺省）
+      "skeletonMode": false,         # 骨骼模式开关
+      "activeCameraId": "cam_1",     # 当前机位 entity 的 id
+      "scene": {
+        "background": "#060608",     # 场景背景色（hex）
+        "gridVisible": true,
+        "groundVisible": true,
+        "snap": true,
+        "panorama": null             # 全景模式（本模块不生成全景，恒为 null）
+      },
+      "entities": [
+        {
+          "id": "char_1",
+          "type": "character",       # character / camera / crowd / prop / skeleton / mannequin / custom
+          "kind": "standard",        # 素体类型（standard 等）
+          "name": "林风",
+          "color": "#2f80ff",        # 人偶颜色（CHARACTER_COLORS 前 8 种）
+          "visible": true,
+          "uniformScale": 1.0,
+          "heightScale": 1.0,        # 身高缩放（1.0 = 1.7m 标准身高）
+          "height": 1.7,
+          "girth": 1.0,              # 体型（胖瘦）
+          "style": "neutral",
+          "transform": {
+            "position": [x, y, z],   # 站位（世界坐标，y 为离地高度）
+            "rotation": [x, y, z],   # 朝向（欧拉角，弧度）
+            "scale": [1, 1, 1]
+          },
+          "poseValues": {},          # 姿势（骨骼角，本模块置空 → 默认站姿）
+          "currentPreset": "",       # 姿势预设名
+          ...
+        },
+        { "id": "cam_1", "type": "camera", "kind": "custom", "name": "机位1",
+          "transform": { "position": [...], "rotation": [...], "scale": [1,1,1] } }
+      ]
+    }
+
+前端 ``looksLikeSceneJson()`` 的识别判据：``JSON.parse`` 成功且是对象，且
+``Array.isArray(entities) || scene || version || aspect`` 任一命中。本模块恒输出
+``version`` + ``aspect`` + ``entities``，一定被识别。
+
+## 关键约束（本模块职责边界）
+
+1. **两档用法**：
+   * **文字软约束** —— ``block_annotation`` 把站位/机位写成一行英文，注入分镜图提示词；
+   * **出图（2026-09-27 起）** —— ``build_render_plan`` 给出完整渲染计划，由
+     ``app/te_3d_render.py`` 用无头浏览器把 scene_json 渲染成**站位/机位基准图**，
+     作为分镜生成的 ``<image1>`` 构图基准（详见该模块；TE_3D_Director 节点自身
+     仍然是「只透传两个字符串、不出图」的浏览器面板，出图是我们在服务端复刻它的
+     机位数学重渲染的）。
+2. **scene_json 只放前端认得的字段**：渲染专用的 FOV / 视线落点等放在
+   ``build_render_plan`` 的独立字段里，不塞进 scene_json（保证导演台回读不报错）。
+3. **零模型调用、确定性输出**：纯规则从 shot 字段翻译，不烧 token、可复现。
+4. 复用 ``comfyui_client.camera_key / camera_angle`` 的景别/机位判定，不重复造解析。
+5. **机位在 +Z 侧**（角色面朝 +Z）—— 旧实现在 -Z 侧，等于拍后脑勺，勿改回去。
+6. **取景与提示词景别规范同口径**：``_FRAMING_SPAN`` 以「米」为单位写取景区间，
+   再换算成机位距离 + FOV（见该表上方注释），逐条对齐 ``SHOT_CAMERA_SPECS``。
+   改这些数值前先想清楚「这张基准图是分镜的主要画布，取景会被强先验复刻」。
+7. **不 fits 就不出图**：``build_render_plan`` 的 ``fits`` 是渲染的唯一闸门
+   （空舞台 / 未声明景别 / 人数超容量 → 调用方回退文字站位锚点）。
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import re
+from typing import Dict, List, Optional, Tuple
+
+# 与前端 te_3d_director.js 对齐的常量（勿改数值，改了用户在导演台里打开会对不上）
+SCENE_VERSION = 4
+TARGET_CHARACTER_HEIGHT = 1.7
+PANORAMA_RADIUS = 60.0
+PANORAMA_SUBJECT_DISTANCE = 5.0
+DEFAULT_BACKGROUND = "#060608"
+
+# CHARACTER_COLORS（前端 8 色，按出场顺序轮转）
+_CHAR_COLORS = [
+    "#2f80ff", "#e978a8", "#ffb84d", "#41c97a",
+    "#b58cff", "#ff6f61", "#35c9d0", "#d4d85b",
+]
+
+# ---- 机位推导（2026-09-27 重写；同日二次校准：取景范围对齐 SHOT_CAMERA_SPECS）----
+#
+# ⚠️ 旧实现把机位放在 **z 负半轴**（``base[2] = -dist * TARGET``），而本模块的朝向约定是
+#    「rotation y=0 → 面朝 **+Z**（朝镜头）」（实测 Xbot.glb 骨骼：左右髋连线与 +X 夹角
+#    3.7°，确认模型原生面朝 +Z）。两者矛盾 ⇒ 旧机位算出来在角色**背后**，用于手动拖拽的
+#    导演台时没人察觉（用户自己摆机位），但一旦要**程序化出图**就会拍到后脑勺。
+#    这里统一改为机位在 **+Z 侧**，与朝向约定对齐。
+#
+# ⭐ 取景范围**以米为单位**定义，再换算成「机位距离 + 视线落点高度」：
+#      可见高度 = 2·d·tan(fov/2)（three.js 的 ``PerspectiveCamera.fov`` 是**垂直** FOV），
+#      d = 取景高度 / (2·tan(fov/2))，视线落点 = 取景区间的中点。
+#    这样表里写的「从 X 米取到 Y 米」可以直接与 ``comfyui_client.SHOT_CAMERA_SPECS``
+#    的景别规范逐条对照 —— 基准图是分镜的 ``<image1>`` **主要画布**，而参考图的取景会被
+#    模型当强先验复刻（见 ``app._pick_char_view`` 的长注释：参考图构图牵引正是「景别画不准」
+#    的根因）。基准图取景与提示词景别一旦不一致，等于把「景别」这个分镜质检最大的一类
+#    驳回又放大一遍。
+#
+#     景别   取景（相对地面，米）          主体占画面高   对应 SHOT_CAMERA_SPECS
+#     ────  ──────────────────────────  ────────────  ─────────────────────────────
+#     特写   1.47 → 1.80（头）                ~68%       面部占画面 70% 以上
+#     近景   1.22 → 1.88（胸部以上至头顶）     ~37%       取景自胸部以上至头顶
+#     中景   0.50 → 2.17（膝部以上）          ~73%       腰部或膝部以上；严禁膝盖以下/脚部
+#     全景  -0.35 → 2.35（全身 + 环境）        ~64%       完整全身，占画面高度大半
+#     远景  -1.35 → 3.45（宽环境）            ~36%       人物较小、环境为主体
+# ⚠️ 中景下沿取 0.50 而非更低的 0.42：膝盖实测在 ≈0.45m（0.26×身高），下沿必须**在膝以上**，
+#    否则渲染图里会露出一截小腿，与规范「严禁出现膝盖以下部位」直接冲突。
+#
+# 角色身高口径 = ``TARGET_CHARACTER_HEIGHT``（1.7m；渲染页归一化到 1.72m，差异可忽略）。
+_FRAMING_SPAN: Dict[str, Tuple[float, float, float]] = {
+    "特写": (1.47, 1.80, 30.0),
+    "近景": (1.22, 1.88, 36.0),
+    "中景": (0.50, 2.17, 38.0),
+    "全景": (-0.35, 2.35, 40.0),
+    "远景": (-1.35, 3.45, 40.0),
+}
+
+
+def _framing_to_shot(bottom_y: float, top_y: float, fov: float) -> Tuple[float, float, float]:
+    """取景区间（米）+ 垂直 FOV → ``(机位水平距离 m, 视线落点高度 m, FOV)``。"""
+    span = max(0.05, float(top_y) - float(bottom_y))
+    d = span / (2.0 * math.tan(math.radians(fov) / 2.0))
+    return (round(d, 4), round((float(bottom_y) + float(top_y)) / 2.0, 4), float(fov))
+
+
+#: 景别 → (机位到主体的水平距离 m, 视线落点高度 m, 垂直 FOV 度)：由 ``_FRAMING_SPAN`` 换算。
+_FRAMING_SHOT: Dict[str, Tuple[float, float, float]] = {
+    _k: _framing_to_shot(*_v) for _k, _v in _FRAMING_SPAN.items()
+}
+
+#: 本镜**未指定景别**（camera 只有机位/运镜，如「俯拍缓推」）时的取景档。
+#: ⚠️ 这一档**只用来把渲染计划补齐字段，实际不产图**（见 ``build_render_plan`` 的 ``fits``）：
+#:    此时提示词里写的是「按 SCENE AND ACTION 自行决定取景，**不要**默认中景或全景」，
+#:    再塞一张带固定取景的基准图就是与提示词直接互斥（历史坑：编造景别导致模型摇摆）。
+_FRAMING_UNSPEC: Tuple[float, float, float] = _FRAMING_SHOT["全景"]
+
+#: 人偶**完整轮廓宽度**（米）：Xbot 站姿双臂自然下垂时实测 ≈ 0.60m（0.348×身高，
+#: 2026-09-27 用 768 宽渲染图按「画面高 = 可见高」换算像素→米量得）。
+#: ⚠️ 不是「肩宽 0.45」——决定会不会被画框切掉的是**轮廓宽度**（含手臂）。
+_FIGURE_WIDTH = 0.62
+#: 相邻两人**头部可分辨**所需的最小中心距（米）：0.24 ≈ 1.5 个头宽。
+#: 这条是「人物数量」可读的底线（构图基准核对的第一条判据），比轮廓不重叠更宽松：
+#: 真实的中景双人镜本来就允许手臂交叠，但要能一眼数出是两个人。
+_HEAD_GAP = 0.24
+#: 取景框边缘留白比例（0.94 = 最外侧的人轮廓离画面边缘还留 6% 半画幅余量）
+_EDGE_MARGIN = 0.94
+#: 单张基准图最多摆几个人（导演台一般摆 1-3 人；再多构图本身就数不清了）
+_MAX_BLOCKING_CHARS = 3
+
+# 机位角度 → (水平绕主体旋转角 度, 机位相对视线落点的高度偏移 m)
+#   高度偏移 + lookAt(落点) 共同产生俯仰：俯拍把机位抬高（俯视），仰拍压低（仰视）。
+#   水平角让机位绕到主体侧后方，产出侧向/过肩视角。
+_ANGLE_SHOT: Dict[str, Tuple[float, float]] = {
+    "平视": (0.0, 0.00),
+    "俯拍": (0.0, 1.10),
+    "仰拍": (0.0, -0.70),
+    "环绕": (28.0, 0.00),
+    "过肩": (16.0, 0.15),
+    "斜侧": (34.0, 0.00),
+}
+
+# 画幅 → 多人站位的横向铺开**期望半宽**（米）。竖屏横向空间窄，横屏宽。
+# ⚠️ 这只是**期望**，实际半宽由 ``_lateral_spread`` 按「不重叠 + 不出画」两条夹出来。
+_SPREAD_ASPECT: Dict[str, float] = {
+    "9:16": 1.05, "3:4": 1.35, "1:1": 1.70,
+    "4:3": 2.10, "16:9": 2.60, "21:9": 3.00,
+}
+_SPREAD_DEFAULT = 1.70
+
+# 画幅 → (宽, 高) 比例，用于渲染计划推像素尺寸
+_ASPECT_RATIO: Dict[str, Tuple[int, int]] = {
+    "9:16": (9, 16), "16:9": (16, 9), "1:1": (1, 1),
+    "4:3": (4, 3), "3:4": (3, 4), "21:9": (21, 9),
+}
+
+
+def _safe_name(raw) -> str:
+    """把角色/镜头名归一成安全字符串（去空白，缺省给占位）。"""
+    s = str(raw or "").strip()
+    return s or "未命名"
+
+
+def _entity_id(prefix: str, idx: int) -> str:
+    return f"{prefix}_{idx}"
+
+
+def _parse_characters(shot: dict) -> List[str]:
+    """从 shot 取出场角色名单（characters_in_shot 优先，回落 dialogue speaker）。"""
+    chars = shot.get("characters_in_shot") or []
+    if isinstance(chars, str):
+        chars = [c.strip() for c in re.split(r"[，,、/]", chars) if c.strip()]
+    chars = [c for c in chars if c]
+    if not chars:
+        # 回落：从台词里取 speaker（去重、保序）
+        seen: List[str] = []
+        for d in (shot.get("dialogue") or []):
+            sp = str((d or {}).get("speaker") or "").strip()
+            if sp and sp not in seen and sp not in ("旁白", "众人"):
+                seen.append(sp)
+        chars = seen
+    # 去重保序 + 上限（导演台一般摆 1-3 人）
+    uniq: List[str] = []
+    for c in chars:
+        if c not in uniq:
+            uniq.append(c)
+    return uniq[:6]
+
+
+def _position_for_index(idx: int, total: int,
+                        spread: float = _SPREAD_DEFAULT) -> Tuple[float, float, float]:
+    """按出场顺序推导站位（画面横向分布，面向镜头，z 轴前移拉开纵深）。
+
+    约定：z 正方向 = 朝向镜头（屏幕外），所以人物站在 z=0 平面、面向 z 正。
+    x 轴横向分布；多人时按序左右排开，中间者稍靠前（z 略正）。
+    世界 +X 在**画面右侧**（正交右手系，机位在 +Z 侧看向 -Z），因此 idx 递增 = 从左到右，
+    与 :func:`build_composition_prompt` / :func:`block_annotation` 的「最左…最右」文案同向。
+
+    :param spread: 横向铺开**半宽**（米）。由 ``_lateral_spread`` 按「人数不重叠 + 身体不出画」
+        推导（画幅只给期望值）。
+    """
+    if total <= 1:
+        return (0.0, 0.0, 0.0)
+    half = max(0.15, float(spread))
+    x = (idx / (total - 1)) * 2 * half - half
+    # 奇数人时「正中间」者靠前一点，形成层次；偶数人两侧对称、同平面
+    mid = (total - 1) / 2
+    z = 0.4 if (total % 2 == 1 and idx == mid) else 0.0
+    return (round(x, 3), 0.0, round(z, 3))
+
+
+def _rotation_for_index(idx: int, total: int) -> Tuple[float, float, float]:
+    """朝向：默认面向镜头（y 轴旋转 0 = 面朝 z 正）。多人时两侧角色略向内转。"""
+    if total <= 1:
+        return (0.0, 0.0, 0.0)
+    if idx < (total - 1) / 2:
+        return (0.0, 0.35, 0.0)   # 左侧向右转
+    if idx > (total - 1) / 2:
+        return (0.0, -0.35, 0.0)  # 右侧向左转
+    return (0.0, 0.0, 0.0)
+
+
+def _subject_center(chars: List[str], spread: float) -> Tuple[float, float]:
+    """主体水平中心（x, z）：多人时取各站位均值，单人/无人时取原点。"""
+    n = len(chars)
+    if n <= 0:
+        return (0.0, 0.0)
+    xs, zs = [], []
+    for i in range(n):
+        px, _py, pz = _position_for_index(i, n, spread)
+        xs.append(px)
+        zs.append(pz)
+    return (round(sum(xs) / n, 3), round(sum(zs) / n, 3))
+
+
+def visible_width(aspect: str, cam_key: str) -> float:
+    """本镜**画面可见宽度**（米）：``2·d·tan(fov/2)·(w/h)``（d / fov 由景别档给出）。"""
+    dist, _focus_h, fov = _FRAMING_SHOT.get(cam_key) or _FRAMING_UNSPEC
+    aw, ah = _ASPECT_RATIO.get(str(aspect or "").strip(), _ASPECT_RATIO["9:16"])
+    return 2.0 * dist * math.tan(math.radians(fov) / 2.0) * (aw / float(ah))
+
+
+def _side_room(aspect: str, cam_key: str) -> float:
+    """站位中心**最多**能离画面中线多远（米），保证整个人偶轮廓都在画内。
+
+    = ``可见半宽 × 边缘留白 − 半轮廓宽``。中景（9:16）≈ 0.4697×0.94 − 0.31 = 0.132m。
+    """
+    half_frame = visible_width(aspect, cam_key) / 2.0
+    return max(0.0, half_frame * _EDGE_MARGIN - _FIGURE_WIDTH / 2.0)
+
+
+def framing_capacity(aspect: str, cam_key: str) -> int:
+    """该「景别 + 画幅」下基准图**能同时摆下几个人**（头部可分辨、身体不出画）。
+
+    推导：``n`` 人需要 ``2×(可见半宽×留白 − 半轮廓宽) ≥ (n−1)×最小中心距``
+    ⇒ ``可见宽度×留白 ≥ 轮廓宽 + (n−1)×最小中心距``。下限 1、上限 ``_MAX_BLOCKING_CHARS``。
+
+    下限取 1 的道理：单人特写本来就该让肩膀出画的（规范要求面部占 70% 以上），
+    可见宽 0.19m 远小于轮廓宽 0.62m —— 这不是「摆不下」，而是**特写本身就只装一颗头**。
+    """
+    w = visible_width(aspect, cam_key)
+    if w <= 0:
+        return 1
+    usable = w * _EDGE_MARGIN
+    cap = 1
+    while cap < _MAX_BLOCKING_CHARS and usable >= _FIGURE_WIDTH + cap * _HEAD_GAP:
+        cap += 1
+    return cap
+
+
+def _lateral_spread(aspect: str, cam_key: str, n: int = 1) -> float:
+    """站位横向铺开**半宽**（米）：够摆下且整个人偶轮廓不出画。
+
+    三个约束取交（判据由 ``.workbuddy/test/verify_te_3d_render.py`` 逐条实证）：
+      * **下界** ``(n−1)×最小中心距/2`` —— 相邻两人的头不能叠到数不出人数；
+        ``n ≤ 1`` 返回 0（单人恒居中）。
+      * **上界** ``_side_room`` —— 最外侧的人**连手臂**都要在画内。旧实现只按
+        「可见宽 × 0.42」摆开，而 0.42 是**中心点**位置 ⇒ 中心落在 84% 半宽处、
+        轮廓再往外伸半个身宽，实测两人中景/全景两侧**都被画框切掉**（渲染图上是半边人）。
+      * 画幅期望值 ``_SPREAD_ASPECT``（竖屏窄、横屏宽）只作**期望**，被上面两条夹住。
+    """
+    if n <= 1:
+        return 0.0
+    need = (n - 1) * _HEAD_GAP / 2.0                       # 下界：头部可分辨
+    limit = max(_side_room(aspect, cam_key), need)         # 上界：轮廓不出画
+    base = _SPREAD_ASPECT.get(str(aspect or "").strip(), _SPREAD_DEFAULT)
+    return round(min(max(base, need), limit), 4)
+
+
+def build_camera(cam_key: str, cam_angle: str, center_x: float = 0.0, center_z: float = 0.0):
+    """由景别 + 机位角度推导机位（世界坐标）。
+
+    返回 ``(position, target, fov)``：
+
+      * ``position`` = 主体中心水平位置 + 绕 Y 旋转 ``yaw`` 后的水平后退距离 ``d``，
+        y = 视线落点高度 + 高度偏移；
+      * ``target``   = 视线落点（主体中心，高度由景别决定）；
+      * ``fov``      = 垂直视场角（度），与 ``d`` 联合决定取景范围。
+
+    ⚠️ ``d`` 与 ``fov`` **成对定义在** ``_FRAMING_SHOT`` 里，别单独改一个 —— 改距离不改 FOV
+    等于把景别整体缩放；两者一起改才能保持「特写只框住头肩」这类语义。
+    """
+    dist, focus_h, fov = _FRAMING_SHOT.get(cam_key) or _FRAMING_UNSPEC
+    yaw_deg, v_off = _ANGLE_SHOT.get(cam_angle or "平视", _ANGLE_SHOT["平视"])
+    yaw = math.radians(yaw_deg)
+    # 机位在 +Z 侧（角色面朝 +Z）；yaw 让机位绕到主体侧方
+    px = center_x + dist * math.sin(yaw)
+    pz = center_z + dist * math.cos(yaw)
+    py = focus_h + v_off
+    position = (round(px, 3), round(py, 3), round(pz, 3))
+    target = (round(center_x, 3), round(focus_h, 3), round(center_z, 3))
+    return position, target, float(fov)
+
+
+def build_scene_json(
+    shot: dict,
+    aspect: str = "9:16",
+    characters: Optional[List[str]] = None,
+) -> dict:
+    """从单镜 shot 生成 TE_3D_Director 认得的 scene_json（dict）。
+
+    :param shot: 剧本镜头对象（含 camera / characters_in_shot / dialogue / location）
+    :param aspect: 画幅比例（"16:9"/"9:16"/"1:1"/"4:3"/"3:4"/"21:9"）
+    :param characters: 显式指定的角色名单（缺省时从 shot 自动提取）
+    :return: 可直接 json.dumps 的 scene dict（version=4 协议）
+
+    ⚠️ **本 dict 只放 TE_3D_Director 前端认得的字段** —— 渲染用的 FOV 等私有量由
+    :func:`build_render_plan` 单独返回，不塞进这里（塞了会让导演台回读多出未知字段）。
+    """
+    chars = characters if characters is not None else _parse_characters(shot)
+    camera = str(shot.get("camera") or "").strip()
+
+    # 景别/机位判定：复用 comfyui_client 的权威解析（避免重复造、避免两端标准错位）
+    try:
+        from comfyui_client import camera_key, camera_angle  # noqa: PLC0415
+        _cam_key = camera_key(camera)
+        _cam_angle = camera_angle(camera)
+    except Exception:  # noqa: BLE001 - 离线/独立测试时降级
+        _cam_key = ""
+        _cam_angle = ""
+    if _cam_key == "中景" and not camera:
+        _cam_key = ""  # camera 为空时 camera_key 默认回「中景」，这里按「未指定」处理
+
+    spread = _lateral_spread(aspect, _cam_key, len(chars))
+
+    entities: List[dict] = []
+
+    # ---- 角色 entity（站位核心）----
+    total = len(chars)
+    for idx, name in enumerate(chars, start=1):
+        pos = _position_for_index(idx - 1, total, spread)
+        rot = _rotation_for_index(idx - 1, total)
+        entities.append({
+            "id": _entity_id("char", idx),
+            "type": "character",
+            "kind": "standard",
+            "name": name,
+            "color": _CHAR_COLORS[(idx - 1) % len(_CHAR_COLORS)],
+            "visible": True,
+            "uniformScale": 1.0,
+            "heightScale": 1.0,
+            "height": TARGET_CHARACTER_HEIGHT,
+            "girth": 1.0,
+            "style": "neutral",
+            "transform": {
+                "position": list(pos),
+                "rotation": list(rot),
+                "scale": [1.0, 1.0, 1.0],
+            },
+            "poseValues": {},
+            "currentPreset": "",
+        })
+
+    # ---- 机位 entity（camera）----
+    cx, cz = _subject_center(chars, spread)
+    cam_pos, cam_target, _cam_fov = build_camera(_cam_key, _cam_angle, cx, cz)
+    cam_rot = _camera_rotation(_cam_angle)
+    cam_id = _entity_id("cam", 1)
+    entities.append({
+        "id": cam_id,
+        "type": "camera",
+        "kind": "custom",
+        "name": f"机位·{_cam_key or '未指定'}{('·' + _cam_angle) if _cam_angle else ''}",
+        "color": "#ff8a3d",   # 前端 CAMERA_BODY_COLOR
+        "visible": True,
+        "transform": {
+            "position": list(cam_pos),
+            "rotation": list(cam_rot),
+            "scale": [1.0, 1.0, 1.0],
+        },
+        # 视线落点：前端当前不消费，但渲染器需要它来 lookAt（见 build_render_plan）
+        "target": list(cam_target),
+    })
+
+    scene = {
+        "version": SCENE_VERSION,
+        "aspect": aspect,
+        "skeletonMode": False,
+        "activeCameraId": cam_id,
+        "scene": {
+            "background": DEFAULT_BACKGROUND,
+            "gridVisible": True,
+            "groundVisible": True,
+            "snap": True,
+            "panorama": None,
+        },
+        "entities": entities,
+    }
+    return scene
+
+
+def _camera_position(cam_key: str, cam_angle: str) -> Tuple[float, float, float]:
+    """（兼容保留）由景别 + 机位角度推导机位世界坐标。"""
+    return build_camera(cam_key, cam_angle)[0]
+
+
+def _camera_rotation(cam_angle: str) -> Tuple[float, float, float]:
+    """机位朝向：默认平视主体（y 轴 0）。俯拍略低头、仰拍略抬头。"""
+    pitch = {"俯拍": -0.5, "仰拍": 0.5}.get(cam_angle, 0.0)
+    return (round(pitch, 3), 0.0, 0.0)
+
+
+def build_composition_prompt(shot: dict, characters: Optional[List[str]] = None) -> str:
+    """从 shot 生成 composition_prompt（中文构图提示词，喂给导演台 composition_prompt）。
+
+    这条提示词描述「谁站在哪、机位怎么摆」，既可作为导演台面板的参考文案，
+    也可拼进下游分镜提示词作为空间锚点（软约束）。
+    """
+    chars = characters if characters is not None else _parse_characters(shot)
+    camera = str(shot.get("camera") or "").strip()
+    location = _safe_name(shot.get("location"))
+    desc = str(shot.get("description") or "").strip()
+
+    try:
+        from comfyui_client import camera_key, camera_angle  # noqa: PLC0415
+        cam_key = camera_key(camera)
+        cam_angle = camera_angle(camera)
+    except Exception:  # noqa: BLE001
+        cam_key, cam_angle = "", ""
+    if cam_key == "中景" and not camera:
+        cam_key = ""
+
+    parts: List[str] = []
+    if location:
+        parts.append(f"场景：{location}")
+    if chars:
+        # 站位描述：按出场顺序左右排布
+        n = len(chars)
+        if n == 1:
+            parts.append(f"人物站位：{chars[0]} 居中，面向镜头")
+        else:
+            mapping = []
+            for i, c in enumerate(chars):
+                if n == 2:
+                    w = "左侧" if i == 0 else "右侧"
+                elif i == 0:
+                    w = "最左"
+                elif i == n - 1:
+                    w = "最右"
+                elif i == (n - 1) / 2:
+                    w = "居中"
+                else:
+                    w = "偏左" if i < (n - 1) / 2 else "偏右"
+                mapping.append(f"{c} 在{w}")
+            parts.append("人物站位：" + "，".join(mapping) + "，均面向镜头")
+    if cam_key:
+        parts.append(f"景别：{cam_key}")
+    if cam_angle:
+        parts.append(f"机位：{cam_angle}")
+    if desc:
+        parts.append(f"画面要点：{desc}")
+
+    return "；".join(parts) + "。"
+
+
+def dumps_scene_json(scene: dict, indent: int = 2) -> str:
+    """把 scene dict 序列化为 scene_json 字符串（与前端同步写入的格式一致）。"""
+    return json.dumps(scene, ensure_ascii=False, indent=indent)
+
+
+def plan_pixel_size(aspect: str, width: int = 768) -> Tuple[int, int]:
+    """画幅 → 渲染像素尺寸（宽固定，高按比例；未知画幅按 9:16）。"""
+    bw, bh = _ASPECT_RATIO.get(str(aspect or "").strip(), _ASPECT_RATIO["9:16"])
+    w = max(64, int(width))
+    h = max(64, int(round(w * bh / bw)))
+    return w, h
+
+
+def build_render_plan(shot: dict, aspect: str = "9:16", width: int = 768,
+                      characters: Optional[List[str]] = None) -> dict:
+    """给「服务端 3D 站位图渲染器」的完整计划（``app/te_3d_render.py`` 消费）。
+
+    与 :func:`build_scene_json` 的分工：
+      * ``scene``  —— 纯 TE_3D_Director 协议，可原样喂给导演台回读；
+      * ``camera`` —— 渲染器实际使用的机位（position / target / fov），
+        position 与 scene_json 里 camera entity 的坐标**同源**，不会两边打架。
+
+    返回字段：``{width, height, aspect, fov, camera:{position,target}, grid, scene,
+    fits, char_count, capacity}``。纯规则、零模型调用、确定性输出（同一 shot 恒得同一
+    计划，便于按哈希缓存 PNG）。
+
+    ⭐ ``fits`` = 这张基准图**该不该产**。三连判据（任一不满足 → 调用方必须放弃出图，
+    回退到「只注入文字站位锚点」的旧行为）：
+      ① 本镜没有出场角色 —— 空舞台，渲出来只有 ``#060608`` 黑底（构图基准图的全部价值
+         就是「谁站在哪」，没有主体就没有可照搬的构图）；
+      ② 本镜**没声明景别**（camera 只有机位/运镜）—— 基准图会强加一个固定取景，而提示词
+         此时写的是「按 SCENE AND ACTION 自行决定取景、不要默认中景或全景」，两者互斥；
+      ③ 人数超过该景别 + 画幅的**横向容量** —— 人会互相重叠或被裁到数不清人数，
+         而「人物数量」正是构图基准核对的第一条判据，数不清就等于给了错信息。
+    ⚠️ 这三条都**不能**靠「换一个更宽的景别」来凑：参考图的取景是强先验，改宽等于篡改
+       提示词的景别约束（那正是本仓「景别画不准」的根因）。
+    """
+    chars = characters if characters is not None else _parse_characters(shot)
+    scene = build_scene_json(shot, aspect=aspect, characters=chars)
+
+    camera_str = str(shot.get("camera") or "").strip()
+    try:
+        from comfyui_client import camera_key, camera_angle  # noqa: PLC0415
+        cam_key = camera_key(camera_str)
+        cam_angle = camera_angle(camera_str)
+    except Exception:  # noqa: BLE001
+        cam_key, cam_angle = "", ""
+    if cam_key == "中景" and not camera_str:
+        cam_key = ""
+
+    # ⚠️ 主体中心必须用**与 build_scene_json 相同的 spread** 计算（同画幅 + 同景别 + 同人数），
+    #    否则机位会偏离主体。
+    spread = _lateral_spread(aspect, cam_key, len(chars))
+    cx, cz = _subject_center(chars, spread)
+    position, target, fov = build_camera(cam_key, cam_angle, cx, cz)
+    w, h = plan_pixel_size(aspect, width)
+    capacity = framing_capacity(aspect, cam_key)
+    return {
+        "width": w,
+        "height": h,
+        "aspect": aspect,
+        "fov": fov,
+        "camera": {"position": list(position), "target": list(target)},
+        "grid": False,
+        "scene": scene,
+        # 该不该真的出图（判据见 docstring；渲染器据此决定是否启动浏览器）
+        "fits": bool(chars) and bool(cam_key) and len(chars) <= capacity,
+        "char_count": len(chars),
+        "capacity": capacity,
+        "cam_key": cam_key,
+    }
+
+
+def block_annotation(shot: dict, characters: Optional[List[str]] = None) -> str:
+    """派生出「空间锚点」文本（英文，直接拼进分镜/视频提示词作为软约束）。
+
+    与 composition_prompt 的区别：这条是给**生图/生视频模型**读的构图约束，
+    用英文 + 明确的左右/前后/景别措辞，命中现有分镜提示词的 FRAMING/SCENE 语义。
+    """
+    chars = characters if characters is not None else _parse_characters(shot)
+    camera = str(shot.get("camera") or "").strip()
+
+    try:
+        from comfyui_client import camera_key, camera_angle  # noqa: PLC0415
+        cam_key = camera_key(camera)
+        cam_angle = camera_angle(camera)
+    except Exception:  # noqa: BLE001
+        cam_key, cam_angle = "", ""
+    if cam_key == "中景" and not camera:
+        cam_key = ""
+
+    lines: List[str] = []
+    n = len(chars)
+    if n:
+        if n == 1:
+            lines.append(f"{chars[0]} positioned center-frame, facing camera")
+        else:
+            for i, c in enumerate(chars):
+                if n == 2:
+                    side = "left" if i == 0 else "right"
+                elif i == (n - 1) / 2:
+                    side = "center"
+                else:
+                    side = "left" if i < (n - 1) / 2 else "right"
+                lines.append(f"{c} on the {side}, facing camera")
+    if cam_key:
+        lines.append(f"framing: {cam_key}")
+    if cam_angle:
+        lines.append(f"camera angle: {cam_angle}")
+    if not lines:
+        return ""
+    return "Blocking — " + "; ".join(lines) + "."

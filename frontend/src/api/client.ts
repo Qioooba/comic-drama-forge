@@ -535,6 +535,28 @@ export const videoApi = {
       /** 后端已把同集旧成片标记为「需重新合成」 */
       deliverable_marked_stale?: boolean;
     }>('/video/retry-shot', { method: 'POST', body: JSON.stringify(data) }),
+
+  /**
+   * 整集一次提交（mode=episode）：把该集 N 个镜头塞进一个 H3 工作流，
+   * H3 原生段间衔接直接产出**一条连续整集视频**（`<episode_tag>_full.mp4`）。
+   * 后端在 shots 为空时按 project_name + episode_no 自动读剧本兜底。
+   * 异步：返回 task_id，进度走 generation/status/<task_id>。
+   */
+  generateEpisode: (data: {
+    project_name: string;
+    episode_no?: number;
+    mode?: 'episode';
+    timeout_per_segment?: number;
+  }) =>
+    request<{
+      success: boolean;
+      task_id: string;
+      status: string;
+      total: number;
+      mode: string;
+      project_name: string;
+      episode_no: number;
+    }>('/videos/generate', { method: 'POST', body: JSON.stringify({ ...data, mode: 'episode' }) }),
 };
 
 // --- TTS ---

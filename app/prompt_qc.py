@@ -87,6 +87,9 @@ SB_MARK_REF_USAGE_LEGACY = "参考图用途"
 #: 画布/身份锚点段
 SB_MARK_CANVAS = "PRIMARY CANVAS:"
 SB_MARK_IDENTITY = "IDENTITY:"
+#: 3D 导演台「构图基准图」段（2026-09-27）：带了站位基准图就必须声明它的职责，
+#: 否则模型会把人偶当成身份基准（复刻灰彩色身体/无面头部）。
+SB_MARK_BLOCKING = "COMPOSITION BASELINE:"
 #: 保留子句（官方 Preservation Clause）
 SB_MARK_PRESERVE = "PRESERVE:"
 SB_MARK_PRESERVE_LEGACY = "【禁令】"
@@ -134,8 +137,11 @@ _INSTRUCTION_RE = re.compile(
 )
 
 #: 质量类空词：对图像模型无信息量，还会挤占风格/构图语义
+#: 2026-09-28：``highly detailed`` 移出 fluff —— 它是分镜 STYLE 质量尾的正式组成
+#: （style_kit._QUALITY_TAIL_EN），原判定会在 _repair_storyboard 把它当空词直接剥掉，
+#: 导致 with_tail=True 找回的质量尾被静默删除。``ultra detailed`` 与其余项保留。
 _QUALITY_FLUFF: Tuple[str, ...] = (
-    "masterpiece", "best quality", "ultra detailed", "highly detailed",
+    "masterpiece", "best quality", "ultra detailed",
     "award winning", "8k", "4k", "杰作", "最佳画质", "超高清", "高清晰度",
 )
 
@@ -153,13 +159,28 @@ _ASSET_MIN_LEN = 12
 _TS_RE = re.compile(r"\[Shot\s+(\d+)\]\s+(\d{1,2}):(\d{2})\.(\d{3})")
 #: 裸时间码（新格式的 At 00:03.500 与首码判据用）
 _BARE_TS_RE = re.compile(r"(?<![\d:])(\d{1,2}):(\d{2})\.(\d{3})")
-#: 台词标记（本地模板同格式）：``... rate (S1): <d>[Chinese] 台词</d>``。
-#: 兼容历史写法 ``(S1) 说：[Chinese] 台词``——两者都算「有台词标记」。
-_SPOKEN_RE = re.compile(r"\(S\d+\)\s*[^：:\n]{0,6}[：:]\s*(?:<d>\s*)?\[[A-Za-z\-]+\]")
+#: 台词标记。2026-09-26 P0-1「口型与画面分离」前是 ``(S1): <d>[Chinese] 台词</d>``；
+#: P0-1 起提示词**不再写台词原文**（配音走独立 QwenTTS，H3 自带人声还会被 HDEMUCS
+#: 剔除），只保留「说话人槽位 (S1) + 开口说话动作 + 口型自然开合」。故本正则改为
+#: 匹配**说话动作句**（speaks … voice … lips moving），同时保留对历史 ``(S1): <d>…</d>``
+#: 格式的兼容（存量项目重出视频时不应被新规则误判缺陷）。
+_SPOKEN_RE = re.compile(
+    r"speaks\s*[—\-–][^.\n]{0,120}?voice"          # 新：开口说话动作（speaks — … voice）
+    r"|\(S\d+\)\s*[^：:\n]{0,6}[：:]\s*(?:<d>\s*)?\[[A-Za-z\-]+\]"  # 旧：<d>台词</d> 兼容
+    , re.IGNORECASE)
 #: 「开口说话」动作描述（2026-09-24 二次对齐）：模板每句台词前都有
 #: ``speaks — a clear, resonant female voice with …, at a measured declarative rate``。
 #: **没有这句就没有唇部动画**（H3 只配音、不开口，实测现象），故升级为硬检查。
 _SPEAK_ACTION_RE = re.compile(r"speaks\s*[—\-–][^.]{0,120}?voice", re.IGNORECASE)
+#: 「无台词」显式声明（2026-09-27 起新官方句式：no one … speaks / no voice-over；
+#: 保留对旧「No dialogue」的兼容，存量项目重出视频时不应被误判缺陷）。
+_NO_DIALOGUE_RE = re.compile(
+    r"No dialogue"                       # 旧句式（兼容存量）
+    r"|no one[^.\n]{0,40}speaks"         # 新：No one in the frame speaks
+    r"|no voice[- ]?over",               # 新：no voice-over / no voiceover
+    re.IGNORECASE)
+#: 口型自然开合（P0-1 后说话动作句的标志：不再写台词原文，用这句保留驱动嘴型的信号）
+_LIP_SYNC_RE = re.compile(r"lips moving naturally", re.IGNORECASE)
 #: ``detailed_description`` 首句风格声明（模板：``The target video uses a … style …``）。
 #: ⚠️ 必须同时接受历史中文写法（「全片画面风格统一为…」），否则存量项目重出视频时
 #: 会被新规则统一判缺陷（假红）。
@@ -435,6 +456,12 @@ def _check_storyboard(prompt: str, ctx, style, ref_count: Optional[int] = None,
         elif SB_MARK_NO_REF not in prompt and SB_MARK_NO_REF_LEGACY not in prompt:
             issues.append("未声明「本镜无参考图」：模型可能凭空套用模板里的参考图")
 
+        # 3D 导演台构图基准图（<image1>）：带了图却没声明职责 → 模型会把人偶当身份基准
+        if isinstance(ctx, dict) and ctx.get("_blocking_ref"):
+            if not _has_section(prompt, SB_MARK_BLOCKING):
+                issues.append("带了 3D 导演台构图基准图，但提示词缺少 COMPOSITION BASELINE "
+                              "段：未声明「只照它的构图摆、不得复刻人偶外观」")
+
         # 官方禁令：禁止用文字重述五官（重述会让模型「重新画一个符合描述的人」）
         if SB_MARK_IDENTITY in prompt and re.search(
                 r"(脸型|五官|鼻子|眼睛|双眼皮|颧骨|下巴)", prompt):
@@ -568,13 +595,16 @@ def _check_h3(prompt: str, ctx, style, expect_refs: Optional[bool] = None,
             issues.append("时间码非递增：节拍时间轴倒流")
 
     if _dialogue_texts(ctx) and not _SPOKEN_RE.search(prompt):
-        issues.append("镜头有台词但缺少「(S1): <d>[Chinese] 台词</d>」标记：口型与配音可能对不上")
+        issues.append("镜头有台词但缺少「开口说话 + 口型自然开合」动作句：口型与配音可能对不上")
 
     # ⚠️ 2026-09-24 二次对齐模板：台词若只被 <d> 包住、**台词前没有「开口说话」的
     # 动作描述**，H3 会把台词当成背景配音、画面里人物嘴唇不动（实测现象）。
     # 模板每句台词前都有 ``speaks — a clear … voice … at a measured … rate``，
     # 这正是驱动口型的依据。这里把它升级为硬性检查（原先只在守卫里断言）。
-    if _dialogue_texts(ctx) and _SPOKEN_RE.search(prompt) and not _SPEAK_ACTION_RE.search(prompt):
+    # 2026-09-26 P0-1：新格式（speaks … voice）已含在 _SPOKEN_RE 里；此分支只针对
+    # **旧格式兼容**（仅命中 ``(S1): <d>台词</d>`` 而无 speaks 动作）补报。
+    if (_dialogue_texts(ctx) and _SPOKEN_RE.search(prompt)
+            and not _SPEAK_ACTION_RE.search(prompt)):
         issues.append("台词缺少「开口说话」动作描述（speaks — … voice …）："
                       "人物可能只出配音、嘴唇不动")
 
@@ -586,9 +616,11 @@ def _check_h3(prompt: str, ctx, style, expect_refs: Optional[bool] = None,
     # ⚠️ 2026-09-24：**取消**「必须含无文字/字幕约束」这条检查。对齐本地模板后
     # 提示词里不再写「严禁出现文字/字幕/水印」——该措辞会把「字幕/文字」两个词
     # 引入提示词，反而诱导 H3 把台词画成字幕（实测视频出字幕）。
-    # 改为检查「无台词的节拍是否显式声明 No dialogue」，这才是防字幕的有效手段。
-    if not _SPOKEN_RE.search(prompt) and "No dialogue" not in prompt:
-        issues.append("无台词且未显式声明「No dialogue」：模型可能自补台词并画成字幕")
+    # 改为检查「无台词的节拍是否显式声明 no one speaks / no voice-over（或旧 No dialogue）」，
+    # 这才是防字幕/防画外音的有效手段。
+    if not _SPOKEN_RE.search(prompt) and not _NO_DIALOGUE_RE.search(prompt):
+        issues.append("无台词且未显式声明「no one speaks / no voice-over」："
+                      "模型可能自补台词画成字幕，或把画面描述念成画外音")
 
     # ------------------------------------------------------------------ #
     # 2026-09-24 二次对齐本地模板：以下四项是模板 10 段**无一例外**都有的格式特征，
@@ -628,12 +660,13 @@ def _repair_h3(prompt: str, ctx, style) -> Tuple[str, List[str]]:
 
     ⚠️ 2026-09-24：**不再补写**「严禁出现文字/字幕/水印」约束。对齐本地手跑模板后，
     该约束被视为有害（在提示词里引入「字幕/文字」两个词，反而诱导 H3 画出字幕）。
-    现在只补「No dialogue」这类与上下文无关、且真正有利于防字幕的固定句。
+    现在只补「no one speaks / no voice-over」这类与上下文无关、且真正有利于防字幕/防旁白的固定句。
     """
     repairs: List[str] = []
     out = prompt
-    if out and not _SPOKEN_RE.search(out) and "No dialogue" not in out:
-        # 无台词镜：在 detailed_description 段内**最后一条 [Shot 节拍** 上补 No dialogue。
+    if out and not _SPOKEN_RE.search(out) and not _NO_DIALOGUE_RE.search(out):
+        # 无台词镜：在 detailed_description 段内**最后一条 [Shot 节拍** 上补
+        # 「no one speaks / no voice-over」。
         # ⚠️ 不能简单取「下一段名之前的最后一行」—— 那行往往是全片风格声明
         #（「全片画面风格统一为…」），补在后面既语义错位、也识别不到节拍。
         # 这里从段尾向前找最近一条真正的节拍行（以 ``[Shot`` 或 ``At `` 开头）。
@@ -657,12 +690,13 @@ def _repair_h3(prompt: str, ctx, style) -> Tuple[str, List[str]]:
                     beat = j
                     break
             if beat is not None:
-                lines[beat] = lines[beat].rstrip() + " No dialogue."
+                lines[beat] = (lines[beat].rstrip()
+                               + " No one in the frame speaks; there is no voice-over narration.")
                 out = "\n".join(lines)
-                repairs.append("补写「No dialogue」（防模型自补台词被画成字幕）")
+                repairs.append("补写「no one speaks / no voice-over」（防模型自补台词/念旁白）")
         else:
-            out = out.rstrip() + " No dialogue."
-            repairs.append("补写「No dialogue」（防模型自补台词被画成字幕）")
+            out = out.rstrip() + " No one in the frame speaks; there is no voice-over narration."
+            repairs.append("补写「no one speaks / no voice-over」（防模型自补台词/念旁白）")
 
     # ------------------------------------------------------------------ #
     # 2026-09-24 二次对齐：补两处「安全追加」型的模板特征。

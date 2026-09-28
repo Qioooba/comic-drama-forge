@@ -64,6 +64,61 @@ COMFYUI_WORKFLOWS_DIR = _norm_path(_env("COMFYUI_WORKFLOWS_DIR", _DERIVED["workf
 COMFYUI_INPUT_DIR = _norm_path(_env("COMFYUI_INPUT_DIR", _DERIVED["input"]))
 COMFYUI_OUTPUT_DIR = _norm_path(_env("COMFYUI_OUTPUT_DIR", _DERIVED["output"]))
 
+# ===================== 工作流模板目录（项目自包含） =====================
+# ⚠️ 为什么要有这一段：工作流 JSON 以前只存在于本机 ComfyUI 的
+#    `user/default/workflows/` 里，项目仓库一个都不带。后果是**别人下载项目后
+#    直接不可用**（每个模板都找不到文件），而且换机 / 重装 ComfyUI 就会集体失效。
+#    现在把项目引用的全部模板随项目一起分发，默认从项目内解析。
+PROJECT_WORKFLOWS_DIR = _norm_path(os.path.join(PROJECT_ROOT_DIR, "workflows"))
+
+# 解析优先级：
+#   1) MJSCXT_WORKFLOWS_DIR 显式指定目录（最高，换机/调试用）
+#   2) PROJECT_WORKFLOWS_DIR 项目内 workflows/（默认，保证开箱可用）
+#   3) COMFYUI_WORKFLOWS_DIR 本机 ComfyUI 目录（回落）
+# 设 MJSCXT_WORKFLOWS_PREFER=comfyui 可把 ComfyUI 目录提到项目目录之前，
+# 便于「在 ComfyUI 里现调工作流、立刻让项目用上」的本地迭代。
+_WORKFLOWS_DIR_EXPLICIT = _norm_path(_env("MJSCXT_WORKFLOWS_DIR", ""))
+_WORKFLOWS_PREFER_COMFYUI = (
+    _env("MJSCXT_WORKFLOWS_PREFER", "").strip().lower() == "comfyui")
+
+
+def workflow_search_dirs() -> list:
+    """工作流文件的查找目录顺序（去重、剔除空值）。"""
+    dirs = []
+    if _WORKFLOWS_DIR_EXPLICIT:
+        dirs.append(_WORKFLOWS_DIR_EXPLICIT)
+    dirs.extend([COMFYUI_WORKFLOWS_DIR, PROJECT_WORKFLOWS_DIR]
+                if _WORKFLOWS_PREFER_COMFYUI
+                else [PROJECT_WORKFLOWS_DIR, COMFYUI_WORKFLOWS_DIR])
+    seen, out = set(), []
+    for d in dirs:
+        if d and d not in seen:
+            seen.add(d)
+            out.append(d)
+    return out
+
+
+def resolve_workflow_path(workflow_file: str) -> str:
+    """工作流文件名（或相对路径）→ 实际磁盘路径。
+
+    按 ``workflow_search_dirs()`` 顺序取**第一个存在**的文件；全都不存在时返回
+    项目内候选路径（让报错信息直接指向「模板应该放在哪」）。
+    绝对路径原样返回，便于测试/临时替换。
+    """
+    if not workflow_file:
+        return ""
+    name = str(workflow_file)
+    if os.path.isabs(name):
+        return _norm_path(name)
+    dirs = workflow_search_dirs()
+    for d in dirs:
+        cand = os.path.join(d, name)
+        if os.path.isfile(cand):
+            return _norm_path(cand)
+    base = PROJECT_WORKFLOWS_DIR if PROJECT_WORKFLOWS_DIR in dirs else (
+        dirs[0] if dirs else "")
+    return _norm_path(os.path.join(base, name))
+
 # 模型路径
 MODELS_DIR = _norm_path(_env("MODELS_DIR", _DERIVED["models"]))
 QWEN_IMAGE_MODEL = os.path.join(MODELS_DIR, "diffusion_models", "qwen-image-2512",
@@ -152,9 +207,14 @@ PROJECT_DEFAULT_CONFIG = {
     "episodes": 1,                      # 目标集数
     "target_shots": 12,                 # 目标镜头数（AI 转剧本时自动判定，此处为期望值）
     "shots_per_episode": 12,
-    "episode_duration_sec": 60,         # 每集期望时长（秒）
+    "episode_duration_sec": 90,         # 每集期望时长（秒）
+    # ⚠️ 2026-09-26 口径变更：每集时长产品口径 = **1~2 分钟、最长 3 分钟**
+    #（单一事实来源是 novel_to_script.EPISODE_TARGET_SEC=90 / EPISODE_MAX_SEC=180）。
+    # 这里 90 是「期望中位值」，不是硬约束 —— 实际每集落在 60~180 秒都合法，
+    # 集数由章节内容按 EPISODE_MAX_SEC 自动拆分决定（一本 42 章约出 90+ 集）。
+    # 旧值 60 是「一集 1 分钟」时代的默认，已随口径切换上调。
     "resolution": "768p_vertical",
-    "aspect_ratio": "",                 # 画面比例（视频/分镜画幅，如「9:16 竖屏」；空=未设置，沿用总控/默认 9:16）
+    "aspect_ratio": "16:9 横屏",         # 画面比例（视频/分镜画幅，如「16:9 横屏」；空=未设置沿用默认（2026-09-28 默认由 9:16 翻转为 16:9））
     "fps": 24,
     "duration_per_shot": 5,             # 单镜头默认秒数
     "voice_map": {},                    # 角色→音色映射（按项目隔离）
@@ -295,6 +355,8 @@ TE_UPSCALE_LOWVRAM_PARAMS = {
 # 超分耗时标定（离线预估用）：output/upscale/calibration.json
 UPSCALE_CALIBRATION_PATH = os.path.join(UPSCALE_DIR, "calibration.json")
 
+
+
 # ===================== 配音（QwenTTS） =====================
 # 配音产物目录：output/dub/<项目>/lines/ 单句 + output/dub/<项目>/<项目>_epNN_配音.wav 合并音轨
 DUB_DIR = os.path.join(PROJECT_OUTPUT_DIR, "dub")
@@ -367,6 +429,11 @@ H3_SFX_ISOLATE = True               # True = 逐镜跑 HDEMUCS 分离；失败 *
 H3_SFX_STEMS = (1, 2)               # HDEMUCS 输出下标：0=Bass 1=Drums 2=Other(音效/环境) 3=Vocals
                                     # 取 Drums+Other：打斗的撞击/鼓点常被判进 Drums
 H3_SFX_DIR = os.path.join(PROJECT_OUTPUT_DIR, "sfx")   # 分离产物：output/sfx/<项目>/...
+# 视频生成是否用**参考音频驱动口型**（audioMode=source，2026-09-27 用户拍板）：
+#   True  = 把逐镜 QwenTTS 配音写进 segment.refAudios，H3 用音频驱动口型/节奏。
+#           需要该集配音已先行合成（enable_tts_pre），否则自动回退 generate/mute。
+#   False = 维持旧行为（H3 不出人声，配音统一后期 dub_mix 混音）。
+H3_AUDIO_SOURCE = _env_bool("H3_AUDIO_SOURCE", False)
 
 # AI 对话（创作总控）：多轮对话历史 + 已生效的项目创作设定
 AI_CHAT_DIR = os.path.join(PROJECT_OUTPUT_DIR, "ai_chat")
@@ -375,10 +442,18 @@ AI_SETTINGS_PATH = os.path.join(AI_CHAT_DIR, "project_settings.json")
 
 # 工作流文件
 WORKFLOW_TEMPLATE = {
-    # H3 视频生成：该文件仅作为"段链 + 无缝拼接"结构母版，
-    # 实际段数由 h3_episode_builder 按调用方分镜数动态重建
-    # （1 段 = 逐镜头；22/44 段 = 整集一次生成），不再固定 10 段。
-    "h3_video": "H3信号10段测试001.json",
+    # H3 视频生成（2026-09-27 起）：官方 Director 插件工作流，**扁平单实例**——
+    # 一个 MiniMaxH3Director 节点吃整条 timeline_data，段数由 timeline.segments 决定
+    # （1 段=逐镜头；整集=N 段），段间由插件原生「段间引导」衔接，二采由外接的
+    # MiniMaxH3DirectorRefine 承担。工作流**不重建拓扑**，只程序化注入 timeline
+    # （见 app/h3_director_builder.py）。
+    # 旧母版「H3信号10段测试001.json」（10 个子图实例 + H3ContinuousSeamlessJoinV14
+    # 按分镜数重建）仍留在 workflows/ 里，可用 MJSCXT_H3_BUILDER=legacy 一键回退。
+    # 注意：判「走哪条构建路径」只看模板**结构**（有无 MiniMaxH3Director 节点），
+    # 不看文件名——改这里的值不会让分流逻辑失效。
+    "h3_video": "minimax_h3_director_二采_加速.json",
+    # 旧连续拼接母版（回退用，勿删）
+    "h3_video_legacy": "H3信号10段测试001.json",
     # ---- 图片链路：2026-09-23 起统一切换到 QwenImage2.1 + TE-Speed 加速链 ----
     # 母版参考 ComfyUI 工作流「TE-Speed-QwenImage21 加速插件-提速30%(1).json」；
     # *_Qwen21.json 由 .workbuddy/tools/build_qwen21_workflows.py 生成（可复现）。
@@ -399,6 +474,32 @@ WORKFLOW_TEMPLATE = {
 #   always = 无条件串帧
 #   off    = 关闭（旧行为：每镜用自己的分镜图当首帧，镜与镜画面各画各的）
 KEYFRAME_CHAIN_MODE = _env("KEYFRAME_CHAIN_MODE", "auto").strip().lower() or "auto"
+
+# 分镜「候选多选一」（P2，2026-09-26）：每镜生成 K 张候选（不同 seed）、逐一质检、
+# 选 score 最高且达标的那张入库。
+#   K = 1  → 旧行为（出到第一张达标即停，早停，成本最低）
+#   K > 1  → 每镜主动出至多 K 张，选最优（质量更稳，但 GPU 成本约 K 倍）
+# ⚠️ 质检判官会抖（同图 temperature=0 分数 45~92），「选最高分」只作软排序，
+#    不改变「达标才入库」的硬闸门（_qc_gate）；抖动由 image_qc_recheck 同图复核缓解。
+STORYBOARD_CANDIDATES = max(1, _env_int("STORYBOARD_CANDIDATES", 1))
+
+# TE MAN 3D导演台「程序化站位」（2026-09-26）：把每镜 shot 的角色站位/机位/景别
+# 结构化翻译成 scene_json（te_3d_director.py），并派生出「空间锚点」文本注入
+# 分镜图提示词（软约束，增强构图稳定性）。
+#   True  = 分镜提示词的 SCENE AND ACTION 段追加一条 "Blocking — …" 空间锚点行
+#   False = 关闭（纯文本描述，不注入结构化站位）
+# ⚠️ 这是**软约束**：TE_3D_Director 节点本身不产图，scene_json 的价值是结构化、
+#    跨镜一致；注入的锚点只增强构图，不改变 TASK/PRESERVE 等既有硬约束协议。
+ENABLE_BLOCKING_ANNOTATION = _env_bool("ENABLE_BLOCKING_ANNOTATION", True)
+
+# TE MAN 3D导演台「构图基准图」（2026-09-27）：在 ENABLE_BLOCKING_ANNOTATION 的文字
+# 锚点之上，再**真渲染**一张 3D 站位/机位预演图，作为分镜生成的 <image1> 构图基准。
+#   True  = 每镜先渲一张站位图 → 作 <image1> → 分镜提示词追加 COMPOSITION BASELINE 段
+#           → 质检时一并送检该基准图，核对「人物数量/左右位置/前后层次/景别/机位角度」
+#   False = 完全回退到现状（不出站位图、提示词无该段、质检不送基准图）
+# ⚠️ 渲染是**增强项**：无浏览器 / 资产缺失 / 超时 / 全黑 → 自动降级为「只注入文字站位锚点」，
+#    绝不阻断分镜主链路（见 app/te_3d_render.py 的失败静默降级口径）。
+ENABLE_3D_BLOCKING_IMAGE = _env_bool("ENABLE_3D_BLOCKING_IMAGE", True)
 
 # 多视角生成配置
 #

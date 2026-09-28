@@ -1972,6 +1972,7 @@ function KeyframesTab({ projectKey, episodeNo }: { projectKey: string; episodeNo
 // 这里把两个入口放到每张分镜卡上，并在视频重做成功后提示「同集成片已过期」。
 function StoryboardTab({ projectKey, episodeNo }: { projectKey: string; episodeNo?: number | null }) {
   const { t } = useApp();
+  const toast = useToast();
   const [cards, setCards] = useState<any[]>([]);
   const [summary, setSummary] = useState<any>(null);
   const [loading, setLoading] = useState(false);
@@ -1980,8 +1981,13 @@ function StoryboardTab({ projectKey, episodeNo }: { projectKey: string; episodeN
   const [busy, setBusy] = useState<string | null>(null);
   /** 每镜的视频重做模式（reference=分镜图驱动 / keyframe=首尾帧插值） */
   const [videoMode, setVideoMode] = useState<Record<string, 'reference' | 'keyframe'>>({});
+  /** 正在内嵌预览视频的镜头 id（null=全部收起）：按镜头单开，避免多卡同时播放 */
+  const [playingVideo, setPlayingVideo] = useState<string | null>(null);
   const [notice, setNotice] = useState('');
   const [shotError, setShotError] = useState('');
+  /** 整集一次提交（mode=episode）：触发中标记 + 返回的 task_id */
+  const [episodeGenerating, setEpisodeGenerating] = useState(false);
+  const [episodeTaskId, setEpisodeTaskId] = useState<string | null>(null);
 
   const fetchCanvas = async () => {
     if (!projectKey) return;
@@ -2063,11 +2069,40 @@ function StoryboardTab({ projectKey, episodeNo }: { projectKey: string; episodeN
     }
   };
 
+  // 整集一次提交（mode=episode）：把当前集 N 镜塞进一个 H3 工作流，直接出整集成片。
+  const handleGenerateEpisode = async () => {
+    if (!projectKey) return;
+    setEpisodeGenerating(true);
+    setShotError('');
+    try {
+      const r = await videoApi.generateEpisode({
+        project_name: projectKey,
+        episode_no: episodeNo ?? undefined,
+      });
+      setEpisodeTaskId(r.task_id);
+      toast.success(t('sb.episodeGenerateStarted', { total: r.total }));
+    } catch (e) {
+      setShotError(e instanceof Error ? e.message : t('sb.videoRedoFailed'));
+    } finally {
+      setEpisodeGenerating(false);
+    }
+  };
+
   return (
     <div className="space-y-6">
       <div className="flex justify-between items-center">
         <h3 className="text-lg font-semibold">{t('wb.storyboardHub')}</h3>
-        <Button size="sm" onClick={fetchCanvas} disabled={loading}>{t('common.refresh')}</Button>
+        <div className="flex items-center gap-2">
+          <Button
+            size="sm"
+            onClick={handleGenerateEpisode}
+            disabled={loading || episodeGenerating}
+            className="bg-brand hover:bg-brand-strong"
+          >
+            {episodeGenerating ? t('common.generating') : t('sb.episodeGenerate')}
+          </Button>
+          <Button size="sm" onClick={fetchCanvas} disabled={loading}>{t('common.refresh')}</Button>
+        </div>
       </div>
 
       {/* 加载态（此前首屏只剩标题栏，无任何反馈）：对齐真实区块的三列分镜卡 */}
@@ -2161,16 +2196,32 @@ function StoryboardTab({ projectKey, episodeNo }: { projectKey: string; episodeN
                 </div>
               </div>
 
+              {/* 内嵌播放器：插在信息区之后、操作区（带 mt-auto）之前，
+                  使按钮仍被压到卡底，且与卡片内 mb-2 的间距风格一致。
+                  ⚠️ 不写死高度、不加 aspect-video —— 重跑/超分后分辨率会变，交给浏览器按元数据自适应。 */}
+              {playingVideo === sid && card.video?.url && (
+                <video src={card.video.url} controls className="w-full mt-2 rounded-lg bg-black" />
+              )}
+
               <div className="flex flex-wrap items-center gap-2 mt-auto pt-2">
                 {card.video?.exists && card.video?.url && (
-                  <a
-                    href={card.video.url}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className={`text-xs text-brand hover:text-brand rounded-sm ${FOCUS_RING}`}
-                  >
-                    {t('sb.viewVideo')}
-                  </a>
+                  <>
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      onClick={() => setPlayingVideo(playingVideo === sid ? null : sid)}
+                    >
+                      {playingVideo === sid ? t('common.close') : t('common.play')}
+                    </Button>
+                    {/* 端点未设 as_attachment，只能靠 HTML download 属性触发下载（同源，有效） */}
+                    <a
+                      href={card.video.url}
+                      download
+                      className={`text-xs text-brand hover:text-brand rounded-sm ${FOCUS_RING}`}
+                    >
+                      {t('common.download')}
+                    </a>
+                  </>
                 )}
                 <select
                   value={mode}

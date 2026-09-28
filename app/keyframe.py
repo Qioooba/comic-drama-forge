@@ -483,7 +483,7 @@ def generate_keyframes(shots: List[dict], sb_map: Dict[str, str], keyframes_dir:
                 import config as _cfg
                 tpl = _cfg.WORKFLOW_TEMPLATE.get("storyboard_gen")
                 if tpl:
-                    wf_path = os.path.join(_cfg.COMFYUI_WORKFLOWS_DIR, tpl)
+                    wf_path = _cfg.resolve_workflow_path(tpl)
                     if os.path.isfile(wf_path):
                         h = hashlib.sha256()
                         with open(wf_path, "rb") as _f:

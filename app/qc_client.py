@@ -36,6 +36,10 @@ import requests
 # 因此这里 import 不会形成循环；硬阈值与渲染逻辑都由它持有（谁消费谁定义）。
 import audio_qc
 
+# 性别兜底工具（2026-09-28）：本模块只借它的中文性别判定做「能否启用性别核对项」的门控。
+# ⚠️ asset_prompt_kit 只依赖标准库（re/logging/typing），不会形成循环导入。
+import asset_prompt_kit
+
 logger = logging.getLogger(__name__)
 
 # 项目根目录（定位加密密钥库 output/secrets.enc 与主密钥 .secret_key）
@@ -138,6 +142,36 @@ CONTINUITY_NOTE = (
     "不要凭空臆造「与上一镜不一致」，直接跳过本项。"
 )
 
+# 人物性别一致性（2026-09-28）：资产图实测出现「角色名是「三百年旧怨女子」（女性）、
+# 出图却是短发男性脸型体格」的致命错误 —— 而质检侧**完全没有性别判据**，模型只按
+# 发色/瞳色/服装比对，性别画反也能拿高分入库。这里补一条资产核对项。
+#
+# ⚠️ 只在**能拿到性别设定**时启用：调用方（app.py 资产生成）已把「性别：女/男」写进
+# 「资产设定」，本函数据此判定；推断不出性别时**整段不追加** —— 否则模型会凭画面
+# 气质臆测性别、把正确出图判成缺陷。
+GENDER_CHECK_NOTE = (
+    "\n【人物性别一致性判定·重要】上方「资产设定」里已写明该人物性别"
+    "（如「性别：女」「女性」「男子」）。请额外判定：**画面中该人物的性别形象必须与设定一致**"
+    "（设定为女性则必须是女性形象，设定为男性则必须是男性形象）；"
+    "性别不符 —— 例如设定为女性却画成短发男性脸型与体格 —— 属**致命缺陷**，"
+    "必须在 issues 中写明「性别不符：…」并按上方硬性规则输出 pass=false 且 score ≤ 50。"
+    "⚠️ 若上方「资产设定」并未写明性别，则**不得**判定本项，也不要凭画面气质臆测性别。"
+)
+
+#: 角色资产质检描述的前缀（app.py._generate_asset_task 构造）。
+#: ⚠️ 分镜质检同样走 check_image，而分镜画面描述里出现「女子」只是画面内容 ——
+#: 必须靠这个前缀把性别判据**限定在角色资产**上，否则会把分镜误判成性别不符。
+_CHAR_ASSET_DESC_MARK = "资产类型：character"
+
+
+def _should_check_gender(shot_desc: str) -> bool:
+    """角色资产质检且描述里能拿到性别 → 才追加性别核对项（2026-09-28）。
+
+    拿不到性别时返回 False（不追加），避免模型凭空臆测性别造成误杀。
+    """
+    d = str(shot_desc or "")
+    return _CHAR_ASSET_DESC_MARK in d and bool(asset_prompt_kit.gender_zh(d))
+
 # 关键缺陷硬规则（P0：收紧放行）：模型偶尔给有明显崩坏的图打高分/放行，
 # 因此在提示词里下达硬性规则，并在代码侧再加一道不可绕过的闸门（见 _finalize_verdict）。
 CRITICAL_RULE_NOTE = (
@@ -168,15 +202,47 @@ MAX_REF_IMAGES = 4     # 质检最多附带几张设定参考图（去重后）
 _REF_LABEL_PREFIX_RE = re.compile(r"^参考图\s*\d+\s*是")
 
 
-def build_ref_consistency_note(refs: list) -> str:
+def build_blocking_note(n_ref_after: int) -> str:
+    """生成「3D 导演台构图基准核对」段落（2026-09-27）。
+
+    分镜图现在按「3D 站位基准图」定构图，但**没人核对它到底有没有照做** —— 站位左右颠倒、
+    人数不对、机位/景别跑偏这类问题，只靠设定图是看不出来的。这里把基准图一并送检。
+
+    ⚠️ 判据必须写清「**只比构图、不比外观**」：基准图是无面人偶的预演图，若不说清楚，
+    模型会拿人偶的灰彩色身体 / 无面头部去判「角色与设定不符」，整批假红。
+
+    :param n_ref_after: 基准图之后还有几张设定图（用于说明总张数）
+    """
+    total = 2 + max(0, int(n_ref_after))
+    return (
+        "\n【构图基准核对·重要】本次按顺序传入 %d 张图：\n"
+        "  第 1 张 = 待检的分镜图（AI 生成结果）；\n"
+        "  第 2 张 = **3D 导演台构图基准图**（灰/彩色**无面人偶**的站位与机位预演图）；\n"
+        "  其余 = 角色 / 物品 / 场景的设定图。\n"
+        "请把第 1 张与**第 2 张**逐项核对**构图**：\n"
+        "  · 画面内**人物数量**是否一致；\n"
+        "  · 各人物的**左右位置**与**前后层次**是否一致；\n"
+        "  · **景别（取景范围）**与**机位角度**（俯拍 / 仰拍 / 平视 / 侧向 / 过肩）是否一致；\n"
+        "  · ⚠️ 第 2 张只是构图预演：其人物的**外观、配色、无面头部、体块比例一律不得**"
+        "作为判定依据 —— 角色/物品像不像设定，只看后面的设定图，**禁止**因为「画面里的人物"
+        "不像人偶」而扣分；\n"
+        "  · 允许人物姿态、动作过程、表情、光影与画面细节不同（那些由画面描述决定）；\n"
+        "  · 仅当出现**明显**构图偏差（人数不符、左右颠倒、前后层次错乱、景别差两档以上、"
+        "机位方向相反）时，在 issues 里写明「构图不符：<具体项>」并扣分。\n"
+        % total
+    )
+
+
+def build_ref_consistency_note(refs: list, start: int = 2) -> str:
     """生成「设定一致性核对」段落。
 
     refs 为 [(label, path), ...]，label 形如「角色「方源」的外貌、服装与发型」。
     ⚠️ 第 1 张图固定是待检成品图，因此设定图从「第 2 张」开始编号
     （生成侧 label 里的「参考图N」是相对参考图自身的编号，必须剥掉，否则模型会数错图）。
+    :param start: 设定图起始序号；带了构图基准图（占第 2 张）时调用方传 3。
     """
     items = []
-    for i, (label, _p) in enumerate(refs or [], start=2):
+    for i, (label, _p) in enumerate(refs or [], start=max(2, int(start))):
         lab = _REF_LABEL_PREFIX_RE.sub("", str(label or "").strip()).strip()
         items.append("  第 %d 张 = 设定图：%s" % (i, lab or "（未标注）"))
     if not items:
@@ -534,9 +600,10 @@ DEFAULT_VIDEO_PROMPT = (
 #   script   : title / episode_no / episode_title / theme / style / characters /
 #              items / scenes / shots / production_notes / metadata
 #   shot     : shot_id / duration / camera / location / description / visual_detail /
-#              dialogue[{speaker,text}] / emotion / audio_cues / characters_in_shot /
-#              items_in_shot / prompt_h3 / style
-#              （narration 是 2026-09-19 之前的旧字段，本系统已不产出旁白）
+#              dialogue[{speaker,text}] / emotion / edit_reason（剪辑动机，可选增强项）/
+#              audio_cues / characters_in_shot / items_in_shot / prompt_h3 / style
+#              （narration 是 2026-09-19 之前的旧字段，本系统已不产出旁白；
+#                edit_reason 是 2026-09-28 起的增强项，旧剧本可缺失，故不作硬缺失判定）
 #   character: name / age / identity / appearance / current_outfit / personality /
 #              voice_style / reference_prompt_zh / reference_prompt_en
 #   item     : name / category / appearance / owner / importance /
@@ -563,7 +630,8 @@ DEFAULT_SCRIPT_PROMPT = (
     "10. 画面描述与整体气质必须符合指定创作风格（{style}）\n"
     "11. 角色外观描述应与该风格匹配\n\n"
     "【提示词质量】\n"
-    "12. description 应足够具体（建议 50 字以上），包含人物动作、环境光线与构图要素；\n"
+    "12. description 应简洁（建议 20~80 字），只写人物动作与关键构图；"
+    "禁止堆砌背景陈述、世界观解说、来历评述这类「成片会被念成旁白」的内容；\n"
     "13. camera 应为「景别+运镜」写法（如 中景跟拍 / 特写推入）\n\n"
     "【可执行性评估】\n"
     "14. 总时长应接近目标时长（{target_duration} 秒）\n"
@@ -587,7 +655,37 @@ DEFAULT_SCRIPT_PROMPT = (
     "（如危机降临、身份揭露、关键人物出现、抛出未解问题）。若结尾是平淡的收束/总结，"
     "写明「集尾无钩子」并扣分。\n"
     "22. **景别节奏**：不应连续 5 镜以上使用同一景别（尤其连续中景），"
-    "长短镜与远近景应交替，形成呼吸感。命中时在 issues 里写明。\n\n"
+    "长短镜与远近景应交替，形成呼吸感。命中时在 issues 里写明。\n"
+    "23. **旁白渗漏**（2026-09-26 新增）：本系统成片没有画外音，叙述性内容必须由画面承载。"
+    "检查每条 dialogue.text：若角色说出的内容实为**第三人称全知叙述**（世界观/势力背景交代、"
+    "环境说明、给读者听的解说句等「不像人话」的句子），判为「旁白渗漏」并在 issues 里写明镜号。"
+    "dialogue 只允许两种内容：① 原文的对话；② 原文明确心理活动/独白改写的**第一人称**自语"
+    "（角色以第一人称自然说出）。注意区分：角色之间正常的对话、第一人称回忆与自语是**合格**的，"
+    "不要误伤。\n"
+    "24. **描述臃肿度**（2026-09-27 新增）：统计全片 description+visual_detail 合计字数与 "
+    "dialogue 合计字数之比。若画面描述总字数超过台词总字数的 3 倍，说明剧情被背景描写拖累、"
+    "成片会一直「说背景描述」，判为缺陷并写明「描述/对白比 ≈X 倍」。描述应只写动作与构图，"
+    "纯环境铺陈、背景补叙应删除，而不是堆进 description。\n"
+    "25. **对白驱动率**（2026-09-27 新增）：有台词的镜头占比应 ≥40%。若超过一半镜头既无台词"
+    "又无明确人物动作（静态空镜/环境铺陈），说明叙事靠画面流水账而非人物互动推进，"
+    "判为缺陷并写明有台词镜数/总镜数。\n"
+    "26. **语义忠实度**（2026-09-27 新增）：核对剧本是否忠实表达了原著的情节意图——"
+    "即「冲突/转折/关键动作/金句」是否都在，且没有把原著**背景设定**误当成主线情节大段铺陈。"
+    "凡出现「大段背景解说/世界观介绍/环境气氛复述」压过「人物互动与冲突推进」的，"
+    "判为「偏离原著主线的背景化倾向」并在 issues 里写明。\n\n"
+    "27. 【镜头语言·软提示】（2026-09-28 新增，按 92 镜短片拆解口径，**仅作软提示，不直接判失败**）\n"
+    "  a) 剪辑动机：多数镜头应带 edit_reason（「为什么切到这一镜/承担什么叙事功能」）。"
+    "若整集 edit_reason 覆盖率明显偏低（一大半镜头没写），在 issues 写「剪辑动机缺失」，"
+    "suggestions 建议补每镜一句 15 字内的动机。\n"
+    "  b) 运镜克制：运镜应以**固定机位为主**（参照约 75% 固定），推/拉/摇/手持/跟随只在"
+    "情绪递进或空间转换时用。若本集活动运镜（非固定/定格）占比偏高、或特写+全景占比超过约 10%"
+    "（它们应只作情绪锚点而非主奏），在 issues 写「运镜过于活跃」或「特写/全景占比偏高」，"
+    "suggestions 建议改回固定机位、把特写/全景让给关键情绪点。\n"
+    "  c) 道具回环锚点：若同一关键道具（物品表里 importance 较高者）在 ≥2 镜出现，"
+    "却没有任何镜头的 description 写明它的位置/状态变化、也未标「（视觉锚点·第N次）」，"
+    "在 issues 写「道具回环缺锚点」，suggestions 建议把该道具做成跨镜头视觉锚点。\n"
+    "以上 a/b/c 命中时**不得**据此输出 pass=false、也**不得**扣到不及格——它们是可优化项，"
+    "只进 issues/suggestions 提示；结构、逻辑、时长、台词渗漏等硬缺陷才影响 pass。\n\n"
     "剧本数据：\n{script_data}\n\n"
     "请只输出一个JSON对象，格式：\n"
     '{\"score\": 0-100, \"pass\": true/false, \"reason\": \"一句话结论\", '
@@ -1917,7 +2015,8 @@ def _recheck_image_verdict(ep: dict, prompt: str, image_paths: list, cfg: dict,
 def check_image(image_path: str, shot_desc: str = "", cfg: dict = None,
                 override: dict = None, style: str = "",
                 ref_images: list = None,
-                prev_shot_desc: str = "", prev_shot_ref: str = "") -> dict:
+                prev_shot_desc: str = "", prev_shot_ref: str = "",
+                blocking_ref: str = "") -> dict:
     """单张图片质检。永不抛异常：失败时返回 ok=False 并带 error。
     override 仅用于「测试连通性」临时传参，不落盘。
     style：目标风格串（用户与总控敲定），用于「风格达标」判定；为空则不做风格检测。
@@ -1929,7 +2028,11 @@ def check_image(image_path: str, shot_desc: str = "", cfg: dict = None,
     prev_shot_desc / prev_shot_ref（2026-09-25 需求 J / P1）：**上一镜**的文字描述与画面
       路径。给了就追加「跨镜连续性」判定口径，并把上一镜画面一并送检，让模型能真正比对
       背景结构 / 光照方向 / 服化道是否漂移。两者都为空时**完全不加这部分**（零行为变更），
-      避免模型凭「上一镜」这几个字臆造一条不一致缺陷。"""
+      避免模型凭「上一镜」这几个字臆造一条不一致缺陷。
+    blocking_ref（2026-09-27）：3D 导演台站位/机位**构图基准图**（无面人偶预演图）。
+      给了就追加「构图基准核对」口径，让质检真正判定「这镜有没有照着 3D 站位/机位出图」。
+      送检顺序为 [成品图, 基准图, ...设定图]，与 :func:`build_blocking_note` 的编号一致；
+      该图**不占**设定图名额（``MAX_REF_IMAGES`` 只约束设定图）。"""
     cfg = cfg or _empty_config()
     if not cfg.get("enabled"):
         return {"ok": False, "skipped": True, "reason": "质检总开关未开启"}
@@ -1948,10 +2051,18 @@ def check_image(image_path: str, shot_desc: str = "", cfg: dict = None,
     prompt = prompt + WATERMARK_EXEMPT_NOTE + CRITICAL_RULE_NOTE + FRAMING_TOLERANCE_NOTE
     if style_norm:
         prompt = prompt + STYLE_CHECK_NOTE.replace("{style}", style_norm)
+    # ---- 角色资产的人物性别一致性（2026-09-28）：拿不到性别时整段不追加 ----
+    if _should_check_gender(shot_desc):
+        prompt = prompt + GENDER_CHECK_NOTE
+    # ---- 构图基准图（3D 导演台站位/机位）：不占设定图名额，单独一条口径 ----
+    blocking_used = bool(blocking_ref) and os.path.isfile(blocking_ref) \
+        and os.path.abspath(blocking_ref) != os.path.abspath(image_path)
     # ---- 设定一致性核对：把生成时用的参考图一并送检 ----
     ref_list = []
     if ref_images and cfg.get("image_ref_compare", True):
         seen = {os.path.abspath(image_path)}
+        if blocking_used:
+            seen.add(os.path.abspath(blocking_ref))
         for item in ref_images:
             if isinstance(item, dict):
                 label = item.get("label") or item.get("name") or ""
@@ -1983,9 +2094,14 @@ def check_image(image_path: str, shot_desc: str = "", cfg: dict = None,
             _prev_used = True
         if _prev_lines:
             prompt = prompt + "\n" + "\n".join(_prev_lines) + "\n"
+    if blocking_used:
+        prompt = prompt + build_blocking_note(len(ref_list))
     if ref_list:
-        prompt = prompt + build_ref_consistency_note(ref_list)
-    image_paths = [image_path] + [p for _l, p in ref_list]
+        prompt = prompt + build_ref_consistency_note(ref_list, start=3 if blocking_used else 2)
+    image_paths = [image_path]
+    if blocking_used:
+        image_paths.append(blocking_ref)
+    image_paths.extend(p for _l, p in ref_list)
     if _prev_used:
         # 上一镜画面追加在**最后**（顺序与 prompt 里「见随附的上一镜参考图」对应）
         image_paths.append(prev_shot_ref)
@@ -2003,6 +2119,9 @@ def check_image(image_path: str, shot_desc: str = "", cfg: dict = None,
     verdict = _apply_style_gate(verdict, style_norm)
     # 把「带了几张设定图」透出来，便于前端/体检确认该能力真的生效（而不是静默没带）
     verdict["ref_images_used"] = len(ref_list)
+    if blocking_used:
+        # 同上：透出「本镜确实带了 3D 构图基准图」，便于确认开关/渲染链路真的生效
+        verdict["blocking_ref_used"] = True
     if ref_list:
         verdict["ref_labels"] = [str(l)[:60] for l, _p in ref_list]
     # G9/O1 图片客观层（零模型依赖，与视频/音频客观层同构）：
@@ -2917,8 +3036,10 @@ def _validate_script_prompts(script: dict) -> list:
 
         if not visual_desc:
             issues.append(f"镜头 {shot_id} 缺少画面描述")
-        elif len(visual_desc) < 30:
-            issues.append(f"镜头 {shot_id} 画面描述过短（{len(visual_desc)}字），建议50字以上")
+        elif len(visual_desc) < 20:
+            issues.append(f"镜头 {shot_id} 画面描述过短（{len(visual_desc)}字），建议 20~80 字")
+        elif len(visual_desc) > 120:
+            issues.append(f"镜头 {shot_id} 画面描述过长（{len(visual_desc)}字），疑似背景铺陈堆砌，建议 ≤80 字且只写动作与构图")
 
     # 检查角色外貌描述（真实字段：appearance）
     for i, char in enumerate(script.get("characters", [])):
@@ -2931,6 +3052,191 @@ def _validate_script_prompts(script: dict) -> list:
             issues.append(f"角色 {char_name} 缺少外貌描述")
         elif len(appearance) < 20:
             issues.append(f"角色 {char_name} 外貌描述过短（{len(appearance)}字）")
+
+    return issues
+
+
+#: 描述/对白字数比上限（压缩提炼口径：剧情主要由台词+动作推进，画面描述只做必要补充）。
+#: 与 novel_to_script.REWRITE_RULES 的「description+visual_detail ≤ dialogue×3」同源，此处做客观复检。
+DESC_TO_DIALOGUE_RATIO_MAX = 3.0
+#: 对白驱动率下限：有台词的镜头占比低于该值，说明剧情靠画面铺陈推进、易退化成「背景描述流水账」。
+DIALOGUE_SHOT_RATIO_MIN = 0.40
+
+
+def _shot_dialogue_chars(shot: dict) -> int:
+    """统计单个镜头 dialogue 的合计字数（含 visual_detail 之外的画面补充不计入）"""
+    total = 0
+    dlg = shot.get("dialogue")
+    if isinstance(dlg, list):
+        for d in dlg:
+            if isinstance(d, dict):
+                total += len(str(d.get("text") or ""))
+            elif isinstance(d, str):
+                total += len(d)
+    elif isinstance(dlg, str):
+        total += len(dlg)
+    return total
+
+
+def _validate_script_bloat(script: dict) -> list:
+    """描述臃肿度 + 对白驱动率 客观校验（2026-09-27 新增，补「剧本一开始就偏」的漏检）
+
+    两条判据直击「视频一直说背景描述」的病根：
+    ① 描述臃肿度：全片 description+visual_detail 合计字数 vs dialogue 合计字数，
+       超过 DESC_TO_DIALOGUE_RATIO_MAX 倍说明画面描述压过台词、成片大概率变成背景复述；
+    ② 对白驱动率：有台词的镜头占比低于 DIALOGUE_SHOT_RATIO_MIN，
+       说明大量静态空镜、叙事靠画面铺陈而非人物互动。
+    """
+    issues = []
+    shots = [s for s in (script.get("shots") or []) if isinstance(s, dict)]
+    if not shots:
+        return issues
+
+    desc_chars = 0
+    dialogue_chars = 0
+    dialogue_shots = 0
+    for s in shots:
+        desc_chars += len(str(s.get("description") or ""))
+        desc_chars += len(str(s.get("visual_detail") or ""))
+        d = _shot_dialogue_chars(s)
+        dialogue_chars += d
+        if d > 0:
+            dialogue_shots += 1
+
+    # ① 描述臃肿度
+    if dialogue_chars > 0:
+        ratio = desc_chars / float(dialogue_chars)
+        if ratio > DESC_TO_DIALOGUE_RATIO_MAX:
+            issues.append(
+                f"描述臃肿：全片画面描述+细节 {desc_chars} 字 / 台词 {dialogue_chars} 字 "
+                f"= {ratio:.1f} 倍（> {DESC_TO_DIALOGUE_RATIO_MAX:g} 倍），"
+                f"剧情应由台词+动作驱动，请压缩画面描述、删纯背景铺陈")
+    elif desc_chars > 0:
+        issues.append("全片无台词：画面描述 {0} 字但没有任何 dialogue，"
+                      "成片会退化成纯背景解说/空镜流水账".format(desc_chars))
+
+    # ② 对白驱动率
+    ratio_shots = dialogue_shots / float(len(shots))
+    if ratio_shots < DIALOGUE_SHOT_RATIO_MIN:
+        issues.append(
+            f"对白驱动率过低：{dialogue_shots}/{len(shots)} 个镜头有台词（{ratio_shots*100:.0f}% < "
+            f"{DIALOGUE_SHOT_RATIO_MIN*100:.0f}%），静态空镜过多，观众流失，"
+            f"请把纯环境铺陈改成人物动作/台词推进")
+
+    return issues
+
+
+# ======================================================================
+# 92 镜拆解法「三层全吸收」→ 剧本质检侧软告警（2026-09-28 新增）
+#
+# 背景：写剧本层（novel_to_script.REWRITE_RULES 第 9/10 条 + edit_reason 字段）
+# 已按 92 镜短片的拆解口径约束了镜头语言克制 / 剪辑动机 / 视觉锚点道具回环。
+# 本组纯函数在**剧本质检**侧做同口径的客观复检，但全部走**软告警**：
+# 只写进 issues 提示，不命中 CRITICAL_ISSUE_KEYWORDS、不进 structure/logic
+# critical 桶、不直接判 pass=false —— 避免判官抖动与百分比分布误伤重画。
+#
+# 三层：
+#   ① edit_reason 覆盖率：镜头写了剪辑动机的占比，过低说明「为什么切」缺失；
+#   ② 镜头语言克制分布：固定机位占比下限 / 特写+全景占比上限（做情绪锚点，非主奏）；
+#   ③ 视觉锚点·道具回环：全片出现 ≥2 次的关键道具，其出现镜头是否在
+#      description 里落了「视觉锚点」标注或道具状态变化（位置/动作）。
+
+#: ① edit_reason 覆盖率下限：低于此值提示「剪辑动机缺失」。（样本 < 5 镜时跳过）
+EDIT_REASON_COVERAGE_MIN = 0.5
+#: ② 固定机位占比下限：92 镜参照 77% 固定，软告警阈值取 60%（克制口径，防运镜滥用）。
+LOCKED_OFF_RATIO_MIN = 0.6
+#: ② 特写+全景占比上限：参照 92 镜（特写 2 + 全景 3 = 5.4%），软告警阈值取 10%。
+ANCHOR_SHOT_RATIO_MAX = 0.10
+#: ③ 道具回环的最小出现次数：同一道具出现在 ≥ 该数镜头才认定「回环锚点」。
+PROP_RECURRENCE_MIN = 2
+
+
+def _shot_camera_kind(shot: dict) -> str:
+    """把镜头 camera 串归一成 {locked, anchor, other} 三档（景别+运镜克制分布用）。
+
+    判定顺序（先锚点特写/全景，再固定，其余算活动运镜）：
+    · camera 含「特写」或「全景」→ anchor（情绪锚点，参照 92 镜占比 ~5%）；
+    · 否则运镜部分含「固定」或「定格」，或 camera 本身只有景别无机位 → locked；
+    · 其余（推/拉/摇/手持/跟/环绕/升降…）→ other。
+    """
+    cam = str(shot.get("camera") or "").strip()
+    if not cam:
+        return "other"
+    if "特写" in cam or "全景" in cam:
+        return "anchor"
+    # 固定/定格 视为锁定机位（含「固定中景」「近景固定」等写法）
+    if "固定" in cam or "定格" in cam:
+        return "locked"
+    return "other"
+
+
+def _validate_script_92rules(script: dict) -> list:
+    """92 镜拆解法三层软告警（2026-09-28 新增，全部非 critical）。
+
+    返回的 issues 措辞刻意避开 CRITICAL_ISSUE_KEYWORDS（不用「错位/拼接/变形/崩坏」
+    等硬缺陷词），仅作为提示写进 check_script 的 objective issues（进 prompt_quality
+    维度扣分，但不触发 critical 短路），符合「软告警口径」。
+    """
+    issues = []
+    shots = [s for s in (script.get("shots") or []) if isinstance(s, dict)]
+    n = len(shots)
+    if n < 5:  # 样本太少，分布/覆盖率判据无统计意义，跳过全部三层
+        return issues
+
+    # ① edit_reason 覆盖率
+    with_reason = sum(
+        1 for s in shots if str(s.get("edit_reason") or "").strip())
+    coverage = with_reason / float(n)
+    if coverage < EDIT_REASON_COVERAGE_MIN:
+        issues.append(
+            f"剪辑动机缺失：仅 {with_reason}/{n} 镜写了 edit_reason（{coverage*100:.0f}% < "
+            f"{EDIT_REASON_COVERAGE_MIN*100:.0f}%）。建议按 92 镜口径给每镜补一句「为什么切到这一镜」"
+            f"的剪辑动机（15 字以内），作为构图与取舍依据")
+
+    # ② 镜头语言克制分布
+    kinds = [_shot_camera_kind(s) for s in shots]
+    locked_ratio = kinds.count("locked") / float(n)
+    anchor_ratio = kinds.count("anchor") / float(n)
+    if locked_ratio < LOCKED_OFF_RATIO_MIN:
+        issues.append(
+            f"运镜过于活跃：固定机位仅 {kinds.count('locked')}/{n} 镜"
+            f"（{locked_ratio*100:.0f}% < {LOCKED_OFF_RATIO_MIN*100:.0f}%）。"
+            f"按 92 镜口径运镜应以固定为主（~75%），推/拉/摇/手持/跟随仅在情绪递进或空间转换时用")
+    if anchor_ratio > ANCHOR_SHOT_RATIO_MAX:
+        issues.append(
+            f"特写/全景占比偏高：{kinds.count('anchor')}/{n} 镜"
+            f"（{anchor_ratio*100:.0f}% > {ANCHOR_SHOT_RATIO_MAX*100:.0f}%）。"
+            f"按 92 镜口径特写与全景只做情绪锚点（各 ≤3%），不宜作为主奏景别")
+
+    # ③ 视觉锚点·道具回环
+    from collections import Counter
+    prop_shots = Counter()
+    prop_shot_ids = {}
+    for s in shots:
+        sid = str(s.get("shot_id") or "")
+        for it in (s.get("items_in_shot") or []):
+            it_name = str(it or "").strip()
+            if it_name:
+                prop_shots[it_name] += 1
+                prop_shot_ids.setdefault(it_name, []).append(sid)
+    for prop, cnt in prop_shots.items():
+        if cnt < PROP_RECURRENCE_MIN:
+            continue
+        ids = [i for i in prop_shot_ids.get(prop, []) if i]
+        # 该道具出现的镜头，description 是否落了「视觉锚点」标注或道具名（状态变化）
+        marked = 0
+        for s in shots:
+            if str(s.get("shot_id") or "") in ids:
+                desc = str(s.get("description") or "")
+                if "视觉锚点" in desc or prop in desc:
+                    marked += 1
+        if marked == 0:
+            issues.append(
+                f"道具回环缺锚点：「{prop}」全片出现 {cnt} 次（镜头 "
+                f"{'/'.join(ids[:6])}{'…' if len(ids) > 6 else ''}）但没有任何镜头"
+                f" description 写明它的位置/状态变化，也没标「（视觉锚点·第N次）」。"
+                f"按 92 镜口径，反复出现的关键道具应作为跨镜头视觉锚点，"
+                f"在 description 里写道具的位置与状态变化（如「折叠/展开/递出/攥紧」）")
 
     return issues
 
@@ -2948,9 +3254,42 @@ SHOT_DURATION_MIN_OK = 3.0
 SHOT_DURATION_MAX_OK = 12.0
 SHOT_DURATION_TOLERANCE = 2.0     # 超出边界的容差（模型四舍五入 / 台词长度微调）
 
+#: 每集总时长的**产品口径容差**（2026-09-26 新增）。
+#: ⚠️ 上下文：产品口径是「每集 1-2 分钟，最长不超过 3 分钟」
+#: （`novel_to_script.EPISODE_MAX_SEC`=180）。本函数原来固定用 60 秒作默认目标、
+#: 容差 30%，这在旧口径（一集 1 分钟）下成立，但对新口径会**批量误报** ——
+#: 一集 175 秒（合法，在上限内）会被判「与目标 60 秒偏差 192%」。
+#:
+#: 处置：容差不按「相对目标值的百分比」，而按**是否落在产品允许区间内**判定：
+#:   下限 = `EPISODE_MIN_SEC`(60) - 本容差；上限 = `EPISODE_MAX_SEC`(180) + 本容差。
+#: 即 60 秒下限放宽到 50 秒、180 秒上限放宽到 190 秒，区间内一律不报。
+#: 本容差因此只兜「四舍五入/台词长度微调」级别的小幅越界，不做百分比缩放。
+EPISODE_DURATION_TOLERANCE = 10.0
 
-def _validate_script_feasibility(script: dict, target_duration: int = 60) -> list:
-    """验证可执行性（阈值与剧本生成端保持一致，见上方常量说明）"""
+
+def _episode_duration_bounds() -> tuple:
+    """每集时长的产品允许区间 `(lo, hi)`（秒），含容差。
+
+    从 `novel_to_script` 取口径常量（单一事实来源），取不到时退回
+    (60, 180) —— 与产品需求「1-2 分钟、最长 3 分钟」一致，**不静默放宽**。
+    """
+    try:
+        import novel_to_script as _nts
+        lo = float(getattr(_nts, "EPISODE_MIN_SEC", 60) or 60)
+        hi = float(getattr(_nts, "EPISODE_MAX_SEC", 180) or 180)
+    except Exception:  # noqa: BLE001 —— 常量不可读不许让质检崩，退回产品默认值
+        lo, hi = 60.0, 180.0
+    return (max(0.0, lo - EPISODE_DURATION_TOLERANCE),
+            hi + EPISODE_DURATION_TOLERANCE)
+
+
+def _validate_script_feasibility(script: dict, target_duration: int = None) -> list:
+    """验证可执行性（阈值与剧本生成端保持一致，见上方常量说明）
+
+    ⚠️ `target_duration` 默认 **None**（2026-09-26 起）：
+    空的语义 = 「按产品区间判」（60~180 秒，见 `_episode_duration_bounds`），
+    这是生产路径的默认。显式传正数才走旧的「相对偏差 ≤30%」判据。
+    """
     issues = []
 
     shots = script.get("shots", [])
@@ -2980,15 +3319,35 @@ def _validate_script_feasibility(script: dict, target_duration: int = 60) -> lis
             issues.append(f"镜头 {shot.get('shot_id', f'[{i}]')} 时长过长: {duration}秒"
                           f"（建议 {SHOT_DURATION_MIN_OK:g}~{SHOT_DURATION_MAX_OK:g} 秒）")
 
-    # 检查总时长偏差
-    if target_duration > 0 and shot_durations:
-        duration_diff = abs(total_duration - target_duration) / target_duration
-        if duration_diff > 0.3:  # 偏差超过30%
-            issues.append(f"总时长 {total_duration}秒 与目标 {target_duration}秒 偏差过大"
-                          f"（{duration_diff*100:.0f}%）")
+    # 检查总时长是否落在**产品允许区间**内（2026-09-26：由「相对 60 秒目标 ±30%」
+    # 改为「是否落在 [下限-容差, 上限+容差]」——见 EPISODE_DURATION_TOLERANCE 注释）。
+    #
+    # ⚠️ target_duration 的语义变更（重要）：
+    #   旧口径下它是「一集应有的总时长」（60 秒），判据是相对偏差 ≤30%。
+    #   新口径下「一集多长」是一个**区间**（60~180 秒，由拆集逻辑保证），单一目标值
+    #   不再成立。因此：
+    #     · target_duration 为 None / 0 / 空 → 走**区间判据**（新默认，也是生产路径）；
+    #     · 调用方**显式**传了一个正数 → 保留旧的相对偏差判据（不破坏显式调用与历史测试）。
+    #   生产路径（app.api_generate_script → check_script）本来就传 duration=60，
+    #   那正是旧默认值；改成 None 让区间判据生效，是本次口径切换的关键一步。
+    if shot_durations:
+        lo, hi = _episode_duration_bounds()
+        _explicit = bool(target_duration) and float(target_duration or 0) > 0
+        if _explicit:
+            # 调用方给了明确目标 → 沿用相对偏差判据（容差 30%，与改造前一致）
+            duration_diff = abs(total_duration - target_duration) / float(target_duration)
+            if duration_diff > 0.3:
+                issues.append(f"总时长 {total_duration}秒 与目标 {target_duration}秒 偏差过大"
+                              f"（{duration_diff*100:.0f}%）")
+        elif total_duration > hi:
+            issues.append(f"总时长 {total_duration}秒 超过单集上限 {hi:g} 秒"
+                          f"（产品口径：每集 1~2 分钟、最长 3 分钟）")
+        elif total_duration < lo:
+            issues.append(f"总时长 {total_duration}秒 低于单集下限 {lo:g} 秒"
+                          f"（产品口径：每集 1~2 分钟、最长 3 分钟）")
 
     # 镜头数量：只卡「少到无法叙事」的下限。不设上限 —— 原文越长镜头越多是设计目标
-    #（novel_to_script 按约 120 字/镜承载原文，实测单集可达 56 镜）。
+    #（novel_to_script 按实测约 36 字/镜承载原文，实测单集可达 63 镜）。
     if len(shots) < 3:
         issues.append(f"镜头数量过少（{len(shots)}个），建议至少 5 个镜头")
 
@@ -2996,7 +3355,7 @@ def _validate_script_feasibility(script: dict, target_duration: int = 60) -> lis
 
 
 def check_script(script_path: str = None, script_data: dict = None,
-                 style: str = "国漫古风", target_duration: int = 60,
+                 style: str = "国漫古风", target_duration: int = None,
                  cfg: dict = None, override: dict = None) -> dict:
     """剧本质检：结构+逻辑+风格+提示词质量+可执行性
     
@@ -3004,7 +3363,9 @@ def check_script(script_path: str = None, script_data: dict = None,
         script_path: 剧本文件路径（与script_data二选一）
         script_data: 剧本数据字典
         style: 指定创作风格
-        target_duration: 目标总时长（秒）
+        target_duration: 目标总时长（秒）。
+            ⚠️ 默认 None（2026-09-26 起）= 按**产品区间**判（每集 60~180 秒）。
+            显式传正数则按「与目标的相对偏差 ≤30%」判 —— 兼容历史调用与测试。
         cfg: 质检配置
         override: 临时覆盖配置
     
@@ -3050,11 +3411,15 @@ def check_script(script_path: str = None, script_data: dict = None,
     logic_issues = _validate_script_logic(script_data)
     style_issues = _validate_script_style(script_data, style)
     prompt_issues = _validate_script_prompts(script_data)
+    bloat_issues = _validate_script_bloat(script_data)
     feasibility_issues = _validate_script_feasibility(script_data, target_duration)
-    
+    # 92 镜拆解法三层软告警（2026-09-28）：镜头语言克制分布 / 剪辑动机覆盖率 /
+    # 道具回环锚点。全部非 critical，进 prompt_quality 桶软扣分，不短路判失败。
+    rhythm_issues = _validate_script_92rules(script_data)
+
     all_objective_issues = (
-        structure_issues + logic_issues + style_issues + 
-        prompt_issues + feasibility_issues
+        structure_issues + logic_issues + style_issues +
+        prompt_issues + bloat_issues + feasibility_issues + rhythm_issues
     )
     
     # 计算客观验证得分（每个问题扣5分，最低0分）
@@ -3074,7 +3439,8 @@ def check_script(script_path: str = None, script_data: dict = None,
                 "structure": max(0, 100 - len(structure_issues) * 10),
                 "logic": max(0, 100 - len(logic_issues) * 10),
                 "style": max(0, 100 - len(style_issues) * 5),
-                "prompt_quality": max(0, 100 - len(prompt_issues) * 5),
+                "prompt_quality": max(0, 100 - (len(prompt_issues) + len(bloat_issues)
+                                                + len(rhythm_issues)) * 5),
                 "feasibility": max(0, 100 - len(feasibility_issues) * 5)
             },
             "skipped": False,
@@ -3125,7 +3491,8 @@ def check_script(script_path: str = None, script_data: dict = None,
                 "structure": max(0, 100 - len(structure_issues) * 10),
                 "logic": max(0, 100 - len(logic_issues) * 10),
                 "style": max(0, 100 - len(style_issues) * 5),
-                "prompt_quality": max(0, 100 - len(prompt_issues) * 5),
+                "prompt_quality": max(0, 100 - (len(prompt_issues) + len(bloat_issues)
+                                                + len(rhythm_issues)) * 5),
                 "feasibility": max(0, 100 - len(feasibility_issues) * 5)
             },
             "skipped": False,
@@ -3147,7 +3514,8 @@ def check_script(script_path: str = None, script_data: dict = None,
         "structure": max(0, 100 - len(structure_issues) * 10),
         "logic": max(0, 100 - len(logic_issues) * 10),
         "style": max(0, 100 - len(style_issues) * 5),
-        "prompt_quality": max(0, 100 - len(prompt_issues) * 5),
+        "prompt_quality": max(0, 100 - (len(prompt_issues) + len(bloat_issues)
+                                        + len(rhythm_issues)) * 5),
         "feasibility": max(0, 100 - len(feasibility_issues) * 5)
     }
     
@@ -3192,6 +3560,7 @@ def check_script(script_path: str = None, script_data: dict = None,
             "logic": logic_issues,
             "style": style_issues,
             "prompt_quality": prompt_issues,
+            "bloat": bloat_issues,
             "feasibility": feasibility_issues
         }
     }

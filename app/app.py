@@ -82,6 +82,7 @@ import prompt_qc
 import qc_client
 import qc_coverage
 import style_kit
+import asset_prompt_kit
 import sheet_split
 import task_store
 import gpu_task_gate
@@ -2305,9 +2306,12 @@ def _storyboard_retry_shot_impl():
         (autopilot.get_plan(project) or {}).get("style"))
     if _rs_style:
         shot = dict(shot, style=(shot.get("style") or _rs_style))
-    # G19 同款兜底：风格串无画幅关键词时以默认 9:16 为底。本端点此前漏了这层兜底
-    # → size=None → 完全不覆写，画幅完全沿用模板/参考图，与批量 worker 口径不一致。
-    _rs_size = style_kit.aspect_size(style_kit.aspect_ratio(_rs_style) or style_kit.DEFAULT_RATIO)
+    # G19 同款兜底：风格串无画幅关键词时以默认画幅（2026-09-28 起为 16:9）为底。本端点
+    # 此前漏了这层兜底 → size=None → 完全不覆写，画幅完全沿用模板/参考图，与批量 worker
+    # 口径不一致。第二个实参 = 分镜图预算 0.8MP（画质提升，旧值 0.5）。
+    _rs_size = style_kit.aspect_size(
+        style_kit.aspect_ratio(_rs_style) or style_kit.DEFAULT_RATIO,
+        style_kit.storyboard_megapixels())
     prompt = comfyui_client.build_storyboard_prompt(shot, labels)
     refs = _unify_ref_canvas(refs, _rs_size, project)
     # ---- 提示词预检（生成前质检）：先判 → 确定性自愈 → 再出图 ----
@@ -2511,6 +2515,14 @@ def _video_retry_shot_impl():
     scene_refs = data.get('scene_refs') or []
     ref_imgs = _collect_reference_images(char_refs, scene_refs)
     main_char_img = _collect_reference_images(char_refs[:1], [])
+    # 2026-09-27「分镜 + 本镜资产」：构建角色/物品/场景索引，逐镜匹配。
+    _r_char_idx = _build_asset_index(char_refs, project, "character")
+    _r_item_idx = _build_asset_index(script.get("items") or [], project, "item")
+    _r_scene_idx = _build_asset_index(script.get("scenes") or [], project, "scene")
+    if scene_refs:
+        for _k, _v in _build_asset_index(scene_refs, project, "scene").items():
+            if _v.get("image"):
+                _r_scene_idx[_k] = _v
     # 参考图兜底：前端未传、或传了结构不完整的对象（例如直接传剧本 characters，
     # 只有 reference_prompt_zh 而无 front/base 键）时，从磁盘资产目录自动收集，
     # 避免「无角色锚点」的静默降级。
@@ -2539,12 +2551,53 @@ def _video_retry_shot_impl():
             return jsonify({"success": False,
                             "error": "缺少尾帧，请先执行关键帧生成（/api/keyframes/generate）"}), 400
         _seg_refs = [sb_local, end_p]
+        _r_char_refs, _r_item_refs, _r_scene_refs = char_refs, [], scene_refs
     else:
         if sb_local:
-            refs = [sb_local] + main_char_img
+            # 「分镜 + 本镜资产」：分镜图 + 本镜角色三视图 + 物品 + 场景
+            _r_matched = _match_shot_chars(shot, _r_char_idx)
+            _r_want_half = _framing_wants_half(shot.get("camera"))
+            _r_char_imgs, _r_char_refs = [], []
+            for _mc in (_r_matched or []):
+                _p = _pick_char_view(_r_char_idx.get(_mc) or {}, _r_want_half)
+                if _p and _p not in _r_char_imgs:
+                    _r_char_imgs.append(_p)
+                    _e = _r_char_idx.get(_mc) or {}
+                    _r_char_refs.append({"name": _mc,
+                                         "appearance": _e.get("appearance")
+                                         or _e.get("description") or ""})
+            _r_item_imgs, _r_item_refs = [], []
+            for _it in [n for n in (shot.get("items_in_shot") or [])
+                        if n in _r_item_idx]:
+                _p = (_r_item_idx.get(_it) or {}).get("image")
+                if _p and _p not in _r_item_imgs and _p not in _r_char_imgs:
+                    _r_item_imgs.append(_p)
+                    _e = _r_item_idx.get(_it) or {}
+                    _r_item_refs.append({"name": _it,
+                                         "appearance": _e.get("appearance")
+                                         or _e.get("description") or ""})
+            _r_loc = shot.get("location")
+            _r_scene_img = ((_r_scene_idx.get(_r_loc) or {}).get("image")
+                            if _r_loc in _r_scene_idx else None)
+            _r_scene_refs = ([{"name": _r_loc, "appearance": ""}]
+                             if _r_scene_img else [])
+            _seg_refs = [sb_local] + _r_char_imgs + _r_item_imgs + \
+                ([_r_scene_img] if _r_scene_img else [])
+            if not _r_char_imgs:
+                _seg_refs = [sb_local] + main_char_img
+                _r_char_refs = char_refs[:1] if char_refs else []
+            # 9 张上限（与 builder MAX_REFERENCE_IMAGES=9 一致）
+            if len(_seg_refs) > 9:
+                _seg_refs = _seg_refs[:9]
+                _rk = 9 - 1
+                _r_char_refs = _r_char_refs[:_rk]
+                _rk -= len(_r_char_refs)
+                _r_item_refs = _r_item_refs[:_rk] if _rk > 0 else []
+                _rk -= len(_r_item_refs)
+                _r_scene_refs = _r_scene_refs[:_rk] if _rk > 0 else []
         else:
-            refs = ref_imgs
-        _seg_refs = refs
+            _seg_refs = ref_imgs
+            _r_char_refs, _r_item_refs, _r_scene_refs = char_refs, [], scene_refs
     try:
         dur = float(shot.get('duration') or 5)
     except (TypeError, ValueError):
@@ -2560,15 +2613,18 @@ def _video_retry_shot_impl():
     for _rsi, _rsub in enumerate(_rs_sub_shots):
         if mode == 'keyframe':
             _rp = comfyui_client._build_h3_prompt(
-                _rsub, char_refs, scene_refs, storyboard_ref={"name": f"shot_{seq}"})
+                _rsub, _r_char_refs, _r_scene_refs,
+                storyboard_ref={"name": f"shot_{seq}"}, item_refs=_r_item_refs)
         elif sb_local:
             _rp = comfyui_client._build_h3_prompt(
-                _rsub, char_refs, scene_refs, storyboard_ref={"name": f"shot_{seq}"})
+                _rsub, _r_char_refs, _r_scene_refs,
+                storyboard_ref={"name": f"shot_{seq}"}, item_refs=_r_item_refs)
         else:
             # 择优：既有 prompt_h3 结构合规才采用，否则用规范构建器重建
             # （历史缺陷：`shot.get('prompt_h3') or _build_h3_prompt(...)` 让
             #  剧本里那句无参考图标签的裸英文把结构化提示词整个顶掉）
-            _rp = comfyui_client.resolve_h3_prompt(_rsub, char_refs, scene_refs)
+            _rp = comfyui_client.resolve_h3_prompt(
+                _rsub, _r_char_refs, _r_scene_refs, item_refs=_r_item_refs)
         _rsuf = (f"_{chr(ord('a') + _rsi)}"
                  if len(_rs_sub_shots) > 1 and _rsi < 26 else "")
         _rs_segs.append({"prompt": _rp,
@@ -2988,6 +3044,14 @@ def _generate_asset_task(task_id: str, assets: list, asset_type: str, project_na
                         continue
             
                 prompt_zh = asset.get('reference_prompt_zh', asset.get('prompt_zh', asset.get('appearance', '')))
+                if asset_type == 'character':
+                    # 不变量（2026-09-28）：qc_desc 里说「性别：X」，出图 prompt 里就必须有 X。
+                    # reference_prompt_zh 为空时 canon 条款无处可落（ensure_canon_clause 对空
+                    # zh 直接返回 False）→ 不在生成入口兜底就会出现「生成侧零性别约束、质检侧
+                    # 按性别判」的反复重画。放在这里（而不是 qc_desc 之后）是为了让
+                    # orig_asset_prompt（重试基准 + 教训库 key）也带上性别，否则每次重试
+                    # 都会把 prompt 复原成无性别版本。
+                    prompt_zh = asset_prompt_kit.ensure_prompt_gender(prompt_zh, asset)
 
                 with lock:
                     generation_state[task_id].update({
@@ -3000,7 +3064,7 @@ def _generate_asset_task(task_id: str, assets: list, asset_type: str, project_na
                 scratch_dir = os.path.join(scratch_root, f"{asset_type}_{name}")
                 os.makedirs(scratch_dir, exist_ok=True)
                 _qc_prune_attempts(scratch_dir)   # G8③：清理上一轮遗留的过期 try（只留最近 4）
-                qc_desc = f"资产类型：{asset_type}；资产名称：{name}；资产设定：{str(prompt_zh)[:400]}"
+                _g_hint = asset_prompt_kit.gender_hint(asset); qc_desc = f"资产类型：{asset_type}；资产名称：{name}；{(_g_hint + '；') if _g_hint else ''}资产设定：{str(prompt_zh)[:400]}"
 
                 # ---------- 阶段1：基础图（生成 → 质检 → 重生成 → 阻断判定） ----------
                 base_dst = os.path.join(asset_dir, "base.png")
@@ -3859,8 +3923,10 @@ def _storyboard_worker(task_id: str, project_name: str, shots: list,
     _sb_sub = (f"ep{int(_sb_ep):02d}/" if int(_sb_ep) > 1 else "")
     _sb_url_base = f"/api/storyboards/file/{project_name}/{_sb_sub}"
     # 风格/画幅：整批分镜共用
-    # G19：风格串未含画幅关键词时以默认 9:16 为底，不再静默回落模板 16:9
-    _sb_style_res = style_kit.resolve(style, default_ratio=style_kit.DEFAULT_RATIO)
+    # G19：风格串未含画幅关键词时以默认画幅（2026-09-28 起为 16:9）为底，
+    #      不再静默回落模板尺寸。megapixels：分镜图预算 0.8MP（画质提升，旧值 0.5）。
+    _sb_style_res = style_kit.resolve(style, default_ratio=style_kit.DEFAULT_RATIO,
+                                      megapixels=style_kit.storyboard_megapixels())
     _sb_style = _sb_style_res["style"]
     _sb_size = _sb_style_res["size"]
     if _sb_style:
@@ -4282,6 +4348,24 @@ def _project_style(project_name: str = "") -> str:
         except Exception as e:  # noqa: BLE001
             app.logger.warning(f"读取项目 config.style/aspect_ratio 失败（忽略）：{e}")
             brief = ""
+    # 2026-09-28 修复（「建项目时选的画面比例」必须真正生效）：
+    # 三级兜底顺序**完全不变**，但「拼画幅」不再只发生在第三级 —— 只要最终 brief 里
+    # **还没有任何画幅信息**（style_kit.aspect_ratio(brief) is None），且项目
+    # config.aspect_ratio 非空，就统一补一句「画面比例：<ar>」。这样 plan.json / AI
+    # 设定面板有 style（正常情况恒成立）时，用户在「新建项目」里手选的比例也能落到
+    # 视频 / 分镜画布（两链路的 style_kit.resolve 都能解析这句）。
+    # ⚠️ 硬约束：brief **已带**画幅（关键词或显式 a:b）时绝不覆盖 —— 显式意图优先。
+    # 读 config 失败 fail-open：沿用原 brief、只告警不抛。
+    if not style_kit.aspect_ratio(brief):
+        try:
+            _rec = project_store.get_project(proj)
+            if _rec:
+                _ar = str(project_store.read_config(_rec["dir_key"]).get("aspect_ratio")
+                          or "").strip()
+                if _ar:
+                    brief = f"{brief}，画面比例：{_ar}" if brief else f"画面比例：{_ar}"
+        except Exception as e:  # noqa: BLE001
+            app.logger.warning(f"补齐项目画面比例失败（忽略）：{e}")
     return style_kit.normalize_style(brief)
 
 
@@ -4566,6 +4650,31 @@ def api_generate_videos():
     chain_mode = keyframe.norm_chain_mode(
         data.get('chain_mode') or KEYFRAME_CHAIN_MODE)
 
+    # 集号：作为入口幂等键的一部分（见下），也写进 generation_state 供状态回显。
+    # 裸 int(episode_no) 会抛 —— 历史前端可能传 "" / null / "2"，统一走 _ep_of_script 同口径的容错。
+    # ⚠️ 提前到这里解析：空 shots 时要用它读剧本兜底，后面幂等键 / 状态 / worker 全部复用同一个值。
+    _vid_ep = data.get('episode_no')
+    try:
+        _vid_ep = int(_vid_ep) if str(_vid_ep or "").strip() else 1
+    except (TypeError, ValueError):
+        _vid_ep = 1
+
+    # ⚠️ 2026-09-28 修复：前端「整集生成视频」按钮（工程台 handleGenerateEpisode）只发
+    #    {project_name, episode_no}，从不带 shots —— 旧代码在此直接 400「没有镜头数据」，
+    #    按钮永久失败（client.ts 注释承诺的「后端按剧本兜底」从未实现）。
+    #    现在：shots 为空时按本集剧本兜底（剧本里的 shots 就是生成视频所需的镜头表）。
+    #    ⚠️ 兜底只发生在空 shots 时，有 shots 的调用路径（流水线 / 单镜重跑）行为**完全不变**。
+    if not shots:
+        _scr_fb = _load_script_for(project_name, _vid_ep)
+        if not isinstance(_scr_fb, dict):
+            _scr_fb = {}
+        shots = _scr_fb.get("shots") or []
+        # 参考图同理兜底：只在调用方没显式传时补剧本里已判定的角色 / 场景。
+        # （物品的权威来源是剧本、由 _video_generate_worker_body 自行兜底；此处不覆盖显式传参）
+        if not character_refs:
+            character_refs = _scr_fb.get("characters") or []
+        if not scene_refs:
+            scene_refs = _scr_fb.get("scenes") or []
     if not shots:
         return jsonify({"error": "没有镜头数据"}), 400
     _g = _style_aspect_guard(project_name)
@@ -4576,13 +4685,6 @@ def api_generate_videos():
     episode_stats = _episode_schema_defaults(project_name, shots)
 
     task_id = f"video_{project_name}_{uuid.uuid4().hex[:12]}"
-    # 集号：作为入口幂等键的一部分（见下），也写进 generation_state 供状态回显。
-    # 裸 int(episode_no) 会抛 —— 历史前端可能传 "" / null / "2"，统一走 _ep_of_script 同口径的容错。
-    _vid_ep = data.get('episode_no')
-    try:
-        _vid_ep = int(_vid_ep) if str(_vid_ep or "").strip() else 1
-    except (TypeError, ValueError):
-        _vid_ep = 1
     with lock:
         # G5 + B-11 P1-8：同项目**同集**已有 running 的视频任务 → 复用。
         # ⚠️ 修复（2026-09-25）：旧键只匹配 project_name + step=="video"，**不含集号** ——
@@ -4731,8 +4833,13 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
     """视频生成的实际业务体（外壳见 :func:`_video_generate_worker`，负责注册中止信号）"""
     try:
         # 风格/画幅：整集共用一次解析
-        # G19：风格串未含画幅关键词时以默认 9:16 为底，不再静默回落模板 16:9
-        _style_res = style_kit.resolve(style, default_ratio=style_kit.DEFAULT_RATIO)
+        # G19：风格串未含画幅关键词时以默认画幅（2026-09-28 起为 16:9）为底，
+        #      不再静默回落模板尺寸。megapixels：视频预算走 video_megapixels()
+        #      —— 让 MJSCXT_VIDEO_MEGAPIXELS 真正生效（8GB 卡的 0.4 应急档）。
+        #      默认 0.5 与 aspect_size 的默认值**完全等价**（16:9→960×544、
+        #      9:16→544×960），故本行不改变既有行为。
+        _style_res = style_kit.resolve(style, default_ratio=style_kit.DEFAULT_RATIO,
+                                       megapixels=style_kit.video_megapixels())
         _size = _style_res.get("size")
         if style:
             app.logger.info("[视频] 风格=%s；画幅=%s", _style_res.get("style") or style,
@@ -4757,6 +4864,17 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
 
         # B-18 P1-7：构建角色索引，供 _shot_segment 逐镜匹配参考图（与分镜链路口径对齐）
         char_idx = _build_asset_index(character_refs, project_name, "character")
+        # 2026-09-27 扩展：物品/场景索引也逐镜匹配（「分镜+本镜资产」参考图策略）。
+        # 前端 video 接口未传 items/scenes 时，从剧本兜底读取（含 characters/items/scenes）。
+        _scr = _load_script_for(project_name, episode_no) or {}
+        item_idx = _build_asset_index((_scr.get("items") or []), project_name, "item")
+        scene_idx = _build_asset_index((_scr.get("scenes") or []), project_name, "scene")
+        # 前端显式传来的 scene_refs 优先（可能带 URL/本地路径，比剧本兜底更准）
+        if scene_refs:
+            _scene_idx_explicit = _build_asset_index(scene_refs, project_name, "scene")
+            for _k, _v in _scene_idx_explicit.items():
+                if _v.get("image"):
+                    scene_idx[_k] = _v
 
         # 分镜图映射（步骤5产物）→ 作为 H3 的 <Picture 1> 构图基准
         # 修复：改用合并式映射（目录扫描 + manifest + 前端传入）。
@@ -4806,6 +4924,10 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
             """
             sid = shot.get('shot_id')
             sb_local = sb_map.get(_norm_shot_key(sid)) if use_storyboard else None
+            # 按镜匹配的参考图 refs（供提示词构建），非 sb_local 分支默认走全局 refs
+            _shot_char_refs = character_refs
+            _shot_item_refs = []
+            _shot_scene_refs = scene_refs
             if mode == 'keyframe' and sb_local:
                 sb_local = sb_map.get(_norm_shot_key(seq)) or sb_map.get(
                     f"shot_{seq:02d}") or sb_local
@@ -4815,20 +4937,63 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
                 end_p = kf_end_map.get(str(sid)) or kf_end_map.get(f"shot_{seq:02d}")
                 refs = [start_p] + ([end_p] if end_p else [])
             elif sb_local:
-                # B-18 P1-7：参考图按 characters_in_shot 逐镜匹配，不再全段共用 main_char_img
-                # H3 参考图上限 2 张：[分镜图, 本镜主角锚点]
+                # 2026-09-27「分镜 + 本镜资产」参考图策略：分镜图(构图基准) +
+                # 本镜出场角色三视图(每人一张) + 本镜物品 + 场景图。
+                # H3 Director 每段最多 9 张（ref_image_0..8），去掉旧的「上限 2 张」保守限制。
                 _matched_chars = _match_shot_chars(shot, char_idx)
-                _shot_char_img = None
+                # 本镜角色参考图（每人一张，景别对档取半身/全身）
+                _want_half = _framing_wants_half(shot.get("camera"))
+                _shot_char_imgs = []
+                _shot_char_refs = []      # 供提示词构建（含 name/appearance）
                 for _mc in (_matched_chars or []):
-                    _p = (char_idx.get(_mc) or {}).get("image")
-                    if _p:
-                        _shot_char_img = _p
-                        break
-                if _shot_char_img:
-                    refs = [sb_local, _shot_char_img]
-                else:
-                    # 兜底：逐镜匹配失败时回退到全局主角锚点（保持原行为）
+                    _p = _pick_char_view(char_idx.get(_mc) or {}, _want_half)
+                    if _p and _p not in _shot_char_imgs:
+                        _shot_char_imgs.append(_p)
+                        _entry = char_idx.get(_mc) or {}
+                        _shot_char_refs.append({
+                            "name": _mc,
+                            "appearance": _entry.get("appearance")
+                            or _entry.get("description") or ""})
+                # 本镜物品参考图
+                _items_in = [n for n in (shot.get("items_in_shot") or [])
+                             if n in item_idx]
+                _shot_item_imgs = []
+                _shot_item_refs = []
+                for _it in _items_in:
+                    _p = (item_idx.get(_it) or {}).get("image")
+                    if _p and _p not in _shot_item_imgs and _p not in _shot_char_imgs:
+                        _shot_item_imgs.append(_p)
+                        _entry = item_idx.get(_it) or {}
+                        _shot_item_refs.append({
+                            "name": _it,
+                            "appearance": _entry.get("appearance")
+                            or _entry.get("description") or ""})
+                # 场景参考图
+                _loc = shot.get("location")
+                _scene_entry = scene_idx.get(_loc) if _loc in scene_idx else None
+                _scene_img = (_scene_entry or {}).get("image") if _scene_entry else None
+                _shot_scene_refs = ([{"name": _loc, "appearance": ""}]
+                                    if _scene_img else [])
+                refs = [sb_local] + _shot_char_imgs + _shot_item_imgs + \
+                    ([_scene_img] if _scene_img else [])
+                if not _shot_char_imgs:
+                    # 兜底：逐镜角色匹配失败时回退到全局主角锚点（保持原行为）
                     refs = [sb_local] + main_char_img
+                    _shot_char_refs = (character_refs[:1]
+                                       if character_refs else [])
+                # ⭐ 9 张上限：H3 Director 每段 ref_image_0..8（与
+                # h3_director_builder.MAX_REFERENCE_IMAGES=9 保持一致）。超出时按
+                # 「角色→物品→场景」优先级截断（分镜图恒保留），并同步截断提示词的
+                # char/item/scene refs，避免「提示词声明的 <Picture N> > 实际传入的图」错位。
+                _max_refs = 9
+                if len(refs) > _max_refs:
+                    refs = refs[:_max_refs]
+                    _kept = _max_refs - 1  # 分镜图占 1 张
+                    _shot_char_refs = _shot_char_refs[:_kept]
+                    _kept -= len(_shot_char_refs)
+                    _shot_item_refs = _shot_item_refs[:_kept] if _kept > 0 else []
+                    _kept -= len(_shot_item_refs)
+                    _shot_scene_refs = _shot_scene_refs[:_kept] if _kept > 0 else []
             else:
                 refs = ref_imgs
             try:
@@ -4853,15 +5018,18 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
                 # 提示词按子段重建（keyframe / reference 两条参考图分支共用同一构建入口）
                 if mode == 'keyframe' and sb_local:
                     _sub_prompt = comfyui_client._build_h3_prompt(
-                        _sub, character_refs, scene_refs,
-                        storyboard_ref={"name": f"shot_{sid}"})
+                        _sub, _shot_char_refs, _shot_scene_refs,
+                        storyboard_ref={"name": f"shot_{sid}"},
+                        item_refs=_shot_item_refs)
                 elif sb_local:
                     _sub_prompt = comfyui_client._build_h3_prompt(
-                        _sub, character_refs, scene_refs,
-                        storyboard_ref={"name": f"shot_{sid}"})
+                        _sub, _shot_char_refs, _shot_scene_refs,
+                        storyboard_ref={"name": f"shot_{sid}"},
+                        item_refs=_shot_item_refs)
                 else:
                     _sub_prompt = comfyui_client.resolve_h3_prompt(
-                        _sub, character_refs, scene_refs)
+                        _sub, _shot_char_refs, _shot_scene_refs,
+                        item_refs=_shot_item_refs)
                 # ---- 提示词预检（生成前质检）----
                 # ⚠️ 这里**只自愈 + 记录，不阻断**：整集模式一次提交 N 段，为一条提示词的问题把
                 #    整集生成打断，代价远大于收益；且 H3 提示词由构建器产出、结构必然齐全，
@@ -4887,7 +5055,6 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
                     app.logger.warning("镜头 %s 视频提示词预检未通过（%s）：%s",
                                        shot.get("shot_id"), _pgate_seg.get("label"),
                                        _pgate_seg.get("reason"))
-            seg = _segs[0]
             if _multi_seg:
                 app.logger.info(
                     "[长镜切段] project=%s shot=%s %ss → %d 段 %s（每段 ≤%ss，总时长守恒）",
@@ -4904,7 +5071,11 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
                                           reason=f"视频提示词预检未通过（{_pgate_seg.get('label')}）")
                 except Exception as _pe:  # noqa: BLE001
                     app.logger.warning(f"不合格提示词清理失败（忽略）：{_pe}")
-            return seg, sb_local
+            # ⚠️ 必须返回**列表**：长镜切段后一个分镜可能产出 N 个子段（见上方 _segs）。
+            #    两个调用方（episode / per_shot）都用 isinstance(seg, list) 兼容单段，
+            #    故单段场景零行为变更。旧写法 `return _segs[0]` 会把切段结果砍成 1 段，
+            #    导致整集只生成每镜的第 1 个子段（实测第 2 集 7 段 562 帧，应为 18 段 1450 帧）。
+            return _segs, sb_local
 
         # ---------- 模式 episode：整集 N 段一次生成（H3 原生衔接）+ 整片 QC 门控 ----------
         if mode == 'episode':
@@ -5673,6 +5844,8 @@ def api_watermark_file(filename):
                        as_attachment=request.args.get('download') == '1')
 
 
+
+
 # ===== 视频超分（FlashVSR 真实实现，成片/片段 → 高分辨率） =====
 
 upscale_tasks = {}
@@ -6061,6 +6234,7 @@ def api_upscale_file(filename):
     """提供超分产物访问（支持 Range 拖动进度条与下载）"""
     return _serve_safe(UPSCALE_DIR, filename, conditional=True,
                       as_attachment=request.args.get('download') == '1')
+
 
 
 @app.route('/api/script/fallback', methods=['POST'])

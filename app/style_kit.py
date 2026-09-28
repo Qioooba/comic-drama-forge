@@ -29,6 +29,7 @@
 from __future__ import annotations
 
 import math
+import os
 import re
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -99,10 +100,64 @@ _KEYWORD_RATIO: Sequence[Tuple[str, Tuple[int, int]]] = (
     ("ultrawide", (21, 9)),
 )
 
-#: 默认画幅：漫剧短视频主形态为竖屏 9:16（抖音/视频号）。
-#: G19 修复：风格串未含画幅关键词时，各生成入口以本值为底，
+#: 默认画幅：**2026-09-28 用户要求默认改横屏 16:9**（对标参考作品即 16:9），
+#: 由原竖屏 9:16（漫剧短视频主形态，抖音/视频号）翻转而来。
+#: ⚠️ 显式比例「a:b」与「竖屏/横屏」等关键词仍**优先于**本默认值，
+#:    :func:`aspect_ratio` 的解析语义未变 —— 本值只在风格串未含任何画幅信息时兜底。
+#: G19 修复（历史）：风格串未含画幅关键词时，各生成入口以本值为底，
 #: 不再静默回落工作流模板里写死的 16:9 尺寸。
-DEFAULT_RATIO: Tuple[int, int] = (9, 16)
+DEFAULT_RATIO: Tuple[int, int] = (16, 9)
+
+#: 视频画幅的**像素预算**兜底（MP）。⚠️ 这不是审美参数，是显存预算。
+#: 默认 **0.5**：16:9 → 960×544，9:16 → 544×960。
+#: H3 Director 模板自带的 output 配置就是 ``megapixels=0.4``（864×480）。
+#: 2026-09-27 实测（RTX 5060 Laptop 8GB）：544×960 + 2 段 146 帧的 Director
+#: 任务在「模型初始化」阶段**可复现崩溃**（fresh 进程也一样）：
+#:   Fatal Python error: Aborted / Windows fatal exception: code 0x80000003
+#: 栈恒落在 SolAttn 的 ``_morton_h3.py:135``（该行是 ``finally:`` 里的
+#: ``model._sol_morton_state = None`` —— 制造 abort 的是 comfy_aimdo 的分配
+#: 失败，这一帧只是最后碰到的 Python 语句，属噪音）。
+#: 8GB 卡已知**可跑通**的档位是 **0.4**（864×480，与 H3 模板自带 output 同档）；
+#: 需要时覆盖：``MJSCXT_VIDEO_MEGAPIXELS=0.4``（只在视频链路消费，见
+#: :func:`video_megapixels`；分镜 / 资产链路的 :func:`resolve` 行为不变）。
+#: ⚠️ 2026-09-28 默认画幅由 9:16 翻转为 16:9 后，**竖屏尺寸**仅当项目/风格串
+#: 显式声明 9:16 时才会出现（本注释里 544×960 / 864×480 的尺寸即属此列）。
+VIDEO_MEGAPIXELS_DEFAULT: float = 0.5
+
+#: 分镜图的画幅像素预算（MP）。2026-09-28 画质提升：0.5 → 0.8。
+#: 依据：分镜图分辨率是**全链路画质天花板** —— 分镜模板 `分镜生成_Qwen21.json`
+#: 没有尺寸节点，输出画幅完全由 _unify_ref_canvas 把参考图 cover 到这个尺寸决定。
+#: 当年压到 0.5MP 是为规避 H3 竖屏崩溃，而该崩溃真因是 SolAttn morton 组合（已解决）
+#: → 预算可以恢复。env MJSCXT_STORYBOARD_MEGAPIXELS 可覆盖。
+STORYBOARD_MEGAPIXELS_DEFAULT: float = 0.8
+
+
+def storyboard_megapixels() -> float:
+    """分镜链路画幅像素预算（MP）：env ``MJSCXT_STORYBOARD_MEGAPIXELS`` 优先。
+
+    非法 / 越界一律回落 :data:`STORYBOARD_MEGAPIXELS_DEFAULT`（不抛异常：
+    这是显存调优参数，读错不该让整集分镜生成挂掉）。
+    """
+    raw = str(os.environ.get("MJSCXT_STORYBOARD_MEGAPIXELS") or "").strip()
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return STORYBOARD_MEGAPIXELS_DEFAULT
+    return val if 0.05 <= val <= 4.0 else STORYBOARD_MEGAPIXELS_DEFAULT
+
+
+def video_megapixels() -> float:
+    """视频链路的画幅像素预算（MP）：env ``MJSCXT_VIDEO_MEGAPIXELS`` 优先。
+
+    越界 / 非法值一律回落 :data:`VIDEO_MEGAPIXELS_DEFAULT`（不抛异常：
+    这是显存调优参数，读错不该让整集生产挂掉）。
+    """
+    raw = str(os.environ.get("MJSCXT_VIDEO_MEGAPIXELS") or "").strip()
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return VIDEO_MEGAPIXELS_DEFAULT
+    return val if 0.05 <= val <= 4.0 else VIDEO_MEGAPIXELS_DEFAULT
 
 # --------------------------------------------------------------------------- #
 # 资产内置画幅（2026-09-22 需求：参考资产图的画幅**写死**，不跟随视频比例）
@@ -733,12 +788,18 @@ def _collapse_style(text: str, style) -> str:
 # 便捷组合
 # --------------------------------------------------------------------------- #
 
-def resolve(style, *, default_ratio: Optional[Tuple[int, int]] = None
-            ) -> Dict[str, object]:
-    """一次拿到风格落地所需的全部派生值（供各生成入口统一调用）"""
+def resolve(style, *, default_ratio: Optional[Tuple[int, int]] = None,
+            megapixels: Optional[float] = None) -> Dict[str, object]:
+    """一次拿到风格落地所需的全部派生值（供各生成入口统一调用）
+
+    ``megapixels``：画幅像素预算（MP）。``None`` 时沿用 ``aspect_size`` 的
+    默认 0.5（**行为与历史一致**）；视频链路显式传
+    :func:`video_megapixels` 以便按机器显存调档。
+    """
     norm = normalize_style(style)
     ratio = aspect_ratio(norm) or default_ratio
-    size = aspect_size(ratio)
+    size = (aspect_size(ratio, megapixels) if megapixels is not None
+            else aspect_size(ratio))
     return {
         "style": norm,
         "tokens": style_tokens(norm),

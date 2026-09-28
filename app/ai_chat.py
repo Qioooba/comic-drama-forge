@@ -71,7 +71,12 @@ SETTING_FIELDS = [
     {"key": "aspect_ratio", "label": "画面比例", "hint": "成片画幅",
      "options": ["1:1 方形", "2:3 竖幅", "3:2 横幅", "3:4 竖幅", "4:3 横幅",
                  "9:16 竖屏", "16:9 横屏", "21:9 超宽"]},
-    {"key": "episode_duration", "label": "单集时长", "hint": "每集大致时长", "options": ["60 秒", "90 秒", "2 分钟", "3 分钟"]},
+    # ⚠️ 2026-09-26 口径变更：每集时长改为「1~2 分钟、最长 3 分钟」的产品区间
+    #（见 novel_to_script.EPISODE_MAX_SEC / EPISODE_TARGET_SEC）。选项同步为区间内取值，
+    # 默认推荐值 90 秒（1.5 分钟）。集数不再由用户指定，而由章节内容自动拆分。
+    {"key": "episode_duration", "label": "单集时长",
+     "hint": "每集大致时长（1~2 分钟，最长 3 分钟；集数由章节内容自动拆分）",
+     "options": ["60 秒", "90 秒", "2 分钟"]},
     {"key": "shots_per_episode", "label": "单集镜头数", "hint": "每集分镜数量", "options": ["8 个", "10 个", "12 个", "16 个"]},
     {"key": "pacing", "label": "分镜节奏", "hint": "镜头切换与叙事节奏", "options": ["快节奏卡点", "平缓叙事", "张弛有度"]},
     {"key": "color_palette", "label": "色彩倾向", "hint": "主色调倾向", "options": ["高饱和明快", "低饱和冷调", "暖色调复古", "黑白+点缀色"]},
