@@ -85,6 +85,7 @@
 | 持久化任务队列 | `app/task_store.py` | SQLite（`output/tasks.db`）+ 单元级进度 + 串行队列；启动自动 `recycle_interrupted()` |
 | 断点续跑 | `is_unit_done` / `filter_pending_units` | 判据以**磁盘产物**为准——产物存在且非空即视为完成，状态表丢失也能正确跳过 |
 | 统一环境加载 | `app/env_loader.py` | 任一模块单独导入（不经过 `config`）也能读到 `.env`，避免「换入口就丢密钥」 |
+| 依赖自检（模型 + 插件） | `app/deps_check.py` + `GET /api/deps/check` | 自动核查 ComfyUI 侧**插件节点**（`custom_nodes/` 里 6 个包，映射自 `docs/依赖清单.md`）与**模型权重**（`models/` 下 H3 + QwenImage2.1 全链路文件）是否齐备。双通道：在线拉 `/object_info` 以「节点是否注册」为准；离线/强制离线则退化为扫描本地 `custom_nodes/` 目录名并标注「不可靠」。只读、绝不阻断，返回 `comfyui / plugins / models / workflows / summary` 结构化结果，缺什么一目了然 |
 
 ### 质量与一致性
 
@@ -225,10 +226,10 @@ output/
 | 步骤 | 功能 | 技术 | 工作流模板 |
 |------|------|------|-----------|
 | 1. 剧本生成 | 主题 → 结构化 JSON（角色/物品/场景/镜头） | 文本分析模型（OpenAI 兼容·任意厂商） | — |
-| 2. 角色资产 | 基础图 + 多视图（正/左/右/背） | QwenImage2.1 + Qwen-Edit | 角色生成.json + 分镜生成.json |
-| 3. 物品资产 | 基础图 + 3D多视角（正/左45/右45/俯视） | QwenImage2.1 + Qwen-Edit | 物品生成.json + 分镜生成.json |
-| 4. 场景资产 | 基础图 + 3D多视角（正/左45/右45/俯视） | QwenImage2.1 + Qwen-Edit | 场景生成.json + 分镜生成.json |
-| 5. 视频生成 | 10段无缝视频 + 原生音频 | MiniMax H3 (Ref2VA) + Turbo LoRA | H3信号10段测试001.json |
+| 2. 角色资产 | 基础图 + 多视图（正/左/右/背） | QwenImage2.1 + TE-Speed | 角色生成_Qwen21.json + 分镜生成_Qwen21.json |
+| 3. 物品资产 | 基础图 + 3D多视角（正/左45/右45/俯视） | QwenImage2.1 + TE-Speed | 物品生成_Qwen21.json + 分镜生成_Qwen21.json |
+| 4. 场景资产 | 基础图 + 3D多视角（正/左45/右45/俯视） | QwenImage2.1 + TE-Speed | 场景生成_Qwen21.json + 分镜生成_Qwen21.json |
+| 5. 视频生成 | 动态段数无缝视频 + 原生音频 | MiniMax H3 Director（Ref2VA） | minimax_h3_director_二采_加速.json |
 | 6. 成片输出 | 合并 + 字幕 | FFmpeg | — |
 
 ## 📝 剧本 JSON 格式
@@ -319,33 +320,37 @@ python app.py
 > **Claude（Anthropic）Key 仅在独立 CLI `comic_drama_pipeline.py` 场景需要**（走
 > `ANTHROPIC_API_KEY` 环境变量），Web 主流程不再依赖它。
 
-## 🔧 已安装模型与节点
+## 🔧 模型与自定义节点（当前版本）
 
-### 模型
+> 权威清单见 [`docs/依赖清单.md`](docs/依赖清单.md)；**检测状态用 `GET /api/deps/check` 一键查**（下方只是参考快照，以接口返回为准）。
+
+### 模型（ComfyUI `models/` 下）
 ```
 models/diffusion_models/
-├── qwen-image/qwen_image_2.1_fp8.safetensors              # 图像生成（QwenImage2.1）
-├── qwen-image/qwen_image_edit_bf16.safetensors            # 图像编辑（多视角）
-└── minimax-h3/minimax_h3_ref2va_pruned_int8_convrot.safetensors # 视频生成
-
+├── minimaxH3Singularity_prunedInt8-d8a59c68df78.safetensors   # H3 UNET（视频）
+├── qwen_image_2.1_int8_convrot.safetensors                    # QwenImage2.1 UNET（图片）
+models/clip/
+├── minimax-h3/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors    # H3 CLIP
+├── qwen3vl_8b_int8_convrot.safetensors                        # QwenImage2.1 CLIP
 models/loras/
-├── Qwen-Image-Lightning-4steps-V1.0-fp32.safetensors       # 图像生成加速
-├── Qwen-Image-Edit-Lightning-4steps-V1.0-bf16.safetensors  # 图像编辑加速
-├── Qwen-Image-Edit-Multiple-Angles-LoRA.safetensors        # 多角度生成
-└── minimax_h3/minimax_h3_fl2v_lightx2v_turbo_4step_v0.1.safetensors # H3 加速
-
-models/FlashVSR-v1.1/                                           # 超分辨率
+├── minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors # H3 4 步加速 LoRA
+models/vae/
+├── minimax-h3/minimax_h3_audio_vae_fp32.safetensors           # H3 音频 VAE（⚠ 不能接 TRT 视频 VAE）
+├── minimax_h3_vae_encoder.engine / minimax_h3_vae_decoder_w4a16_awq.engine  # TRT 视频 VAE（⚠ GPU 架构专用）
+├── qwen_image_2.1_vae_bf16.safetensors                        # QwenImage2.1 VAE
+models/FlashVSR-v1.1/                                          # 超分（仅 enable_upscale=true 才用到）
 ```
 
-### 自定义节点
+### 自定义节点（ComfyUI `custom_nodes/`，跑现役链路需 6 个包）
 ```
 custom_nodes/
-├── Herrgotts-H3-Infinite-Continuation-Suite-main/  # H3 无缝续集拼接
-├── ComfyUI-qwenmultiangle/                         # 3D 相机角度控制
-├── ComfyUI-MiniMax-H3-Turbo/                       # H3 Turbo 加速
-├── TE-Speed-MiniMaxH3 / TE-Speed-FlashVSR          # TE 加速
-├── ComfyUI-Qwen-TTS/                               # 本地配音（可选）
-└── ComfyUI-FlashVSR / ComfyUI-FlashVSR_Ultra_Fast  # 超分节点
+├── ComfyUI_MiniMaxH3_Director/      # H3 Director 核心（MiniMaxH3Director / Refine / BasicScheduler）
+├── ComfyUI-H3VAE_TRT/               # 视频 VAE 走 TRT（MiniMaxH3TRTVAELoader）
+├── ComfyUI-NVIDIA-DLSS-Frame-Interpolation/   # 补帧（NvidiaDLSSFrameInterpolation）
+├── ComfyUI-KJNodes/                 # SageAttention + EasyCache + XHImagePrecision
+├── ComfyUI-SolAttn_triton/          # SolAttn 注意力（morton=False）
+└── TE-Speed-MiniMaxH3 / TE-Speed-QwenImage21/  # 视频/图片 TE 加速
+（可选：ComfyUI_BFSNodes；legacy 回退才需 Herrgotts-H3-Infinite-Continuation-Suite）
 ```
 
 ## ⚡ 性能优化
@@ -367,4 +372,4 @@ custom_nodes/
 
 ---
 
-**版本**: 2.6.0 | **日期**: 2026-09-24
+**版本**: 2.6.1 | **日期**: 2026-09-28

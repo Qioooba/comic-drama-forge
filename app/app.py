@@ -74,6 +74,7 @@ import nle_export
 import pipeline
 import audio_qc
 import plugin_registry
+import deps_check
 import project_store
 import shot_key
 from fs_atomic import atomic_write_json, read_json_strict
@@ -6030,6 +6031,30 @@ def api_upscale_env():
     env["te_lowvram"] = dict(TE_UPSCALE_LOWVRAM_PARAMS)
     env["default_engine"] = UPSCALE_ENGINE
     return jsonify(env)
+
+
+@app.route('/api/deps/check', methods=['GET'])
+def api_deps_check():
+    """依赖自检：核查 ComfyUI 侧「插件节点」与「模型权重」是否齐备（只读，绝不阻断）。
+
+    依据 docs/依赖清单.md：模板 JSON 已内置，但跑起来还差①插件包（custom_nodes/）
+    ②模型权重（models/）。本端点把两层逐一报出「就位 / 缺失 / 无法判定」。
+
+    query 参数：
+      offline=1        强制离线（不探 ComfyUI，只扫本地 custom_nodes/ 目录名，标注不可靠）
+      url=<host:port>  指定 ComfyUI 地址（覆盖 config.COMFYUI_URL）
+    返回：comfyui / plugins / models / workflows / summary（见 deps_check.check_deps 契约）
+    """
+    offline = request.args.get('offline', '').strip().lower() in ('1', 'true', 'yes')
+    url_arg = (request.args.get('url') or '').strip()
+    try:
+        result = deps_check.check_deps(comfyui_url=(url_arg or None), force_offline=offline)
+    except Exception as e:
+        # 检测本身是「锦上添花」，任何异常都降级为 200 + 明确标记，不把自检打挂
+        return jsonify({"error": str(e), "comfyui": {"online": False},
+                        "summary": {"all_ok": False, "blockers": [f"检测异常：{e}"]}})
+    result["docs"] = "docs/依赖清单.md"
+    return jsonify(result)
 
 
 @app.route('/api/upscale/sources', methods=['GET'])

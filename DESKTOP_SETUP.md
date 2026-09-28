@@ -11,8 +11,9 @@ python app/serve.py
 
 ### 方法二：双击启动
 ```bash
-# Windows用户直接运行
-双击运行 启动漫剧工坊.bat
+# Windows用户直接运行（根目录启动脚本，自动找 python 环境并起 app/serve.py）
+双击运行 run_app.bat
+# 或绿色便携包：packaging/启动.bat（配 packaging/安装依赖.bat 一次性装依赖）
 ```
 
 ### 方法三：Electron桌面应用
@@ -21,12 +22,16 @@ python app/serve.py
 cd electron-app
 npm install
 
-# 开发模式运行
+# 开发模式运行（自动起/复用本机后端）
 npm start
 
-# 打包为EXE
+# 收集后端资源 + 打包为EXE（前后端自包含，零 Python 安装）
+node pack_backend.js
 npm run build:win
 ```
+> 桌面版支持**自动更新**（资源增量 / 整包，SHA256 校验，GitHub 匿名下载）：
+> 启动检查一次 + 每 24h 静默轮询 + 菜单「帮助 → 检查更新」。
+> 发版走根目录 `.github/workflows/desktop-release.yml`（打 tag 自动发 Release）。
 
 ## 打包EXE
 
@@ -53,7 +58,8 @@ npm run build:win
 | 九宫格分镜 | ✅ | 侧边栏「网格」图标 |
 | FCPXML/EDL导出 | ✅ | 侧边栏「导出」图标 |
 | Docker部署 | ✅ | docker-compose.yml |
-| EXE打包 | ✅ | 启动漫剧工坊.bat |
+| EXE打包 | ✅ | run_app.bat / packaging/启动.bat |
+| 依赖自检（模型+插件） | ✅ | `GET /api/deps/check`（缺什么一目了然） |
 
 ### 核心能力
 - 🎬 全自动生产流水线
@@ -81,23 +87,27 @@ pip install pyinstaller --upgrade
 
 ```
 漫剧生成系统/
-├── app/                      # Flask后端
-│   ├── app.py               # 主应用
-│   ├── character_manager.py # 角色管理
-│   ├── nine_grid_storyboard.py # 九宫格分镜
-│   ├── export_manager.py    # 导出管理
+├── app/                      # Flask后端（UI 由 app/static 提供，非 Jinja 模板）
+│   ├── serve.py             # WSGI 启动入口（waitress）
+│   ├── app.py               # 主应用（路由 + 管线）
+│   ├── config.py            # 单点配置（COMFYUI_ROOT 推导各路径）
+│   ├── deps_check.py        # 依赖自检（插件节点 + 模型权重）
 │   ├── autonomous.py        # 全自动生产
-│   └── templates/
-│       └── index.html       # 前端界面
+│   └── static/             # 前端构建产物（Vite）
 ├── electron-app/            # Electron桌面应用
-│   ├── main.js
-│   ├── preload.js
+│   ├── main.js              # 主进程（后端生命周期 + 更新系统）
+│   ├── preload.js           # contextBridge 暴露面
+│   ├── updater.js           # 更新引擎（纯 Node，无第三方依赖）
+│   ├── update-config.js     # 更新常量（GitHub 仓库 + 资产命名）
+│   ├── pack_backend.js      # 收集后端资源到 _backend/
 │   └── package.json
+├── packaging/               # 绿色便携打包（make_package.py + 启动.bat + 安装依赖.bat）
+├── .github/workflows/desktop-release.yml  # CI：打 tag 自动烘焙 Python + 发 Release
+├── docs/依赖清单.md           # 插件/模型 权威清单（deps_check.py 映射来源）
 ├── novels/                  # 小说库
 ├── output/                  # 输出目录
 ├── main.py                  # 启动入口
-├── build.bat                # 打包脚本
-└── 漫剧工坊.spec            # PyInstaller配置
+└── 漫剧工坊.spec             # PyInstaller配置
 ```
 
 ## 上线 / 交付运维清单（凭据与配置安全）
