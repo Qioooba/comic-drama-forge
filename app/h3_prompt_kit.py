@@ -705,6 +705,10 @@ def build_detailed_description(shot: dict, duration: float, style: str = "",
       （如 ``中景跟拍`` / ``特写推入`` / ``全景升降``），旧实现只翻景别前缀、把运镜整段丢掉，
       导致模型自行猜运镜、出片运镜随机。现在运镜**写进句首的镜头声明**（与景别同处），
       既补回了信息，也符合模板「镜号后先写景别/机位、再写画面内容」的写法。
+    - **P0-1 首帧/运动/末帧三段锚点**（借鉴 ViMax / CineGen，2026-09-28）：``first_frame``
+      作 ``Opening frame`` 前置声明、``motion`` 显式区分「摄影机运动 vs 画面内运动」、
+      ``last_frame`` 作文字末态兜底（**仅在无 ``end_frame_ref`` 尾帧图时写入**，有图时图已锚定
+      末态、不叠文字避免图文打架）。旧剧本三字段缺失 → 各段整块不出现，零回归。
     """
     camera = str(shot.get("camera") or "中景").strip()
     camera_en = _camera_en(camera)
@@ -720,7 +724,16 @@ def build_detailed_description(shot: dict, duration: float, style: str = "",
     beats = _beats(shot, duration)
     spoken = _spoken_clause(lines, slots)
 
+    # P0-1 首帧 / 运动三段锚点（借鉴 ViMax / CineGen）：
+    # 读到三字段（旧剧本/模型未输出 → 空串，下面各段整块不出现，零回归）。
+    _first_frame = str(shot.get("first_frame") or "").strip()
+    _motion = str(shot.get("motion") or "").strip()
+
     out: List[str] = [_style_opening(style)]
+    # 首帧（运动起点静态快照）：前置到时间轴最前，给「动作从哪个画面开始」明确落点。
+    if _first_frame:
+        out.append(
+            f"Opening frame (static snapshot before the motion begins): {_first_frame}.")
     for idx, (start, _span, text) in enumerate(beats, start=1):
         clause = _strip_end(text)
         # A-5：单节拍的画面细节（description + visual_detail）也设闸门，
@@ -767,6 +780,24 @@ def build_detailed_description(shot: dict, duration: float, style: str = "",
             f"composition, framing, character pose and expression shown in "
             f"{end_frame_ref}; the camera movement and action settle into that exact "
             f"end image as the clip closes.")
+    else:
+        # P0-1 文字末态兜底：无尾帧参考图时，用 ``last_frame`` 给时间轴末端一个文字落点，
+        # 减少动作画崩。⚠️ 与尾帧图二选一（上面 if 命中即不叠文字），避免「图说一个终态、
+        # 文说另一个」打架（同 blocking 基准图教训）。
+        _last_frame = str(shot.get("last_frame") or "").strip()
+        if _last_frame:
+            out.append(
+                f"End state: by the close of this shot the frame settles into — "
+                f"{_last_frame}.")
+    # P0-1 运动声明：严格区分「摄影机运动（推拉摇移跟升降）」与「画面内运动（人物/物体
+    # 自身动作）」。写进末段（时间轴锚点之后、作为独立一句），给模型显式运动类型锚点。
+    # ⚠️ 与句首 camera_move（景别+运镜复合词）不同处：这里是**本镜整体运动定性**，
+    # 句首是逐拍镜头声明；两者互补不重复（句首不写本镜无运镜时的画面内动作）。
+    if _motion:
+        out.append(
+            "Motion: strictly separate camera movement (push-in / pull-out / pan / "
+            f"track / follow / tilt) from movement within the frame (character or "
+            f"object action). Guiding motion for this shot — {_motion}.")
 
     return "\n".join(out)
 
