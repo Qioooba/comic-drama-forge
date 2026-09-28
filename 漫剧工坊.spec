@@ -12,6 +12,10 @@ datas = [
     ('app/static', 'app/static'),
     ('locales', 'locales'),
     ('output', 'output'),
+    # ⚠️ 2026-09-28 补：工作流模板必须随 exe 分发。PROJECT_WORKFLOWS_DIR 在
+    # frozen 模式下 = _MEIPASS/workflows（env_loader 注释：只读资源留 PROJECT_ROOT_DIR），
+    # 漏掉这里会让单文件包用户「模板缺失」——克隆/Docker 有 workflows/ 但 exe 没有。
+    ('workflows', 'workflows'),
 ]
 
 # 排除不必要的模块
