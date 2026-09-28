@@ -711,8 +711,12 @@ def build_detailed_description(shot: dict, duration: float, style: str = "",
       末态、不叠文字避免图文打架）。旧剧本三字段缺失 → 各段整块不出现，零回归。
     """
     camera = str(shot.get("camera") or "中景").strip()
-    camera_en = _camera_en(camera)
-    camera_move = _camera_move_en(camera)
+    # A1：景别/运镜优先读权威字段（新剧本 shot_type / camera_motion）；旧剧本两字段为空 →
+    # 回退整个 camera 复合串，行为与改动前逐字一致（零回归）。
+    _st = str(shot.get("shot_type") or "").strip()
+    _mo = str(shot.get("camera_motion") or "").strip()
+    camera_en = _camera_en(_st or camera)
+    camera_move = _camera_move_en(_mo or camera)
     lines = dialogue_lines(shot.get("dialogue"))
     slots = speaker_slots(lines)
     picture_refs = picture_refs or {}
