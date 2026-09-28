@@ -31,8 +31,9 @@
 2. 注入**逐段**``segment.refs``（参考图走 ComfyUI ``input/`` 相对文件名，
    每段的第 j 张 = 该段提示词里的 ``<Picture {j+1}>``）；
 3. 改写 SaveVideo 的 ``filename_prefix``（新模板输出链已是**单一成片**：
-   ``Director.images → CreateVideo → NvidiaDLSSFrameInterpolation → DLSSNR_Video →
-   SaveVideo``，不再有「一采」那路 SaveVideo 需要裁），让「一次调用 = 一个 mp4」，
+   ``Director.images → CreateVideo → NvidiaDLSSFrameInterpolation →
+   SaveVideo``，不再有「一采」那路 SaveVideo 需要裁；DLSS NR 画质增强节点
+   已删，输出链保留补帧但去掉降噪/放大），让「一次调用 = 一个 mp4」，
    保住 ``shot_XX.mp4`` 契约；
 4. 把一采链上的 ``SolAttnPatch`` 参数**完全跟随模板**（``_SOLATTN_ALIGNED_*``，
    不注入任何 LowVRAM / ChunkFF / Sage 节点——``_insert_lowvram_patches`` /
@@ -1050,8 +1051,9 @@ class H3DirectorBuilder:
         #   一采链：UNETLoader → LoraLoader → PathchSage → TESpeed → SolAttnPatch → EasyCache → Director
         #   二采链：UNETLoader → LoraLoader → PathchSage → TESpeed → EasyCache → { BasicScheduler, Refine }
         # （二采链**无** SolAttnPatch；两链各自独立，EasyCache 各一个），输出链：
-        #   Director.images → CreateVideo → NvidiaDLSSFrameInterpolation → DLSSNR_Video → SaveVideo
-        # （新增 DLSS 帧插值 + 降噪 + MiniMaxH3TRTVAELoader 替代 VAELoader）。
+        #   Director.images → CreateVideo → NvidiaDLSSFrameInterpolation → SaveVideo
+        # （新增 DLSS 帧插值 + MiniMaxH3TRTVAELoader 替代 VAELoader；DLSS NR 画质增强
+        #   节点 DLSSNR_Video 已删，补帧帧直接进 SaveVideo，画质改由 FlashVSR 超分承担）。
         # 模板**不再含** MiniMaxLowVRAMAttention / MiniMaxChunkFeedForward /
         # MemoryEfficientSagePatch，也不再有两路 SaveVideo。
         # 因此不再程序化注入任何加速节点（_insert_lowvram_patches /
