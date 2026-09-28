@@ -46,10 +46,43 @@ MAX_CONTRACT_ISSUES: int = 12
 #: edit_reason 里含这些子词视为「已声明场景切换/转场」，scene_jump 不报。
 _SCENE_SWITCH_MARKERS = ("转场", "切换", "切至", "切到", "切换场景", "转场至", "cross-cut", "cut to")
 
-#: 校验器输出的三类 category 常量（供下游/前端按类聚合）。
+# ---- P2-4 关键道具跨镜状态追踪（props with state，软告警不阻断）----
+#: 关键道具在相邻两次出镜之间「消失」≥ 此镜数后再次出现，判「道具不连戏、缺交接」。
+PROP_REAPPEAR_GAP: int = 3
+#: importance 含这些子词视为「关键道具」（在 bible 声明重要道具名单时，只跟踪名单内，避免一般道具刷噪）。
+_PROP_IMPORTANT_MARKERS = ("high", "高", "主要", "核心", "重要", "key")
+
+#: 校验器输出的 category 常量（供下游/前端按类聚合）。
 CATEGORY_CHARACTER_GAP = "角色连贯"
 CATEGORY_APPEAR_SODDEN = "角色连贯"
 CATEGORY_SCENE_JUMP = "场景连贯"
+CATEGORY_PROP_GAP = "道具连贯"
+
+
+def _shot_items(s: Dict[str, Any]) -> List[str]:
+    """取镜头出场物品（``items_in_shot``），去重保序、去空。"""
+    seen: List[str] = []
+    for c in (s.get("items_in_shot") or []):
+        name = str(c or "").strip()
+        if name and name not in seen:
+            seen.append(name)
+    return seen
+
+
+def _important_prop_names(bible: Optional[Dict[str, Any]]) -> List[str]:
+    """从 bible 取出「关键道具」名单（importance 命中 _PROP_IMPORTANT_MARKERS）。
+
+    未声明重要道具（名单为空）时返回 [] → 调用方退化为「跟踪所有出现 ≥2 镜的道具」。
+    """
+    out: List[str] = []
+    for it in ((bible or {}).get("items") or []):
+        if not isinstance(it, dict):
+            continue
+        nm = str(it.get("name") or "").strip()
+        imp = str(it.get("importance") or it.get("level") or "").strip().lower()
+        if nm and any(m in imp for m in _PROP_IMPORTANT_MARKERS):
+            out.append(nm)
+    return out
 
 
 def _shot_location(s: Dict[str, Any]) -> str:
@@ -84,16 +117,27 @@ class GlobalConsistencyContract:
         self.locations: List[str] = [_shot_location(s) for s in shots]
         # 角色 → 出镜序号列表（升序，首次构建即有序）
         self.char_shots: Dict[str, List[int]] = {}
+        # 道具 → 出镜序号列表（P2-4：关键道具跨镜状态追踪，口径同角色占用）
+        self.prop_shots: Dict[str, List[int]] = {}
         for idx, s in enumerate(shots):
             for name in _shot_chars(s):
                 self.char_shots.setdefault(name, []).append(idx)
-        # 去重后每角色出镜序号（防御重复追加）
+            for name in _shot_items(s):
+                self.prop_shots.setdefault(name, []).append(idx)
+        # 去重后每角色/每道具出镜序号（防御重复追加）
         for name, seq in self.char_shots.items():
             self.char_shots[name] = sorted({i for i in seq})
+        for name, seq in self.prop_shots.items():
+            self.prop_shots[name] = sorted({i for i in seq})
 
     @property
     def characters(self) -> List[str]:
         return sorted(self.char_shots.keys())
+
+    @property
+    def props(self) -> List[str]:
+        """出过镜的道具名（升序）。P2-4 状态追踪的占用来源。"""
+        return sorted(self.prop_shots.keys())
 
     @property
     def all_shots(self) -> List[Dict[str, Any]]:
@@ -127,13 +171,22 @@ class CrossChunkValidator:
     def __init__(self,
                  surprise_appear_gap: int = CHAR_SURPRISE_APPEAR_GAP,
                  disappear_gap: int = CHAR_DISAPPEAR_GAP,
-                 max_issues: int = MAX_CONTRACT_ISSUES):
+                 max_issues: int = MAX_CONTRACT_ISSUES,
+                 prop_reappear_gap: int = PROP_REAPPEAR_GAP):
         self.surprise_appear_gap = int(surprise_appear_gap)
         self.disappear_gap = int(disappear_gap)
         self.max_issues = int(max_issues)
+        self.prop_reappear_gap = int(prop_reappear_gap)
 
     def validate(self, contract: GlobalConsistencyContract,
-                 episode_no: int = 1) -> List[Dict[str, Any]]:
+                 episode_no: int = 1,
+                 prop_filter: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        """跨镜头一致性校验（角色 3 类 + 场景跳切 + P2-4 道具 1 类，全软告警）。
+
+        prop_filter（P2-4）：非空时**只**跟踪名单内的关键道具（由调用方从 bible 解析）；
+        为 None / 空时退化为「跟踪所有出现 ≥2 镜的道具」。道具出镜间隔 ≥ prop_reappear_gap
+        视为「中途消失、缺交接」（severity=low，不阻断、不触发 LLM 重写）。
+        """
         issues: List[Dict[str, Any]] = []
         for name in contract.characters:
             seq = contract.char_shots.get(name) or []
@@ -177,6 +230,25 @@ class CrossChunkValidator:
                         episode_no, [sid],
                     ))
             prev_loc = loc
+        # 4) P2-4 关键道具跨镜状态：出镜序列中间有「缺口」（相邻两次出镜间隔 ≥ 阈值）
+        #    → 道具中途消失、缺乏交接镜头（软告警，severity=low，不阻断不重写）。
+        tracked_props = (prop_filter if prop_filter else contract.props)
+        for pname in tracked_props:
+            seq = contract.prop_shots.get(pname) or []
+            if len(seq) < 2:
+                continue  # 只出过 0/1 镜谈不上「中途消失再出现」
+            for a, b in zip(seq, seq[1:]):
+                gap = b - a - 1          # 两次出镜之间的镜头数（= a 之后、b 之前有多少镜没它）
+                if gap >= self.prop_reappear_gap:
+                    sid_b = contract.all_shots[b].get("shot_id")
+                    issues.append(_make_issue(
+                        CATEGORY_PROP_GAP,
+                        f"道具「{pname}」在第 {a + 1} 镜出现后，中间隔了 {gap} 镜才在第 {b + 1} 镜再出现（缺交接）",
+                        f"再现镜 #{sid_b}（前次第 {a + 1} 镜）；该道具共出镜 {len(seq)} 镜",
+                        "若该道具为关键道具，建议在缺口处补一个交代其下落/仍持有的镜头；"
+                        "若剧情上确已离场/转移则无需处理",
+                        episode_no, [sid_b],
+                    ))
         if len(issues) > self.max_issues:
             logger.warning(
                 "P0-2 contract 告警 %d 条 > 上限 %d，截断保留前 %d 条（第%d集）",
@@ -206,7 +278,11 @@ def merge_contract_issues(validation: Dict[str, Any], script: Dict[str, Any],
     因为它改单句就能修）；contract 类问题改单镜修不好，故刻意**不**置 rewrite_needed，
     纯软告警供人工/下游审查。
     """
-    issues = CrossChunkValidator().validate(build_contract(script), int(episode_no))
+    # P2-4：从 bible 取「关键道具」名单作为 prop_filter；名单为空时退化为跟踪所有出现
+    # ≥2 镜的道具（validate 内 prop_filter=None 的默认分支）。
+    prop_filter = _important_prop_names(bible)
+    issues = CrossChunkValidator().validate(
+        build_contract(script), int(episode_no), prop_filter=prop_filter)
     if not issues:
         return validation
     validation.setdefault("issues", [])
