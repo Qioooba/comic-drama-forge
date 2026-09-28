@@ -3692,7 +3692,9 @@ def _allocate_storyboard_refs(shot: dict, char_idx: dict, item_idx: dict, scene_
                      img))
         slot_no += 1
 
-    return _apply_closeup_ref_strategy(refs, shot, project_name)
+    refs = _apply_closeup_ref_strategy(refs, shot, project_name)
+    # P0-3（借鉴 ViMax reference_image_selector）：每镜参考图**相关性优先 + ≤8 张上限**。
+    return _cap_storyboard_refs(refs, shot)
 
 
 # 特写镜头参考图策略 ---------------------------------------------------------
@@ -3766,6 +3768,30 @@ def _apply_closeup_ref_strategy(refs: list, shot: dict, project_name: str = None
                         _mark + "已替换为该角色头部特写，画面取景范围以此为准：仅肩部以上",
                         _closeup_char_crop(path, project_name, shot.get("shot_id", 1))))
     return out or refs
+
+
+def _cap_storyboard_refs(refs: list, shot: dict) -> list:
+    """P0-3（借鉴 ViMax reference_image_selector）：每镜参考图**相关性优先 + ≤8 张上限**。
+
+    官方 Qwen-Image-2.1 支持最多 10 张但明确「容量不是目标」；ViMax 实践为每帧 ≤8 张，
+    且同角色多视图只取一张（已由 ``_pick_char_view`` 按景别对档处理）。这里在分配末端
+    再加一道安全网：超出 8 张时按相关性优先级截断（角色身份 > 场景 > 道具），
+    绝不丢弃角色身份锚点，并打日志便于排查「参考图被静默截断」。
+
+    只做**保序截断**，不改变已分配槽位的职责语义；``build_storyboard_prompt`` 按位置
+    重编号 ``<imageN>``，列表顺序即相关性顺序。
+    """
+    MAX_STORYBOARD_REFS = 8
+    if len(refs) <= MAX_STORYBOARD_REFS:
+        return refs
+    _rank = {"主角色": 0, "次角色": 0, "场景": 1}   # 其余（道具等）→ 2，最先被截断
+    ordered = sorted(refs, key=lambda r: _rank.get(r[0], 2))
+    dropped = ordered[MAX_STORYBOARD_REFS:]
+    app.logger.warning(
+        "镜头 %s 参考图 %d 张 > 上限 %d，已按相关性丢弃 %d 张：%s",
+        shot.get("shot_id"), len(refs), MAX_STORYBOARD_REFS, len(dropped),
+        "、".join(f"{d[0]}:{str(d[1])[:24]}" for d in dropped))
+    return ordered[:MAX_STORYBOARD_REFS]
 
 
 # --------------------------------------------------------------------------- #
