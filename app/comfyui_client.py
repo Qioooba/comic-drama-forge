@@ -1006,6 +1006,30 @@ class ComfyUIClient:
         except Exception as e:  # noqa: BLE001
             logger.warning(f"ComfyUI 删除队列项失败（不影响取消流程）: {prompt_id}: {e}")
 
+    def queue_state(self) -> dict:
+        """查询 ComfyUI 队列状态 → ``{"running": n, "pending": n, "ok": bool}``。
+
+        用于**删除类操作前的安全检查**。`sb_ref_*` 参考图是本轮分镜上传到
+        ComfyUI output 目录的**临时引用文件**，收尾清理时若队列里还压着任务，
+        删文件会让那些任务执行到 ``LoadImage`` 时直接报 ``FileNotFoundError``。
+
+        实测根因（用户 2026-09-29 日志）：某镜 ``wait_for_completion`` **超时返回**
+        或批次被中止后，任务其实仍留在 ComfyUI 队列里；收尾照常清理 `sb_ref` →
+        那些任务开始执行时文件已被移入回收站 → **连续 7 个镜头 0.01s 失败**，
+        分镜图整批全灭。故清理前先问一句「还有人在用吗」。
+
+        ``ok=False`` 表示查询本身失败（ComfyUI 不可达）——调用方应当**保守处理**：
+        宁可跳过清理（残留有滚动回收兜底），也不要在信息不明时删掉可能正被引用的文件。
+        """
+        try:
+            d = self._get("/queue") or {}
+        except Exception as e:  # noqa: BLE001
+            logger.debug("查询 ComfyUI 队列失败: %s", e)
+            return {"running": 0, "pending": 0, "ok": False}
+        return {"running": len(d.get("queue_running") or []),
+                "pending": len(d.get("queue_pending") or []),
+                "ok": True}
+
     def wait_for_completion(self, prompt_id: str, timeout: int = 1800) -> dict:
         """轮询远端任务直到完成。
 

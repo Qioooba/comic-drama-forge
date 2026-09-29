@@ -28,6 +28,7 @@ import fs_atomic
 import style_kit
 import h3_prompt_kit
 import asset_prompt_kit
+import asset_name_match
 
 logger = logging.getLogger(__name__)
 
@@ -1367,34 +1368,48 @@ def _overflow_detail(raw, limit: int) -> str:
     return s[int(limit):].strip()[:400]
 
 
-def _match_known_names(raw_names, known: list, field: str) -> list:
+def _match_known_names(raw_names, known: list, field: str,
+                       kind: str = "character") -> list:
     """把镜头声明的角色/物品名收敛到 bible 名单内（**禁止静默 take-first**）。
 
     P1-16 修复：旧实现用 `[...] if c in chars] or chars[:1]` —— 名字与 bible 对不上时
     静默填入首个角色（通常是主角），使整集以**错误角色**为外观锚点（日志/界面看不出来），
     并把下游 S6「禁止静默 take-first」的 `_no_reference` 分支彻底架空（列表恒非空）。
-    现在只保留**精确命中 bible** 的名字（去重保序）；匹配不到即返回空列表，交由下游
+    现在只保留**命中 bible** 的名字（去重保序）；一个都不命中即返回空列表，交由下游
     `_allocate_storyboard_refs` 的 no_reference 分支显式告警/跳过，并在「有输入但全未
     命中」时记 warning，保证排障可见。
+
+    ⚠️ 2026-09-29 统一匹配（三类资产同口径）：判据从「裸字符串相等」升级为
+    :mod:`asset_name_match` 三级降级（精确 → 归一化 → **唯一**子串）。
+    旧实现只做精确相等，模型写的名字差一个全角括号 / 书名号 / 空格就被**静默丢弃**
+    —— 注意**上游丢掉的名字，下游再怎么容错也救不回来**（字段已经空了），
+    所以统一必须从这一层开始。``kind="item"`` 用于物品（不做角色后缀剥离）。
+
+    ``known`` 可以是名字列表（bible 名单），``resolve_names`` 内部会转成索引。
     """
     if isinstance(raw_names, str):
         raw_names = [raw_names]
-    names = [n for n in (raw_names or []) if n]
+    names = [str(n) for n in (raw_names or []) if n]
     if not names:
         return []
-    known_set = set(known or [])
-    seen, out = set(), []
-    for n in names:
-        if n in known_set and n not in seen:
-            seen.add(n)
-            out.append(n)
-    if not out:
-        logger.warning(
-            "镜头 %s 声明的名字 %s 均未命中 bible（可用：%s）→ 保留空列表，"
-            "交由下游 no_reference 显式告警/跳过（禁止静默兜底取错角色）",
-            field, "、".join(names)[:80],
-            "、".join(x for x in (known or []) if x)[:120])
-    return out
+    resolved, missing, fuzzy = asset_name_match.resolve_names(names, known or [], kind)
+    for _q, _k, _lv in fuzzy:
+        logger.info("[%s] 名字模糊命中 bible：%r → %r（%s）", field, _q, _k, _lv)
+    if missing:
+        if not resolved:
+            logger.warning(
+                "镜头 %s 声明的名字 %s 均未命中 bible（可用：%s）→ 保留空列表，"
+                "交由下游 no_reference 显式告警/跳过（禁止静默兜底取错资产）",
+                field, "、".join(missing)[:80],
+                "、".join(x for x in (known or []) if x)[:120])
+        else:
+            # 部分命中：旧实现对此**完全静默**，未命中的那个资产全程没有设定图。
+            logger.warning(
+                "镜头 %s 的 %s 部分未命中 bible（已保留 %s，可用：%s）→ "
+                "未命中者不带设定图，请检查剧本用词",
+                field, "、".join(missing)[:60], "、".join(resolved)[:60],
+                "、".join(x for x in (known or []) if x)[:120])
+    return resolved
 
 
 # 实质台词文本判据（P0-2 补修 / task#9）：
@@ -1482,16 +1497,21 @@ def audit_shots_structure(raw_shots, bible: dict, tag: str = "") -> list:
             _add("field_type_drift", f"镜#{idx + 1} dialogue 类型为 {type(dlg).__name__}"
                                      f"（应为数组），将被结构修正", idx)
         # 3) characters_in_shot / items_in_shot 引用 bible 之外的名字（会被过滤丢弃）
+        # ⚠️ 2026-09-29：审计口径必须与 _match_known_names 的**实际**判据同源
+        # （三级容错匹配），否则会把「其实能模糊命中、不会被过滤」的名字报成
+        # 「将被过滤」——报告与行为不一致比不报告更误导。
         cast = s.get("characters_in_shot")
-        if isinstance(cast, list):
+        if isinstance(cast, list) and char_names:
             unknown = [str(x).strip() for x in cast
-                       if str(x).strip() and char_names and str(x).strip() not in char_names]
+                       if str(x).strip()
+                       and not asset_name_match.match(x, char_names, "character")[0]]
             if unknown:
                 _add("unknown_cast", f"镜#{idx + 1} 出场角色 {unknown[:4]} 不在角色表，将被过滤", idx)
         itms = s.get("items_in_shot")
-        if isinstance(itms, list):
+        if isinstance(itms, list) and item_names:
             unknown = [str(x).strip() for x in itms
-                       if str(x).strip() and item_names and str(x).strip() not in item_names]
+                       if str(x).strip()
+                       and not asset_name_match.match(x, item_names, "item")[0]]
             if unknown:
                 _add("unknown_cast", f"镜#{idx + 1} 物品 {unknown[:4]} 不在物品表，将被过滤", idx)
         # 4) 字符串字段超 _norm_shots 截断上限（内容会被静默截断）
@@ -1603,13 +1623,22 @@ def _norm_shots(raw_shots: list, bible: dict, episodes: int, start_id: int = 1) 
             dropped_empty.append(s.get("camera") or s.get("location") or "?")
             continue
         loc = str(s.get("location") or "").strip()
-        if scenes and loc and loc not in scenes:
+        if scenes and loc:
             # P1-16 修复（场景侧）：匹配不到时**保留原 loc** 并记 warning，绝不静默回落
             # `scenes[0]`。旧行为会把「破败的大殿」这类不在 bible 里的场景名换成「后山」
             # 这类首个场景 —— 环境锚点整集级错位，且日志/界面看不出来。
-            _hit = next((n for n in scenes if n and n in loc), None)
-            if _hit:
-                loc = _hit
+            #
+            # ⚠️ 2026-09-29 统一匹配：旧的 `next((n for n in scenes if n in loc), None)`
+            # 是**单向子串 + 取第一个命中** —— scenes 里有「卧室」和「卧室外」而 loc 是
+            # 「卧室外面的走廊」时，会**误配**成「卧室」（环境锚点被悄悄换成另一个场景，
+            # 比丢图更难发现）。现改为与下游 app.py 完全同一套三级匹配
+            # （精确 → 归一化 → **唯一**子串），多候选一律放弃并保留原文 + 告警。
+            _k, _lv = asset_name_match.match(loc, scenes, "scene")
+            if _k:
+                if _lv != asset_name_match.LEVEL_EXACT:
+                    logger.info("镜头场景名模糊命中 scenery bible：%r → %r（%s）",
+                                loc, _k, _lv)
+                loc = _k
             else:
                 logger.warning(
                     "镜头场景名未命中 scenery bible：%r（可用：%s）→ 保留原文，"
@@ -1674,7 +1703,10 @@ def _norm_shots(raw_shots: list, bible: dict, episodes: int, start_id: int = 1) 
             # 由下游 `_allocate_storyboard_refs` 的 no_reference 分支显式告警/跳过。
             "characters_in_shot": _match_known_names(
                 s.get("characters_in_shot"), chars, "characters_in_shot"),
-            "items_in_shot": [i for i in (s.get("items_in_shot") or []) if i in items],
+            # 2026-09-29：与 characters_in_shot 同口径（此前是裸 `i in items` 判据，
+            # 模型写的物品名差一个标点就静默丢弃，该物品全程没有设定图且日志无痕）。
+            "items_in_shot": _match_known_names(
+                s.get("items_in_shot"), items, "items_in_shot", kind="item"),
             # P0-1：首帧/末帧/运动三段（借鉴 ViMax）。限长避免模型越界输出塞一长段；
             # 旧剧本/模型未输出 → 空串，下游 build_storyboard_prompt 回落单段 description，零变化。
             "first_frame": str(s.get("first_frame") or "").strip()[:40],

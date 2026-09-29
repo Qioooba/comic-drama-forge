@@ -81,6 +81,7 @@ from fs_atomic import atomic_write_json, read_json_strict
 import providers
 import comfyui_models
 import log_viewer
+import asset_name_match
 import prompt_qc
 import qc_client
 import qc_coverage
@@ -520,6 +521,22 @@ def _purge_sb_refs(project: str) -> dict:
     try:
         root = COMFYUI_OUTPUT_DIR
         if not root or not os.path.isdir(root):
+            return res
+        # ⚠️ 2026-09-29 前置安全检查（实测根因，用户 09-29 日志）：
+        # 「收尾调用一次」这个前提在**异常收尾**时不成立 —— 某镜 wait_for_completion
+        # 超时返回、或批次被中止信号打断时，任务其实**仍在 ComfyUI 队列里跑/等待**。
+        # 此时照常清理 `sb_ref_*`，那些任务执行到 LoadImage 就报
+        # FileNotFoundError（实测 shot_05~11 连续 7 镜全灭，每镜 0.01s 失败）。
+        # 故队列非空、或队列状态查不到（ok=False，信息不明）时**跳过本轮清理**：
+        # 宁可留残留（有 _maybe_reclaim_comfyui_output 滚动兜底），
+        # 也不删正在被引用的参考图。
+        _q = comfyui_client.queue_state()
+        if not _q.get("ok") or _q.get("running") or _q.get("pending"):
+            app.logger.warning(
+                "[质检清理] 跳过 sb_ref 清理（project=%s）：ComfyUI 队列 运行=%s / 等待=%s"
+                "（查询ok=%s）—— 队列里可能仍有引用这些参考图的任务，"
+                "删掉会让它们 LoadImage 报 FileNotFoundError",
+                project, _q.get("running"), _q.get("pending"), _q.get("ok"))
             return res
         # generate_storyboard 的命名：sb_ref_<filename_prefix 的 basename>_<idx>.png，
         # 分镜链路 filename_prefix 形如 `comic_drama_sb/<项目>_shot_NN[...]`，
@@ -2570,8 +2587,7 @@ def _video_retry_shot_impl():
                                          "appearance": _e.get("appearance")
                                          or _e.get("description") or ""})
             _r_item_imgs, _r_item_refs = [], []
-            for _it in [n for n in (shot.get("items_in_shot") or [])
-                        if n in _r_item_idx]:
+            for _it in _resolve_item_names(shot, _r_item_idx, "重跑切段"):
                 _p = (_r_item_idx.get(_it) or {}).get("image")
                 if _p and _p not in _r_item_imgs and _p not in _r_char_imgs:
                     _r_item_imgs.append(_p)
@@ -3610,6 +3626,8 @@ def _normalize_char_alias(name) -> str:
 #   强制要求**唯一命中**，多候选一律放弃。
 
 #: 全角 ASCII（！-～）→ 半角；另加全角空格。只动标点/空白，不动汉字。
+#: ⚠️ 2026-09-29：归一化与匹配逻辑已收敛到 ``asset_name_match``（三类资产共用），
+#: 下面保留同名函数作为**薄封装**——调用点与既有探针无需改动，实现只有一份。
 _SCENE_FULLWIDTH_MAP = {i: i - 0xFEE0 for i in range(0xFF01, 0xFF5F)}
 _SCENE_FULLWIDTH_MAP[0x3000] = 0x20
 #: 装饰性符号（引号/书名号/间隔号）：本身无语义，剥离后仍指向同一场景。
@@ -3624,66 +3642,49 @@ def _normalize_scene_name(name) -> str:
     剥了会把「卧室」和「卧室外」混成一个。此类差异交给
     :func:`_match_scene_name` 的「唯一子串」一级去兜（且必须唯一）。
 
-    与 :func:`_normalize_char_alias` 同风格——只解决「同一个场景的两种写法」，
-    绝不猜测「两个不同地点是不是同一个」。
+    ⚠️ 2026-09-29：实现已移到 :mod:`asset_name_match`（三类资产共用一份），
+    这里只是保持旧函数名的薄封装。
     """
-    s = str(name or "").strip()
-    if not s:
-        return ""
-    s = s.translate(_SCENE_FULLWIDTH_MAP)
-    for ch in _SCENE_DECOR_CHARS:
-        s = s.replace(ch, "")
-    s = re.sub(r"\s+", "", s)
-    return s.lower()
+    return asset_name_match.normalize(name)
 
 
 def _match_scene_name(loc, scene_idx) -> tuple:
     """把镜头写的场景名解析到 ``scene_idx`` 的键 → ``(key, level)``。
 
-    三级降级，逐级更保守；全部失败返回 ``(None, "")``：
-
-    1. ``"exact"``      —— 原样相等（历史行为，零风险）
-    2. ``"normalized"`` —— 归一化后相等（全半角 / 引号 / 空白差异）
-    3. ``"substring"``  —— 一方包含另一方，且**在索引中唯一命中**
-       （「铜铃巷」↔「铜铃巷（夜）」）
-
+    三级降级（精确 → 归一化 → **唯一**子串），全部失败返回 ``(None, "")``。
     第 3 级必须唯一：若索引里「卧室」「卧室外」都能被子串命中，则放弃——
     **宁可不给图，也不给错图**。
+
+    ⚠️ 2026-09-29：实现已移到 :mod:`asset_name_match`，此处为薄封装。
     """
-    raw = str(loc or "").strip()
-    if not raw or not isinstance(scene_idx, dict) or not scene_idx:
-        return None, ""
-    if raw in scene_idx:
-        return raw, "exact"
-    n = _normalize_scene_name(raw)
-    if not n:
-        return None, ""
-    # 归一化后可能撞键（两个原名归一到同一串）→ 保留先出现的，避免歧义。
-    norm_map = {}
-    for k in scene_idx.keys():
-        nk = _normalize_scene_name(k)
-        if nk and nk not in norm_map:
-            norm_map[nk] = k
-    if n in norm_map:
-        return norm_map[n], "normalized"
-    hits = []
-    for nk, k in norm_map.items():
-        if n in nk or nk in n:
-            hits.append(k)
-            if len(hits) > 1:
-                return None, ""          # 多候选 → 放弃（防误配）
-    if len(hits) == 1:
-        return hits[0], "substring"
-    return None, ""
+    return asset_name_match.match(loc, scene_idx, "scene")
+
+
+def _note_ref_warning(shot, msg: str) -> None:
+    """把「参考图未命中」告警挂到镜头上（**累加，不覆盖**）。
+
+    一个镜头可能同时缺场景图与物品图；直接赋值会把前一条覆盖掉，排障时只能
+    看到最后一条。这里统一累加到 ``_ref_warnings``，同时保留 ``_ref_warning``
+    （首条）以兼容既有读取方。
+    """
+    if not isinstance(shot, dict) or not msg:
+        return
+    lst = shot.get("_ref_warnings")
+    if not isinstance(lst, list):
+        lst = []
+        shot["_ref_warnings"] = lst
+    if msg not in lst:
+        lst.append(msg)
+    shot.setdefault("_ref_warning", msg)
 
 
 def _resolve_scene_entry(shot: dict, scene_idx: dict,
                          where: str = "") -> tuple:
     """解析镜头所属场景 → ``(scene_name, entry)``；未命中时**显式告警**并记账。
 
-    调用方只有在 ``entry is None`` 时才真正「没有场景锚点」。告警只打一次，
-    并把原因写进 ``shot["_ref_warning"]``（批量生成时不刷屏，但能在任务结果里
-    定位到具体是哪一镜、写的什么场景名）。
+    调用方只有在 ``entry is None`` 时才真正「没有场景锚点」。告警写进
+    ``shot["_ref_warnings"]``（**累加**），能在任务结果里定位到具体哪一镜、
+    写的什么名字。
 
     ⚠️ 只有「剧本声明了场景、且索引非空」时未命中才告警——两者皆空属于正常
     空镜脚本，不该制造噪音。
@@ -3697,7 +3698,7 @@ def _resolve_scene_entry(shot: dict, scene_idx: dict,
             _msg = (f"场景名未匹配：镜头 {shot.get('shot_id')} 的 location={loc!r} "
                     f"在场景资产 {sorted(scene_idx.keys())[:8]} 中无对应项，"
                     f"该镜将不带场景参考图")
-            shot["_ref_warning"] = _msg
+            _note_ref_warning(shot, _msg)
             app.logger.warning("[%s] %s", where or "scene-ref", _msg)
         return None, None
     if level != "exact":
@@ -3707,35 +3708,61 @@ def _resolve_scene_entry(shot: dict, scene_idx: dict,
     return name, (scene_idx.get(name) or {})
 
 
+def _resolve_item_names(shot: dict, item_idx: dict, where: str = "") -> list:
+    """解析镜头出场物品 → **规范名列表**（去重保序）；未命中显式告警。
+
+    与 :func:`_resolve_scene_entry` / :func:`_match_shot_chars` 同口径：
+    「宁可告警、不可静默」。旧实现是裸判据
+    ``[n for n in items_in_shot if n in item_idx]`` —— 物品名只因全角括号、
+    书名号、空格或「（断）」这类后缀差异对不上，该物品的设定图就**不注入、
+    不打任何日志**，画面里道具形制只能靠模型猜（「道具走形」类质检缺陷的
+    隐蔽来源）。
+    """
+    if not isinstance(shot, dict):
+        return []
+    resolved, missing, fuzzy = asset_name_match.resolve_names(
+        shot.get("items_in_shot"), item_idx, "item")
+    for _q, _k, _lv in fuzzy:
+        app.logger.info("[%s] 物品名模糊命中：%r → %r（%s）",
+                        where or "item-ref", _q, _k, _lv)
+    if missing:
+        _msg = (f"物品名未匹配：镜头 {shot.get('shot_id')} 的 {missing} "
+                f"在物品资产 {sorted(item_idx.keys())[:8]} 中无对应项，"
+                f"该物品将不带参考图")
+        _note_ref_warning(shot, _msg)
+        app.logger.warning("[%s] %s", where or "item-ref", _msg)
+    return resolved
+
+
 def _match_shot_chars(shot: dict, char_idx: dict) -> list:
     """S6 修复：按镜头 characters_in_shot 匹配 char_idx，**禁止静默 take-first**。
 
-    返回匹配到的角色名列表（保持 shot 原顺序）；镜头一个角色都匹配不到 → 返回 []，
-    由调用方设 shot['_no_reference']=True / shot['_ref_error']=... 决定 400 / 跳过。
+    返回匹配到的角色名列表（保持 shot 原顺序、去重）；镜头一个角色都匹配不到 →
+    返回 []，由调用方设 shot['_no_reference']=True / shot['_ref_error']=... 决定
+    400 / 跳过。
+
+    ⚠️ 2026-09-29 与物品／场景统一口径：
+      · 匹配走 :mod:`asset_name_match` 三级降级（精确 → 归一化 → **唯一**子串），
+        不再只做「精确 + 后缀别名」两档 —— 「方源。（少年）」这类写法以前会静默丢图；
+      · **部分未命中也会告警**。旧实现只在「一个都没匹配上」时出声，而
+        「镜头登记了 A、B 两人、只有 A 命中」时 B 被静默丢弃（B 的参考图不注入，
+        用户与日志都看不出来），是「角色不像设定」的隐蔽来源。
     """
+    if not isinstance(shot, dict):
+        return []
     chars_in = [n for n in (shot.get("characters_in_shot") or []) if n]
     if not chars_in:
         return []
-    alias_map = {k: _normalize_char_alias(k) for k in char_idx.keys()}
-    alias_rev = {}
-    for k, v in alias_map.items():
-        if v and v not in alias_rev:
-            alias_rev[v] = k
-    matched: list = []
-    for cname in chars_in:
-        if cname in char_idx:
-            matched.append(cname)
-            continue
-        norm = _normalize_char_alias(cname)
-        hit = alias_rev.get(norm)
-        if hit:
-            matched.append(hit)
-    # 去重保序
-    seen = set(); out = []
-    for m in matched:
-        if m not in seen:
-            seen.add(m); out.append(m)
-    return out
+    resolved, missing, fuzzy = asset_name_match.resolve_names(
+        chars_in, char_idx, "character")
+    for _q, _k, _lv in fuzzy:
+        app.logger.info("[角色参考图] 角色名模糊命中：%r → %r（%s）", _q, _k, _lv)
+    if missing:
+        _msg = (f"角色名未匹配：镜头 {shot.get('shot_id')} 的 {missing} "
+                f"在角色资产 {sorted(char_idx.keys())[:8]} 中无对应项，将不带其参考图")
+        _note_ref_warning(shot, _msg)
+        app.logger.warning("[角色参考图] %s", _msg)
+    return resolved
 
 
 def _framing_wants_half(camera) -> bool:
@@ -3842,7 +3869,9 @@ def _allocate_storyboard_refs(shot: dict, char_idx: dict, item_idx: dict, scene_
     （见 generate_storyboard 的 slot_cleared），不会塞重复图。
     """
     chars_in = _match_shot_chars(shot, char_idx)
-    items_in = [n for n in (shot.get("items_in_shot") or []) if n in item_idx]
+    # 2026-09-29：物品与角色/场景同口径——走统一匹配器（原先 `if n in item_idx`
+    # 让名字稍有差异的物品**静默不带参考图**，且不打日志）。
+    items_in = _resolve_item_names(shot, item_idx, "分镜参考图")
 
     refs = []
     if not chars_in:
@@ -4227,6 +4256,11 @@ def _storyboard_worker(task_id: str, project_name: str, shots: list,
     qc_on = qc_client.image_qc_ready(qc_cfg)
     qc_declared = bool(qc_cfg.get("enabled") and qc_cfg.get("image_enabled"))
     max_retries = int(qc_cfg.get("max_retries", 0)) if qc_on else 0
+    # best-of-N（2026-09-29，借 ViMax best_image_selector）：>1 时每镜固定生成 N 张候选，
+    # 循环内只收集、**不立即入库**，循环后按质检分选**最佳**那张入库；==1 时完全走原
+    # 「通过即停」逻辑（零回归）。质检未开（qc_on=False）无分可比 → 强制退回 1。
+    best_of = max(1, int(qc_cfg.get("best_of", 1) or 1)) if qc_on else 1
+    _rounds = best_of if best_of > 1 else (max_retries + 1)
     try:
         for i, shot in enumerate(shots):
             shot_id = shot.get("shot_id", i + 1)
@@ -4318,12 +4352,13 @@ def _storyboard_worker(task_id: str, project_name: str, shots: list,
                     # G13：qc_cfg/qc_on/qc_declared/max_retries 已在 worker 级读一次（见上方），
                     # 本批所有镜头共用，不再逐镜 _qc_load_cfg()。
                     attempts = []
+                    _best_candidates = []   # best-of-N：本镜候选 [(score, png, rec, gate)]
                     # O3：第 1 轮也用真实随机 seed 并始终注入（不再 None 走模板默认常量），
                     # 使 manifest.shots[*].qc.history[0].seed 不再为 null，产物可复现、可追溯。
                     seed = random.randint(1, 2 ** 31 - 1)
                     dst = os.path.join(out_dir, f"shot_{seq:02d}.png")
 
-                    for attempt in range(max_retries + 1):
+                    for attempt in range(_rounds):
                         if attempt > 0:
                             seed = random.randint(1, 2 ** 31 - 1)
                             # G10：基准改为 self_healed_prompt（自愈后提示词）。
@@ -4441,6 +4476,12 @@ def _storyboard_worker(task_id: str, project_name: str, shots: list,
                         item["qc_gate"] = gate
                         item["qc"] = _qc_summary(attempts, qc_declared, True, max_retries)
                         if gate["accept"]:
+                            if best_of > 1:
+                                # best-of-N：本轮达标也**不立即入库** —— 先收集候选，
+                                # 循环后按质检分选最佳那张入库（见循环末尾收口块）。
+                                _best_candidates.append(
+                                    (verdict.get("score"), scratch_png, rec, gate))
+                                continue
                             shutil.copy2(scratch_png, dst)   # 质检达标 → 写入正式交付目录
                             item["file"] = dst
                             # O2：产物旁路元数据（seed/提示词/工作流 SHA256/质检结论）
@@ -4474,6 +4515,34 @@ def _storyboard_worker(task_id: str, project_name: str, shots: list,
                                 f"提前停止重试。缺陷：{_hopeless_detail}；"
                                 f"建议改写该镜剧本字段（camera / description）后单独重跑该镜")
                             break
+                    # ---------- best-of-N 收口：从候选里选**质检分最高**的一张入库 ----------
+                    # 仅在 best_of>1 且收集到候选时生效；==1 时此块完全不出现（零回归）。
+                    # 达标 → 入库；最佳仍未达标 → **不在此处阻断**，交下方统一阻断逻辑处理
+                    #（scratch_png 已指向最佳候选，确保「不合格产物不留本地」删的是被选中那张）。
+                    if best_of > 1 and _best_candidates:
+                        _bi = qc_client.pick_best_candidate([c[0] for c in _best_candidates])
+                        _bs, _bpng, _brec, _bgate = _best_candidates[_bi]
+                        scratch_png = _bpng
+                        item["qc_gate"] = _bgate
+                        item["best_of"] = {
+                            "candidates": len(_best_candidates), "picked": _bi + 1,
+                            "score": _bs, "accepted": bool(_bgate.get("accept"))}
+                        app.logger.info(
+                            "镜头 %s best-of-N：%d 张候选中选第 %d 张（score=%s，达标=%s）",
+                            shot_id, len(_best_candidates), _bi + 1, _bs,
+                            bool(_bgate.get("accept")))
+                        if _bgate.get("accept"):
+                            shutil.copy2(_bpng, dst)
+                            item["file"] = dst
+                            item["url"] = f"{_sb_url_base}shot_{seq:02d}.png"
+                            item["success"] = True
+                            item.pop("error", None)
+                            _write_artifact_meta(
+                                dst, kind="storyboard", project_name=project_name,
+                                seed=seed, prompt=item.get("prompt"),
+                                workflow_key="storyboard_gen", qc=_bgate, shot_id=shot_id,
+                                extra={"ref_count": item.get("ref_count"),
+                                       "best_of": len(_best_candidates)})
                     if qc_declared or qc_on:
                         item["qc"] = _qc_summary(attempts, qc_declared, qc_on,
                                                  int(qc_cfg.get("max_retries", 0)))
@@ -5216,8 +5285,7 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
                             "appearance": _entry.get("appearance")
                             or _entry.get("description") or ""})
                 # 本镜物品参考图
-                _items_in = [n for n in (shot.get("items_in_shot") or [])
-                             if n in item_idx]
+                _items_in = _resolve_item_names(shot, item_idx, "H3视频段")
                 _shot_item_imgs = []
                 _shot_item_refs = []
                 for _it in _items_in:
@@ -8077,9 +8145,13 @@ def _qc_ref_images(shot: dict, char_idx: dict, item_idx: dict, scene_idx: dict,
         seen.add(path)
         out.append((label, path))
 
-    for n in (shot.get("characters_in_shot") or []):
+    # 2026-09-29：角色 / 物品也走统一匹配。原先这里与场景**不同源** ——
+    # 场景已用 _resolve_scene_entry，角色 / 物品却是裸 char_idx.get(n) /
+    # item_idx.get(n)：名字只因标点或后缀差一点，质检就**拿不到该资产的设定图**，
+    # 「这个角色像不像设定」只能靠模型凭记忆猜（正是本函数注释里说的历史缺陷）。
+    for n in _match_shot_chars(shot, char_idx):
         _add(f"角色「{n}」的外貌、服装与发型", (char_idx.get(n) or {}).get("image"))
-    for n in (shot.get("items_in_shot") or []):
+    for n in _resolve_item_names(shot, item_idx, "图片质检"):
         _add(f"物品「{n}」的形状、材质与配色", (item_idx.get(n) or {}).get("image"))
     loc, _scene_e = _resolve_scene_entry(shot, scene_idx, "图片质检")
     if _scene_e:
