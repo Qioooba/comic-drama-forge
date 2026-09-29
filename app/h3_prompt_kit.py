@@ -455,8 +455,9 @@ def _beats(shot: dict, duration: float) -> List[Tuple[float, float, str]]:
             # 台词当成背景旁白、人物嘴唇不动。
             text = ("the movement settles and the posture stabilises, with the framing "
                     "cutting cleanly from the previous moment")
-            if narration:
-                text += f'; the voice-over continues: "{narration[:30]}"'
+            # 审计 P2-18（2026-09-29）：不再把旁白原文拼进提示词。「成片不产出旁白」是
+            # 产品决策（DEPRECATED_SHOT_FIELDS 显式拒绝 narration），且这里一旦有人
+            # 调大 H3_SEGMENT_MAX_SEC 越过 BEAT_MAX_SEC，旧剧本的旁白会借这条分支复活。
         else:
             text = ("the action continues to advance, keeping the characters' appearance, "
                     "wardrobe and scene lighting exactly consistent with the previous moment")

@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useApp } from '@/context/AppContext';
 import { t } from '@/i18n';
-import { projectsApi, keyframesApi, storyboardApi, videoApi, ttsApi, mixApi, qcApi, exportApi, autopilotApi, upscaleApi, chatApi, agentApi, episodesApi } from '@/api/client';
+import { projectsApi, keyframesApi, storyboardApi, videoApi, ttsApi, mixApi, qcApi, exportApi, autopilotApi, upscaleApi, chatApi, agentApi, episodesApi, novelsSplitPlanApi } from '@/api/client';
 import { Button, Input, EmptyState, ErrorState, Skeleton, Modal } from '@/components/ui';
 // tab 图标統一走线性 SVG（方案 P2-10）：此前是 emoji，字号受系统字体影响且观感与全站割裂
 import {
@@ -9,6 +9,8 @@ import {
   FolderOpen, ImageIcon, MessageSquare, Mountain, Music, Network, Share2, Target, User, X, ZoomIn,
 } from '@/components/ui/icons';
 import { useToast } from '@/components/ui/toast';
+import { useComfyProgress } from '@/hooks/useComfyProgress';
+import { getAgentSession, type ChatMsg } from '@/agentSession';
 import { GridPage } from '@/pages/GridPage';
 import { RelationGraphTab } from '@/components/RelationGraphTab';
 import { OutputReviewTab } from '@/components/OutputReviewTab';
@@ -144,7 +146,7 @@ export function ProjectWorkbenchPage({ projectKey }: ProjectWorkbenchPageProps) 
           {/* Header */}
           <div className="flex items-center justify-between">
             <div>
-              <h2 className="text-2xl font-bold text-ink-1">{project.name}</h2>
+              <h2 className="text-gradient text-2xl font-bold">{project.name}</h2>
               <p className="text-sm text-ink-2 mt-1">
                 {t('project.style')}: {project.config?.style} • {project.episode_count} {t('ep.suffix')}
               </p>
@@ -165,8 +167,8 @@ export function ProjectWorkbenchPage({ projectKey }: ProjectWorkbenchPageProps) 
               { label: t('wb.scenes'), count: assets?.counts?.scenes || 0, color: 'text-warning-strong' },
               { label: t('wb.storyboard'), count: assets?.counts?.storyboards || 0, color: 'text-info-strong' },
             ].map((stat) => (
-              <div key={stat.label} className="bg-surface rounded-lg p-4 border border-line">
-                <div className={`text-2xl font-bold ${stat.color}`}>{stat.count}</div>
+              <div key={stat.label} className="bg-surface rounded-lg p-4 border border-line transition-all hover:-translate-y-0.5 hover:shadow-md hover:border-line-strong">
+                <div className={`text-2xl font-bold tabular-nums ${stat.color}`}>{stat.count}</div>
                 <div className="text-sm text-ink-2">{stat.label}</div>
               </div>
             ))}
@@ -180,7 +182,7 @@ export function ProjectWorkbenchPage({ projectKey }: ProjectWorkbenchPageProps) 
                 onClick={() => setActiveTab(tab.id)}
                 className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all ${FOCUS_RING} ${
                   activeTab === tab.id
-                    ? 'bg-brand-subtle text-brand'
+                    ? 'bg-brand-subtle text-brand shadow-xs'
                     : 'text-ink-2 hover:bg-surface-2 hover:text-ink-1'
                 }`}
               >
@@ -310,6 +312,9 @@ function ProductionProgress({ projectKey }: { projectKey: string }) {
     };
   }, [projectKey]);
 
+  // ComfyUI 采样级实时进度：有生产任务时才轮询 comfyui 日志源（tqdm N/M）
+  const comfy = useComfyProgress(!!cur);
+
   if (!cur) return null;
 
   const percent = Math.max(0, Math.min(100, Number(cur.percent) || 0));
@@ -340,7 +345,7 @@ function ProductionProgress({ projectKey }: { projectKey: string }) {
       {/* 进度条 */}
       <div className="w-full bg-line rounded-full h-2 mb-3">
         <div
-          className="bg-brand h-2 rounded-full transition-all"
+          className="progress-fill h-2 rounded-full transition-all"
           style={{ width: `${percent}%` }}
         />
       </div>
@@ -372,6 +377,21 @@ function ProductionProgress({ projectKey }: { projectKey: string }) {
 
       {/* 当前步骤消息 + 超时告警 */}
       {cur.message && <p className="text-xs text-ink-2 mb-1">{cur.message}</p>}
+
+      {/* ComfyUI 采样进度（如「比例分镜 10/19」）：解析 comfyui 日志的 tqdm 行 */}
+      {comfy.active && comfy.total > 0 && (
+        <div className="mt-2 flex items-center gap-2 rounded-md border border-line bg-surface-2 px-2.5 py-1.5 text-xs">
+          <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-accent" />
+          <span className="shrink-0 text-ink-2">{t('live.comfySampling')}</span>
+          <span className="shrink-0 font-medium tabular-nums text-ink-1">
+            {comfy.current}/{comfy.total}
+          </span>
+          <div className="h-1 flex-1 overflow-hidden rounded-full bg-line">
+            <div className="progress-fill h-full rounded-full transition-all duration-300" style={{ width: `${comfy.percent}%` }} />
+          </div>
+          <span className="shrink-0 tabular-nums text-ink-2">{comfy.percent}%</span>
+        </div>
+      )}
       {stalled >= 900 && (
         <div className="flex items-start gap-2 mt-2 p-2.5 rounded bg-warning-subtle text-warning-strong text-xs">
           <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
@@ -383,89 +403,6 @@ function ProductionProgress({ projectKey }: { projectKey: string }) {
             </p>
             <p className="text-ink-2 mt-0.5">{t('wb.stallHint')}</p>
           </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-/** 紧凑版生产进度条：专供「AI 总控」右侧窄面板（340px）使用。
- *  与 OverviewTab 里的 ProductionProgress 共享同一数据源（/api/autopilot/status），
- *  但只保留最关键的「当前步骤 + 进度条 + 百分比 + 当前消息 + 停滞告警」——
- *  窄面板放不下完整步骤链，故用单行步骤名替代。 */
-function ChatProductionProgress({ projectKey }: { projectKey: string }) {
-  const { t } = useApp();
-  const [cur, setCur] = useState<AutopilotCurrent | null>(null);
-
-  useEffect(() => {
-    let alive = true;
-    let timer: ReturnType<typeof setInterval> | null = null;
-    const poll = async () => {
-      try {
-        const st = await autopilotApi.status(projectKey);
-        if (!alive) return;
-        setCur((st.current as AutopilotCurrent) || null);
-      } catch {
-        // 静默：进度刷新是锦上添花，不能因一次失败打扰对话
-      }
-    };
-    poll();
-    timer = setInterval(poll, 3000);
-    return () => {
-      alive = false;
-      if (timer) clearInterval(timer);
-    };
-  }, [projectKey]);
-
-  // 无正在生产的项目 → 不占面板空间（用户纯聊天时保持干净）
-  if (!cur) return null;
-
-  const percent = Math.max(0, Math.min(100, Number(cur.percent) || 0));
-  const stepsDone = Array.isArray(cur.steps_done) ? cur.steps_done : [];
-  const currentStepId = (cur.step || '').split(':')[0];
-  const currentStep = PRODUCTION_STEPS.find((s) => s.id === currentStepId);
-  const stalled = Number(cur.step_stalled_sec) || 0;
-  const stalledMin = Math.floor(stalled / 60);
-  const stalledSec = stalled % 60;
-
-  return (
-    <div
-      className="mx-3 mt-3 p-2.5 rounded-lg border border-line bg-surface shrink-0"
-      role="status"
-      aria-live="polite"
-      aria-label={t('wb.productionProgress')}
-    >
-      <div className="flex items-center justify-between mb-1.5">
-        <span className="text-xs font-semibold text-ink-1 flex items-center gap-1.5">
-          <span className="inline-block w-1.5 h-1.5 rounded-full bg-info animate-pulse" />
-          {t('wb.productionProgress')}
-        </span>
-        <span className="text-xs text-ink-2">
-          {t(currentStep ? currentStep.labelKey : 'wb.producing')}
-          {cur.episode != null ? ` · ${t('wb.producingEpisode', { n: cur.episode })}` : ''}
-        </span>
-      </div>
-
-      <div className="w-full bg-line rounded-full h-1.5 mb-1.5">
-        <div
-          className="bg-brand h-1.5 rounded-full transition-all"
-          style={{ width: `${percent}%` }}
-        />
-      </div>
-
-      <div className="flex items-center justify-between text-[11px] text-ink-2">
-        <span className="truncate">{cur.message || t('wb.producing')}</span>
-        <span className="shrink-0 ml-2 tabular-nums">{percent}%</span>
-      </div>
-
-      {stalled >= 900 && (
-        <div className="flex items-start gap-1.5 mt-2 text-[11px] text-warning-strong">
-          <AlertTriangle className="h-3.5 w-3.5 shrink-0 mt-0.5" />
-          <span>
-            {t('wb.currentStep')}
-            {currentStep ? `：${t(currentStep.labelKey)}` : ''} ·{' '}
-            {t('wb.stepStalled', { min: stalledMin, sec: stalledSec })}
-          </span>
         </div>
       )}
     </div>
@@ -498,6 +435,12 @@ function OverviewTab({
   /** 记下最近一次请求的集号：详情加载失败后 ErrorState 的「重试」要能定位回同一集 */
   const lastDetailEpRef = React.useRef<number | null>(null);
 
+  // P2-2 分集断点提议（与生产口径同源的只读预览，不触发任何生成）
+  const [splitPlanOpen, setSplitPlanOpen] = useState(false);
+  const [splitPlan, setSplitPlan] = useState<any | null>(null);
+  const [splitPlanLoading, setSplitPlanLoading] = useState(false);
+  const [splitPlanError, setSplitPlanError] = useState('');
+
   // 加载剧集列表
   // 抽成具名函数：错误态需要「重试」入口，而 useEffect 无法被手动重新触发。
   // 取数逻辑与原实现逐字一致，仅补一次错误清理，避免重试成功后旧的失败文案残留。
@@ -519,6 +462,25 @@ function OverviewTab({
   }, [novelId, t]);
 
   useEffect(() => { fetchEpisodes(); }, [fetchEpisodes]);
+
+  // 拉取分集断点提议：默认不带参数，与生产 autopilot.episode_units 完全同源，
+  // 保证「提议 ≡ 实际生成」，不会提议说 1 集、真生成拆 3 集。
+  const fetchSplitPlan = React.useCallback(() => {
+    if (!novelId) return;
+    setSplitPlanLoading(true);
+    setSplitPlanError('');
+    novelsSplitPlanApi.get(novelId)
+      .then(data => {
+        setSplitPlan(data);
+        setSplitPlanOpen(true);
+      })
+      .catch(err => {
+        setSplitPlan(null);
+        setSplitPlanError(err instanceof Error ? err.message : t('project.loadingFailed'));
+        setSplitPlanOpen(true);
+      })
+      .finally(() => setSplitPlanLoading(false));
+  }, [novelId, t]);
 
   // 加载单集详情
   // ⚠️ 后端 /api/episodes/<novel>/<ep> 的剧本正文嵌在 `script` 对象下（shots/characters/items/scenes），
@@ -836,9 +798,106 @@ function OverviewTab({
             {/* 剧集列表 */}
             <div className="bg-surface rounded-lg border border-line">
               <div className="p-4 border-b border-line">
-                <h4 className="font-semibold text-ink-1">{t('wb.episodeList')}</h4>
+                <div className="flex items-center justify-between">
+                  <h4 className="font-semibold text-ink-1">{t('wb.episodeList')}</h4>
+                  <button
+                    onClick={() => (splitPlanOpen ? setSplitPlanOpen(false) : fetchSplitPlan())}
+                    title={t('wb.splitPlanHint')}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-all ${FOCUS_RING} ${
+                      splitPlanOpen
+                        ? 'bg-brand text-white'
+                        : 'bg-surface-2 text-ink-2 hover:bg-line hover:text-ink-1 border border-line'
+                    }`}
+                  >
+                    {splitPlanOpen ? t('wb.splitPlanCollapse') : t('wb.splitPlan')}
+                  </button>
+                </div>
                 <p className="text-xs text-ink-2 mt-1">{t('wb.clickEpisodeHint')}</p>
               </div>
+
+              {/* P2-2 分集断点提议卡片（与生产口径同源的只读预览） */}
+              {splitPlanOpen && (
+                <div className="px-4 py-4 border-b border-line bg-surface-2/50">
+                  {splitPlanLoading && (
+                    <div className="text-sm text-ink-2 flex items-center gap-2">
+                      <div className="w-4 h-4 border-2 border-brand border-t-transparent rounded-full animate-spin" />
+                      {t('wb.splitPlanLoading')}
+                    </div>
+                  )}
+                  {!splitPlanLoading && splitPlanError && (
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="text-sm text-danger-strong">{splitPlanError}</span>
+                      <button
+                        onClick={fetchSplitPlan}
+                        className={`px-2.5 py-1 rounded-md text-xs bg-surface-2 text-ink-2 hover:bg-line ${FOCUS_RING}`}
+                      >
+                        {t('wb.splitPlanRetry')}
+                      </button>
+                    </div>
+                  )}
+                  {!splitPlanLoading && !splitPlanError && splitPlan && splitPlan.chapters?.length > 0 && (
+                    <div className="space-y-3">
+                      {/* 汇总行 */}
+                      <div className="flex flex-wrap items-center gap-2 text-sm">
+                        <span className="font-medium text-ink-1">
+                          {t('wb.splitPlanTotal', { ep: splitPlan.total_episodes ?? 0, ch: splitPlan.chapter_count ?? splitPlan.chapters.length })}
+                        </span>
+                        {(splitPlan.needs_confirm_chapters?.length ?? 0) > 0 && (
+                          <span className="px-2 py-0.5 rounded-full text-xs font-medium bg-warning-subtle text-warning-strong">
+                            {t('wb.splitPlanNeedsConfirm', { n: splitPlan.needs_confirm_chapters.length })}
+                          </span>
+                        )}
+                      </div>
+                      {/* 逐章断点 */}
+                      <div className="space-y-2">
+                        {splitPlan.chapters.map((ch: any) => (
+                          <div key={ch.index} className="bg-surface rounded-lg border border-line p-3">
+                            <div className="flex flex-wrap items-center gap-2 mb-2">
+                              <span className="text-sm font-semibold text-ink-1">
+                                {t('wb.splitPlanChapter', { n: ch.index })}
+                                {ch.title && <span className="ml-1.5 text-sm text-brand font-normal">{t('wb.splitPlanChapterTitle', { title: ch.title })}</span>}
+                              </span>
+                              <span className="text-xs text-ink-2">{t('wb.splitPlanParts', { n: ch.total_parts })}</span>
+                              {ch.needs_confirm && (
+                                <span className="px-1.5 py-0.5 rounded text-[11px] font-medium bg-warning-subtle text-warning-strong">
+                                  {t('wb.splitPlanConfirmNote')}
+                                </span>
+                              )}
+                            </div>
+                            {ch.units?.length > 0 && (
+                              <div className="space-y-1">
+                                {ch.units.map((u: any) => (
+                                  <div key={u.part} className="flex flex-wrap items-center gap-2 text-xs text-ink-2">
+                                    <span className="font-medium text-ink-1 w-24 shrink-0">
+                                      {t('wb.splitPlanPart', { part: u.part, total: ch.total_parts })}
+                                    </span>
+                                    <span className="tabular-nums">{t('wb.splitPlanShots', { n: u.est_shots ?? '—' })}</span>
+                                    <span className="tabular-nums">{t('wb.splitPlanSec', { sec: u.est_sec ?? '—' })}</span>
+                                    {u.over_redline && (
+                                      <span className="px-1.5 py-0.5 rounded text-[11px] font-medium bg-danger-subtle text-danger-strong">
+                                        {t('wb.splitPlanOverRedline')}
+                                      </span>
+                                    )}
+                                    {u.preview && (
+                                      <span className="text-ink-3 truncate max-w-[14rem]">{u.preview}</span>
+                                    )}
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                            {ch.message && (
+                              <p className="mt-1.5 text-xs text-ink-3">{ch.message}</p>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {!splitPlanLoading && !splitPlanError && splitPlan && (splitPlan.chapters?.length ?? 0) === 0 && (
+                    <p className="text-sm text-ink-3">{t('wb.splitPlanNoChapters')}</p>
+                  )}
+                </div>
+              )}
 
               {/* P2-15：补列表语义 —— 此前是一串裸 div/button，读屏不会播报
                   「列表，共 N 项」。这里刻意**不用** <table>：它是可点击的导航列表，
@@ -1256,6 +1315,7 @@ function QcTab({ projectKey }: { projectKey: string }) {
         image_ref_compare: !!cfgDraft.image_ref_compare,
         pass_score: Number(cfgDraft.pass_score),
         max_retries: Number(cfgDraft.max_retries),
+        best_of: Number(cfgDraft.best_of),
         video_frame_count: Number(cfgDraft.video_frame_count),
         timeout: Number(cfgDraft.timeout),
       } as any);
@@ -1498,7 +1558,7 @@ function QcTab({ projectKey }: { projectKey: string }) {
             </span>
           </label>
 
-          {/* 保留原生：这四个 number 输入带 step/min/max 约束与数值型默认值，
+          {/* 保留原生：这几个 number 输入带 step/min/max 约束与数值型默认值，
               Input 组件未开放 step/min/max，换成 Input 会静默丢掉步进与取值范围 */}
           <div className="mt-3 grid grid-cols-2 md:grid-cols-4 gap-3">
             <div>
@@ -1518,6 +1578,16 @@ function QcTab({ projectKey }: { projectKey: string }) {
                 onChange={(e) => setCfgDraft({ ...cfgDraft, max_retries: e.target.value })}
                 className={`w-full px-2 py-1 text-sm rounded border border-line bg-surface text-ink-1 ${FOCUS_RING}`}
               />
+            </div>
+            <div>
+              <div className="text-xs text-ink-2 mb-1">{t('qc.bestOfLabel')}</div>
+              <input
+                type="number" step="1" min="1" max="4"
+                value={cfgDraft.best_of ?? 1}
+                onChange={(e) => setCfgDraft({ ...cfgDraft, best_of: e.target.value })}
+                className={`w-full px-2 py-1 text-sm rounded border border-line bg-surface text-ink-1 ${FOCUS_RING}`}
+              />
+              <div className="text-xs text-ink-3 mt-1">{t('qc.bestOfHint')}</div>
             </div>
             <div>
               <div className="text-xs text-ink-2 mb-1">{t('qc.videoFramesLabel')}</div>
@@ -2845,61 +2915,231 @@ function useProductionStatus(projectKey: string) {
   return current;
 }
 
-// 正在生产的状态条：集号 + 章节 + 阶段 + 进度百分比
-function ProductionBar({ current }: { current: any }) {
-  if (!current) return null;
-  const pct = Math.max(0, Math.min(100, Number(current.percent) || 0));
-  const stalled = Number(current.step_stalled_sec) || 0;
+// 正在生产的状态条 → 实时状态卡（合并了原先叠加的两条进度条）：
+//   一行「正在生产」= 哪一集 / 哪一步 / 几成（/api/autopilot/status）；
+//   一行「ComfyUI 采样」= 解析 comfyui 日志 tqdm 的 N/M 实时步数（如 10/19）。
+// 有生产任务才轮询日志源，纯聊天时整卡不渲染。
+function AgentStatusCard({ projectKey }: { projectKey: string }) {
+  const current = useProductionStatus(projectKey);
+  const comfy = useComfyProgress(!!current);
+
+  if (!current && !comfy.active) return null;
+
+  const pct = current ? Math.max(0, Math.min(100, Number(current.percent) || 0)) : 0;
+  const stalled = current ? Number(current.step_stalled_sec) || 0 : 0;
   const stallMin = Math.floor(stalled / 60);
+
   return (
-    <div className="px-4 py-2.5 border-b border-line bg-brand-subtle/40 shrink-0 space-y-1.5">
-      <div className="flex items-center gap-2 text-[11px]">
-        <span className="w-2 h-2 rounded-full bg-brand animate-pulse shrink-0" />
-        <span className="text-ink-2 shrink-0">{t('chat.producingNow')}</span>
-        <span className="text-ink-1 font-medium truncate">
-          {current.describe || current.message || ''}
-        </span>
-      </div>
-      <div className="h-1.5 rounded-full bg-surface-2 overflow-hidden">
-        <div
-          className="h-full bg-brand transition-all duration-500 rounded-full"
-          style={{ width: `${pct}%` }}
-        />
-      </div>
-      {stallMin >= 3 && (
-        <div className="text-[10px] text-warning-strong">
-          {t('chat.producingStalled', { m: stallMin })}
+    <div
+      className="glass glow-brand mx-3 mt-3 shrink-0 space-y-2.5 rounded-lg border border-line p-3"
+      role="status"
+      aria-live="polite"
+      aria-label={t('wb.productionProgress')}
+    >
+      {current && (
+        <>
+          <div className="flex items-center gap-2 text-[11px]">
+            <span className="h-2 w-2 shrink-0 animate-pulse rounded-full bg-brand" />
+            <span className="shrink-0 text-ink-2">{t('chat.producingNow')}</span>
+            <span className="truncate font-medium text-ink-1">
+              {current.describe || current.message || ''}
+            </span>
+            <span className="ml-auto shrink-0 tabular-nums text-ink-2">{pct}%</span>
+          </div>
+          <div className="h-1.5 overflow-hidden rounded-full bg-surface-2">
+            <div
+              className="progress-fill h-full rounded-full transition-all duration-500"
+              style={{ width: `${pct}%` }}
+            />
+          </div>
+          {stallMin >= 3 && (
+            <div className="text-[10px] text-warning-strong">
+              {t('chat.producingStalled', { m: stallMin })}
+            </div>
+          )}
+        </>
+      )}
+      {comfy.active && comfy.total > 0 && (
+        <div className="flex items-center gap-2 text-[11px]">
+          <span className="h-2 w-2 shrink-0 animate-pulse rounded-full bg-accent" />
+          <span className="shrink-0 text-ink-2">{t('live.comfySampling')}</span>
+          <span className="shrink-0 font-medium tabular-nums text-ink-1">
+            {comfy.current}/{comfy.total}
+          </span>
+          <div className="h-1 flex-1 overflow-hidden rounded-full bg-surface-2">
+            <div
+              className="progress-fill h-full rounded-full transition-all duration-300"
+              style={{ width: `${comfy.percent}%` }}
+            />
+          </div>
+          <span className="shrink-0 tabular-nums text-ink-2">{comfy.percent}%</span>
         </div>
       )}
     </div>
   );
 }
 
+/** 总控执行轨迹：像 Agent 工作台一样把「它正在干什么」摊开 —— 一次工具调用一个节点
+ *  （工具名徽标 + 耗时 + 结果摘要），执行中最新一步高亮、末尾挂「等待下一步」。
+ *  live=true（执行中）始终展开、标题实时计时；job 结束后作为一条 run 消息留在
+ *  对话里（默认展开、可收起）——此前 run 结束即被置 null，「它做过什么」无处可查。 */
+function AgentTrace({ steps, status, startedAt, live = false }: {
+  steps: AgentStep[];
+  status: string;
+  startedAt?: number;
+  live?: boolean;
+}) {
+  const [open, setOpen] = useState(true);
+  // 执行中每秒重渲染一次，让标题里的耗时走秒
+  const [, tick] = useState(0);
+  useEffect(() => {
+    if (!live) return;
+    const id = window.setInterval(() => tick(v => v + 1), 1000);
+    return () => window.clearInterval(id);
+  }, [live]);
+
+  const running = status === 'running';
+  const failed = steps.some((s) => !s.ok && !s.blocked);
+  const elapsed = live && startedAt ? Math.max(0, Math.round((Date.now() - startedAt) / 1000)) : null;
+  const titleKey =
+    running ? 'live.agentRunning'
+    : status === 'failed' ? 'live.agentRunFailed'
+    : status === 'killed' ? 'live.agentRunKilled'
+    : status === 'timeout' ? 'live.agentTimeout'
+    : 'live.agentRunDone';
+
+  return (
+    <div className={`mr-6 rounded-lg border bg-surface ${running ? 'glow-brand border-brand/30' : 'border-line'}`}>
+      <div className="flex items-center gap-2 px-3 py-2 text-xs">
+        {running ? (
+          <span className="h-3 w-3 shrink-0 animate-spin rounded-full border-2 border-brand/40 border-t-brand" aria-hidden="true" />
+        ) : (
+          <span className={`h-2 w-2 shrink-0 rounded-full ${failed ? 'bg-danger' : 'bg-success'}`} aria-hidden="true" />
+        )}
+        <span className={`shrink-0 font-medium tabular-nums ${running ? 'text-brand' : 'text-ink-2'}`}>
+          {t(titleKey, { n: steps.length, s: elapsed ?? 0 })}
+        </span>
+        {!running && (
+          <button
+            type="button"
+            onClick={() => setOpen(v => !v)}
+            aria-expanded={open}
+            title={open ? t('live.collapse') : t('live.expand')}
+            className={`ml-auto rounded p-0.5 text-ink-3 transition-colors hover:text-ink-1 ${FOCUS_RING}`}
+          >
+            <svg
+              className={`h-3.5 w-3.5 transition-transform ${open ? 'rotate-180' : ''}`}
+              fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true"
+            >
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+            </svg>
+          </button>
+        )}
+      </div>
+      {open && (
+        <ol className="relative mx-3 mb-3 space-y-2 border-l border-line pl-3.5">
+          {steps.map((s, i) => {
+            const isCurrent = live && i === steps.length - 1;
+            return (
+              <li key={i} className="relative text-[11px] leading-snug">
+                <span
+                  className={`absolute -left-[22px] top-0 flex h-3.5 w-3.5 items-center justify-center rounded-full border bg-surface ${
+                    s.blocked
+                      ? 'border-warning/50 text-warning-strong'
+                      : s.ok
+                        ? 'border-success/50 text-success-strong'
+                        : 'border-danger/50 text-danger-strong'
+                  }`}
+                  aria-hidden="true"
+                >
+                  {s.blocked
+                    ? <AlertTriangle className="h-2.5 w-2.5" />
+                    : s.ok
+                      ? <Check className="h-2.5 w-2.5" />
+                      : <X className="h-2.5 w-2.5" />}
+                </span>
+                <div className={isCurrent ? 'rounded-md bg-brand-subtle/40 px-1.5 py-1' : ''}>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="rounded bg-brand-subtle px-1.5 py-0.5 font-medium text-brand" title={s.tool}>
+                      {toolLabel(t, s.tool)}
+                    </span>
+                    {s.elapsed_sec != null && (
+                      <span className="tabular-nums text-ink-3">{t('live.elapsed', { s: Math.round(s.elapsed_sec) })}</span>
+                    )}
+                  </div>
+                  <p className="mt-0.5 break-all text-ink-2">
+                    {s.summary}
+                    {s.cached ? t('chat.cached') : ''}
+                  </p>
+                </div>
+              </li>
+            );
+          })}
+          {running && (
+            <li className="relative text-[11px] text-ink-3">
+              <span
+                className="absolute -left-[22px] top-0 flex h-3.5 w-3.5 items-center justify-center rounded-full border border-brand/40 bg-surface"
+                aria-hidden="true"
+              >
+                <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-brand" />
+              </span>
+              {t('live.waitingNext')}
+            </li>
+          )}
+        </ol>
+      )}
+    </div>
+  );
+}
+
 function ChatPanel({ projectKey, onClose }: { projectKey: string; onClose: () => void }) {
-  const [messages, setMessages] = useState<any[]>([]);
+  // 会话缓存（@/agentSession）：切菜单/收起面板时组件卸载，消息与进行中的 job
+  // 存在模块级 session 里，重挂载时原样恢复并继续跟踪同一个 job。
+  const [messages, setMessages] = useState<ChatMsg[]>(() => [...getAgentSession(projectKey).messages]);
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
   const [error, setError] = useState('');
   // 自主执行模式：默认开启。指令交给总控模型自己决策并调用工具，全过程无需人工确认。
   const [autoMode, setAutoMode] = useState(true);
-  const [run, setRun] = useState<{ steps: AgentStep[]; status: string } | null>(null);
+  const [run, setRun] = useState<{ steps: AgentStep[]; status: string; startedAt?: number } | null>(null);
   const [toolCount, setToolCount] = useState(0);
   const [killOn, setKillOn] = useState(false);
   const messagesEndRef = React.useRef<HTMLDivElement>(null);
-  // 常驻显示「后台在生成什么」——用户不必再问「现在跑到哪了」
-  const producing = useProductionStatus(projectKey);
+  // 审计 P2-35（2026-09-29）：发送路径的 trackJob 此前没传取消守卫 —— 面板卸载后
+  // 轮询最长还会空转 35 分钟并对已卸载组件 setState。与「恢复跟踪」路径同一口径：
+  // 卸载即让位（session 里的 job 信息保留，重挂载的新实例接手）。
+  const panelAliveRef = React.useRef(true);
+  React.useEffect(() => {
+    panelAliveRef.current = true;
+    return () => { panelAliveRef.current = false; };
+  }, []);
 
-  // 加载该项目的历史对话
-  const loadHistory = async () => {
+  // 追加消息：session 是唯一真源，state 只是它的投影——组件卸载后 session 仍会更新，
+  // 回来时轨迹不丢（直接写 setMessages 的话，卸载期间发生的事就没人记了）。
+  const pushMsg = (m: ChatMsg) => {
+    const s = getAgentSession(projectKey);
+    s.messages = [...s.messages, m];
+    setMessages(s.messages);
+  };
+
+  // 加载该项目的历史对话。会话缓存非空时直接还原（保留 run 轨迹与进行中的 job），
+  // 不回后端重拉——重拉会把结构化轨迹洗掉；「刷新」按钮传 force 才真正重拉。
+  const loadHistory = async (force = false) => {
+    const s = getAgentSession(projectKey);
+    if (!force && s.messages.length > 0) {
+      setMessages([...s.messages]);
+      return;
+    }
     try {
       const d = await chatApi.history(projectKey);
-      setMessages(d.messages || []);
+      s.messages = (d.messages || []) as ChatMsg[];
+      setMessages(s.messages);
     } catch (err) {
       console.error('加载对话历史失败:', err);
     }
   };
 
-  useEffect(() => { loadHistory(); }, [projectKey]);
+  useEffect(() => { void loadHistory(); }, [projectKey]);
 
   // 拉取总控可用工具数与急停状态（失败不影响对话，静默降级）
   useEffect(() => {
@@ -2907,6 +3147,16 @@ function ChatPanel({ projectKey, onClose }: { projectKey: string; onClose: () =>
       .then((d) => { setToolCount(d.count || 0); setKillOn(!!d.kill?.on); })
       .catch(() => {});
   }, []);
+
+  // 恢复跟踪：切菜单/收起面板前若有进行中的 job，回来后继续轮询同一个 job。
+  // （StrictMode 双挂载/组件卸载时通过 cancelled 停掉旧循环，session 状态留给新实例）
+  useEffect(() => {
+    const s = getAgentSession(projectKey);
+    if (!s.runningJobId) return;
+    let cancelled = false;
+    void trackJob(s.runningJobId, s.runningStartedAt ?? Date.now(), () => cancelled);
+    return () => { cancelled = true; };
+  }, [projectKey]);
 
   const toggleKill = async () => {
     try {
@@ -2921,51 +3171,80 @@ function ChatPanel({ projectKey, onClose }: { projectKey: string; onClose: () =>
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
+  /** 轮询一个总控 job 到结束：实时刷新 run（AgentTrace 时间线），结束后把轨迹与回复落进对话。
+   *  isCancelled=组件卸载/重挂载时停掉旧循环——不清 session 状态，重挂载的新实例会接手。 */
+  const trackJob = async (jobId: string, startedAt?: number, isCancelled?: () => boolean) => {
+    const s = getAgentSession(projectKey);
+    s.runningJobId = jobId;
+    s.runningStartedAt = startedAt ?? s.runningStartedAt ?? Date.now();
+    setSending(true);
+    setRun({ steps: [], status: 'running', startedAt: s.runningStartedAt });
+    let failures = 0;
+    const deadline = Date.now() + 35 * 60 * 1000; // 兜底，避免异常时永久轮询
+    for (;;) {
+      await new Promise(r => setTimeout(r, 1200));
+      if (isCancelled?.()) return; // 旧实例让位：session 里的 job 信息由重挂载的新实例接手
+      let job;
+      try {
+        job = await agentApi.job(jobId);
+        failures = 0;
+      } catch {
+        failures += 1;
+        // 后端连续不可达（重启中/挂了）：停止跟踪，避免空转到 35 分钟兜底
+        if (failures >= 5) { setError(t('live.pollFailed')); break; }
+        if (Date.now() > deadline) break;
+        continue;
+      }
+      setRun({ steps: job.steps || [], status: job.status || 'running', startedAt: s.runningStartedAt ?? undefined });
+      if (job.status !== 'running') {
+        pushMsg({ role: 'assistant', kind: 'run', steps: job.steps || [], status: job.status || 'done', timestamp: new Date().toISOString() });
+        if (job.reply) {
+          pushMsg({ role: 'assistant', content: job.reply, timestamp: new Date().toISOString() });
+        } else if (job.error) {
+          setError(job.error);
+        }
+        break;
+      }
+      if (Date.now() > deadline) { setError(t('chat.timeout')); break; }
+    }
+    s.runningJobId = null;
+    s.runningStartedAt = null;
+    setRun(null);
+    setSending(false);
+  };
+
   const sendMessage = async () => {
     const text = input.trim();
     if (!text || sending) return;
     setSending(true);
     setError('');
     // 乐观渲染用户消息
-    setMessages(prev => [...prev, { role: 'user', content: text, timestamp: new Date().toISOString() }]);
+    pushMsg({ role: 'user', content: text, timestamp: new Date().toISOString() });
     setInput('');
     try {
       // 纯聊天模式：走老链路，只做对话 + 抽取创作设定
       if (!autoMode) {
         const data = await chatApi.send(text, projectKey);
         if (data.success && data.reply) {
-          setMessages(prev => [...prev, { role: 'assistant', content: data.reply, timestamp: new Date().toISOString() }]);
+          pushMsg({ role: 'assistant', content: data.reply, timestamp: new Date().toISOString() });
         } else {
           setError(t('chat.noReply'));
         }
         return;
       }
 
-      // 自主执行模式：下发任务 → 轮询 → 逐步展示「它自己做了什么」
+      // 自主执行模式：下发任务 → trackJob 轮询 → 时间线摊开「它自己做了什么」
       const started = await agentApi.send(text, projectKey);
       if (!started.success || !started.job_id) {
         setError(t('chat.startFailed'));
         return;
       }
-      setRun({ steps: [], status: 'running' });
-      const deadline = Date.now() + 35 * 60 * 1000; // 兜底，避免异常时永久轮询
-      for (;;) {
-        await new Promise(r => setTimeout(r, 1200));
-        const job = await agentApi.job(started.job_id);
-        setRun({ steps: job.steps || [], status: job.status || 'running' });
-        if (job.status !== 'running') {
-          if (job.reply) {
-            setMessages(prev => [...prev, { role: 'assistant', content: job.reply, timestamp: new Date().toISOString() }]);
-          } else if (job.error) {
-            setError(job.error);
-          }
-          break;
-        }
-        if (Date.now() > deadline) { setError(t('chat.timeout')); break; }
-      }
-      setRun(null);
+      await trackJob(started.job_id, Date.now(), () => !panelAliveRef.current);
     } catch (err) {
       setError(err instanceof Error ? err.message : t('chat.sendFailed'));
+      const s = getAgentSession(projectKey);
+      s.runningJobId = null;
+      s.runningStartedAt = null;
       setRun(null);
     } finally {
       setSending(false);
@@ -2976,7 +3255,8 @@ function ChatPanel({ projectKey, onClose }: { projectKey: string; onClose: () =>
     <aside
       // h-[calc(100vh-7rem)] = 视口高 −（顶栏 ~63px + main 上下 padding 48px），
       // 让面板与左列内容等高、上下贯通；sticky 使其随页面滚动保持停靠。
-      className="flex w-full flex-col overflow-hidden rounded-xl border border-line bg-surface lg:sticky lg:top-0 lg:h-[calc(100vh-7rem)] lg:w-[340px] lg:shrink-0 min-h-[420px]"
+      // glass：半透明 + 背景模糊，盖在科技感氛围层上（常驻 chrome 才用 blur）。
+      className="glass flex w-full flex-col overflow-hidden rounded-xl border border-line lg:sticky lg:top-0 lg:h-[calc(100vh-7rem)] lg:w-[340px] lg:shrink-0 min-h-[420px]"
     >
       {/* 头部：与工作台其他面板一致的白底 + 灰边 + indigo 强调 */}
       <div className="flex items-center justify-between px-4 py-3 border-b border-line shrink-0">
@@ -3034,18 +3314,15 @@ function ChatPanel({ projectKey, onClose }: { projectKey: string; onClose: () =>
         </div>
       </div>
 
-      {/* 生产进行中：把「现在在生成哪一集 / 哪一步 / 几成」常驻摊开 */}
-      <ProductionBar current={producing} />
+      {/* 实时状态卡：正在生产（哪一集/哪一步/几成）+ ComfyUI 采样进度（如 10/19）。
+          此处原先是两条几乎相同的进度条叠加，已合并为一张卡。 */}
+      <AgentStatusCard projectKey={projectKey} />
 
       {error && (
         <div className="mx-3 mt-3 p-2 bg-danger-subtle border border-danger/30 rounded-lg text-danger-strong text-xs shrink-0">
           {error}
         </div>
       )}
-
-      {/* 生产进度（实时）：AI 总控面板内也能看到当前正在生产哪一集/步骤/百分比，
-          无需切回「总览」标签页。数据源与 OverviewTab 的进度卡一致。 */}
-      <ChatProductionProgress projectKey={projectKey} />
 
       {/* 消息区：浅色底以区别于面板头部/输入区，形成「对话」区域感。
           注意：空态与消息列表要二选一渲染 —— 若把滚动哨兵 <div> 和 h-full 的空态
@@ -3075,49 +3352,24 @@ function ChatPanel({ projectKey, onClose }: { projectKey: string; onClose: () =>
           </div>
         ) : (
           <div className="p-3 space-y-3">
-            {messages.map((msg: any, idx: number) => (
-              <div
-                key={idx}
-                className={`px-3 py-2 rounded-lg text-sm ${
-                  msg.role === 'user'
-                    ? 'bg-brand text-white ml-6 rounded-br-sm'
-                    : 'bg-surface border border-line text-ink-1 mr-6 rounded-bl-sm'
-                }`}
-              >
-                <p className="whitespace-pre-wrap break-words">{msg.content}</p>
-              </div>
-            ))}
-            {/* 自主执行过程：把总控「自己调了哪些功能、成功没有」透明地摊开 */}
-            {run && (
-              <div className="mr-6 px-3 py-2 rounded-lg border border-line bg-surface space-y-1.5">
-                <div className="flex items-center gap-2 text-xs text-ink-2">
-                  {run.status === 'running' ? (
-                    <span className="w-3 h-3 border-2 border-brand/40 border-t-brand rounded-full animate-spin inline-block shrink-0" />
-                  ) : (
-                    <span className="w-1.5 h-1.5 rounded-full bg-ink-3 inline-block shrink-0" />
-                  )}
-                  {t('chat.runningSteps', { n: run.steps.length })}
+            {messages.map((msg: ChatMsg, idx: number) =>
+              msg.kind === 'run' ? (
+                <AgentTrace key={idx} steps={msg.steps || []} status={msg.status || 'done'} />
+              ) : (
+                <div
+                  key={idx}
+                  className={`px-3 py-2 rounded-lg text-sm ${
+                    msg.role === 'user'
+                      ? 'bg-brand text-white ml-6 rounded-br-sm'
+                      : 'bg-surface border border-line text-ink-1 mr-6 rounded-bl-sm'
+                  }`}
+                >
+                  <p className="whitespace-pre-wrap break-words">{msg.content}</p>
                 </div>
-                {run.steps.map((s: AgentStep, i: number) => (
-                  <div key={i} className="flex items-start gap-1.5 text-[11px] leading-snug">
-                    <span className={`shrink-0 flex items-center ${s.blocked ? 'text-warning-strong' : s.ok ? 'text-success-strong' : 'text-danger-strong'}`}>
-                      {s.blocked
-                        ? <AlertTriangle className="h-3.5 w-3.5" />
-                        : s.ok
-                          ? <Check className="h-3.5 w-3.5" />
-                          : <X className="h-3.5 w-3.5" />}
-                    </span>
-                    <span className="text-ink-1 shrink-0" title={s.tool}>
-                      {toolLabel(t, s.tool)}
-                    </span>
-                    <span className="text-ink-2 break-all">
-                      {s.summary}
-                      {s.cached ? t('chat.cached') : ''}
-                    </span>
-                  </div>
-                ))}
-              </div>
+              )
             )}
+            {/* 自主执行过程（实时）：正在跑的 job 摊开在对话流里，像 Agent 工作台一样看它干活 */}
+            {run && <AgentTrace steps={run.steps} status={run.status} startedAt={run.startedAt} live />}
             {sending && !run && (
               <div className="bg-surface border border-line mr-6 px-3 py-2 rounded-lg text-sm text-ink-2 flex items-center gap-2">
                 <span className="w-3 h-3 border-2 border-brand/40 border-t-brand rounded-full animate-spin inline-block" />

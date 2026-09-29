@@ -23,7 +23,15 @@ const AppContext = createContext<AppContextType>({
 });
 
 export function AppProvider({ children }: { children: React.ReactNode }) {
-  const [lang, setLangState] = useState('zh-CN');
+  // 审计 P2-38（2026-09-29）：语言选择持久化到 localStorage —— 旧实现只写内存，
+  // 用户选了英文、刷新即丢回 navigator.language。
+  const [lang, setLangState] = useState(() => {
+    try {
+      const saved = window.localStorage.getItem('mjscxt.lang');
+      if (saved === 'zh-CN' || saved === 'en-US') return saved;
+    } catch { /* 隐私模式等 localStorage 不可用：按浏览器语言回退 */ }
+    return navigator.language.startsWith('zh') ? 'zh-CN' : 'en-US';
+  });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   // 语言包版本号 —— 见 i18n/index.ts 的说明。
@@ -32,21 +40,23 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [localeVersion, setLocaleVersion] = useState(getLocaleVersion());
 
   useEffect(() => {
-    const browserLang = navigator.language.startsWith('zh') ? 'zh-CN' : 'en-US';
-    loadLocale(browserLang).then(() => {
-      setLangState(browserLang);
+    loadLocale(lang).then(() => {
       setLocaleVersion(getLocaleVersion());
       setLoading(false);
     }).catch((e) => {
       console.error('Failed to load locale:', e);
       setLoading(false);
     });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const setLang = useCallback(async (newLang: string) => {
     await loadLocale(newLang);
     setLangState(newLang);
     setLocaleVersion(getLocaleVersion());
+    try {
+      window.localStorage.setItem('mjscxt.lang', newLang);
+    } catch { /* localStorage 不可用时静默：仅本次会话生效 */ }
   }, []);
 
   // 引用随 localeVersion 变化 → 依赖 t 的 useMemo/useCallback 会在语言包就绪后重算

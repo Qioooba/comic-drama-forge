@@ -12617,7 +12617,14 @@ def api_autopilot_exception_resolve():
 @app.route('/api/autopilot/run-once', methods=['POST'])
 @_autopilot_guard
 def api_autopilot_run_once():
-    """立即生产指定一集（同步返回结果；用于联调与补跑，不建议前端长等待）"""
+    """立即生产指定一集（**异步**：校验通过即返回 task_id，后台执行）
+
+    审计 P2-6（2026-09-29）：旧实现同步跑完整集流水线（可数小时），占用 waitress
+    工作线程（默认 8）—— 几次并发就把线程池占满，连 /api/status 轮询一并饿死
+    （表现为「全站卡死」）。现在校验通过即返回 task_id，生产在后台线程执行：
+    进度经 _cb 写进 autopilot.current，用 /api/autopilot/status 轮询；
+    完成态看交付清单（/api/autopilot/deliverables）。
+    """
     # P0-5 门禁：整集生产依赖文本分析模型，未配置直接阻断（不再「跑一半才 401」）
     _gate = _ai_gate_or_400("episode")
     if _gate is not None:
@@ -12648,9 +12655,8 @@ def api_autopilot_run_once():
                         "error": f"该小说没有第{ep}集（共 {len(chapters)} 章 / {_n_units} 集）"}), 400
     cfg = pipeline.normalize_config({**plan, 'novel_id': meta.get('novel_id')},
                                     default_project_key=project)
-    # P1-5：run-once 是同步阻塞执行，此前不接 progress_cb → 前端 `current` 状态全程不更新，
-    # UI 只能看到「执行中」而看不到「当前在哪一步 / 百分之几 / 卡在重试」，用户干等 40 分钟无反馈。
-    # 这里把进度实时写进 autopilot 的 current 状态，`/api/autopilot/status` 轮询即可拿到实时进度。
+    # P1-5：run-once 的 progress_cb 把进度实时写进 autopilot 的 current 状态，
+    # `/api/autopilot/status` 轮询即可拿到实时进度（当前在哪一步 / 百分之几 / 卡在重试）。
     _seen: list = []
 
     def _cb(message, percent, phase=None):
@@ -12670,23 +12676,39 @@ def api_autopilot_run_once():
         except Exception as e:  # noqa: BLE001  进度上报失败不得阻断生产
             app.logger.warning("run-once 进度上报失败：%s", e)
 
-    try:
-        result = pipeline.run_episode(cfg, project, ep, meta, chapter, progress_cb=_cb)
-    finally:
-        try:
-            autopilot._clear_current()
-        except Exception as e:  # noqa: BLE001
-            app.logger.warning("run-once 清理 current 失败：%s", e)
-    if result.get('status') == 'busy':
+    # 审计 P2-6：先做一次非阻塞忙检（保留旧「busy → 409」语义），再转后台执行
+    if pipeline.is_episode_running(project, ep):
         # B-02 P0-5：该集正被另一执行体（托管轮转）生产，集级锁拒绝双跑
         return jsonify({"success": False,
-                        "error": result.get('error') or "该集正在生产中",
+                        "error": "该集正在生产中",
                         "retry_after_sec": 30}), 409
-    if result.get('ok') and result.get('deliverable'):
-        pipeline.record_deliverable(project, ep, result['deliverable'], meta={
-            'title': chapter.get('title') or '', 'chapter_index': chapter.get('index'),
-            'elapsed_sec': result.get('elapsed_sec')})
-    return jsonify({"success": bool(result.get('ok')), "result": result})
+
+    def _run_once_worker():
+        try:
+            result = pipeline.run_episode(cfg, project, ep, meta, chapter, progress_cb=_cb)
+            if result.get('status') == 'busy':
+                # 罕见竞态：预检后另一执行体抢跑 —— 集级锁拒绝双跑，留痕即可
+                app.logger.warning("run-once %s 第%s集被集级锁拒绝（另一执行体正在生产）",
+                                   project, ep)
+                return
+            if result.get('ok') and result.get('deliverable'):
+                pipeline.record_deliverable(project, ep, result['deliverable'], meta={
+                    'title': chapter.get('title') or '', 'chapter_index': chapter.get('index'),
+                    'elapsed_sec': result.get('elapsed_sec')})
+        except Exception as e:  # noqa: BLE001  后台任务异常不得带崩进程/线程静默死亡
+            app.logger.error("run-once 后台生产失败（%s 第%s集）：%s",
+                             project, ep, e, exc_info=True)
+        finally:
+            try:
+                autopilot._clear_current()
+            except Exception as e:  # noqa: BLE001
+                app.logger.warning("run-once 清理 current 失败：%s", e)
+
+    threading.Thread(target=_run_once_worker, daemon=True,
+                     name=f"runonce_{project}_{ep}").start()
+    return jsonify({"success": True, "task_id": f"runonce_{project}_{ep}",
+                    "project": project, "episode_no": ep, "status": "started",
+                    "message": "已开始生产；进度见 /api/autopilot/status，完成态见交付清单"})
 
 
 @app.route('/api/autopilot/plan-from-settings/<project_name>', methods=['POST'])

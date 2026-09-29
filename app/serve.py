@@ -44,7 +44,46 @@ def _load_flask_app():
           waitress 缺失时的回退分支再报 `module 'app.app' has no attribute 'run'`，
           最终所有页面与 API 全部返回 500。
         这里改为显式按文件路径加载，彻底消除同名歧义。
+
+    打包版（frozen）补充：单文件 EXE 里 app.py 不在磁盘上（收进 PYZ 归档），
+    按文件路径加载必然 FileNotFoundError。PyInstaller `collect_submodules('app')`
+    已把它登记为模块 `app.app`，故 frozen 时改用 `importlib.import_module` 从
+    PYZ 取模块，同样先注册 `sys.modules["app"]` 供 app.py 自引用，逻辑与源码一致。
     """
+    # ⚠️ 启动故障修复（2026-09-29）：`import importlib` 原先只写在下方 frozen 分支内，
+    #   Python 会把 importlib 编译成**整个函数的局部变量** —— 非 frozen 路径走到
+    #   `importlib.util.spec_from_file_location`（下方 L85）时必然 UnboundLocalError，
+    #   源码模式（python app/serve.py / 计划任务）启动即崩（实测 LastTaskResult=1）。
+    #   在函数入口统一绑定；模块顶部本就有 import importlib.util，frozen 分支内的
+    #   重复 import 变成无害的重复绑定。
+    import importlib
+    if getattr(sys, "frozen", False):
+        # PYZ 里已登记为 `app.app`（spec 的 collect_submodules('app')）。
+        # 先试 `app.app`，再试 `app`；拿到后注册 sys.modules["app"] 供自引用。
+        # 诊断信息全部打到日志（frozen 下已重定向到 exe 同级 logs/），不静默吞。
+        import traceback
+        _candidate = None
+        for _name in ("app.app", "app"):
+            try:
+                _mod = importlib.import_module(_name)
+            except Exception:
+                print(f"[frozen] import {_name} 失败：\n{traceback.format_exc()}")
+                continue
+            _fa = getattr(_mod, "app", None)
+            print(f"[frozen] {_name} 已导入，type=<{type(_mod).__name__}>，"
+                  f"app 属性 type=<{type(_fa).__name__ if _fa is not None else 'None'}>")
+            if _fa is not None and not isinstance(_fa, types.ModuleType):
+                sys.modules.setdefault("app", _mod)
+                return _fa
+            _candidate = _mod
+        if _candidate is not None:
+            return _candidate
+        # 诊断：列出 sys.modules 里所有含 app / serve 的键，定位真实登记名
+        _hits = [k for k in sys.modules if "app" in k or "serve" in k]
+        print(f"[frozen] sys.modules 中含 app/serve 的模块: {_hits[:40]}")
+        raise RuntimeError(
+            "frozen 模式下未找到 Flask 应用实例 `app`（已试 app.app / app，详见上方日志）")
+
     app_py = os.path.join(_HERE, "app.py")
     if not os.path.isfile(app_py):
         raise FileNotFoundError(f"未找到应用入口文件：{app_py}")

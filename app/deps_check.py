@@ -87,7 +87,8 @@ def _is_real_node_type(t: str) -> bool:
         return False
     return True
 
-# 模型清单（来自 docs/依赖清单.md §2 + 本机实测 widgets_values）
+# 模型清单（与 docs/依赖清单.md §2 **同源**，2026-09-29 审计对齐双向补齐；
+# required=False 的条目缺失只提示、不判"缺依赖"）
 MODEL_CHECKLIST = [
     {"path": "diffusion_models\\minimaxH3Singularity_prunedInt8-d8a59c68df78.safetensors", "kind": "video_unet", "required": True, "note": "H3 UNET 主模型"},
     {"path": "clip\\minimax-h3\\qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors", "kind": "video_clip", "required": True, "note": "H3 CLIP（minimax/Qwen3-VL）"},
@@ -99,6 +100,7 @@ MODEL_CHECKLIST = [
     {"path": "diffusion_models\\qwen_image_2.1_int8_convrot.safetensors", "kind": "image_unet", "required": True, "note": "QwenImage2.1 UNET"},
     {"path": "clip\\qwen3vl_8b_int8_convrot.safetensors", "kind": "image_clip", "required": True, "note": "QwenImage2.1 CLIP"},
     {"path": "vae\\qwen_image_2.1_vae_bf16.safetensors", "kind": "image_vae", "required": True, "note": "QwenImage2.1 VAE"},
+    {"path": "diffusion_models\\minimax_h3_latent_upscaler_3d_bf16.safetensors", "kind": "video_latent_upscaler", "required": False, "note": "latent 3D 超分（可选，未进现役模板硬校验）"},
     {"path": "FlashVSR-v1.1\\diffusion_pytorch_model_streaming_dmd.safetensors", "kind": "upscale_dit", "required": False, "note": "超分 DiT（enable_upscale=true 才需要）"},
 ]
 

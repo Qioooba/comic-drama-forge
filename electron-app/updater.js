@@ -118,16 +118,20 @@ async function downloadAndVerify(assets, assetName, shaSumsText, destDir, onProg
   fs.mkdirSync(destDir, { recursive: true });
   const localPath = path.join(destDir, path.basename(assetName));
   await downloadFile(url, localPath, onProgress);
-  // 若提供 SHA256SUMS 清单则强制校验；否则仅本地记录
-  let verified = false;
-  if (shaSumsText) {
-    const sums = parseSha256Sums(shaSumsText);
-    const expected = sums[assetName];
-    const actual = await sha256File(localPath);
-    verified = !!expected && expected.toLowerCase() === actual;
-    if (expected && !verified) {
-      throw new Error(`SHA256 校验失败：${assetName}（期望 ${expected} 实际 ${actual}）`);
-    }
+  // 审计 P2-24（2026-09-29）：fail-closed —— SHA256SUMS 缺失/拉取失败时**拒绝更新**。
+  // 旧实现静默跳过校验继续解包/替换，完整性校验恰好在最需要它的异常时刻失效
+  // （release 被篡改 / 网络半途失败）。发布 CI（desktop-release.yml）总会上传
+  // SHA256SUMS.txt，因此清单为空只可能是上述两种情况 —— 都不该继续。
+  if (!shaSumsText) {
+    throw new Error(`SHA256SUMS 清单缺失或拉取失败，无法校验 ${assetName} 的完整性，已取消本次更新（可稍后重试或到 Release 页手动下载）`);
+  }
+  const sums = parseSha256Sums(shaSumsText);
+  const expected = sums[assetName];
+  const actual = await sha256File(localPath);
+  const verified = !!expected && expected.toLowerCase() === actual;
+  if (!verified) {
+    // 注意：清单存在但**没列出**该资产同样拒绝（旧实现 verified=false 却继续）
+    throw new Error(`SHA256 校验失败：${assetName}（期望 ${expected || '清单中无此项'} 实际 ${actual}）`);
   }
   return { localPath, verified };
 }

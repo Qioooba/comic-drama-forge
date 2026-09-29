@@ -48,73 +48,73 @@ class ExportManager:
         root = ET.Element("fcpxml")
         root.set("version", "1.9")
 
-        # Project
-        # 注意：这里绝不能用一个写死的中文占位串（原先是 "项目"）。调用方漏传
-        # project_name 时，导出的 FCPXML 会带着 "项目" 这个名字进入剪映/达芬奇，
-        # 让人误以为导出成功；退回本项目 key 至少能定位到是哪个项目。
-        proj_name = timeline.get("project_name") or self.project_key
-        project = ET.SubElement(root, "project")
-        project.set("name", str(proj_name))
+        # 审计 P2-25（2026-09-29）：整个方法重写为**合规 FCPXML**。旧实现自造元素
+        # （spacetime / videospacetimerange / asset-ref / originalsequence，且无
+        # DOCTYPE / resources / library / spine 结构），Premiere / Final Cut 根本
+        # 导不进去 —— 用户却以为导出成功。现对齐 nle_export.export_fcpxml 的结构：
+        # resources(format+asset) + library/event/project/sequence/spine，
+        # 素材用 asset-clip（带 offset/duration），无素材的镜头用 gap 占位保持时间轴。
+        proj_name = str(timeline.get("project_name") or self.project_key)
+        fps = int(timeline.get("fps", 30) or 30)
+        clips_info = (timeline.get("sequences") or [{}])[0].get("clips", [])
+        width = int(timeline.get("resolution", {}).get("width", 1920) or 1920)
+        height = int(timeline.get("resolution", {}).get("height", 1080) or 1080)
 
-        # Sequence
-        sequence = ET.SubElement(project, "sequence")
-        sequence.set("duration", str(timeline.get("duration", 0)))
-        sequence.set("frameRate", str(timeline.get("fps", 30)))
+        from xml.sax.saxutils import escape as _xml_escape
 
-        # Spacetime
-        spacetime = ET.SubElement(sequence, "spacetime")
-        ET.SubElement(spacetime, "duration").text = str(timeline.get("duration", 0))
+        def _e(s) -> str:
+            return _xml_escape(str(s or ""))
 
-        # Resources
-        resources = ET.SubElement(sequence, "resources")
-        res_format = ET.SubElement(resources, "format")
-        res_format.set("id", "f1")
-        res_format.set("name", str(proj_name))
-        res_format.set("frameDuration", f"1/{timeline.get('fps', 30)}")
-        res_format.set("width", str(timeline.get("resolution", {}).get("width", 1920)))
-        res_format.set("height", str(timeline.get("resolution", {}).get("height", 1080)))
+        assets: List[str] = []
+        spine_clips: List[str] = []
+        for i, clip_info in enumerate(clips_info):
+            start = float(clip_info.get("start", 0) or 0)
+            end = float(clip_info.get("end", 0) or 0)
+            dur = max(0.0, end - start)
+            dur_s = f"{int(round(dur * fps))}/{fps}s"
+            off_s = f"{int(round(start * fps))}/{fps}s"
+            clip_name = str(clip_info.get("name", f"clip{i + 1}"))
+            asset_path = str(clip_info.get("asset_path") or "")
+            if asset_path and Path(asset_path).is_file():
+                aid = f"r{i + 2}"
+                assets.append(
+                    f'    <asset id="{aid}" name="{_e(clip_name)}" '
+                    f'start="0s" duration="{dur_s}" hasVideo="1" format="r1">\n'
+                    f'      <media-rep kind="original-media" '
+                    f'src="file:///{_e(Path(asset_path).resolve().as_posix())}"/>\n'
+                    f'    </asset>')
+                spine_clips.append(
+                    f'        <asset-clip ref="{aid}" offset="{off_s}" '
+                    f'name="{_e(clip_name)}" duration="{dur_s}"/>')
+            else:
+                spine_clips.append(
+                    f'        <gap name="{_e(clip_name)}" offset="{off_s}" '
+                    f'duration="{dur_s}"/>')
 
-        # Clips
-        clips = ET.SubElement(sequence, "clips")
-        for clip_info in timeline.get("sequences", [{}])[0].get("clips", []):
-            clip = ET.SubElement(clips, "clip")
-            clip.set("name", clip_info.get("name", "镜头"))
-            clip.set("start", str(clip_info.get("start", 0)))
-            clip.set("duration", str(clip_info.get("end", 0) - clip_info.get("start", 0)))
-
-            # Video track position
-            vid_pos = ET.SubElement(clip, "videospacetimerange")
-            ET.SubElement(vid_pos, "time").text = f"0:{int(clip_info.get('start', 0) * timeline.get('fps', 30))}:0"
-            ET.SubElement(vid_pos, "duration").text = f"0:{int((clip_info.get('end', 0) - clip_info.get('start', 0)) * timeline.get('fps', 30))}:0"
-
-            # Asset reference
-            asset = ET.SubElement(clip, "asset-ref")
-            asset.set("ref", "r1")
-
-        # Assets
-        assets = ET.SubElement(sequence, "assets")
-        for i, clip_info in enumerate(timeline.get("sequences", [{}])[0].get("clips", [])):
-            asset = ET.SubElement(assets, "asset")
-            asset.set("id", f"r{i+1}")
-            asset.set("name", clip_info.get("name", f"镜头{i+1}"))
-
-            format_ref = ET.SubElement(asset, "format-ref")
-            format_ref.set("ref", "f1")
-
-            # Source clip
-            source_clip = ET.SubElement(asset, "originalsequence")
-            reel = ET.SubElement(source_clip, "reel")
-            ET.SubElement(reel, "name").text = "Reel 1"
-            ET.SubElement(reel, "startIndex").text = "0"
-
-            # Timeline range
-            start = clip_info.get("start", 0) * timeline.get("fps", 30)
-            duration = (clip_info.get("end", 0) - clip_info.get("start", 0)) * timeline.get("fps", 30)
-            ET.SubElement(asset, "time").text = f"0:0:{int(start)}:0"
-            ET.SubElement(asset, "duration").text = f"0:0:{int(duration)}:0"
-
-        # Generate XML string
-        xml_str = minidom.parseString(ET.tostring(root, encoding='unicode')).toprettyxml(indent="  ")
+        total_s = f"{int(round(float(timeline.get('duration', 0) or 0) * fps))}/{fps}s"
+        xml_str = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<!DOCTYPE fcpxml>\n'
+            '<fcpxml version="1.9">\n'
+            '  <resources>\n'
+            f'    <format id="r1" name="FFVideoFormat{width}x{height}" '
+            f'frameDuration="1/{fps}s" width="{width}" height="{height}" '
+            f'colorSpace="1-1-1 (Rec. 709)"/>\n'
+            + ("\n".join(assets) + "\n" if assets else "")
+            + '  </resources>\n'
+            '  <library>\n'
+            f'    <event name="{_e(proj_name)}">\n'
+            f'      <project name="{_e(proj_name)}">\n'
+            f'        <sequence format="r1" duration="{total_s}" tcStart="0s" tcFormat="NDF">\n'
+            '          <spine>\n'
+            + ("\n".join(spine_clips) + "\n" if spine_clips else "")
+            + '          </spine>\n'
+            '        </sequence>\n'
+            '      </project>\n'
+            '    </event>\n'
+            '  </library>\n'
+            '</fcpxml>\n'
+        )
 
         # Save to file
         output_path = self.base_dir / f"{self.project_key}_fcpml.xml"

@@ -1006,6 +1006,10 @@ def _produce(project: str, plan: dict, pick: dict) -> None:
                      title=chapter.get("title") or f"第{episode_no}章",
                      step="blocked", message=_reason, percent=0,
                      started_at=_now(), retries=0, phase="blocked", steps_done=[])
+        # 审计 P2-5（2026-09-29）：阻断信息已落死信（上方 mark_dead_letter，前端
+        # 「异常」列表可见可处理）—— current 若不清，会永久停在 blocked 卡片，
+        # 直到下一次生产覆盖（正常路径末尾有 _clear_current，这条分支此前漏了）。
+        _clear_current()
         return
 
     _set_current(project=project, episode=episode_no,

@@ -11,11 +11,14 @@ datas = [
     ('app/templates', 'app/templates'),
     ('app/static', 'app/static'),
     ('locales', 'locales'),
-    ('output', 'output'),
     # ⚠️ 2026-09-28 补：工作流模板必须随 exe 分发。PROJECT_WORKFLOWS_DIR 在
     # frozen 模式下 = _MEIPASS/workflows（env_loader 注释：只读资源留 PROJECT_ROOT_DIR），
     # 漏掉这里会让单文件包用户「模板缺失」——克隆/Docker 有 workflows/ 但 exe 没有。
     ('workflows', 'workflows'),
+    # ⚠️ 2026-09-29 移除 ('output', 'output')：output/ 是**纯写入目标**
+    # （QC_DIR / tasks.db / PROJECTS_DIR 全在 PROJECT_OUTPUT_DIR 下），启动不读它，
+    # 打包进 exe 只会让单文件包膨胀 3GB+ 且在 _MEIPASS 里变只读。运行期由
+    # main.py 的 output_dir.mkdir(exist_ok=True) 自建（配合 MJSCXT_DATA_DIR 重定向）。
 ]
 
 # 排除不必要的模块

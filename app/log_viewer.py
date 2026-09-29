@@ -19,12 +19,27 @@
 
 import logging
 import os
+import sys
 import time
 
 logger = logging.getLogger(__name__)
 
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_LOG_DIR = os.path.join(_PROJECT_ROOT, ".workbuddy", "test", "_out")
+# ⚠️ frozen 感知（2026-09-29 桌面版看不到日志的根因）：
+#   源码模式下 __file__ 落在 <root>/app/log_viewer.py，上一级就是项目根，
+#   日志目录 = <root>/.workbuddy/test/_out。
+#   但 PyInstaller 打包后 __file__ 落在临时 _MEIPASS 目录，按它找 .workbuddy
+#   必然「日志文件不存在」。打包版的本进程日志改写到 exe 同级的 logs/ 目录
+#   （见 main.py 的 _redirect_stdouts），故 frozen 时优先定位 exe 同级 logs/。
+def _resolve_log_dir() -> str:
+    if getattr(sys, "frozen", False):
+        # 单文件 exe：同级目录放 logs/
+        return os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "logs")
+    return os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        ".workbuddy", "test", "_out")
+
+
+_LOG_DIR = _resolve_log_dir()
 
 # ⚠️ source -> 文件路径的白名单。新增日志源在此登记，**永不接受外部传入的路径**。
 LOG_SOURCES = {
@@ -137,6 +152,14 @@ def _read_since_bytes(path, since):
         f.seek(since)
         data = f.read(_MAX_FOLLOW_BYTES)
         offset = f.tell()
+    # 审计 P2-9（2026-09-29）：按 1MB 字节边界截断可能切在 GBK 双字节中间 —— 下次
+    # 从该偏移续读会产生半个字符。回退到最后一个换行之后再定偏移，保证每次增量
+    # 读取都从完整行首开始（纯日志尾部无换行的极端情况保持原行为）。
+    if offset < size:
+        last_nl = data.rfind(b"\n")
+        if last_nl >= 0:
+            data = data[: last_nl + 1]
+            offset = since + last_nl + 1
     return data, offset
 
 

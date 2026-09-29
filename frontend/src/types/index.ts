@@ -72,8 +72,10 @@ export interface Task {
   status: 'pending' | 'running' | 'done' | 'failed';
   progress: number;
   created_at: string;
-  started_at: string;
-  finished_at: string;
+  // 审计 P2-40：未开始/未结束时后端为 null —— 旧声明为必填 string，
+  // 调用方直接 toLocaleString() 会对 null 抛错
+  started_at: string | null;
+  finished_at: string | null;
   error: string;
   result_path: string;
   payload: Record<string, unknown>;
@@ -276,9 +278,14 @@ export interface KeyframePlanResponse {
   end_frames_ready: number;
   to_generate: number;
   plan: KeyframePlan[];
+  // 审计 P2-40（2026-09-29）：后端 api_keyframes_plan 实际返回（链式模式信息）
+  chain_mode?: string;
+  chained_count?: number;
 }
 
 // --- Storyboard ---
+// 审计 P2-40：以下可选字段为后端 canvas 卡片（api_storyboard_canvas）实际返回、
+// 本类型此前未声明的部分 —— 标可选避免破坏现有渲染，供新代码使用时不再读 any。
 export interface StoryboardShot {
   shot_id: string;
   seq: number;
@@ -288,6 +295,19 @@ export interface StoryboardShot {
   emotion: string;
   description: string;
   dialogue_text: string;
+  // A1 拆分字段（剧本归一化产出）
+  shot_type?: string;
+  camera_motion?: string;
+  visual_detail?: string;
+  audio_cues?: string;
+  /** 台词结构化数组（后端 dialogue 元素含 speaker+text） */
+  dialogue?: { speaker?: string; text?: string }[];
+  /** 画布排序值（metadata.shot_order 投影） */
+  order?: number;
+  characters_in_shot?: string[];
+  items_in_shot?: string[];
+  /** 参考图未命中告警（_note_ref_warning 记账，未命中必带） */
+  _ref_warnings?: string[];
   storyboard?: {
     exists: boolean;
     url: string;
@@ -425,6 +445,8 @@ export interface MixStatusResponse {
 export interface QCConfig {
   enabled: boolean;
   max_retries: number;
+  /** best-of-N 分镜候选数：1=关闭（默认），>1 时每镜生成 N 张候选按质检分选最佳 */
+  best_of?: number;
   threshold: number;
   endpoint?: string;
 }

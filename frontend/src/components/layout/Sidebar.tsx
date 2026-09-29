@@ -39,7 +39,7 @@ export function Sidebar({
 
   return (
     <aside
-      className={`relative z-sticky flex flex-col border-r border-line bg-surface transition-all duration-300 ${
+      className={`glass relative z-sticky flex flex-col border-r border-line transition-all duration-300 ${
         collapsed ? 'w-16' : 'w-16 md:w-56'
       }`}
     >

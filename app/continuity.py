@@ -1660,9 +1660,44 @@ def rewrite_shots_for_issues(client, script: dict, issues: list, episode_no: int
                 (f"{d['speaker']}：{d['text']}" if d.get("speaker") else d.get("text") or "")
                 for d in old["dialogue"]).strip()
         if isinstance(r.get("characters_in_shot"), list) and r["characters_in_shot"]:
-            old["characters_in_shot"] = [c for c in r["characters_in_shot"] if c in chars] or old["characters_in_shot"]
+            # 审计 P2-12（2026-09-29）：走 asset_name_match 三级匹配（与全库同源），
+            # 替代裸相等 —— 旧写法把「古月方源（青年）」这类近名静默丢弃且无告警。
+            _rs_chars, _miss_chars, _ = asset_name_match.resolve_names(
+                r["characters_in_shot"], chars, "character")
+            if _miss_chars:
+                logger.warning("重写镜 %s：角色 %s 未命中已登记角色，已忽略（防误配）",
+                               sid, _miss_chars)
+            old["characters_in_shot"] = _rs_chars or old["characters_in_shot"]
         if isinstance(r.get("items_in_shot"), list):
-            old["items_in_shot"] = r["items_in_shot"]
+            # 审计 P2-12：物品同样走统一匹配器 —— 旧实现完全不过滤，模型发明的
+            # 未登记物品名直接写回剧本（下游只能靠 no_reference 告警兜底）。
+            if r["items_in_shot"]:
+                _rs_items, _miss_items, _ = asset_name_match.resolve_names(
+                    r["items_in_shot"], items, "item")
+                if _miss_items:
+                    logger.warning("重写镜 %s：物品 %s 未命中已登记物品，已忽略（防误配）",
+                                   sid, _miss_items)
+                old["items_in_shot"] = _rs_items or old["items_in_shot"]
+            else:
+                old["items_in_shot"] = []
+        # 审计 P2-11（2026-09-29）：重写可能改长/改短台词与描述，但旧实现不重算时长
+        # —— duration 与 duration_overflow_sec 停在旧值，audit_script 读过期字段，
+        # 配音溢出不可见。与 _norm_shots 同口径重算（保持四舍五入到 0.5s 与溢出记账）。
+        _auto_dur = estimate_shot_duration(old)
+        _model_dur = None
+        try:
+            _model_dur = float(old.get("duration"))
+        except (TypeError, ValueError):
+            _model_dur = None
+        if _model_dur and SHOT_DURATION_MIN <= _model_dur <= SHOT_DURATION_MAX:
+            old["duration"] = round(max(_model_dur, _auto_dur) * 2) / 2.0
+        else:
+            old["duration"] = _auto_dur
+        _need = required_shot_duration(old)
+        if _need > SHOT_DURATION_MAX:
+            old["duration_overflow_sec"] = round(_need - SHOT_DURATION_MAX, 2)
+        else:
+            old.pop("duration_overflow_sec", None)
         changed.append(sid)
         if r.get("fix_note"):
             notes.append({"shot_id": sid, "fix_note": str(r["fix_note"]).strip()[:40]})

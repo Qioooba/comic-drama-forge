@@ -127,11 +127,13 @@ module.exports = {
         lg: '12px',
         xl: '16px',
       },
+      // 阴影指向 index.css 的 --shadow-* 变量：浅色取值与原先写死的完全一致，
+      // 深色主题在 :root.dark 里覆盖为纯黑高不透明度（token 唯一真源）。
       boxShadow: {
-        xs: '0 1px 2px rgb(15 23 42 / .04)',
-        sm: '0 1px 3px rgb(15 23 42 / .06), 0 1px 2px rgb(15 23 42 / .04)',
-        md: '0 4px 16px rgb(15 23 42 / .08)',
-        lg: '0 12px 32px rgb(15 23 42 / .12)',
+        xs: 'var(--shadow-xs)',
+        sm: 'var(--shadow-sm)',
+        md: 'var(--shadow-md)',
+        lg: 'var(--shadow-lg)',
       },
       fontSize: {
         xs: ['12px', '18px'],

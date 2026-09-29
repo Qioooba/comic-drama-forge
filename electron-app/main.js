@@ -316,7 +316,9 @@ async function runResourceUpdate(info, manual) {
     const rel = await updater.fetchLatestRelease();
     const sumAsset = (rel.assets || []).find((a) => a.name === updateConfig.ASSET.sha256sums);
     if (sumAsset) shaSums = await (await fetch(sumAsset.url, { headers: { 'User-Agent': 'mjscxt' } })).text();
-  } catch { /* 清单缺失则跳过强校验（仍下载） */ }
+    // 审计 P2-24：清单拉取失败/缺失时 shaSums 为空 → downloadAndVerify 会
+    // **拒绝更新**（fail-closed），不再静默跳过校验继续解包。
+  } catch { /* 错误由 downloadAndVerify 的 fail-closed 统一处理 */ }
   try {
     await updater.downloadAndUnpackResources(info.latest, info.assets, shaSums, destDir, mirror,
       (f) => { if (manual) console.log(`资源增量下载 ${(f * 100).toFixed(0)}%`); });
@@ -346,7 +348,8 @@ async function runFullUpdate(info, manual) {
     const rel = await updater.fetchLatestRelease();
     const sumAsset = (rel.assets || []).find((a) => a.name === updateConfig.ASSET.sha256sums);
     if (sumAsset) shaSums = await (await fetch(sumAsset.url, { headers: { 'User-Agent': 'mjscxt' } })).text();
-  } catch { /* 清单缺失则跳过强校验 */ }
+    // 审计 P2-24：同资源增量 —— 清单为空时 applyFullPortable 会拒绝下载（fail-closed）
+  } catch { /* 错误由 downloadAndVerify 的 fail-closed 统一处理 */ }
   try {
     // 只下载 + 校验，先不 spawn；把接管时机留给用户确认后
     const { localPath } = await updater.applyFullPortable(info.latest, info.assets, shaSums, destDir,

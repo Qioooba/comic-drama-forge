@@ -2718,7 +2718,10 @@ class ComfyUIClient:
         不同集的 ``shot_01.png`` 会互相覆盖 → 后面所有镜头参考图全串成同一张
         （跨集连跑时是静默错，比报错难查得多）。
         """
-        key = os.path.normpath(os.path.abspath(local_path))
+        # 审计 P2-20（2026-09-29）：cache key 统一 normcase(normpath(abspath)) ——
+        # 调用方的公共图/段级去重键都先 normcase，这里不 normcase 时同一路径
+        # 大小写不同的两次引用会 cache miss → 同一文件以两个哈希名重复上传。
+        key = os.path.normcase(os.path.normpath(os.path.abspath(local_path)))
         if cache is not None and key in cache:
             return cache[key]
         base = os.path.basename(key) or "ref.png"
@@ -2744,7 +2747,10 @@ class ComfyUIClient:
         音频走 ``/upload/image`` 端点（ComfyUI 的通用 input 文件上传，不校验 MIME），
         但 content-type 用音频类型避免误导。
         """
-        key = os.path.normpath(os.path.abspath(local_path))
+        # 审计 P2-20（2026-09-29）：cache key 统一 normcase(normpath(abspath)) ——
+        # 调用方的公共图/段级去重键都先 normcase，这里不 normcase 时同一路径
+        # 大小写不同的两次引用会 cache miss → 同一文件以两个哈希名重复上传。
+        key = os.path.normcase(os.path.normpath(os.path.abspath(local_path)))
         if cache is not None and key in cache:
             return cache[key]
         base = os.path.basename(key) or "audio.wav"

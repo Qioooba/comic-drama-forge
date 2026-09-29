@@ -19,11 +19,14 @@
       在 CSS 里直接使用时请写 `rgb(var(--brand))`。
    3. -subtle = 徽标 / 提示条浅底；-strong = 同色系深字（白底上满足 WCAG AA
       4.5:1）。⚠️ 不要拿 --success 这类主色直接当文字色：白底上仅 ~2.5:1。
-   4. 深色主题此前 619 处 `dark:` 类全部不可达（`.dark` 从未被注入），
-      已按方案整体移除；如需再上深色，请走 token 覆盖而非散落变体类。
+   4. 深色主题走 token 覆盖（见下方 `:root.dark` 块），不散落 `dark:` 变体类；
+      此前 619 处因 `.dark` 从未被注入而不可达的 `dark:` 类已按方案整体移除。
    ========================================================================== */
 
 :root {
+  /* 跟随主题的 UA 原生渲染（滚动条 / 表单控件 / 查找高亮等） */
+  color-scheme: light;
+
   /* ---- 承载与分层 ---- */
   --bg-canvas: 247 248 250;     /* #F7F8FA 页面画布底 */
   --bg-surface: 255 255 255;    /* #FFFFFF 卡片 / 面板 */
@@ -90,6 +93,23 @@
   --viz-teal: 20 184 166;
   --viz-amber: 217 119 6;
 
+  /* ---- 阴影（tailwind.config.js 的 boxShadow 指向这四个变量） ----
+     浅色取值与原先写死在 config 里的完全一致，观感不变；
+     深色主题在 :root.dark 里覆盖为纯黑高不透明度。 */
+  --shadow-xs: 0 1px 2px rgb(15 23 42 / 0.04);
+  --shadow-sm: 0 1px 3px rgb(15 23 42 / 0.06), 0 1px 2px rgb(15 23 42 / 0.04);
+  --shadow-md: 0 4px 16px rgb(15 23 42 / 0.08);
+  --shadow-lg: 0 12px 32px rgb(15 23 42 / 0.12);
+
+  /* ---- 科技感氛围层（body::before 使用） ----
+     两团极低透明度的品牌/青色辉光 + 一张细网格，铺在所有内容后面；
+     App 根节点 bg-canvas 调成半透明后辉光透出，玻璃卡片才有东西可模糊。 */
+  --tech-glow-1: 79 70 229;   /* 品牌辉光（浅色下压得很低） */
+  --tech-glow-2: 6 182 212;   /* 次辉光（青） */
+  --tech-grid: 15 23 42;      /* 网格线 */
+  --tech-glow-opacity: 0.5;
+  --tech-grid-opacity: 0.04;
+
   /* ---- 层级规范（收敛自原先 40/50/100/200 四档乱序） ---- */
   --z-sticky: 10;
   --z-dropdown: 20;
@@ -110,6 +130,99 @@
   -moz-osx-font-smoothing: grayscale;
 }
 
+/* ==========================================================================
+   深色主题（token 覆盖层）
+   --------------------------------------------------------------------------
+   `.dark` 由 ThemeContext（src/context/ThemeContext.tsx）注入到 <html>；
+   index.html 里有同一套判定的防闪烁脚本，避免系统深色用户首屏白闪。
+   规则只有一条：**这里只覆盖变量，不写组件级 CSS** —— 组件层的语义色类
+   （bg-surface / text-ink-1 / border-line…）会自动随变量切到深色取值。
+
+   取值策略：
+   - 承载面反转：canvas 最深(slate-950) → surface(slate-900) → surface-2(slate-800)；
+   - 描边上移一档（slate-700/600）：深色下靠描边分层，阴影只作辅助；
+   - 文字反转：primary=slate-200 / secondary=slate-400 / tertiary=slate-500；
+   - 语义主色（success/warning/danger/info/state-* 的主档）保持 500 档不变：
+     作实心底时白字对比度不受影响，作点缀色在深底上也足够醒目；
+   - -subtle 从「浅色淡底」翻转为同色系 950 深底，-strong 从「深字」翻转为
+     同色系 300 浅字 —— 徽标 / 提示条在深色下依旧是「淡底 + 同系字」；
+   - brand 取 indigo-500：既当实心底（配白字 ≈3.9:1）又当文字/图标（深底上
+     ≈3.6:1），是双职责下的折中档（indigo-600 作字太暗，indigo-400 配白字太浅）。
+   ========================================================================== */
+:root.dark {
+  color-scheme: dark;
+
+  /* ---- 承载与分层 ---- */
+  --bg-canvas: 2 6 23;        /* #020617 slate-950 */
+  --bg-surface: 15 23 42;     /* #0F172A slate-900 */
+  --bg-surface-2: 30 41 59;   /* #1E293B slate-800 */
+
+  /* ---- 描边 ---- */
+  --border: 51 65 85;         /* #334155 slate-700 */
+  --border-strong: 71 85 105; /* #475569 slate-600 */
+
+  /* ---- 文字 ---- */
+  --text-primary: 226 232 240;   /* #E2E8F0 slate-200 */
+  --text-secondary: 148 163 184; /* #94A3B8 slate-400 */
+  --text-tertiary: 100 116 139;  /* #64748B slate-500 */
+
+  /* ---- 品牌 / 强调 / 主动作 ---- */
+  --brand: 99 102 241;        /* #6366F1 indigo-500（双职责折中，见上方说明） */
+  --brand-hover: 129 140 248; /* #818CF8 indigo-400：深色下 hover 提亮 */
+  --brand-subtle: 30 27 75;   /* #1E1B4B indigo-950 */
+  --accent: 6 182 212;        /* #06B6D4 不变，深底上依旧醒目 */
+  --accent-subtle: 8 51 68;   /* #083344 cyan-950 */
+  --action: 51 65 85;         /* #334155 slate-700：主按钮转中性色阶，白字对比度充足 */
+
+  /* ---- 通用语义色（主档不动，subtle/strong 反转） ---- */
+  --success: 16 185 129;
+  --success-subtle: 2 44 34;     /* #022C22 emerald-950 */
+  --success-strong: 110 231 183; /* #6EE7B7 emerald-300 */
+  --warning: 245 158 11;
+  --warning-subtle: 69 26 3;     /* #451A03 amber-950 */
+  --warning-strong: 252 211 77;  /* #FCD34D amber-300 */
+  --danger: 239 68 68;
+  --danger-subtle: 69 10 10;     /* #450A0A red-950 */
+  --danger-strong: 252 165 165;  /* #FCA5A5 red-300 */
+  --info: 59 130 246;
+  --info-subtle: 23 37 84;       /* #172554 blue-950 */
+  --info-strong: 147 197 253;    /* #93C5FD blue-300 */
+
+  /* ---- 生产状态语义色 ---- */
+  --state-pending: 148 163 184;
+  --state-pending-subtle: 30 41 59;    /* #1E293B */
+  --state-pending-strong: 203 213 225; /* #CBD5E1 slate-300 */
+  --state-running: 6 182 212;
+  --state-running-subtle: 8 51 68;
+  --state-running-strong: 103 232 249; /* #67E8F9 cyan-300 */
+  --state-done: 16 185 129;
+  --state-done-subtle: 2 44 34;
+  --state-done-strong: 110 231 183;
+  --state-failed: 239 68 68;
+  --state-failed-subtle: 69 10 10;
+  --state-failed-strong: 252 165 165;
+  --state-skipped: 161 161 170;
+  --state-skipped-subtle: 39 39 42;    /* #27272A zinc-800 */
+  --state-skipped-strong: 212 212 214; /* #D4D4D8 zinc-300 */
+  --state-attention: 245 158 11;
+  --state-attention-subtle: 69 26 3;
+  --state-attention-strong: 252 211 77;
+
+  /* ---- 数据可视化专用色板：分类色保持不变（500 档在深底上仍可辨） ---- */
+
+  /* ---- 阴影：换纯黑高不透明度，弥补深底上原有阴影不可见 ---- */
+  --shadow-xs: 0 1px 2px rgb(0 0 0 / 0.3);
+  --shadow-sm: 0 1px 3px rgb(0 0 0 / 0.4), 0 1px 2px rgb(0 0 0 / 0.3);
+  --shadow-md: 0 4px 16px rgb(0 0 0 / 0.5);
+  --shadow-lg: 0 12px 32px rgb(0 0 0 / 0.6);
+
+  /* ---- 科技感氛围层：深色下辉光换用深色主题的品牌/青档并调亮一档 ---- */
+  --tech-glow-1: 99 102 241;  /* indigo-500 */
+  --tech-glow-2: 34 211 238;  /* cyan-400 */
+  --tech-glow-opacity: 0.62;
+  --tech-grid-opacity: 0.055;
+}
+
 * {
   box-sizing: border-box;
 }
@@ -119,6 +232,29 @@ body {
   min-height: 100vh;
   /* 原为 #667eea → #764ba2 的紫蓝渐变（第二套设计语言），现统一为画布底色 */
   background: rgb(var(--bg-canvas));
+}
+
+/* ==========================================================================
+   科技感画布氛围层
+   --------------------------------------------------------------------------
+   position:fixed 的伪元素铺在所有内容**后面**：两团品牌/青色辉光 + 64px 细网格。
+   App 根节点的 bg-canvas 调成半透明（见 App.tsx），辉光透过界面,
+   .glass 玻璃面板的 backdrop-blur 才有东西可模糊。
+   ⚠️ 透明度刻意压得很低，是「氛围」不是「夜店」；深色主题在 :root.dark 调亮一档。
+   ========================================================================== */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background-image:
+    radial-gradient(42rem 30rem at 12% -8%, rgb(var(--tech-glow-1) / var(--tech-glow-opacity)), transparent 68%),
+    radial-gradient(38rem 28rem at 96% 4%, rgb(var(--tech-glow-2) / calc(var(--tech-glow-opacity) * 0.8)), transparent 66%),
+    radial-gradient(46rem 34rem at 55% 118%, rgb(var(--tech-glow-1) / calc(var(--tech-glow-opacity) * 0.55)), transparent 70%),
+    linear-gradient(rgb(var(--tech-grid) / var(--tech-grid-opacity)) 1px, transparent 1px),
+    linear-gradient(90deg, rgb(var(--tech-grid) / var(--tech-grid-opacity)) 1px, transparent 1px);
+  background-size: auto, auto, auto, 64px 64px, 64px 64px;
 }
 
 #root {
@@ -139,6 +275,44 @@ body {
     outline: 2px solid rgb(var(--brand));
     outline-offset: 2px;
     border-radius: 4px;
+  }
+}
+
+/* ==========================================================================
+   玻璃 / 辉光 / 渐变 —— 科技感工具类
+   --------------------------------------------------------------------------
+   .glass        常驻 chrome 用（侧栏 / 总控面板 / 弹窗 / 下拉），长列表卡片
+                 **不要**加 backdrop-blur：滚动时逐帧重绘会把帧率拖垮。
+   .glow-brand   强调容器（进行中状态卡 / 品牌主按钮）的一圈极浅光晕。
+   .text-gradient 品牌→青渐变文字，仅限页面级 h2 大标题，正文禁用。
+   .progress-fill 进度条填充（品牌→青渐变），是科技感的主视觉锚点之一。
+   ========================================================================== */
+@layer components {
+  .glass {
+    background: rgb(var(--bg-surface) / 0.82);
+    -webkit-backdrop-filter: blur(18px) saturate(1.5);
+    backdrop-filter: blur(18px) saturate(1.5);
+  }
+
+  .glass-strong {
+    background: rgb(var(--bg-surface) / 0.92);
+    -webkit-backdrop-filter: blur(24px) saturate(1.6);
+    backdrop-filter: blur(24px) saturate(1.6);
+  }
+
+  .glow-brand {
+    box-shadow: 0 0 0 1px rgb(var(--brand) / 0.16), 0 4px 24px rgb(var(--brand) / 0.22);
+  }
+
+  .text-gradient {
+    background-image: linear-gradient(115deg, rgb(var(--brand)) 15%, rgb(var(--accent)) 85%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+
+  .progress-fill {
+    background-image: linear-gradient(90deg, rgb(var(--brand)), rgb(var(--accent)));
   }
 }
 

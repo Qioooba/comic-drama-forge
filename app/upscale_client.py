@@ -689,7 +689,9 @@ class VideoUpscaler:
                 "input": os.path.abspath(input_video),
                 "before": f"{src['width']}x{src['height']}",
                 "after": f"{dst['width']}x{dst['height']}",
-                "frames": src.get("frame_count") or 0,
+                # 审计 P2-22（2026-09-29）：probe_video 返回的键名是 `frames`（没有
+                # frame_count）—— 旧写法恒取 0，标定记录的帧数失真、离线预估不准
+                "frames": src.get("frames") or 0,
                 "mode": used_mode,
                 "scale": int(scale),
                 "elapsed_sec": elapsed,

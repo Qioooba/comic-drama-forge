@@ -487,8 +487,11 @@ class TaskQueue:
                 path = result if isinstance(result, str) else ""
                 self.store.finish(task_id, result_path=path)
                 logger.info(f"任务完成：{task_id}")
-            except Exception as e:  # noqa: BLE001  任务失败不得拖垮队列
-                logger.exception(f"任务失败：{task_id} - {e}")
+            except BaseException as e:  # noqa: BLE001  含环境守卫注入的 SystemExit（继承 BaseException）
+                # 审计 P2-7（2026-09-29）：只捕 Exception 会让消费线程被 BaseException
+                # 静默杀死 —— 队列停摆且 status() 仍显示 running。这里记录失败态后
+                # 继续消费循环（守护线程里上抛无人接，只会让线程死亡、队列停摆）。
+                logger.exception(f"任务异常终止：{task_id} - {e}")
                 try:
                     self.store.fail(task_id, f"{type(e).__name__}: {e}")
                 except Exception as e:  # noqa: BLE001

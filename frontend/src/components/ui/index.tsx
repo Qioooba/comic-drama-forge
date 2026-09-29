@@ -263,7 +263,8 @@ export function Button({
   const base = `inline-flex items-center justify-center gap-2 rounded-md font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${FOCUS_RING}`;
   const variants = {
     primary: 'bg-action text-white hover:bg-action/85',
-    brand: 'bg-brand text-white hover:bg-brand-hover',
+    // 品牌=科技感主视觉：品牌→青渐变 + 极浅辉光（.progress-fill 见 index.css）
+    brand: 'progress-fill text-white shadow-[0_2px_16px_rgb(var(--brand)/0.35)] hover:shadow-[0_2px_24px_rgb(var(--brand)/0.5)] hover:brightness-110',
     secondary: 'border border-line bg-surface text-ink-1 hover:bg-surface-2',
     danger: 'bg-danger text-white hover:bg-danger-strong',
     ghost: 'bg-transparent text-ink-2 hover:bg-surface-2 hover:text-ink-1',
@@ -504,7 +505,7 @@ export function Modal({
         aria-modal="true"
         aria-labelledby={titleId}
         aria-describedby={description ? descId : undefined}
-        className={`relative flex max-h-[90vh] w-full animate-modal-in flex-col rounded-xl bg-surface shadow-lg ${MODAL_SIZES[size]}`}
+        className={`glass-strong relative flex max-h-[90vh] w-full animate-modal-in flex-col rounded-xl border border-line shadow-lg ${MODAL_SIZES[size]}`}
       >
         <div className="flex shrink-0 items-start justify-between gap-3 border-b border-line px-6 py-4">
           <div className="min-w-0">

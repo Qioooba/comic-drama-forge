@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { AppProvider } from '@/context/AppContext';
+import { ThemeProvider } from '@/context/ThemeContext';
 import { ToastProvider } from '@/components/ui/toast';
 import { Navbar } from '@/components/layout/Navbar';
 import { Sidebar } from '@/components/layout/Sidebar';
@@ -58,7 +59,8 @@ function AppContent() {
   const PageComponent = useMemo(() => SECTIONS[activeSection] || OverviewPage, [activeSection]);
 
   return (
-    <div className="flex h-screen bg-canvas text-ink-1">
+    // bg-canvas 半透明：透出 body::before 的科技感辉光层（见 index.css），玻璃面板才有景深
+    <div className="flex h-screen bg-canvas/75 text-ink-1">
       {/* Sidebar */}
       <Sidebar
         activeSection={activeSection}
@@ -75,9 +77,13 @@ function AppContent() {
       <div className="flex-1 flex overflow-hidden">
         <div className="flex-1 flex flex-col overflow-hidden">
           <Navbar />
-          <main className="flex-1 overflow-y-auto p-6">
+          {/* 超宽屏下限宽居中，避免一行文字拉到 2000px+ 难以阅读 */}
+          <main className="mx-auto w-full max-w-[1600px] flex-1 overflow-y-auto p-6">
             {activeSection === 'project-workbench' && projectKey ? (
-              <ProjectWorkbenchPage projectKey={projectKey} />
+              // 审计 P2-36（2026-09-29）：key={projectKey} 强制切项目时整页重挂 ——
+              // 旧实现组件实例复用，OverviewTab/QcTab/StoryboardTab 等保留上一个
+              // 项目的选中集与数据，快速切换时还会出现旧项目响应覆盖新项目的竞态。
+              <ProjectWorkbenchPage key={projectKey} projectKey={projectKey} />
             ) : (
               <PageComponent />
             )}
@@ -91,13 +97,18 @@ function AppContent() {
 export default function App() {
   return (
     <ErrorBoundary>
-      {/* ToastProvider 必须在 AppProvider 之外：AppContext.showError 要往 Toast 里推消息 */}
-      <ToastProvider>
-        <AppProvider>
-          <AppContent />
-          <ServiceMonitor />
-        </AppProvider>
-      </ToastProvider>
+      {/* ThemeProvider 放最外层（不依赖其他 context）：深色实现 = 给 <html> 注入
+          .dark 类，配合 index.css 的 :root.dark token 覆盖层整站换肤，
+          组件层不感知主题、无 dark: 变体。 */}
+      <ThemeProvider>
+        {/* ToastProvider 必须在 AppProvider 之外：AppContext.showError 要往 Toast 里推消息 */}
+        <ToastProvider>
+          <AppProvider>
+            <AppContent />
+            <ServiceMonitor />
+          </AppProvider>
+        </ToastProvider>
+      </ThemeProvider>
     </ErrorBoundary>
   );
 }

@@ -2262,7 +2262,7 @@ def plan_shots_for_chars(char_count) -> int:
     ⚠️ 与 `estimate_shots_for_chars` 的区别是本函数存在的全部理由，别混用：
       · `estimate_shots_for_chars` = 按 `CHARS_PER_SHOT=120`（**提示词引导值**）。
         它喂给模型写提示词、也用作覆盖率容量基准 —— **偏乐观**（实测只有实际的 1/3）。
-      · 本函数 = 按 `EPISODE_PLAN_CHARS_PER_SHOT=36`（**实测密度**）。
+      · 本函数 = 按 `EPISODE_PLAN_CHARS_PER_SHOT=26`（**实测密度**，2026-09-26 起）。
         只用于「这一章要拆几集」的前置规划 —— **必须贴近实际**，否则拆集判据失效。
 
     实测依据见 `EPISODE_PLAN_CHARS_PER_SHOT` 的注释（2361 字 → 实测 63 镜）。
@@ -2288,7 +2288,7 @@ def estimate_episode_parts(char_count, max_sec: int = None) -> int:
     规则：`parts = ceil(预估秒数 / max_sec)`，`max_sec` 默认 `EPISODE_MAX_SEC`（180 秒）。
     预估不超上限就是 1 集 —— 集数完全由「这一章能拍几分钟」决定。
 
-    ⚠️ 预估秒数走 `estimate_episode_plan_sec`（**实测密度 36 字/镜**），
+    ⚠️ 预估秒数走 `estimate_episode_plan_sec`（**实测密度 26 字/镜**），
     而不是 `estimate_episode_shots`（提示词口径 120 字/镜）。用错口径会让判据失效 ——
     本次实测踩到：按 120 字/镜估算，42 章全部落在 180 秒内 → 集数永远拆不动，
     而实际每集约 6 分钟。详见 `EPISODE_PLAN_CHARS_PER_SHOT` 注释。

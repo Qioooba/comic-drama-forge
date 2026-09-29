@@ -53,6 +53,15 @@ export function AudioTab({ projectKey }: AudioTabProps) {
   /** 最近一次配音任务的质检结论（任务级下发，用于列出未通过的句子） */
   const [ttsQc, setTtsQc] = useState<any>(null);
 
+  // 审计 P2-35（2026-09-29）：TTS/混音轮询此前无卸载守卫 —— 切 Tab/切项目后循环
+  // 仍会跑满 20/10 分钟并对已卸载组件 setState。aliveRef 在卸载时置 false，
+  // 轮询循环每拍检查、立即退出（后端任务本身继续跑，回到本页重新生成即可见结果）。
+  const aliveRef = React.useRef(true);
+  useEffect(() => {
+    aliveRef.current = true;
+    return () => { aliveRef.current = false; };
+  }, []);
+
   // 加载环境信息
   const loadEnv = async () => {
     try {
@@ -120,6 +129,7 @@ export function AudioTab({ projectKey }: AudioTabProps) {
       // 不轮询就拿不到（此前只 toast 一句就结束，用户看不到质检发现的问题）
       for (let i = 0; i < 400; i += 1) {
         await new Promise((r) => setTimeout(r, 3000));
+        if (!aliveRef.current) break; // 卸载/切项目：停止本页轮询（后端任务不受影响）
         let task: any = null;
         try {
           task = (await ttsApi.status(result.task_id)) as any;
@@ -200,6 +210,7 @@ export function AudioTab({ projectKey }: AudioTabProps) {
       // 混音本身很快，但配音未就绪时可能排队；最多轮询 10 分钟
       for (let i = 0; i < 200; i += 1) {
         await new Promise((r) => setTimeout(r, 3000));
+        if (!aliveRef.current) break; // 卸载/切项目：停止本页轮询（后端任务不受影响）
         let task: any = null;
         try {
           const resp = await mixApi.status(result.task_id);
