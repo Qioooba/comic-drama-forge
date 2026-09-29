@@ -104,8 +104,12 @@ def run_gpu_task(task_id: str, label: str = ""):
     acquired = sem.acquire(timeout=3600 * 24)  # 长期等待，实际永不超时
     waited = _time.time() - _t0
     if not acquired:
+        # 审计 P2-1（2026-09-29）：@contextmanager 生成器不 yield 就 return，会让
+        # with 语句抛 RuntimeError: generator didn't yield —— 等待方拿到的是费解的
+        # 异常且任务态可能卡 running。显式 raise 给出可读失败原因，由 worker 的
+        # catch-all 回写任务失败态。
         logger.error("GPU 任务 %s 排队超时（24h），放弃执行", task_id)
-        return
+        raise RuntimeError(f"GPU 任务 {task_id} 排队超时（24h），放弃执行")
     if waited > 30:
         with _LOCK:
             _cur = _module_state._running_count

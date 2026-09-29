@@ -145,7 +145,12 @@ export const novelsApi = {
 // --- Tasks ---
 export const tasksApi = {
   list: () => request<TasksResponse>('/tasks'),
-  get: (id: string) => request<Task>(`/tasks/${id}`),
+  // 审计 P2：后端 api_task_detail 返回 { success, task, ... } 信封 —— 解包出 task，
+  // 否则调用方拿 task.progress 等字段全是 undefined
+  get: async (id: string): Promise<Task> => {
+    const d = await request<{ success: boolean; task: Task }>(`/tasks/${id}`);
+    return d?.task;
+  },
 };
 
 // --- Characters ---
@@ -198,15 +203,20 @@ export const relationsApi = {
     request<Record<string, unknown>>(
       `/relations/graph?project=${encodeURIComponent(projectId)}`
     ),
-  add: (data: Partial<Relation>) =>
+  // 审计 P2：后端 api_add_relation / update_relation / delete_relation 一律从
+  // body 读 `project`（不是 project_id）；DELETE 也必须带 body，否则 400
+  add: (data: Partial<Relation> & { project?: string }) =>
     request<Relation>('/relations', { method: 'POST', body: JSON.stringify(data) }),
-  update: (id: string, data: Partial<Relation>) =>
+  update: (id: string, data: Partial<Relation> & { project?: string }) =>
     request<Relation>(`/relations/${id}`, {
       method: 'PUT',
       body: JSON.stringify(data),
     }),
-  delete: (id: string) =>
-    request<void>(`/relations/${id}`, { method: 'DELETE' }),
+  delete: (id: string, project?: string) =>
+    request<void>(`/relations/${id}`, {
+      method: 'DELETE',
+      body: JSON.stringify({ project }),
+    }),
 };
 
 // --- AI Chat ---
@@ -384,9 +394,10 @@ export const memoryApi = {
       success?: boolean; hints?: string[]; learned_prompt?: string; changed?: boolean;
     }>(`/memory/lessons/search?${qs.toString()}`);
   },
-  list: async (params?: { query?: string; type?: string }): Promise<Memory[]> => {
+  // 审计 P2：后端 api_memory_list 只认 type/limit —— query 会被静默忽略
+  // （「按关键词过滤」实际不过滤），已移除避免误导调用方
+  list: async (params?: { type?: string }): Promise<Memory[]> => {
     const qs = new URLSearchParams();
-    if (params?.query) qs.set('query', params.query);
     if (params?.type) qs.set('type', params.type);
     const query = qs.toString() ? `?${qs.toString()}` : '';
     const d = await request<{ memories?: Memory[] } | Memory[]>(`/memory/list${query}`);
@@ -668,21 +679,19 @@ export const qcApi = {
   clearConfig: () => request<{ success: boolean }>('/qc/config/clear', { method: 'POST' }),
   resetEndpoint: () => request<{ success: boolean }>('/qc/config/reset-endpoint', { method: 'POST' }),
   syncFromAI: () => request<{ success: boolean }>('/qc/config/sync-from-ai', { method: 'POST' }),
-  // 后端 /api/qc/test 实际只读 base_url / api_key / model / image_path / video_path
-  // （见 api_qc_test）：project / shot_id 不是它认识的入参——传了也被忽略。
-  // 单镜重测靠的是后端从 STORYBOARDS_DIR 里**按项目自动挑一张分镜图当样张**，
-  // 因此这里的 shot_id 只用于前端本地展示，不参与请求。
+  // 审计 P1-7（2026-09-29）：必须把 project_name 送到后端 —— api_qc_test 按
+  // project_name（缺省回落共享命名空间 'project'）从分镜目录自动挑样张；
+  // 旧实现恒发空包体，「重测」拿到的要么是连通性探测、要么是别的项目的样张结论。
+  // shot_id 后端暂不支持按镜定位，仅用于前端本地展示。
   test: (data: { project?: string; shot_id?: string }) =>
     request<{ success: boolean; verdict: string; score: number }>(
       '/qc/test',
-      { method: 'POST', body: JSON.stringify({}) }
+      { method: 'POST', body: JSON.stringify({ project_name: data?.project || '' }) }
     ),
   history: (project: string) =>
     request<QCResponse>(`/qc/project-summary?project=${encodeURIComponent(project)}`),
-  frames: (project: string) =>
-    request<{ success: boolean; frames: any[] }>(
-      `/qc/frames/${encodeURIComponent(project)}`
-    ),
+  // 审计 P2：frames 方法已删除 —— 后端 GET /api/qc/frames/<file> 是**图片回显**
+  // 路由（send_file），没有「按项目列帧」的 JSON 端点；旧方法命中后 JSON 解析必炸。
   /** 音频成品质检：客观层（ffmpeg 指标）始终执行；AI 层需配置质检接口 */
   checkAudio: (data: {
     project_name?: string;
@@ -715,10 +724,15 @@ export const episodesApi = {
     request<EpisodeListResponse>(`/episodes/${encodeURIComponent(novelId)}`),
   get: (novelId: string, episodeNo: number) =>
     request<Episode>(`/episodes/${encodeURIComponent(novelId)}/${episodeNo}`),
-  generate: (novelId: string) =>
+  // 审计 P2：后端 api_novel_episodes_generate 必须带 chapters（章节号数组）或
+  // start/end —— 空包体一律 400「未选择有效章节」（旧签名无 body，接线即坏）
+  generate: (
+    novelId: string,
+    body: { chapters?: number[]; start?: number; end?: number }
+  ) =>
     request<{ success: boolean; episode_count: number }>(
       `/novels/${encodeURIComponent(novelId)}/episodes/generate`,
-      { method: 'POST' }
+      { method: 'POST', body: JSON.stringify(body) }
     ),
 };
 
@@ -824,8 +838,18 @@ export const autopilotApi = {
       `/autopilot/plan/${encodeURIComponent(project)}`,
       { method: 'POST', body: JSON.stringify(patch) }
     ),
-  enable: () => request<{ success: boolean }>('/autopilot/enable', { method: 'POST' }),
-  disable: () => request<{ success: boolean }>('/autopilot/disable', { method: 'POST' }),
+  // 审计 P2：enable/disable 后端走 _project_or_400(data.get('project'))——
+  // 空包体一律 400「缺少 project」，调用时必须带项目
+  enable: (project: string) =>
+    request<{ success: boolean }>('/autopilot/enable', {
+      method: 'POST',
+      body: JSON.stringify({ project }),
+    }),
+  disable: (project: string) =>
+    request<{ success: boolean }>('/autopilot/disable', {
+      method: 'POST',
+      body: JSON.stringify({ project }),
+    }),
   pause: () => request<{ success: boolean }>('/autopilot/pause', { method: 'POST' }),
   resume: () => request<{ success: boolean }>('/autopilot/resume', { method: 'POST' }),
   progress: () => request<{ success: boolean; count?: number; items: AutopilotProgress[] }>('/autopilot/progress'),
@@ -856,7 +880,9 @@ export const autopilotApi = {
     }),
   exceptions: () =>
     request<{ success: boolean; exceptions: any[] }>('/autopilot/exceptions'),
-  resolveException: (data: { project: string; exception_id: string; action: string }) =>
+  // 审计 P2：后端 api_autopilot_exception_resolve 读 project/project_name +
+  // episode_no + note —— 没有 exception_id/action，旧签名接线必 404（第0集）
+  resolveException: (data: { project: string; episode_no: number; note?: string }) =>
     request<{ success: boolean }>('/autopilot/exceptions/resolve', {
       method: 'POST',
       body: JSON.stringify(data),

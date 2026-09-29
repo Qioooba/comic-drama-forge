@@ -9,6 +9,26 @@
     "title": "漫剧生成系统",
     "subtitle": "本地 AI 漫剧全流程生产台"
   },
+  "theme": {
+    "label": "界面主题",
+    "light": "浅色",
+    "dark": "深色",
+    "system": "跟随系统"
+  },
+  "live": {
+    "comfySampling": "ComfyUI 采样",
+    "agentTrace": "总控执行轨迹",
+    "agentRunning": "执行中 · {n} 步 · 已 {s}s",
+    "waitingNext": "等待下一步…",
+    "pollFailed": "查询执行状态失败，已停止跟踪",
+    "agentRunDone": "执行完成 · {n} 步",
+    "agentRunFailed": "执行失败 · {n} 步",
+    "agentRunKilled": "已被急停",
+    "agentTimeout": "执行超时",
+    "elapsed": "{s}s",
+    "collapse": "收起轨迹",
+    "expand": "展开轨迹"
+  },
   "step": {
     "1": "剧本生成",
     "2": "角色资产",
@@ -85,7 +105,10 @@
     "keyframe": "关键帧驱动（首尾帧插值）",
     "auto": "自动生产",
     "advanced": "高级模式",
-    "running": "运行中"
+    "running": "运行中",
+    "pending": "排队中",
+    "done": "已完成",
+    "failed": "失败"
   },
   "keyframe": {
     "title": "关键帧驱动",
@@ -1014,6 +1037,8 @@
     "refCompareHint": "关闭后模型没有锚点，「角色不像设定 / 道具变形」只能靠猜",
     "passScoreLabel": "合格线（0-100）",
     "maxRetriesLabel": "不达标最大重试",
+    "bestOfLabel": "分镜候选数（best-of-N）",
+    "bestOfHint": "1=关闭；>1 时每镜生成 N 张候选、按质检分选最佳入库（N 倍耗时，建议 2）",
     "videoFramesLabel": "视频抽帧数",
     "timeoutLabel": "单次请求超时（秒）",
     "saveCfg": "保存质检配置",

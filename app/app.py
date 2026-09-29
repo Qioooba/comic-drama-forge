@@ -15,7 +15,6 @@ import uuid
 import contextvars
 from datetime import datetime
 from flask import Flask, render_template, request, jsonify, send_file, abort, redirect, send_from_directory
-from flask_cors import CORS
 from werkzeug.exceptions import BadRequest, HTTPException
 
 from config import (
@@ -137,7 +136,12 @@ _norm_shot_key = shot_key.norm_shot_key
 app = Flask(__name__)
 # 总控 AI 自主执行内核：注入 Flask 实例，工具调用走进程内直连（不走网络/不绑端口）
 agent_core.bind_app(app)
-CORS(app)
+# ⚠️ 审计 P1-6（2026-09-29）：不再启用全局 CORS。
+# 旧实现 `CORS(app)` 等价于 Access-Control-Allow-Origin: * —— 任意网页都能在用户
+# 浏览器里跨源 fetch 本服务（包括 GET /api/ai/config/reveal 明文回显密钥、全部写操作路由），
+# 属「drive-by 偷密钥」面。而本应用三端全部同源：Web 前端由本服务直接托管（app/static）、
+# Electron 桌面壳 loadURL('http://127.0.0.1:<port>/')、Vite 开发期走 server.proxy ——
+# 没有任何跨源调用方，全局 CORS 纯属攻击面。如未来确需跨源，必须按路由白名单收紧。
 
 # 服务配置（可通过环境变量覆盖：APP_HOST / APP_PORT / APP_DEBUG）
 APP_HOST = os.getenv("APP_HOST", "127.0.0.1")
@@ -192,6 +196,37 @@ def _h3_audio_policy(path: str) -> dict:
 # 全局状态
 generation_state = {}
 lock = threading.Lock()
+
+# 审计 P1-4（2026-09-29）：任务态字典（generation_state / upscale_tasks / dub_tasks /
+# mix_tasks）此前只增不清 —— 24/7 挂机下内存无界增长，且幂等复用扫描、任务列表遍历
+# 随历史线性变慢。这里提供按「终态条数上限」的清理：超出上限时按插入序（≈时间序）从
+# 最旧开始丢弃。running 条目永不清；刚到终态的条目不会立即被清（超限才清），
+# 前端按 task_id 轮询不受影响。调用方必须已持有该注册表自己的锁。
+_TASK_TERMINAL_STATUSES = ("completed", "done", "failed", "error", "cancelled")
+_TASK_STATE_KEEP_DONE = 40
+
+
+def _prune_task_registry(registry: dict) -> int:
+    """清理一个任务注册表里超量的终态条目，返回清理条数（须持有该注册表的锁）"""
+    if not isinstance(registry, dict):
+        return 0
+    _done = sum(1 for v in registry.values()
+                if isinstance(v, dict)
+                and str(v.get("status") or "") in _TASK_TERMINAL_STATUSES)
+    _excess = _done - _TASK_STATE_KEEP_DONE
+    if _excess <= 0:
+        return 0
+    _pruned = 0
+    for _k in list(registry):
+        if _excess <= 0:
+            break
+        _v = registry.get(_k)
+        if isinstance(_v, dict) and \
+                str(_v.get("status") or "") in _TASK_TERMINAL_STATUSES:
+            registry.pop(_k, None)
+            _excess -= 1
+            _pruned += 1
+    return _pruned
 
 # 视频 worker「是否托管（pipeline）任务」的执行期标记（contextvar，随线程上下文传递）。
 # 用于让「托管暂停」只掐断托管任务，不误杀用户手动触发的生成。见 _video_should_stop。
@@ -2029,7 +2064,13 @@ def api_keyframes_list(project_name):
     """列出项目已有首尾帧"""
     project = _safe_project(os.path.basename(project_name.rstrip('/')))
     _kl_ep = request.args.get('episode_no')
-    _kl_sub = f"ep{int(_kl_ep):02d}/" if str(_kl_ep or '').strip() and int(_kl_ep) > 1 else ""
+    # 审计 P2-2（2026-09-29）：episode_no 非数字时裸 int() 会 500（全库只注册了
+    # BadRequest 处理器，ValueError 漏成 HTML 500）。与 _ep_read_dir 的容错口径对齐。
+    try:
+        _kl_no = int(_kl_ep)
+    except (TypeError, ValueError):
+        _kl_no = 1
+    _kl_sub = f"ep{_kl_no:02d}/" if _kl_no > 1 else ""
     kf_dir = _ep_read_dir(KEYFRAMES_DIR, project, _kl_ep)
     items = []
     if os.path.isdir(kf_dir):
@@ -2566,6 +2607,7 @@ def _video_retry_shot_impl():
     _rs_sub = f"ep{int(_rs_ep):02d}/" if _rs_ep and int(_rs_ep) > 1 else ""
     sb_map = _keyframe_sb_map(project, script, episode_no=_rs_ep)
     sb_local = sb_map.get(_shot_num_key(shot_id))
+    _r_end_ref = None  # keyframe 模式的尾帧声明（<Picture 2>），非 keyframe 恒 None
 
     if mode == 'keyframe':
         kf_dir = _ep_dir(os.path.join(KEYFRAMES_DIR, project), _rs_ep)
@@ -2576,7 +2618,12 @@ def _video_retry_shot_impl():
             return jsonify({"success": False,
                             "error": "缺少尾帧，请先执行关键帧生成（/api/keyframes/generate）"}), 400
         _seg_refs = [sb_local, end_p]
-        _r_char_refs, _r_item_refs, _r_scene_refs = char_refs, [], scene_refs
+        # 审计 P1-1（2026-09-29）：与主链路 keyframe 分支同口径 —— 实际挂图只有
+        # 「首帧 + 尾帧」两张，char/item/scene 引用必须置空（旧实现残留
+        # char_refs/scene_refs，会声明出实际不存在的 <Picture 3..N>）；尾帧图
+        # 经 end_frame_ref 声明为 <Picture 2>，让提示词真正产出尾帧锚定句。
+        _r_char_refs, _r_item_refs, _r_scene_refs = [], [], []
+        _r_end_ref = {"name": f"shot_{seq:02d}_end"}
     else:
         if sb_local:
             # 「分镜 + 本镜资产」：分镜图 + 本镜角色三视图 + 物品 + 场景
@@ -2638,7 +2685,8 @@ def _video_retry_shot_impl():
         if mode == 'keyframe':
             _rp = comfyui_client._build_h3_prompt(
                 _rsub, _r_char_refs, _r_scene_refs,
-                storyboard_ref={"name": f"shot_{seq}"}, item_refs=_r_item_refs)
+                storyboard_ref={"name": f"shot_{seq}"}, item_refs=_r_item_refs,
+                end_frame_ref=_r_end_ref)
         elif sb_local:
             _rp = comfyui_client._build_h3_prompt(
                 _rsub, _r_char_refs, _r_scene_refs,
@@ -4368,16 +4416,29 @@ def _apply_closeup_ref_strategy(refs: list, shot: dict, project_name: str = None
       （主角色头部特写，占 ``<image1>``），其余槽位由生成端留空。
       多角色特写时保留每个角色的头部特写（各占一槽），不复制。
     """
-    if "特写" not in str(shot.get("camera") or ""):
+    # 审计 P2-13（2026-09-29）：特写判定改为 shot_type / camera 双查 —— camera 字段
+    # 已拆分（A1），_norm_shots 允许 camera 为纯运镜串（如「推入」）而 shot_type=「特写」；
+    # 只看旧 camera 会漏掉这类镜头，与生成端（build_storyboard_prompt 按 shot_framing
+    # 注入特写硬约束）判定分裂。
+    _is_closeup = ("特写" in str(shot.get("shot_type") or "")
+                   or "特写" in str(shot.get("camera") or ""))
+    if not _is_closeup:
         return refs
     out = []
     for kind, label, path in refs:
         if kind in ("主角色", "次角色"):
             # 保留 <imageN> 编号锚点，让质检端能继续核对「编号 ↔ 职责」一致性。
+            # 审计 P2-19（2026-09-29）：必须完整保留「（<imageN>）」整组 —— 旧实现
+            # 只留「参考图N（」，<imageN> 被削掉，下游 _ref_label_body 剥前缀不净
+            # （提示词出现「参考图2（已替换为…」脏片段）且特写镜丢身份保留句。
             _mark = ""
             if label.startswith("参考图"):
-                _head = label.split("）", 1)[0]
-                _mark = _head.split("（", 1)[0] + "（"
+                _m = re.match(r"(参考图\d+（<image\d+>）)", label)
+                if _m:
+                    _mark = _m.group(1)
+                else:
+                    _head = label.split("）", 1)[0]
+                    _mark = _head.split("（", 1)[0] + "（"
             out.append((kind,
                         _mark + "已替换为该角色头部特写，画面取景范围以此为准：仅肩部以上",
                         _closeup_char_crop(path, project_name, shot.get("shot_id", 1))))
@@ -5196,6 +5257,7 @@ def api_generate_storyboards():
     # B-11 P1-8：守卫键加 episode_no —— 第 2 集请求不再被第 1 集运行中任务吞掉。
     _ep_no = data.get('episode_no')
     with lock:
+        _prune_task_registry(generation_state)
         _existing_sb = next((tid for tid, st in generation_state.items()
                              if st.get("status") == "running"
                              and st.get("project_name") == project_name
@@ -5249,7 +5311,12 @@ def api_storyboard_manifest(project_name):
     # 无清单时按磁盘文件兜底（项目可能由其他会话生成）
     # ⚠️ URL 必须带集前缀：out_dir 是集级目录（第 2 集起 <项目>/epNN/），
     #    漏掉 epNN 段会让第 2 集起的所有图 404（同 _storyboard_worker 的旧 bug）。
-    _mf_sub = f"ep{int(_mf_ep):02d}/" if _mf_ep and int(_mf_ep) > 1 else ""
+    #    审计 P2-2：episode_no 非数字时裸 int() 会 500，改容错解析。
+    try:
+        _mf_no = int(_mf_ep)
+    except (TypeError, ValueError):
+        _mf_no = 1
+    _mf_sub = f"ep{_mf_no:02d}/" if _mf_no > 1 else ""
     shots = []
     if os.path.isdir(out_dir):
         for fn in sorted(os.listdir(out_dir)):
@@ -5367,6 +5434,7 @@ def api_generate_videos():
 
     task_id = f"video_{project_name}_{uuid.uuid4().hex[:12]}"
     with lock:
+        _prune_task_registry(generation_state)
         # G5 + B-11 P1-8：同项目**同集**已有 running 的视频任务 → 复用。
         # ⚠️ 修复（2026-09-25）：旧键只匹配 project_name + step=="video"，**不含集号** ——
         #    用户在第 2 集点「生成视频」，若第 1 集的视频任务还在跑，会被直接吞掉：
@@ -5630,6 +5698,7 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
             _shot_item_refs = []
             _shot_scene_refs = scene_refs
             _seg_comps = []       # 本段**私有**组件（不含公共项）
+            _end_frame_ref = None  # keyframe 模式的尾帧声明（<Picture K>），非 keyframe 恒 None
             if mode == 'keyframe' and sb_local:
                 sb_local = sb_map.get(_norm_shot_key(seq)) or sb_map.get(
                     f"shot_{seq:02d}") or sb_local
@@ -5638,9 +5707,18 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
                            or kf_start_map.get(f"shot_{seq:02d}") or sb_local)
                 end_p = kf_end_map.get(str(sid)) or kf_end_map.get(f"shot_{seq:02d}")
                 refs = [start_p] + ([end_p] if end_p else [])
-                # ⚠️ keyframe 的 refs 是「首帧+尾帧」两句式，与 char/item/scene 三段式
-                #    声明不是同一套编号，公共块不参与（公共池在 _h3_plan_common_refs
+                # ⚠️ 审计 P1-1（2026-09-29）：keyframe 的实际挂图只有「首帧+尾帧」两张，
+                #    提示词声明必须与之对齐 —— char/item/scene 三段式引用一律置空
+                #    （旧实现残留全局 character_refs/scene_refs，会声明出实际不存在的
+                #    <Picture 3..N>，属于「声明指向错误图」的静默错位）；尾帧图经
+                #    end_frame_ref 声明为 <Picture K>，让 h3_prompt_kit 真正产出
+                #    「End state: the final frame must land on <Picture K>」尾帧锚定句
+                #    （<Picture 1>=首帧构图基准；公共块不参与，_h3_plan_common_refs
                 #    已按 mode 前置挡掉，见 episode 分支的调用点）。
+                _shot_char_refs = []
+                _shot_item_refs = []
+                _shot_scene_refs = []
+                _end_frame_ref = ({"name": f"shot_{seq:02d}_end"} if end_p else None)
                 _c_refs = []
             elif sb_local:
                 # 2026-09-27「分镜 + 本镜资产」参考图策略：分镜图(构图基准) +
@@ -5709,7 +5787,8 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
                         _sub, _shot_char_refs, _shot_scene_refs,
                         storyboard_ref={"name": f"shot_{sid}"},
                         item_refs=_shot_item_refs,
-                        common_refs=_c_refs)
+                        common_refs=_c_refs,
+                        end_frame_ref=_end_frame_ref)
                 elif sb_local:
                     _sub_prompt = comfyui_client._build_h3_prompt(
                         _sub, _shot_char_refs, _shot_scene_refs,
@@ -6333,6 +6412,11 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
                 with lock:
                     generation_state[task_id]["results"].append(video_item)
                     generation_state[task_id]["phase"] = "视频生成"
+            except cancellation.Cancelled:
+                # 审计 P1-2：中止信号必须穿透到 worker 外壳（cancelled 分支）。
+                # Cancelled 继承 Exception，在这里被吞会让任务终态误报 failed，
+                # 且 per_shot 循环会继续给后续镜头提交 ComfyUI 任务（白耗配额）。
+                raise
             except Exception as shot_err:
                 # 单镜头失败不影响其余镜头（原实现会让整批 failed）
                 app.logger.error(f"镜头 {shot_id} 生成失败: {shot_err}")
@@ -6351,6 +6435,11 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
                 "qc_blocked_count": blocked,
                 "error": "" if ok else "所有镜头均生成失败",
             })
+    except cancellation.Cancelled:
+        # 审计 P1-2：与上面逐镜循环同理 —— Cancelled 不是失败，必须穿透到
+        # _video_generate_worker 外壳的 cancelled 分支（pipeline._run_task_worker
+        # 的「中止信号不重试」保护也依赖它原样上抛）。
+        raise
     except Exception as e:
         app.logger.error(f"视频生成失败: {e}")
         # B-16 P2-11：视频任务异常 → 清理本任务产生的视频 scratch 中间产物
@@ -6605,6 +6694,16 @@ def _upscale_resolve_video(data: dict) -> str:
         video_path = os.path.abspath(video_path)
         if not os.path.exists(video_path):
             raise UpscaleError(f"视频文件不存在: {video_path}")
+        # 审计 P2-4（2026-09-29）：绝对路径输入限定在 output/ 与 ComfyUI 输出目录内。
+        # URL 分支本就有目录边界，绝对路径分支此前没有 —— 零鉴权部署下等于
+        # 「任意磁盘视频文件间接读取」（送 ComfyUI 渲染、产物可回看）。normcase
+        # 对齐大小写不敏感文件系统的路径比较。
+        _vp_norm = os.path.normcase(video_path)
+        _allowed_roots = (os.path.abspath(PROJECT_OUTPUT_DIR),
+                          os.path.abspath(COMFYUI_OUTPUT_DIR))
+        if not any(_vp_norm.startswith(os.path.normcase(r + os.sep))
+                   for r in _allowed_roots):
+            raise UpscaleError("非法路径：video_path 仅允许 output/ 或 ComfyUI 输出目录内的文件")
         return video_path
 
     url = (data.get("video_url") or "").strip()
@@ -6724,6 +6823,8 @@ def _upscale_worker(task_id: str, video_path: str, project_name: str, params: di
                 "status": "done", "progress": 100, "message": "超分完成",
                 "result": result, "finished_at": time.time(),
             })
+        with upscale_lock:
+            _prune_task_registry(upscale_tasks)
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -9290,7 +9391,9 @@ def api_qc_frame_file(filename):
     safe = filename.replace('\\', '/')
     target = os.path.abspath(os.path.join(QC_DIR, safe))
     root = os.path.abspath(QC_DIR)
-    if not target.startswith(root):
+    # 审计 P2（2026-09-29）：前缀必须带路径分隔符 —— 否则 output/qc_backup 等
+    # 「qc 开头」的兄弟目录也能通过前缀判断（与 _serve_safe 的 base+os.sep 口径对齐）
+    if not target.startswith(root + os.sep):
         abort(403)
     if not os.path.exists(target):
         abort(404)
@@ -11348,6 +11451,8 @@ def _dub_worker(task_id: str, project_name: str, plan: dict, out_dir: str,
                 "manifest": manifest_path,
                 "error": "" if ok_items else "全部句子合成失败，请查看 results 中的错误原因",
             })
+        with dub_lock:
+            _prune_task_registry(dub_tasks)
     except (TTSError, OSError) as e:
         app.logger.error(f"配音任务失败: {e}")
         # B-16 P2-11：配音失败 → 清理本任务产生的中间产物（lines 目录、merged 半成品）
@@ -12003,6 +12108,8 @@ def _mix_worker(task_id: str, prepared: dict, out_name: str):
                 "audio_qc": _aq,
                 "result": report,
             })
+        with mix_lock:
+            _prune_task_registry(mix_tasks)
         # 带配音成片＝用户真正要验收的成品：自动登记进「成品验收」队列
         reg = register_final_deliverable(
             project_name, prepared["episode"], report["output_path"],

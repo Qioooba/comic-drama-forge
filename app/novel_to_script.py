@@ -134,10 +134,12 @@ except (TypeError, ValueError):
 #:     的稀释），不是纯主生成的密度。
 #:
 #: 处置：拆集**规划**改用本常量（纯主生成实测密度）而不是 `CHARS_PER_SHOT`。
-#: 为什么不在估计器里直接改 `CHARS_PER_SHOT`：它同时被喂给模型的提示词
-#: （`REWRITE_RULES.format(chars_per_shot=...)`）与覆盖率容量校验
+#: 为什么不在估计器里直接改 `CHARS_PER_SHOT`：它还被覆盖率容量校验
 #: （`build_chapter_coverage_meta(capacity=n*chars_per_shot)`）消费，
-#: 改它会连带改提示词语义与覆盖率口径 —— 那不是这次要动的东西。
+#: 改它会连带改覆盖率口径 —— 那不是这次要动的东西。
+#: （审计 P2-10 修正（2026-09-29）：旧注释声称 CHARS_PER_SHOT 还经
+#: `REWRITE_RULES.format(chars_per_shot=...)` 喂给模型提示词 —— 实为空转：
+#: REWRITE_RULES 全文没有该占位符，`.format()` 无害但不生效，调用点已移除。）
 #: 因此**只把规划口径独立出来**：两个数字服务两个目的，各自有各自的依据。
 #:
 #: 取值：实测 823/29 = 28.4 字/镜。取 **26**（略密 = 略偏多估镜数 = 拆得更保险）。
@@ -434,8 +436,16 @@ def build_chunks(text: str, chapters: list, chunk_chars: int = CHUNK_CHARS) -> l
     chunks = []
     if chapters:
         buf_text, buf_start, buf_chars, from_ch, to_ch = [], None, 0, None, None
-        for ch in chapters:
-            seg = text[ch["start"]:ch["end"]]
+        _first_start = int(chapters[0].get("start") or 0) if chapters else 0
+        for _ci, ch in enumerate(chapters):
+            _seg_start = ch["start"]
+            if _ci == 0 and _first_start > 0 and text[:_first_start].strip():
+                # 审计 P2-15（2026-09-29）：第一个章节标记之前的开篇正文（无
+                # 「序章/楔子」标题的简介、开篇白）不属于任何章区间 —— 旧实现直接
+                # 从第一章 start 聚合，这段正文被静默丢弃（与「零丢弃」不变量相悖，
+                # 仅靠覆盖率补生成部分兜回）。并入首块一起送模型。
+                _seg_start = 0
+            seg = text[_seg_start:ch["end"]]
             if buf_start is None:
                 buf_start, from_ch = ch["start"], ch["index"]
             buf_text.append(seg)
@@ -1015,7 +1025,7 @@ def build_shots_for_chunk(client, bible: dict, outline: dict, chunk: dict, shots
         shots_cap = min(shots_cap, max(shots_target, _hard))
     speech_budget = SHOT_SPEECH_BUDGET_CHARS
     prompt = f"""【任务】为漫剧《{bible.get('title') or ''}》的「{chunk.get('title')}」（第 {chunk['index']}/{chunk['total']} 段）编写分镜：至少 {shots_target} 个、上限 {shots_cap} 个。把下方原文**压缩提炼**成可拍摄的镜头，只保留推动剧情的关键情节（冲突/转折/关键动作/金句），纯背景铺陈直接删去、勿逐句照搬。
-{REWRITE_RULES.format(chars_per_shot=CHARS_PER_SHOT)}
+{REWRITE_RULES}
 【全剧风格】{bible.get('style') or ''}　【画面风格指南】{_ctx_block(continuity_ctx, 'style_guide_text') or (bible.get('production_notes') or {}).get('style_guide') or ''}
 {_ctx_line(continuity_ctx, 'prev_block')}{_ctx_line(continuity_ctx, 'bible_block')}{_ctx_line(continuity_ctx, 'contract_block')}{_ctx_line(continuity_ctx, 'style_block')}{_ctx_line(continuity_ctx, 'camera_block')}{prev_tail}【可用角色】{json.dumps(char_brief, ensure_ascii=False)}
 【可用物品】{json.dumps(item_brief, ensure_ascii=False)}
@@ -1085,7 +1095,8 @@ def build_shots_for_chunk(client, bible: dict, outline: dict, chunk: dict, shots
             merged.extend(build_shots_for_chunk(client, bible, sub_outline, s, per,
                                                 events=events, depth=depth + 1,
                                                 continuity_ctx=continuity_ctx,
-                                                cache_dir=cache_dir))
+                                                cache_dir=cache_dir,
+                                                shots_hard_cap=shots_hard_cap))
         return merged
     if isinstance(data, dict):
         shots = data.get("shots")

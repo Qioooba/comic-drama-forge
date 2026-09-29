@@ -11,7 +11,11 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # 复制依赖文件
-COPY requirements.txt .
+# 审计 P1-5（2026-09-29）：改用 app/requirements.txt —— 根目录 requirements.txt 是
+# CLI 旧清单（仅 9 个包，缺 flask/waitress/cryptography/openai），用它装出的镜像
+# `import flask` 直接 ModuleNotFoundError；缺 cryptography 还会让 secret_store
+# 拒绝任何密钥落盘。桌面发布 CI（desktop-release.yml）装的也是这份完整清单。
+COPY app/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 # 复制应用代码

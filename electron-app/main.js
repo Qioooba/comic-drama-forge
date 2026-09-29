@@ -657,14 +657,15 @@ function registerIpc() {
     return { ok: true, ...r };
   });
   ipcMain.handle('config:get', () => ({ ...config, configPath: configPath() }));
-  ipcMain.handle('config:setProjectRoot', async (_e, root) => {
+  const applyProjectRoot = async (root) => {
     root = String(root || '').trim();
     if (!root) throw new Error('项目根目录不能为空');
     const warnings = validateProjectRoot(root); // 无效则抛错，preload 侧会显示
     config.projectRoot = root;
     saveConfig(config);
     return { ok: true, warnings, config: { ...config } };
-  });
+  };
+  ipcMain.handle('config:setProjectRoot', (_e, root) => applyProjectRoot(root));
   ipcMain.handle('config:chooseProjectRoot', async () => {
     const win = BrowserWindow.getAllWindows()[0];
     const r = await dialog.showOpenDialog(win, {
@@ -674,7 +675,10 @@ function registerIpc() {
     });
     if (r.canceled || r.filePaths.length === 0) return { ok: false };
     try {
-      const res = await ipcMain.handle('config:setProjectRoot', null, r.filePaths[0]);
+      // 审计 P2（2026-09-29）：旧实现误用 ipcMain.handle 当「调用」——handle 是
+      // 注册接口，listener 传 null 直接 TypeError，导致「选择目录」流程恒失败。
+      // 现在直接调用与 setProjectRoot 同一个应用函数。
+      const res = await applyProjectRoot(r.filePaths[0]);
       return { ok: true, ...res };
     } catch (e) {
       dialog.showErrorBox('项目根目录无效', String(e.message || e));

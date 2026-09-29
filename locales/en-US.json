@@ -9,6 +9,26 @@
     "title": "Comic Drama Studio",
     "subtitle": "Local AI comic-drama production pipeline"
   },
+  "theme": {
+    "label": "Theme",
+    "light": "Light",
+    "dark": "Dark",
+    "system": "System"
+  },
+  "live": {
+    "comfySampling": "ComfyUI sampling",
+    "agentTrace": "Agent trace",
+    "agentRunning": "Running · {n} steps · {s}s",
+    "waitingNext": "Waiting for next step…",
+    "pollFailed": "Failed to poll job status; tracking stopped",
+    "agentRunDone": "Completed · {n} steps",
+    "agentRunFailed": "Failed · {n} steps",
+    "agentRunKilled": "Stopped by kill switch",
+    "agentTimeout": "Timed out",
+    "elapsed": "{s}s",
+    "collapse": "Collapse trace",
+    "expand": "Expand trace"
+  },
   "step": {
     "1": "Script",
     "2": "Characters",
@@ -85,7 +105,10 @@
     "keyframe": "Keyframe-driven (start/end interpolation)",
     "auto": "Auto",
     "advanced": "Advanced",
-    "running": "Running"
+    "running": "Running",
+    "pending": "Pending",
+    "done": "Done",
+    "failed": "Failed"
   },
   "keyframe": {
     "title": "Keyframe Driven",
@@ -1014,6 +1037,8 @@
     "refCompareHint": "When off, the model has no anchor, so \"character drift / prop deformation\" can only be guessed",
     "passScoreLabel": "Pass line (0-100)",
     "maxRetriesLabel": "Max retries on failure",
+    "bestOfLabel": "Storyboard candidates (best-of-N)",
+    "bestOfHint": "1=off; >1 generates N candidates per shot and keeps the best-scored (N× time; 2 recommended)",
     "videoFramesLabel": "Video frame samples",
     "timeoutLabel": "Request timeout (seconds)",
     "saveCfg": "Save QC settings",

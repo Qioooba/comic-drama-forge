@@ -31,9 +31,20 @@ from llm_client import thinking_token_floor as _thinking_token_floor
 from novel_to_script import (
     CHAPTER_CHUNK_CHARS,
     CHAPTER_MAX_SUBCHUNKS,
+    SHOT_DURATION_MAX,
+    SHOT_DURATION_MIN,
+    _norm_camera_motion,
+    _norm_shot_type,
     convert_chapter_to_script,
+    estimate_shot_duration,
+    required_shot_duration,
     save_episode_script,
 )
+
+# 审计 P2-12（2026-09-29）：局部重写回写的角色/物品名必须走统一匹配器 ——
+# 旧实现 characters 裸相等（近名静默丢）、items 完全不过滤（未登记名直接写回），
+# 与「资产名匹配唯一实现 asset_name_match」的全库口径相反。
+import asset_name_match
 
 # 原文覆盖率校验（④⑤：逐句核对是否被镜头承载 + 低于阈值自动补生成；只增不改，不删原文）
 import coverage as coverage_mod
@@ -1605,6 +1616,7 @@ def rewrite_shots_for_issues(client, script: dict, issues: list, episode_no: int
 
     from dialogue_utils import normalize_lines as _dlg_lines
     chars = [c.get("name") for c in (script.get("characters") or []) if isinstance(c, dict)]
+    items = [i.get("name") for i in (script.get("items") or []) if isinstance(i, dict)]
     new_rows = data.get("shots") if isinstance(data.get("shots"), list) else []
     if not new_rows:
         return {"rewritten_shot_ids": [], "script": script, "error": "模型未返回重写镜头"}
@@ -1622,9 +1634,20 @@ def rewrite_shots_for_issues(client, script: dict, issues: list, episode_no: int
             continue
         # 注意：**不回写 prompt_h3**。视频提示词由生成期 h3_prompt_kit 按当次参考图规范构建，
         # 这里若是把模型现写的英文描述写回去，会再次出现「薄英文顶掉结构化构建器」的老问题。
+        _prev_cam = str(old.get("camera") or "").strip()
         for k in ("camera", "location", "description", "emotion", "audio_cues"):
             if str(r.get(k) or "").strip():
                 old[k] = str(r.get(k)).strip()[:400]
+        # 审计 P1-9（2026-09-29）：重写只回写 camera 复合串，但下游取景别/运镜的
+        # 权威入口优先读 shot_type / camera_motion（comfyui_client.shot_framing、
+        # h3_prompt_kit._camera_en/_camera_move_en）—— 不同步刷新的话，重写给出的
+        # 新镜头语言会被旧权威字段整个顶掉（D⑨ 重写闭环对镜头语言的修正静默失效）。
+        # 归一未命中时 _norm_shot_type 返回空串（宁可留空让下游回退解析**新** camera，
+        # 也不保留过期的旧景别），并打枚举漂移告警。
+        _new_cam = str(old.get("camera") or "").strip()
+        if _new_cam and _new_cam != _prev_cam:
+            old["shot_type"] = _norm_shot_type(_new_cam)
+            old["camera_motion"] = _norm_camera_motion(_new_cam)
         # ⚠️ description 一旦被重写，旧的 visual_detail 就是**上一条描述的尾巴**，必须同步处理，
         # 否则 build_storyboard_prompt 会把「新描述 + 旧细节」拼成画面主体，自相矛盾
         #（实测场景：重写后新描述写「正午平光」，旧尾巴仍留着「黄昏暖调逆光」）。

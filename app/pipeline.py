@@ -46,6 +46,7 @@ import time
 import traceback
 
 import cancellation
+import gpu_task_gate
 
 from fs_atomic import atomic_write_json, read_json_strict
 
@@ -857,12 +858,17 @@ def step_storyboard(ctx) -> dict:
     item_idx = A._build_asset_index(script.get("items") or [], ctx["project_name"], "item")
     scene_idx = A._build_asset_index(script.get("scenes") or [], ctx["project_name"], "scene")
     ctx["progress"](f"生成分镜图（{len(shots)} 镜）", 34, phase="storyboard")
-    final = _run_task_worker(
-        A._storyboard_worker, (ctx["project_name"], shots, char_idx, item_idx, scene_idx,
-                               ctx["episode_no"], ctx["config"].get("style") or ""),
-        "generation_state", "lock",
-        init={"total": len(shots), "phase": "分镜图生成"},
-        prefix="pipe_sb")
+    # 审计 P1-3（2026-09-29）：托管 GPU 步骤也必须过并发闸门 —— 旧实现只闸手动链路，
+    # 托管跑批期间手动任务可同时打 ComfyUI；且 has_other_running_gpu_tasks() 在托管
+    # 期间返回 False，upscale/tts 会发 /free 卸掉托管任务正在用的模型。
+    with gpu_task_gate.run_gpu_task(
+            f"pipe_sb_{int(time.time() * 1000)}", "托管·分镜图"):
+        final = _run_task_worker(
+            A._storyboard_worker, (ctx["project_name"], shots, char_idx, item_idx, scene_idx,
+                                   ctx["episode_no"], ctx["config"].get("style") or ""),
+            "generation_state", "lock",
+            init={"total": len(shots), "phase": "分镜图生成"},
+            prefix="pipe_sb")
     out = _outcome_from_task(final, "分镜图生成")
     detail = {"count": out["count"], "total": len(shots), "blocked": out["blocked"],
               "qc_blocked": (final or {}).get("qc_blocked_count")}
@@ -899,13 +905,15 @@ def step_keyframe(ctx) -> dict:
     _kf_verify, _kf_vretries = A._keyframe_qc_verifier(ctx["project_name"], script=ctx.get("script"))
     # 尾帧提示词预检（生成前质检）：与手动链路保持同一覆盖（能自愈先自愈，成批不阻断）
     _kf_pre, _kf_pre_on = A._keyframe_prompt_preflight(ctx["project_name"])
-    report = A.keyframe.generate_keyframes(
-        shots, sb_map, kf_dir, seed=ctx["config"].get("seed"),
-        timeout=int(ctx.get("timeout_per_segment") or 900),
-        only_missing=True, progress_cb=_cb,
-        chain_mode=ctx["config"].get("keyframe_chain_mode") or "auto",
-        verify_cb=_kf_verify, max_verify_retries=_kf_vretries,
-        preflight_cb=_kf_pre)
+    with gpu_task_gate.run_gpu_task(
+            f"pipe_kf_{int(time.time() * 1000)}", "托管·尾帧"):
+        report = A.keyframe.generate_keyframes(
+            shots, sb_map, kf_dir, seed=ctx["config"].get("seed"),
+            timeout=int(ctx.get("timeout_per_segment") or 900),
+            only_missing=True, progress_cb=_cb,
+            chain_mode=ctx["config"].get("keyframe_chain_mode") or "auto",
+            verify_cb=_kf_verify, max_verify_retries=_kf_vretries,
+            preflight_cb=_kf_pre)
     recheck = probe_keyframe(ctx)
     if not recheck.get("done"):
         return {"ok": False, "detail": {"report": report, "probe": recheck},
@@ -936,17 +944,20 @@ def step_video(ctx) -> dict:
     char_refs = script.get("characters") or []
     scene_refs = script.get("scenes") or []
     ctx["progress"](f"生成视频（{len(shots)} 镜 · {mode}）", 50, phase="video")
-    final = _run_task_worker(
-        A._video_generate_worker,
-        (ctx["project_name"], shots, char_refs, scene_refs, {}, True, mode,
-         int(ctx.get("timeout_per_segment") or 900),
-         ctx.get("episode_tag") or f"ep{ctx['episode_no']:02d}",
-         ctx["episode_no"],
-         cfg.get("keyframe_chain_mode") or "auto",
-         cfg.get("style") or ""),
-        "generation_state", "lock",
-        init={"total": len(shots), "phase": "视频生成", "qc": A._qc_brief("video")},
-        prefix="pipe_video")
+    # 审计 P1-3：托管视频是闸门最重要的覆盖点（整集提交，独占 GPU 时间最长）
+    with gpu_task_gate.run_gpu_task(
+            f"pipe_video_{int(time.time() * 1000)}", "托管·视频"):
+        final = _run_task_worker(
+            A._video_generate_worker,
+            (ctx["project_name"], shots, char_refs, scene_refs, {}, True, mode,
+             int(ctx.get("timeout_per_segment") or 900),
+             ctx.get("episode_tag") or f"ep{ctx['episode_no']:02d}",
+             ctx["episode_no"],
+             cfg.get("keyframe_chain_mode") or "auto",
+             cfg.get("style") or ""),
+            "generation_state", "lock",
+            init={"total": len(shots), "phase": "视频生成", "qc": A._qc_brief("video")},
+            prefix="pipe_video")
     out = _outcome_from_task(final, "视频生成")
     recheck = probe_video(ctx)
     detail = {"mode": mode, "count": out["count"], "total": len(shots),
@@ -1264,14 +1275,21 @@ def step_upscale(ctx) -> dict:
         scale = 2
     ctx["progress"](f"超分（FlashVSR {scale}x）…", 96, phase="upscale")
     try:
-        res = upscale_client.VideoUpscaler().upscale(
-            src, project_name=ctx["project_name"], scale=scale,
-            # ⚠️ 成片是带 TTS 配音的，而 TE-Speed 链路默认 attach_audio=False ——
-            # 不显式开启会把音轨丢掉，超分产物变成无声视频。
-            attach_audio=True,
-            progress_cb=lambda msg, pct=None: ctx["progress"](
-                f"超分：{msg}", 96, phase="upscale"),
-        )
+        # 审计 P1-3：托管超分同样过闸门；并把闸门 id 同步给 upscaler 的
+        # current_task_id —— /free 守卫（has_other_running_gpu_tasks）据此排除自身，
+        # 语义与手动超分路由一致（只挡「他人」的 /free，不挡自己的）。
+        _upscaler = upscale_client.VideoUpscaler()
+        _up_tid = f"pipe_up_{int(time.time() * 1000)}"
+        _upscaler.current_task_id = _up_tid
+        with gpu_task_gate.run_gpu_task(_up_tid, "托管·超分"):
+            res = _upscaler.upscale(
+                src, project_name=ctx["project_name"], scale=scale,
+                # ⚠️ 成片是带 TTS 配音的，而 TE-Speed 链路默认 attach_audio=False ——
+                # 不显式开启会把音轨丢掉，超分产物变成无声视频。
+                attach_audio=True,
+                progress_cb=lambda msg, pct=None: ctx["progress"](
+                    f"超分：{msg}", 96, phase="upscale"),
+            )
     except Exception as e:  # noqa: BLE001  超分失败不阻断出片
         logger.warning("第%s集超分失败（已跳过，不影响成片交付）：%s",
                        ctx["episode_no"], e, exc_info=True)
