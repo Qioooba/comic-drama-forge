@@ -37,6 +37,8 @@ from config import (
     CHARACTER_SHEET_VIEWS, ASSET_VIEW_STEMS,
     CHARACTER_SHEET_CELLS, CHARACTER_SHEET_GRID, CHARACTER_SHEET_HALF_BAND,
     CHARACTER_HALF_VIEWS,
+    SCENE_VIEW_KEYS, SCENE_VIEW_LABELS, SCENE_VIEW_ANGLE_ZH,
+    SCENE_ANGLE_TO_VIEW, SCENE_VIEWS_ENABLED, SCENE_VIEW_MAX_RETRIES,
     PROJECT_DEFAULT_CONFIG,
 )
 from script_generator import ScriptGenerator
@@ -2596,7 +2598,8 @@ def _video_retry_shot_impl():
                                          "appearance": _e.get("appearance")
                                          or _e.get("description") or ""})
             _r_loc, _r_sc_entry = _resolve_scene_entry(shot, _r_scene_idx, "重跑切段")
-            _r_scene_img = (_r_sc_entry or {}).get("image")
+            # 与主链路同口径：按本镜机位取对应场景档（缺失逐级回落 front/base）
+            _r_scene_img = _pick_scene_view(_r_sc_entry, shot) if _r_sc_entry else None
             _r_scene_refs = ([{"name": _r_loc, "appearance": ""}]
                              if _r_scene_img else [])
             _seg_refs = [sb_local] + _r_char_imgs + _r_item_imgs + \
@@ -3400,12 +3403,124 @@ def _generate_asset_task(task_id: str, assets: list, asset_type: str, project_na
                             known=ASSET_VIEW_STEMS, logger=app.logger)
                     except Exception as _pe:  # noqa: BLE001
                         app.logger.warning("清理陈旧视角文件失败（不影响入库）：%s", _pe)
-                else:
-                    # 物品 / 场景：基础图即单主体图；清掉旧实现遗留的视角图，避免 UI 把陈旧的
-                    # 「重渲染整图」继续当成一个视角展示。
+                elif asset_type == "scene" and SCENE_VIEWS_ENABLED:
+                    # ---------- 场景：按机位逐档出图（2026-09-29 新增） ----------
+                    # 动机：场景此前只有一张 base.png，分镜不论什么机位都拿它当参考图 ——
+                    #   俯拍 / 斜侧镜头拿到的是**正面基准图**，构图先验与镜头要求反向。
+                    # 做法：在**基础图阶段**把机位写进提示词逐档**独立出图**（T2I），
+                    #   而不是基础图之后用参考图编辑补机位 —— 后者在 cfg=1.0 下改不动
+                    #   机位，正是 2026-09-24 被废除的那条路（机制见 config.SCENE_VIEW_KEYS
+                    #   上方注释 + comfyui_client.scene_view_prompt_suffix）。
+                    # 成本口径：正面档**复用刚过质检的 base.png**（不重复烧 GPU），
+                    #   只多出 left45 / right45 / top 三档；三档都是**加值**而非必需，
+                    #   不达标就丢弃并由下游回落正面档，绝不把资产判 failed。
+                    view_paths["front"] = base_dst
+                    view_gate["front"] = {
+                        "accept": True, "blocked": False, "skipped": True,
+                        "label": "复用基础图（正面档）",
+                        "reason": "基础图即正面机位出图，正面档直接复用，不重复出图",
+                        "critical_issues": [],
+                    }
+                    saved_views.append("front")
+                    for vk in SCENE_VIEW_KEYS:
+                        if vk == "front":
+                            continue
+                        _v_label = SCENE_VIEW_LABELS.get(vk) or vk
+                        _v_angle = SCENE_VIEW_ANGLE_ZH.get(vk) or _v_label
+                        _v_dst = os.path.join(asset_dir, f"{vk}.png")
+                        _v_gate = None
+                        _v_scratch = None
+                        view_attempts[vk] = []   # 逐次累加（不覆盖），供结果回传与排障
+                        _v_seed = seed      # 同 seed：跨档共享初始噪声，结构最相关
+                        for _va in range(SCENE_VIEW_MAX_RETRIES + 1):
+                            if _va > 0:
+                                _v_seed = random.randint(1, 2 ** 31 - 1)
+                            _set_phase(f"{name} 场景机位档「{_v_label}」"
+                                       f"（第 {_va + 1}/{SCENE_VIEW_MAX_RETRIES + 1} 次）", "views")
+                            _v_files = comfyui_client.generate_scene_base(
+                                prompt_zh, seed=_v_seed, style=gen_style, size=gen_size,
+                                filename_prefix=(f"comic_drama/{project_name}/{asset_type}"
+                                                 f"/{name}/{vk}"),
+                                view_key=vk)
+                            if not _v_files:
+                                # 出图失败（非质检问题）→ 换 seed 重试无意义
+                                app.logger.warning("场景「%s」机位档 %s 出图失败（seed=%s）",
+                                                   name, vk, _v_seed)
+                                break
+                            _v_scratch = os.path.join(scratch_dir, f"{vk}_try{_va + 1}.png")
+                            shutil.move(_v_files[0], _v_scratch)
+                            if not qc_on:
+                                _v_gate = {"accept": True, "blocked": False, "skipped": True,
+                                           "label": "质检未开启", "reason": "图片质检未开启（跳过）",
+                                           "critical_issues": []}
+                                break
+                            # 机位档的质检口径**显式带机位要求**：否则判官只核「是不是这个场景」，
+                            # 出一张正面图也会判过，机位档就白生成了。
+                            _v_desc = (
+                                f"资产类型：scene；资产名称：{name}；"
+                                f"本图机位要求：{_v_angle}；"
+                                f"资产设定：{str(prompt_zh)[:400]}")
+                            _set_phase(f"{name} 场景机位档「{_v_label}」质检中"
+                                       f"（第 {_va + 1} 次）", "checking")
+                            _v_verdict = qc_client.check_image(
+                                _v_scratch, _v_desc, qc_cfg, style=gen_style)
+                            app.logger.info(
+                                "[资产质检] view scene/%s/%s 第%d次 → ok=%s passed=%s "
+                                "score=%s", name, vk, _va + 1, _v_verdict.get("ok"),
+                                _v_verdict.get("passed"), _v_verdict.get("score"))
+                            view_attempts[vk].append(
+                                _qc_record_verdict(
+                                    project_name, "asset_image", f"{name}_{vk}",
+                                    f"场景机位档「{_v_label}」质检", _va + 1, _v_seed,
+                                    _v_scratch, _v_verdict, style=gen_style))
+                            _v_gate = _qc_gate(_v_verdict)
+                            if _v_gate["accept"]:
+                                break
+                            if not _v_verdict.get("ok"):
+                                break     # 质检接口异常 → 重生成无意义
+                            # ⚠️ 刻意**不**调 _record_qc_lesson：机位档的缺陷（角度不对）
+                            #    不是资产提示词的缺陷，沉淀进去会让**下一轮的基础图提示词**
+                            #    被按「机位」改写，把加值项的毛病传播成资产本身的毛病。
+                        _v_ok = bool(_v_gate and _v_gate.get("accept") and _v_scratch)
+                        if _v_ok:
+                            shutil.copy2(_v_scratch, _v_dst)
+                            view_paths[vk] = _v_dst
+                            view_gate[vk] = _v_gate
+                            saved_views.append(vk)
+                            # O2：机位档旁路元数据（标注「同 seed 独立出图」，可复现）
+                            _write_artifact_meta(
+                                _v_dst, kind="asset_view", project_name=project_name,
+                                seed=_v_seed, prompt=orig_asset_prompt,
+                                workflow_key="scene_gen",
+                                qc=_v_gate, asset_name=name,
+                                extra={"asset_type": asset_type, "view": vk,
+                                       "view_label": _v_label, "angle_zh": _v_angle,
+                                       "derive_mode": "angle_regen",
+                                       "derived_from": os.path.basename(base_dst)})
+                        else:
+                            # 加值项不阻断资产：本档不提供，分镜侧逐级回落 front/base
+                            app.logger.warning(
+                                "场景「%s」机位档「%s」未达标，本次不落盘"
+                                "（分镜将回落正面档）：%s",
+                                name, _v_label, (_v_gate or {}).get("label"))
+                    # 清掉本档集合内**本轮不再产出**的陈旧机位图（含上一轮/旧实现遗留），
+                    # 避免 UI 与资产索引把陈旧机位当成有效档展示。
                     try:
                         sheet_split.prune_stale_views(
-                            asset_dir, keep=(), known=ASSET_VIEW_STEMS, logger=app.logger)
+                            asset_dir, keep=tuple(view_paths.keys()),
+                            known=tuple(ASSET_VIEW_STEMS) + tuple(SCENE_VIEW_KEYS),
+                            logger=app.logger)
+                    except Exception as _pe:  # noqa: BLE001
+                        app.logger.warning("清理陈旧视角文件失败（不影响入库）：%s", _pe)
+                else:
+                    # 物品：基础图即单主体图；清掉旧实现遗留的视角图，避免 UI 把陈旧的
+                    # 「重渲染整图」继续当成一个视角展示。
+                    # （场景在关闭 SCENE_VIEWS_ENABLED 时也走这里 → 与改造前逐字一致）
+                    try:
+                        sheet_split.prune_stale_views(
+                            asset_dir, keep=(),
+                            known=tuple(ASSET_VIEW_STEMS) + tuple(SCENE_VIEW_KEYS),
+                            logger=app.logger)
                     except Exception as _pe:  # noqa: BLE001
                         app.logger.warning("清理陈旧视角文件失败（不影响入库）：%s", _pe)
 
@@ -3418,12 +3533,14 @@ def _generate_asset_task(task_id: str, assets: list, asset_type: str, project_na
                     "qc_blocked_views": blocked_views,
                     "derive_error": derive_error,
                     "error": None,
-                    # 视角图为本地派生（不单独质检），故 qc 汇总只反映基础图
+                    # 视角图多为本地派生（不单独质检），故 qc 汇总只反映基础图
                     "qc": _qc_summary(base_attempts, qc_declared, qc_on,
                                       int(qc_cfg.get("max_retries", 0))),
                     "qc_base": _qc_summary(base_attempts, qc_declared, qc_on,
                                            int(qc_cfg.get("max_retries", 0))),
-                    "qc_views": {},
+                    # 逐档质检结论（角色档是「本地派生·继承基础图质检」，场景机位档是
+                    # 真跑质检的结论）。前端此前未消费该字段，这里填实数据不改形状。
+                    "qc_views": {k: dict(v) for k, v in view_gate.items()},
                 })
 
             except Exception as _asset_err:  # noqa: BLE001
@@ -3525,6 +3642,10 @@ def api_generation_status(task_id):
 # ===== 步骤5：分镜图片生成 =====
 
 _ASSET_DIRS = {"character": CHARACTERS_DIR, "item": ITEMS_DIR, "scene": SCENES_DIR}
+# 资产「主视角候选文件名」——**只是顺序提示，不是取图实现**：真正的取图入口是
+# `_build_asset_index`（`_first_existing` + `_dir` 约定）与 `_first_existing_asset_image`
+# （`_ASSET_IMG_PRIORITY`）。本常量目前**无任何调用方**（grep 仅命中定义处），
+# 故不重复登记各机位档，避免三份名字副本互相漂移。
 _ASSET_VIEW_FILES = {"character": ("front.png", "base.png"),
                      "item": ("front.png", "base.png"),
                      "scene": ("front.png", "base.png")}
@@ -3580,7 +3701,11 @@ def _build_asset_index(assets: list, project_name: str, kind: str) -> dict:
         #      分辨不出「没这个档位」与「有这个档位但路径为空」。
         #   ⚠️ `_dir` 是 `_pick_char_view` 的兜底按需推导目录（而不是批量 stat），
         #      这样前端上报的 http URL 失效时仍能命中磁盘约定路径。
-        for _stem in ASSET_VIEW_STEMS:
+        # 2026-09-29：挂在集合里再并入**场景机位档**（front/left45/right45/top）——
+        # 供 `_pick_scene_view` 按镜头机位取「同机位场景图」。两类档位名不重叠
+        # （角色 front/left/right/back/half vs 场景 front/left45/right45/top），
+        # 且键只在**文件真实存在**时写入，故混挂不会互相干扰、也不会给没有的档写空串。
+        for _stem in tuple(ASSET_VIEW_STEMS) + tuple(SCENE_VIEW_KEYS):
             _p = _first_existing(
                 comfyui_client.resolve_local_path(payload.get(_stem) or ""),
                 os.path.join(asset_dir_for_name, f"{_stem}.png"),
@@ -3588,6 +3713,11 @@ def _build_asset_index(assets: list, project_name: str, kind: str) -> dict:
             )
             if _p:
                 entry[_stem] = _p
+        # 场景把**正面档别名到 base.png**：场景不单独产出 front.png（base 本身就是正面
+        # 机位出图，见资产 worker 的 scene 分支），但下游 `_pick_scene_view` 的回退链
+        # 要按档位名逐级取，别名能省掉「每个调用点各自特判 scene」的分支。
+        if kind == "scene" and "front" not in entry and local:
+            entry["front"] = local
         index[name] = entry
     return index
 
@@ -3835,6 +3965,64 @@ def _pick_char_view(char_payload: dict, want_half: bool) -> str:
     return _first_existing(*cands) or ""
 
 
+def _scene_view_for_shot(shot) -> str:
+    """本镜**机位**该取哪个场景档（``front`` / ``left45`` / ``right45`` / ``top``）。
+
+    与景别（`shot_type` / `camera` 里的特写/近景/全景）**正交**：景别决定取景范围，
+    机位决定观察方向。映射表单一来源在 :data:`config.SCENE_ANGLE_TO_VIEW`，
+    未列出的机位（含未指定即空串）一律回落到正面档。
+
+    ⚠️ 机位只能从**复合串** `camera` 解析（`shot_type` 只登记景别，无角度信息）；
+    `camera_motion` 是 A1 新增的运镜权威字段，老剧本为空、新剧本可能把「俯拍缓推」
+    写在那里，故作为**第二来源**（不是第一条）：先正规字段，再权威字段，
+    两边都没有才判「未指定」。
+    """
+    if not isinstance(shot, dict):
+        return "front"
+    ang = _camera_angle(str(shot.get("camera") or "")) or \
+        _camera_angle(str(shot.get("camera_motion") or ""))
+    return SCENE_ANGLE_TO_VIEW.get(ang, "front")
+
+
+def _pick_scene_view(scene_payload: dict, shot) -> str:
+    """按镜头机位从场景资产里挑一张**同机位**的场景参考图（2026-09-29 新增）。
+
+    动机：场景此前只有一张基准图，俯拍 / 斜侧镜头拿到的都是正面图，构图先验与镜头
+    要求**反向**（「要求俯拍却给了平视」既没被约束、也没被检出）。场景现在按机位档
+    逐档出图（`config.SCENE_VIEW_KEYS`），这里负责把镜头机位映射到档位。
+
+    ⚠️ 必须**逐级优雅降级**，绝不返回空（与 `_pick_char_view` 同口径）：返回空会让该镜
+    判成「无场景锚点」，把「机位档缺失」这种**加值项缺失**升级成「镜头不能出图」。
+    回退链：
+      · 目标档 → front → base（该档没生成 / 是老项目没有机位档）
+      · 目标档本身就是 front → front → base
+    `base` 是每个场景都有的兜底（正面机位出图），故链尾一定落得住。
+
+    ⚠️ 刻意**不做**「俯拍档缺失就退而取斜侧档」这类跨机位借用：俯视与仰拍是反向机位，
+    拿俯视图当仰拍镜头的锚点会把构图拽反 —— 「误配比丢图更糟」（丢图只是没有锚点，
+    误配是把错误机位焊进画面，且日志看不出来）。宁可回落正面档。
+
+    ⚠️ 链尾必须是 ``entry["image"]``（2026-09-29 实修）：它是**长期存在的主图契约**，
+    `_build_asset_index` 与历史生产者都填它，但**不一定**同时给 `front`/`base`/`_dir`。
+    少了这一档，任何「只填 image」的场景索引都会静默丢场景锚点 —— 这不是假想：
+    改完当场被 ``probe_scene_match.py`` 的端到端用例抓出（fixture 就是只填 image 的形态）。
+    """
+    payload = scene_payload or {}
+    target = _scene_view_for_shot(shot)
+    order = []
+    for k in (target, "front", "base"):
+        if k and k not in order:
+            order.append(k)
+    cands = [comfyui_client.resolve_local_path(payload.get(k) or "") for k in order]
+    # 资产目录约定路径兜底（前端未上报 / 索引未挂到该档时）
+    d = payload.get("_dir")
+    if d and os.path.isdir(d):
+        cands += [os.path.join(d, f"{k}.png") for k in order]
+    # 最后回落主图契约（老索引 / 外部生产者只填 image 的形态）
+    cands.append(comfyui_client.resolve_local_path(payload.get("image") or ""))
+    return _first_existing(*cands) or ""
+
+
 def _allocate_storyboard_refs(shot: dict, char_idx: dict, item_idx: dict, scene_idx: dict,
                                project_name: str = None) -> list:
     """为单个镜头分配参考图（Qwen-Image-2.1 reference stack，最多 9 张）
@@ -3913,7 +4101,10 @@ def _allocate_storyboard_refs(shot: dict, char_idx: dict, item_idx: dict, scene_
     # 2026-09-29：走统一容错匹配（精确 → 归一化 → 唯一子串）；未命中时**显式告警**，
     # 不再沿用旧的 `loc if loc in scene_idx else None`——那条路会静默丢场景锚点。
     scene_name, _sc_entry = _resolve_scene_entry(shot, scene_idx, "分镜参考图")
-    scene_img = (_sc_entry or {}).get("image") if _sc_entry else None
+    # 2026-09-29：取**与本镜机位同向**的那一档场景图（俯拍→俯视档 / 斜侧→斜侧档），
+    # 而不是恒取基准图 —— 机位反向的参考图会把构图先验拽反。档位缺失时逐级回落。
+    _sc_view = _scene_view_for_shot(shot)
+    scene_img = _pick_scene_view(_sc_entry, shot) if _sc_entry else None
     if scene_img and scene_img in used_paths:
         scene_img = None
 
@@ -3938,11 +4129,16 @@ def _allocate_storyboard_refs(shot: dict, char_idx: dict, item_idx: dict, scene_
         # ⚠️ 改这句话必须同步 comfyui_client._REF_ROLE_ZH2EN（中文职责 → 官方英文
         #    短语）与 prompt_memory._BOILERPLATE（相似度剥离用），否则职责声明会
         #    退化成中文原文、教训召回会被套话稀释。
+        # 2026-09-29：参考图已按**本镜机位**选档（俯拍→俯视档…），故话术里点明档位，
+        #    让模型知道这张图**就是本镜机位**的空间参考，「不得照搬机位」的豁免随之
+        #    收紧为「同一机位、取景范围仍以镜头描述为准」——档位与镜头同向时再照搬
+        #    机位不再有害，但**取景范围**（全景 vs 特写）仍必须听镜头。
         refs.append(("场景",
-                     f"参考图{slot_no}（<image{slot_no}>）是场景「{scene_name}」的"
-                     f"空间与光照锚点：保持空间结构、地理关系（入口 / 通道 / 固定"
-                     f"陈设的位置关系）与光源方向、色温基调一致；"
-                     f"不得照搬该参考图的机位与取景范围，本镜构图以镜头描述为准",
+                     f"参考图{slot_no}（<image{slot_no}>）是场景「{scene_name}」"
+                     f"（{SCENE_VIEW_LABELS.get(_sc_view) or _sc_view}）的空间与光照锚点："
+                     f"保持空间结构、地理关系（入口 / 通道 / 固定陈设的位置关系）"
+                     f"与光源方向、色温基调一致；"
+                     f"取景范围以本镜镜头描述为准，不得照搬该参考图的构图范围",
                      scene_img))
         used_paths.add(scene_img)
         slot_no += 1
@@ -5299,7 +5495,8 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
                             or _entry.get("description") or ""})
                 # 场景参考图
                 _loc, _scene_entry = _resolve_scene_entry(shot, scene_idx, "H3视频段")
-                _scene_img = (_scene_entry or {}).get("image")
+                # 与分镜同口径：按本镜机位取场景档（视频段继承分镜的机位意图）
+                _scene_img = _pick_scene_view(_scene_entry, shot) if _scene_entry else None
                 _shot_scene_refs = ([{"name": _loc, "appearance": ""}]
                                     if _scene_img else [])
                 refs = [sb_local] + _shot_char_imgs + _shot_item_imgs + \
@@ -8157,7 +8354,11 @@ def _qc_ref_images(shot: dict, char_idx: dict, item_idx: dict, scene_idx: dict,
     if _scene_e:
         # 质检口径与生成侧话术同步（2026-09-29）：场景锚点核对的是**空间结构与
         # 光照基调**，而非笼统的「环境与氛围」——与 <imageN> 场景槽位新规格一致。
-        _add(f"场景「{loc}」的空间结构与光照基调", _scene_e.get("image"))
+        # ⚠️ 送检的锚点也必须**同机位**（与生成侧 _allocate_storyboard_refs 同一取图函数）：
+        #    否则判官拿正面锚点去判一张俯拍分镜图，只会判「背景不一致」，
+        #    把「机位档没生效」误报成「场景画错了」。
+        _add(f"场景「{loc}」的空间结构与光照基调",
+             _pick_scene_view(_scene_e, shot))
     if not out:
         # 兜底：本镜没登记角色/物品时，用生成侧实际用的那几张（至少保住场景锚点）
         for r in (fallback_refs or []):

@@ -38,6 +38,7 @@ from config import (
     COMFYUI_URL, COMFYUI_OUTPUT_DIR,
     resolve_workflow_path,
     PROJECT_OUTPUT_DIR, WORKFLOW_TEMPLATE, MULTIVIEW_CONFIG,
+    SCENE_VIEW_ANGLE_ZH, SCENE_VIEW_KEYS, SCENE_VIEW_LABELS,
     H3_EMIT_AUDIO,
     CONFLICT_NEGATIVE_TOKENS,
     ENABLE_BLOCKING_ANNOTATION,
@@ -514,6 +515,39 @@ CHARACTER_QTY_RE = re.compile(
 )
 # 提示词分句符（按句清洗，人物句整句丢弃）
 _PROMPT_SPLIT_RE = re.compile(r"[，,；;。\n]")
+
+
+def scene_view_prompt_suffix(view_key: str) -> str:
+    """场景**机位档** → 追加进正向提示词的机位句（``None`` / 空 / 未知档 → 空串）。
+
+    背景（2026-09-29）：场景资产此前只有一张 base.png，分镜不论机位都拿它当参考图 ——
+    俯拍 / 斜侧镜头拿到的是正面基准图，构图先验与镜头要求**反向**。
+    实测结论（见 ``MULTIVIEW_CONFIG`` 上方注释）：参考图编辑改不动机位，
+    **必须在基础图阶段的提示词里带入角度**。本函数就是那个角度句的来源。
+
+    ⚠️ 两条硬约束：
+      1. 本函数是**纯查表**：`SCENE_VIEW_KEYS` 里的每一档（含 ``front``）都返回机位句，
+         只有 ``None`` / 空串 / 未知档才返回空串。**不留「front 特殊返回空」的隐式分支** ——
+         「基础图不追加机位句」这件事由调用方传 ``None`` 表达（`generate_scene_base`
+         的默认值就是 ``None``），语义在调用点、不在查表函数里。
+         生产链路**不会**用 ``view_key="front"`` 出图：正面档直接复用已过质检的
+         base.png（见 app.py 资产 worker 的 scene 分支），故存量行为零变化。
+      2. 句子里**不得出现** :data:`CHARACTER_WORDS` / ``CHARACTER_QTY_RE`` 能命中的词，
+         否则会在 ``sanitize_scene_prompt`` 里被当成「人物描述句」整句丢弃
+         （机位静默失效，日志只显示「丢弃人物描述句」）。改措辞前先跑
+         ``.workbuddy/test/_out/probe_scene_views.py``。
+    """
+    key = str(view_key or "").strip()
+    if not key or key not in SCENE_VIEW_KEYS:
+        return ""
+    angle = SCENE_VIEW_ANGLE_ZH.get(key)
+    if not angle:
+        return ""
+    label = SCENE_VIEW_LABELS.get(key) or key
+    # 与 base 同空间、只换机位：显式声明「同一场地」是防止模型把四个档理解成四个场地
+    # （一旦理解错，分镜换机位就等于换场景，比没有机位档更糟）。
+    return (f"。本图机位（{label}）：{angle}；"
+            f"这是同一个场地的另一个机位，建筑形制、空间关系、陈设与光照方向保持不变")
 
 # 目录标注（P0-5 修复）：
 #   LoadImageOutput / LoadAudioOutput / LoadVideoOutput 等「Output 系列」读取 ComfyUI
@@ -1189,14 +1223,32 @@ class ComfyUIClient:
 
     @classmethod
     def sanitize_scene_prompt(cls, prompt_zh: str) -> str:
-        """场景提示词去人物（P0：场景资产带人）
+        """场景提示词去人物（P0：场景资产带人）**且幂等**（2026-09-29 修正）
 
         场景定义常写「村民三两结伴」→ 资产图实测渲染出 4 人。这里按分句粒度丢弃含人物
         描述的短句，并追加空场景声明；若清洗后为空则回退原文（避免把场景描述清空）。
+
+        ⚠️ 2026-09-29 修的是一个**真实的二次清洗缺陷**（勿删这段剥离逻辑）：
+            本函数此前**不幂等** —— 末尾追加的 `SCENE_NO_CHARACTER_SUFFIX` 里带
+            「人物 / 人影 / 人群 / 士兵」这些词，第二次调用时它自己会被当成
+            「人物描述句」**整句丢弃**，然后再追加一遍。而**二次调用是常态**：
+              · `generate_scene_base` 先清洗一次 → 再交给 `_generate_base_image`
+                （内部按 asset_type=="scene" 又清洗一次）；
+              · 新增的「按机位出图」（`view_key`）同样走这条路。
+            后果是提示词被无谓改写（首段声明被吃掉、文本重复），
+            进而出图内容随调用次数漂移 —— 且**只在场景链路出现**，非常隐蔽。
+            修法：进入清洗前先剥掉**已有的**空场景声明，再统一清洗+追加一次。
+            首次调用的输出与修正前**逐字一致**（存量行为不变）。
         """
         text = (prompt_zh or "").strip()
         if not text:
             return text
+        if SCENE_NO_CHARACTER_SUFFIX in text:
+            # 先摘掉旧声明再清洗，保证「清洗几次结果都一样」
+            _stripped = text.replace(SCENE_NO_CHARACTER_SUFFIX, "").strip().rstrip("。;； ")
+            if not _stripped:
+                return text     # 输入只有声明本身 → 已是终态，直接返回（否则会再追加一遍）
+            text = _stripped
         parts = [p.strip() for p in _PROMPT_SPLIT_RE.split(text)]
         kept: List[str] = []
         dropped: List[str] = []
@@ -1268,7 +1320,8 @@ class ComfyUIClient:
     def _generate_base_image(self, workflow_file: str, prompt_zh: str,
                              asset_type: str = None, seed: int = None,
                              style: str = "", size=None,
-                             filename_prefix: str = None) -> List[str]:
+                             filename_prefix: str = None,
+                             prompt_extra: str = "") -> List[str]:
         """通用基础图生成：更新正向提示词节点
 
         P0 修复（同轮补充）：
@@ -1285,6 +1338,13 @@ class ComfyUIClient:
         G8（资源清理）：filename_prefix 非空 → 覆写 SaveImageAdvanced/SaveImage 的
         filename_prefix，让资产基础图落在 `comic_drama/<项目>_asset_<类型>` 这种项目专属
         子目录，而非全部堆在 ComfyUI output 默认目录（此前删项目/滚动清理都够不着）。
+
+        prompt_extra（2026-09-29 新增）：场景「按机位出图」用的**追加句**，插在
+        「风格尾缀之后、场景去人之前」。位置是刻意的：
+          · 在风格之后 —— 风格尾缀是全局收尾语，插在它前面会破坏「风格恒在末尾」的既有口径；
+          · 在 sanitize 之前 —— 这样机位句也过一遍去人清洗（机位句本身不含人物词，
+            只是让清洗成为**唯一入口**，避免出现「绕过清洗的提示词片段」）。
+        为空时整条路径与旧实现逐字一致。
         """
         api_prompt, meta = self.load_workflow(workflow_file, return_meta=True)
         node_id = self._find_positive_text_node(api_prompt)
@@ -1293,6 +1353,8 @@ class ComfyUIClient:
             return []
         # 风格注入：必须在场景去人之前拼好，保证风格词不被 sanitize 丢掉
         prompt_zh = style_kit.with_style(prompt_zh, style) if style else prompt_zh
+        if prompt_extra:
+            prompt_zh = f"{str(prompt_zh).rstrip('。;； ')}{prompt_extra}"
         # 场景资产去人
         if asset_type == "scene":
             prompt_zh = self.sanitize_scene_prompt(prompt_zh)
@@ -1453,18 +1515,43 @@ class ComfyUIClient:
 
     def generate_scene_base(self, prompt_zh: str, seed: int = None,
                             style: str = "", size=None,
-                            filename_prefix: str = None) -> List[str]:
-        logger.info(f"生成场景基础图: {prompt_zh[:50]}...")
+                            filename_prefix: str = None,
+                            view_key: str = None) -> List[str]:
+        """生成场景图（T2I）
+
+        view_key（2026-09-29 新增）：场景**机位档**（``config.SCENE_VIEW_KEYS``）。
+          · ``None``（默认）→ 与旧实现**逐字一致**（不追加任何机位句），
+            这就是「基础图 / base.png」的生成路径；
+          · 任一档位 → 把该机位的出图指令（见 :func:`scene_view_prompt_suffix`）
+            追加进正向提示词后**独立出图**。
+        ⚠️ 生产链路只对 ``left45`` / ``right45`` / ``top`` 三档传非空 view_key；
+        正面档（``front``）**不重新出图**，由 app 层直接复用 base.png
+        （base 本就是无角度声明的正拍基准图），故 ``front`` 虽可传、但没人传。
+
+        ⚠️ 为什么这里是「独立出图」而不是「拿 base.png 做参考图编辑」：
+            参考图编辑（``generate_multiview``）在 cfg=1.0 下 uncond 不评估、文字无引导，
+            只会复刻参考图里已可见的机位，**改不动角度**（8 组对照实验结论，
+            见 ``MULTIVIEW_CONFIG`` 上方注释）。而本函数跑的 ``scene_gen`` 是纯 T2I、
+            没有参考图槽位，提示词里的机位句是**唯一**的构图来源，因此真正生效。
+
+        跨档内容一致性由调用方保证（app 层用**同一颗 seed**逐档出图）：
+        同 seed 下各档共享同一初始噪声，只有机位句不同 → 结构高度相关，
+        细节差异被限制在陈设层面，不会让分镜「换个机位就换了场地」。
+        """
+        logger.info(f"生成场景图（机位档={view_key or 'base'}）: {prompt_zh[:50]}...")
         # 基础图同样必须去人（2026-09-29 补齐原先的不对称）：
         # 此前只有 generate_multiview 做了 sanitize，而**基础图本身就是多视角的输入参考图**
         # —— 基础图一旦渲染出人物，人物会被后续 4 个视角、分镜与视频全部继承
         # （既有教训：资产实测 "山间小径" 基础图渲染出 4 人）。
-        # 幂等：sanitize 内部会追加 SCENE_NO_CHARACTER_SUFFIX，重复调用会叠加，故先判存在。
+        # 幂等：sanitize 现已**真正幂等**（2026-09-29 修正，见其 docstring），
+        # 这里的判存在只是省一次无用调用；_generate_base_image 内部会再走一遍。
         if SCENE_NO_CHARACTER_SUFFIX not in (prompt_zh or ""):
             prompt_zh = self.sanitize_scene_prompt(prompt_zh)
-        return self._generate_base_image(WORKFLOW_TEMPLATE["scene_gen"], prompt_zh,
-                                         asset_type="scene", seed=seed, style=style, size=size,
-                                         filename_prefix=filename_prefix)
+        return self._generate_base_image(
+            WORKFLOW_TEMPLATE["scene_gen"], prompt_zh,
+            asset_type="scene", seed=seed, style=style, size=size,
+            filename_prefix=filename_prefix,
+            prompt_extra=scene_view_prompt_suffix(view_key))
 
     # ===================== 第二阶段：多视角生成 =====================
 
