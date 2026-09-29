@@ -5,6 +5,18 @@
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title data-i18n="app.title">漫剧生成系统</title>
+    <!-- 主题防闪烁：React 挂载前按「localStorage 覆盖 > 系统偏好」先注入 .dark，
+         判定逻辑与 src/context/ThemeContext.tsx 必须保持一致（默认跟随系统）。 -->
+    <script>
+      (function () {
+        var stored = null;
+        try { stored = localStorage.getItem('theme-mode'); } catch (e) { /* 隐私模式等存不了就当没存过 */ }
+        var dark = stored === 'dark' ||
+          ((stored === 'system' || stored === null) &&
+            window.matchMedia('(prefers-color-scheme: dark)').matches);
+        if (dark) document.documentElement.classList.add('dark');
+      })();
+    </script>
     <!-- Tailwind 已改为构建期编译（见 tailwind.config.js / postcss.config.js），
          不再运行时拉取 cdn.tailwindcss.com —— 保证断网与离线打包可用。 -->
     <style>
@@ -22,14 +34,15 @@
         to { opacity: 1; }
       }
       /* 首屏样式：index.css 尚未加载时用，token 由 :root 提供；
-         具体取值与 index.css 的滚动条规则保持一致，不再单独定义深色变体
-         （.dark 从未被注入，属于死链路）。 */
+         滚动条具体取值与 index.css 的滚动条规则保持一致（深色下 --brand 随
+         :root.dark 覆盖层自动切换，无需单独定义变体）。 */
+      html.dark { background: #020617; color-scheme: dark; } /* 防闪烁：深色首屏底色，与 :root.dark 的 --bg-canvas 一致 */
       ::-webkit-scrollbar { width: 6px; height: 6px; }
       ::-webkit-scrollbar-track { background: transparent; }
       ::-webkit-scrollbar-thumb { background: rgb(var(--brand) / 0.35); border-radius: 3px; }
     </style>
-    <script type="module" crossorigin src="/assets/index-B2rNFzGd.js"></script>
-    <link rel="stylesheet" crossorigin href="/assets/index-B_9NGBR8.css">
+    <script type="module" crossorigin src="/assets/index-BONR5TQz.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-CoHPPv7N.css">
   </head>
   <body class="bg-canvas text-ink-1">
     <div id="root"></div>
