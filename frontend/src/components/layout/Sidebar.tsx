@@ -1,6 +1,6 @@
 import React from 'react';
 import { useApp } from '@/context/AppContext';
-import { Brain, FolderOpen, Settings } from '@/components/ui/icons';
+import { Box, Brain, FileText, FolderOpen, Settings } from '@/components/ui/icons';
 
 interface NavItem {
   id: string;
@@ -20,6 +20,8 @@ const navItems: NavItem[] = [
   { id: 'projects', icon: <FolderOpen className="h-5 w-5" />, label: 'project.title' },
   { id: 'ai', icon: <Settings className="h-5 w-5" />, label: 'navAIConfig' },
   { id: 'memory', icon: <Brain className="h-5 w-5" />, label: 'navMemory' },
+  { id: 'comfyui', icon: <Box className="h-5 w-5" />, label: 'navComfyUI' },
+  { id: 'logs', icon: <FileText className="h-5 w-5" />, label: 'navLogs' },
 ];
 
 export function Sidebar({

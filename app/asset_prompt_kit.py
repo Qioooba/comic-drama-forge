@@ -418,6 +418,56 @@ def ensure_prompt_gender(prompt: str, char: dict) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# 场景 canon：以「地理参考可复用」为底线（2026-09-29）
+#
+# 参考外部视觉方法论提炼（location-plate 的地理优先、scene-system 的 actor lane）：
+# **场景图不是一张漂亮的背景**，它要被后续镜头、多视角与视频反复当作同一个
+# 可导航空间来引用。
+#
+# 与 ensure_prompt_gender 同范式：只补**短且确定**的底线条款，绝不去替 LLM 写
+# 具体的布局内容描述（那会稀释提示词、还可能与正文自相矛盾）。
+# --------------------------------------------------------------------------- #
+
+# ⚠️ 职责边界（勿越界）：**去人**由 ``comfyui_client.sanitize_scene_prompt`` 负责 ——
+#    它更强（按分句丢弃含人物的描述 + 追加 ``SCENE_NO_CHARACTER_SUFFIX``）。
+#    这里**绝不再写一遍**「不得出现人物」：两条同源条款会互相叠加，且一旦一侧改口径
+#    另一侧必然漂移。本函数只补既有链路完全缺失的那半：空间的**可读性与可走位性**。
+_SCENE_LAYOUT_MARK = "留出可供角色走动的地面路径"
+
+# 只写「空间可读底线」，不写具体是什么地方（具体布局由 LLM 依 scenes schema 撰写）
+_SCENE_LAYOUT_SUFFIX = (
+    "，保留入口、通道与固定结构，"
+    "留出可供角色走动的地面路径，"
+    "并交代前景、中景与背景的层次"
+)
+
+
+def scene_layout_marked(text: str) -> bool:
+    """提示词里是否已含有布局底线条款（幂等判据）。"""
+    return _SCENE_LAYOUT_MARK in str(text or "")
+
+
+def ensure_scene_layout(prompt: str, scene: dict = None) -> str:
+    """保证**场景出图提示词**达到「可复用地理参考」的布局底线。
+
+    依据外部视觉方法论提炼：场景不是一张漂亮背景，而是后续镜头要反复引用的
+    **同一个可导航空间**。它必须留出能让角色进出与停留的路径、并交代清楚景深分层，
+    否则后续把角色放进画面时会站不下、无处走位，换机位时也难以保持一致。
+
+    与 :func:`ensure_prompt_gender` 同范式：只补**短且确定**的底线条款，
+    绝不替 LLM 写具体的布局内容（那会稀释提示词，还可能与正文自相矛盾）。
+
+    幂等：prompt 已含该条款则原样返回。
+    """
+    p = str(prompt or "").strip()
+    if not p:
+        return _SCENE_LAYOUT_SUFFIX.lstrip("，")
+    if scene_layout_marked(p):
+        return p
+    return p.rstrip("。，,.;； ") + _SCENE_LAYOUT_SUFFIX
+
+
+# --------------------------------------------------------------------------- #
 # 取值抽取
 # --------------------------------------------------------------------------- #
 def _hair_parts(text: str) -> Tuple[str, str, int, int]:

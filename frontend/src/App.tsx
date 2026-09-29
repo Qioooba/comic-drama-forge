@@ -10,6 +10,8 @@ import { ProjectsPage } from '@/pages/ProjectsPage';
 import { AIVaultPage } from '@/pages/AIVaultPage';
 import { MemoryPage } from '@/pages/MemoryPage';
 import { ProjectWorkbenchPage } from '@/pages/ProjectWorkbenchPage';
+import { ComfyUIPage } from '@/pages/ComfyUIPage';
+import { LogsPage } from '@/pages/LogsPage';
 
 // 全局（与具体项目无关）的功能放这里；单个项目的功能一律进 ProjectWorkbenchPage 的标签页。
 // 「上传小说」已并入「项目中心 → 新建项目」，不再单独占一个入口。
@@ -17,6 +19,8 @@ const SECTIONS: Record<string, React.ComponentType<any>> = {
   projects: ProjectsPage,
   ai: AIVaultPage,
   memory: MemoryPage,
+  comfyui: ComfyUIPage,
+  logs: LogsPage,
 };
 
 // Parse URL hash to determine active section and optional project key

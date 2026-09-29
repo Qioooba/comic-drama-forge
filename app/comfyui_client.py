@@ -53,6 +53,7 @@ from dialogue_utils import (dialogue_text as _dlg_text, format_line as _dlg_line
                             dialogue_speaker as _dlg_speaker)
 from h3_episode_builder import H3EpisodeBuilder
 import h3_director_builder
+import comfyui_models
 import style_kit
 import h3_prompt_kit
 
@@ -278,6 +279,33 @@ _CAMERA_ANGLE_ALIASES = {"俯视": "俯拍", "高角度": "俯拍", "高机位":
                          "平角": "平视", "水平视角": "平视",
                          "环摇": "环绕", "绕拍": "环绕"}
 
+def shot_framing(shot) -> str:
+    """本镜**景别**的权威取值（A1）：优先读 ``shot_type``，缺失回退解析 ``camera`` 复合串。
+
+    为什么要有这个统一入口：``camera`` 是「景别+运镜」复合字符串（「特写推入」），十余处
+    消费点各自调 ``camera_key()`` 解析，一旦口径漂移就会**同时**污染生成端与质检端
+    （历史坑：猜错景别曾让分镜质检通过率掉到 57%）。新剧本写入 ``shot_type`` 作单一权威，
+    这里优先读它；旧剧本该字段为空 → 回退 ``camera_key(camera)``，与改动前**逐字一致**。
+    """
+    if not isinstance(shot, dict):
+        return ""
+    st = str(shot.get("shot_type") or "").strip()
+    if st:
+        return st if st in SHOT_CAMERA_SPECS else camera_key(st)
+    return camera_key(str(shot.get("camera") or "").strip())
+
+
+def shot_motion(shot) -> str:
+    """本镜**运镜**的权威取值（A1）：优先读 ``camera_motion``；缺失返回空串（宁可不说）。
+
+    ⚠️ 不回退解析 camera：运镜表在 ``h3_prompt_kit._CAMERA_MOVE_EN``，这里不跨模块反向
+    依赖；且下游 ``_camera_move_en(camera)`` 本来就是吃整个 camera 串，旧剧本走原路径即可。
+    """
+    if not isinstance(shot, dict):
+        return ""
+    return str(shot.get("camera_motion") or "").strip()
+
+
 #: 景别未指定时的判定标准（camera 只给了机位/运镜）。
 #: 这段文字会被同时注入**生成端**与**质检端**，因此措辞必须两边都说得通。
 CAMERA_UNSPECIFIED_SPEC = (
@@ -365,6 +393,10 @@ _REF_IMAGE_TAG_RE = re.compile(r"<image\s*(\d+)>", re.IGNORECASE)
 #: 标签里的中文职责词 → 官方英文职责短语
 _REF_ROLE_ZH2EN = (
     ("身份锚点", "character identity"),
+    # 2026-09-29：场景槽位话术升级为「空间与光照锚点」（地理优先规格）。
+    # 必须放在「环境与氛围锚点」之前（更具体优先）；旧词条保留以兼容存量 label
+    # 与历史剧本，否则存量分镜会退化成「中文职责原文混进英文提示词」。
+    ("空间与光照锚点", "the spatial layout and lighting mood"),
     ("环境与氛围锚点", "the environment and atmosphere"),
     ("形状、材质与配色锚点", "the shape, material and colour"),
     ("形状、材质与配色", "the shape, material and colour"),
@@ -1399,6 +1431,13 @@ class ComfyUIClient:
                             style: str = "", size=None,
                             filename_prefix: str = None) -> List[str]:
         logger.info(f"生成场景基础图: {prompt_zh[:50]}...")
+        # 基础图同样必须去人（2026-09-29 补齐原先的不对称）：
+        # 此前只有 generate_multiview 做了 sanitize，而**基础图本身就是多视角的输入参考图**
+        # —— 基础图一旦渲染出人物，人物会被后续 4 个视角、分镜与视频全部继承
+        # （既有教训：资产实测 "山间小径" 基础图渲染出 4 人）。
+        # 幂等：sanitize 内部会追加 SCENE_NO_CHARACTER_SUFFIX，重复调用会叠加，故先判存在。
+        if SCENE_NO_CHARACTER_SUFFIX not in (prompt_zh or ""):
+            prompt_zh = self.sanitize_scene_prompt(prompt_zh)
         return self._generate_base_image(WORKFLOW_TEMPLATE["scene_gen"], prompt_zh,
                                          asset_type="scene", seed=seed, style=style, size=size,
                                          filename_prefix=filename_prefix)
@@ -1769,9 +1808,10 @@ class ComfyUIClient:
         必须最靠前、独立成句。
         """
         camera = str(shot.get("camera") or "中景").strip()
-        cam_key = camera_key(camera)        # "" = 本镜没给景别（camera 只有机位/运镜）
+        # A1：景别优先读权威字段 shot_type，缺失回退解析 camera 复合串（旧剧本零回归）
+        cam_key = shot_framing(shot)        # "" = 本镜没给景别（camera 只有机位/运镜）
         cam_angle = camera_angle(camera)    # 俯拍 / 仰拍 / 平视 / 环绕 …（与景别正交）
-        cam_spec = camera_spec(camera)
+        cam_spec = camera_spec(cam_key or camera)
 
         sections = []
 
@@ -2802,6 +2842,23 @@ class ComfyUIClient:
             export_mode = "all"
 
         builder = h3_director_builder.H3DirectorBuilder(tpl_path)
+        # ---- 用户手选模型覆盖（见 app/comfyui_models.py）----
+        #    模板里写死的模型文件名会因磁盘目录布局变化而失效：模型被放进
+        #    diffusion_models/minimax-h3/ 后，ComfyUI 报出的合法值会带 `minimax-h3\`
+        #    前缀，裸文件名不再合法 → 节点校验失败 → H3 产出被整段静默丢弃。
+        #    这里优先套用用户在前端从 object_info 扫到并手选的合法值。
+        #    ⚠️ 必须 fail-safe：任何异常都只告警并沿用模板原值，绝不中断主流程。
+        try:
+            _model_ov = comfyui_models.overrides_for("h3_video")
+            if _model_ov:
+                _applied = builder.apply_model_overrides(_model_ov)
+                if _applied:
+                    logger.info(
+                        "[H3-Director] 应用手选模型 %s",
+                        "; ".join(f"#{a['node']}.{a['field']}: {a['from']} -> {a['to']}"
+                                  for a in _applied))
+        except Exception as _e:  # noqa: BLE001
+            logger.warning(f"[H3-Director] 手选模型覆盖失败，沿用模板原值: {_e}")
         # audio_mode 优先级：显式传入 > 有段级参考音频（seg_audios 非空）→ "source" >
         #   emit_audio → "generate" / "mute"。
         #   "source" = H3 用 refAudios 里的参考音频驱动口型/节奏（逐镜 QwenTTS 配音）。

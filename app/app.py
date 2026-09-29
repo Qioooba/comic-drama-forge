@@ -79,6 +79,8 @@ import project_store
 import shot_key
 from fs_atomic import atomic_write_json, read_json_strict
 import providers
+import comfyui_models
+import log_viewer
 import prompt_qc
 import qc_client
 import qc_coverage
@@ -2557,7 +2559,7 @@ def _video_retry_shot_impl():
         if sb_local:
             # 「分镜 + 本镜资产」：分镜图 + 本镜角色三视图 + 物品 + 场景
             _r_matched = _match_shot_chars(shot, _r_char_idx)
-            _r_want_half = _framing_wants_half(shot.get("camera"))
+            _r_want_half = _framing_wants_half_shot(shot)
             _r_char_imgs, _r_char_refs = [], []
             for _mc in (_r_matched or []):
                 _p = _pick_char_view(_r_char_idx.get(_mc) or {}, _r_want_half)
@@ -2577,9 +2579,8 @@ def _video_retry_shot_impl():
                     _r_item_refs.append({"name": _it,
                                          "appearance": _e.get("appearance")
                                          or _e.get("description") or ""})
-            _r_loc = shot.get("location")
-            _r_scene_img = ((_r_scene_idx.get(_r_loc) or {}).get("image")
-                            if _r_loc in _r_scene_idx else None)
+            _r_loc, _r_sc_entry = _resolve_scene_entry(shot, _r_scene_idx, "重跑切段")
+            _r_scene_img = (_r_sc_entry or {}).get("image")
             _r_scene_refs = ([{"name": _r_loc, "appearance": ""}]
                              if _r_scene_img else [])
             _seg_refs = [sb_local] + _r_char_imgs + _r_item_imgs + \
@@ -2851,6 +2852,84 @@ def api_plugins_run():
 
 
 # ==========================================================================
+# ComfyUI 模型 / 插件扫描 + 手选模型
+#
+#  为什么要"扫描"而不是直接读模板：ComfyUI 某节点 combo 的合法值取决于模型在
+#  磁盘上的**目录布局**（放进 diffusion_models/minimax-h3/ 后名字会带
+#  `minimax-h3\` 前缀），而工作流模板里通常写死的是裸文件名。两边一旦不符，
+#  ComfyUI 校验失败 → 该节点产出被丢弃（H3 视频就曾因此整段静默失败）。
+#  所以这里以 ComfyUI 的 object_info 为**唯一权威来源**给出候选，由用户手选。
+# ==========================================================================
+
+@app.route('/api/comfyui/models', methods=['GET'])
+def api_comfyui_models():
+    """扫描 ComfyUI 真实可用的模型槽位候选值 + 已安装自定义节点包。
+
+    refresh=1 强制绕过 object_info 缓存重新拉取（前端「重新扫描」按钮用）。
+    返回体含 success；ComfyUI 离线时 success=False 且带 error，不抛异常。
+    """
+    force = str(request.args.get('refresh') or '').strip() in ('1', 'true', 'yes')
+    data = comfyui_models.scan(comfyui_client, force=force)
+    status = 200 if data.get("success") else 503
+    return jsonify(data), status
+
+
+@app.route('/api/comfyui/models', methods=['POST'])
+def api_comfyui_models_select():
+    """保存用户手动指定的模型（按槽位）。
+
+    body: {"unet_main": "<模型名>", ...}
+    显式传 null 或 "" 表示**清空**该槽位，回落到工作流模板自身的取值。
+    """
+    data = request.json or {}
+    if not isinstance(data, dict):
+        return jsonify({"success": False, "error": "body 必须是 JSON 对象"}), 400
+    # 只允许已知槽位，脏 key 直接忽略（不报错，避免前后端版本差导致整体失败）
+    known = {k: v for k, v in data.items() if k in comfyui_models.SLOTS}
+    try:
+        selection = comfyui_models.save_selection(known)
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"success": False, "error": f"保存失败：{e}"}), 500
+    return jsonify({"success": True, "selection": selection})
+
+
+@app.route('/api/logs', methods=['GET'])
+def api_logs():
+    """查看后台服务日志（只读）。
+
+    服务由计划任务后台启动、没有终端窗口，日志原本只能去翻磁盘上的
+    ``.workbuddy/test/_out/serve_stdout.log``。这里把它接到 Web 上，方便实时排查。
+
+    查询参数:
+        source: serve（默认） / comfyui —— **仅接受白名单 key，绝不接受路径**（防穿越）
+        tail:   返回尾部多少行，默认 300，上限 2000
+        since:  字节偏移，>0 时只返回此后新增的内容（前端「自动刷新」用）
+        q:      关键字过滤；level: ERROR / WARNING / INFO / DEBUG
+    """
+    src = str(request.args.get('source') or '').strip()
+    try:
+        tail = int(request.args.get('tail') or 0)
+        since = int(request.args.get('since') or 0)
+    except ValueError:
+        return jsonify({"success": False, "error": "tail / since 必须是整数"}), 400
+    data = log_viewer.tail_lines(
+        source=src or log_viewer.DEFAULT_SOURCE,
+        tail=tail or log_viewer.DEFAULT_TAIL,
+        since=since,
+        query=str(request.args.get('q') or '').strip(),
+        level=str(request.args.get('level') or '').strip().upper(),
+    )
+    status = 200 if data.get("success") else 400
+    return jsonify(data), status
+
+
+@app.route('/api/logs/sources', methods=['GET'])
+def api_logs_sources():
+    """列出可查看的日志源及其大小 / 最后更新时间。"""
+    return jsonify({"success": True, "sources": log_viewer.available_sources()})
+
+
+# ==========================================================================
 # P2-5 国际化
 # ==========================================================================
 
@@ -3053,6 +3132,13 @@ def _generate_asset_task(task_id: str, assets: list, asset_type: str, project_na
                     # orig_asset_prompt（重试基准 + 教训库 key）也带上性别，否则每次重试
                     # 都会把 prompt 复原成无性别版本。
                     prompt_zh = asset_prompt_kit.ensure_prompt_gender(prompt_zh, asset)
+                elif asset_type == 'scene':
+                    # 场景同款不变量（2026-09-29）：角色有性别、物品有白底，唯独场景缺一条
+                    # —— 场景图要被多视角 / 分镜 / 视频当作**同一个可导航空间**反复引用，
+                    # 图里一旦出现人物就会被一并带进下游，且换机位后无法复用。
+                    # ⚠️ 与 character 一样必须放在下方 qc_desc 之前，否则会重蹈
+                    # 「生成侧零约束、质检侧按另一口径判」→ 反复判不过重画的坑。
+                    prompt_zh = asset_prompt_kit.ensure_scene_layout(prompt_zh, asset)
 
                 with lock:
                     generation_state[task_id].update({
@@ -3506,6 +3592,121 @@ def _normalize_char_alias(name) -> str:
     return s
 
 
+# ---- 场景名容错匹配（2026-09-29）------------------------------------------- #
+# 背景：场景资产名（``scenes[].name``）与镜头引用的场景名（``shot.location``）
+#   是**两次独立的 LLM 生成**，用词不保证逐字一致（全角/半角括号、书名号、
+#   空格、「铜铃巷」vs「铜铃巷（夜）」）。旧实现统一写成::
+#
+#       scene_name = loc if loc in scene_idx else None
+#
+#   —— **不匹配就静默置 None**：场景参考图直接不注入、不打任何日志。画面里
+#   的建筑形制、光位只能靠模型自行想象，是「背景不一致」类质检缺陷的隐蔽
+#   来源；而且这段判据在 5 处取用点各写了一遍（分镜参考图 / 重跑切段 /
+#   H3 视频段 / 图片质检锚点 / 连续性判定），改一处漏四处的风险很高。
+#   这里收敛为**一个匹配器**，并确立「宁可告警、不可静默」。
+#
+# ⚠️ 降级方向**越靠后越保守**：误配（把 A 场景的图给 B）比丢图更糟——
+#   丢图只是「没有锚点」，误配会主动把**错误背景**焊进画面。故最后一级
+#   强制要求**唯一命中**，多候选一律放弃。
+
+#: 全角 ASCII（！-～）→ 半角；另加全角空格。只动标点/空白，不动汉字。
+_SCENE_FULLWIDTH_MAP = {i: i - 0xFEE0 for i in range(0xFF01, 0xFF5F)}
+_SCENE_FULLWIDTH_MAP[0x3000] = 0x20
+#: 装饰性符号（引号/书名号/间隔号）：本身无语义，剥离后仍指向同一场景。
+_SCENE_DECOR_CHARS = ("《", "》", "「", "」", "『", "』", "\"", "'",
+                      "“", "”", "‘", "’", "·", "•")
+
+
+def _normalize_scene_name(name) -> str:
+    """归一化场景名（只做**标点 / 空白 / 全半角**层面，不做语义改写）。
+
+    刻意**不剥**「（夜）」「外」「门口」这类限定词：它们是场景区分的一部分，
+    剥了会把「卧室」和「卧室外」混成一个。此类差异交给
+    :func:`_match_scene_name` 的「唯一子串」一级去兜（且必须唯一）。
+
+    与 :func:`_normalize_char_alias` 同风格——只解决「同一个场景的两种写法」，
+    绝不猜测「两个不同地点是不是同一个」。
+    """
+    s = str(name or "").strip()
+    if not s:
+        return ""
+    s = s.translate(_SCENE_FULLWIDTH_MAP)
+    for ch in _SCENE_DECOR_CHARS:
+        s = s.replace(ch, "")
+    s = re.sub(r"\s+", "", s)
+    return s.lower()
+
+
+def _match_scene_name(loc, scene_idx) -> tuple:
+    """把镜头写的场景名解析到 ``scene_idx`` 的键 → ``(key, level)``。
+
+    三级降级，逐级更保守；全部失败返回 ``(None, "")``：
+
+    1. ``"exact"``      —— 原样相等（历史行为，零风险）
+    2. ``"normalized"`` —— 归一化后相等（全半角 / 引号 / 空白差异）
+    3. ``"substring"``  —— 一方包含另一方，且**在索引中唯一命中**
+       （「铜铃巷」↔「铜铃巷（夜）」）
+
+    第 3 级必须唯一：若索引里「卧室」「卧室外」都能被子串命中，则放弃——
+    **宁可不给图，也不给错图**。
+    """
+    raw = str(loc or "").strip()
+    if not raw or not isinstance(scene_idx, dict) or not scene_idx:
+        return None, ""
+    if raw in scene_idx:
+        return raw, "exact"
+    n = _normalize_scene_name(raw)
+    if not n:
+        return None, ""
+    # 归一化后可能撞键（两个原名归一到同一串）→ 保留先出现的，避免歧义。
+    norm_map = {}
+    for k in scene_idx.keys():
+        nk = _normalize_scene_name(k)
+        if nk and nk not in norm_map:
+            norm_map[nk] = k
+    if n in norm_map:
+        return norm_map[n], "normalized"
+    hits = []
+    for nk, k in norm_map.items():
+        if n in nk or nk in n:
+            hits.append(k)
+            if len(hits) > 1:
+                return None, ""          # 多候选 → 放弃（防误配）
+    if len(hits) == 1:
+        return hits[0], "substring"
+    return None, ""
+
+
+def _resolve_scene_entry(shot: dict, scene_idx: dict,
+                         where: str = "") -> tuple:
+    """解析镜头所属场景 → ``(scene_name, entry)``；未命中时**显式告警**并记账。
+
+    调用方只有在 ``entry is None`` 时才真正「没有场景锚点」。告警只打一次，
+    并把原因写进 ``shot["_ref_warning"]``（批量生成时不刷屏，但能在任务结果里
+    定位到具体是哪一镜、写的什么场景名）。
+
+    ⚠️ 只有「剧本声明了场景、且索引非空」时未命中才告警——两者皆空属于正常
+    空镜脚本，不该制造噪音。
+    """
+    if not isinstance(shot, dict):
+        return None, None
+    loc = shot.get("location")
+    name, level = _match_scene_name(loc, scene_idx)
+    if not name:
+        if loc and scene_idx:
+            _msg = (f"场景名未匹配：镜头 {shot.get('shot_id')} 的 location={loc!r} "
+                    f"在场景资产 {sorted(scene_idx.keys())[:8]} 中无对应项，"
+                    f"该镜将不带场景参考图")
+            shot["_ref_warning"] = _msg
+            app.logger.warning("[%s] %s", where or "scene-ref", _msg)
+        return None, None
+    if level != "exact":
+        app.logger.info("[%s] 场景名模糊命中：%r → %r（%s）",
+                        where or "scene-ref", loc, name, level)
+        shot["_scene_match"] = {"queried": loc, "matched": name, "level": level}
+    return name, (scene_idx.get(name) or {})
+
+
 def _match_shot_chars(shot: dict, char_idx: dict) -> list:
     """S6 修复：按镜头 characters_in_shot 匹配 char_idx，**禁止静默 take-first**。
 
@@ -3563,6 +3764,24 @@ def _framing_wants_half(camera) -> bool:
         return False
     k = _camera_key(_raw)
     return k in ("特写", "近景", "中景")
+
+
+def _framing_wants_half_shot(shot: dict) -> bool:
+    """A1：按**权威景别字段**判断本镜角色参考图是否取「半身档」。
+
+    与 :func:`_framing_wants_half` 的差别：优先读 ``shot_type``（新剧本权威字段），不再靠
+    解析「特写推入」这类复合串去猜；``shot_type`` 与 ``camera`` **都为空**时返回 False
+    （全身档）—— 与原实现「空值返回 False」同口径，绝不把「景别未指定」误判成中景。
+    """
+    if not isinstance(shot, dict):
+        return False
+    st = str(shot.get("shot_type") or "").strip()
+    if st:
+        return st in ("特写", "近景", "中景")
+    _raw = str(shot.get("camera") or "").strip()
+    if not _raw:
+        return False
+    return _camera_key(_raw) in ("特写", "近景", "中景")
 
 
 def _pick_char_view(char_payload: dict, want_half: bool) -> str:
@@ -3636,7 +3855,7 @@ def _allocate_storyboard_refs(shot: dict, char_idx: dict, item_idx: dict, scene_
 
     used_paths = set()
     # 本镜景别决定角色参考图取「半身档」还是「全身档」（画幅与景别同向，消除对抗）。
-    _want_half = _framing_wants_half(shot.get("camera"))
+    _want_half = _framing_wants_half_shot(shot)
 
     # ---- <image1>…<image3>：角色身份锚点（逐个独立，禁止特征串味）----
     # 官方要点：多角色时每人一张图 + 明确「independently / Do not merge facial features」，
@@ -3662,9 +3881,10 @@ def _allocate_storyboard_refs(shot: dict, char_idx: dict, item_idx: dict, scene_
                          f"独立保持其面部身份与发型，不得与其他角色特征混用", img))
 
     # ---- <imageN>：场景（角色之后，作为环境锚点）----
-    loc = shot.get("location")
-    scene_name = loc if loc in scene_idx else None
-    scene_img = scene_idx.get(scene_name, {}).get("image") if scene_name else None
+    # 2026-09-29：走统一容错匹配（精确 → 归一化 → 唯一子串）；未命中时**显式告警**，
+    # 不再沿用旧的 `loc if loc in scene_idx else None`——那条路会静默丢场景锚点。
+    scene_name, _sc_entry = _resolve_scene_entry(shot, scene_idx, "分镜参考图")
+    scene_img = (_sc_entry or {}).get("image") if _sc_entry else None
     if scene_img and scene_img in used_paths:
         scene_img = None
 
@@ -3681,9 +3901,20 @@ def _allocate_storyboard_refs(shot: dict, char_idx: dict, item_idx: dict, scene_
 
     slot_no = len(refs) + 1
     if scene_img:
+        # 2026-09-29 与场景新规格同步：``novel_to_script`` 的 reference_prompt_zh
+        # 已升级为「地理优先」（先定空间结构与地理关系，再定光照基调），此处槽位
+        # 话术同步升级，并**显式声明不锁定机位**——场景基准图是一个固定 View，
+        # 而分镜是另一个机位；不声明的话模型会照搬参考图的取景范围（实测口径与
+        # 特写镜头「场景仅作基调参考」一致）。
+        # ⚠️ 改这句话必须同步 comfyui_client._REF_ROLE_ZH2EN（中文职责 → 官方英文
+        #    短语）与 prompt_memory._BOILERPLATE（相似度剥离用），否则职责声明会
+        #    退化成中文原文、教训召回会被套话稀释。
         refs.append(("场景",
-                     f"参考图{slot_no}（<image{slot_no}>）是场景「{scene_name}」的环境与氛围锚点："
-                     f"环境的结构与氛围保持一致", scene_img))
+                     f"参考图{slot_no}（<image{slot_no}>）是场景「{scene_name}」的"
+                     f"空间与光照锚点：保持空间结构、地理关系（入口 / 通道 / 固定"
+                     f"陈设的位置关系）与光源方向、色温基调一致；"
+                     f"不得照搬该参考图的机位与取景范围，本镜构图以镜头描述为准",
+                     scene_img))
         used_paths.add(scene_img)
         slot_no += 1
     for cand, img in item_refs:
@@ -3703,7 +3934,10 @@ def _allocate_storyboard_refs(shot: dict, char_idx: dict, item_idx: dict, scene_
 # 对策（仅对 camera 含「特写」的镜头生效）：
 #   1) 角色参考图换为该角色全身视图的「头部特写裁剪图」（现裁现用，不改动原始资产）；
 #   2) 剔除道具参考图（特写中道具应已入袖、不应出镜）；
-#   3) 场景参考图保留但降级为「仅色调与氛围参考，不作为构图范围依据」。
+#   3) 场景参考图**整条剔除**（见下方实现：只保留「主角色 / 次角色」两类）。
+#      文件头注释曾写「保留但降级为仅色调参考」，与实现不符 —— 实测口径是剔除；
+#      2026-09-29 修正注释与实现对齐。特写是「只拍局部」，而场景基准图是全景
+#      View，留作基调参考仍会把模型拉回中全景（见上方实测记录）。
 # 角色资产 5 个视角均为「右手握笛」形象（道具已被画进人物），直接作参考会让模型把笛子
 # 画进画面，与「道具已收起」类动作冲突；此处只取角色图顶部「头部条带」作锚点，
 # 从参考层面切断手部/道具先验。
@@ -4969,7 +5203,7 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
                 # H3 Director 每段最多 9 张（ref_image_0..8），去掉旧的「上限 2 张」保守限制。
                 _matched_chars = _match_shot_chars(shot, char_idx)
                 # 本镜角色参考图（每人一张，景别对档取半身/全身）
-                _want_half = _framing_wants_half(shot.get("camera"))
+                _want_half = _framing_wants_half_shot(shot)
                 _shot_char_imgs = []
                 _shot_char_refs = []      # 供提示词构建（含 name/appearance）
                 for _mc in (_matched_chars or []):
@@ -4996,9 +5230,8 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
                             "appearance": _entry.get("appearance")
                             or _entry.get("description") or ""})
                 # 场景参考图
-                _loc = shot.get("location")
-                _scene_entry = scene_idx.get(_loc) if _loc in scene_idx else None
-                _scene_img = (_scene_entry or {}).get("image") if _scene_entry else None
+                _loc, _scene_entry = _resolve_scene_entry(shot, scene_idx, "H3视频段")
+                _scene_img = (_scene_entry or {}).get("image")
                 _shot_scene_refs = ([{"name": _loc, "appearance": ""}]
                                     if _scene_img else [])
                 refs = [sb_local] + _shot_char_imgs + _shot_item_imgs + \
@@ -7781,7 +8014,10 @@ def _qc_prev_shot_desc(shots: list, idx: int) -> str:
         a = str(prev.get(k) or "").strip()
         b = str(cur.get(k) or "").strip()
         if a and b:
-            _same = (a == b)
+            # 2026-09-29：与场景参考图取用共用同一套归一化（全半角 / 引号 / 空白）。
+            # 旧写法 `a == b` 会把「铜铃巷」vs「铜铃巷（夜）」判成换场，
+            # 于是**无谓地关掉**连续性判定与上一镜锚点，同场景承接镜失去衔接约束。
+            _same = (_normalize_scene_name(a) == _normalize_scene_name(b))
             break
     else:
         # 两边都没写场景信息 → 无法判定「是否换场」。宁可**不启用**连续性判定
@@ -7845,9 +8081,11 @@ def _qc_ref_images(shot: dict, char_idx: dict, item_idx: dict, scene_idx: dict,
         _add(f"角色「{n}」的外貌、服装与发型", (char_idx.get(n) or {}).get("image"))
     for n in (shot.get("items_in_shot") or []):
         _add(f"物品「{n}」的形状、材质与配色", (item_idx.get(n) or {}).get("image"))
-    loc = shot.get("location")
-    if loc in scene_idx:
-        _add(f"场景「{loc}」的环境与氛围", (scene_idx.get(loc) or {}).get("image"))
+    loc, _scene_e = _resolve_scene_entry(shot, scene_idx, "图片质检")
+    if _scene_e:
+        # 质检口径与生成侧话术同步（2026-09-29）：场景锚点核对的是**空间结构与
+        # 光照基调**，而非笼统的「环境与氛围」——与 <imageN> 场景槽位新规格一致。
+        _add(f"场景「{loc}」的空间结构与光照基调", _scene_e.get("image"))
     if not out:
         # 兜底：本镜没登记角色/物品时，用生成侧实际用的那几张（至少保住场景锚点）
         for r in (fallback_refs or []):

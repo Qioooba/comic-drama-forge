@@ -14,7 +14,8 @@ import type {
   TTSEnv, TTSPlanResponse, TTSTask,
   MixEnv, MixPlanResponse, MixTask, MixStatusResponse,
   QCConfig, QCResponse,
-  Episode, EpisodeListResponse,
+  Episode, EpisodeListResponse, NovelSplitPlanResponse, ComfyUIModelsResponse,
+  LogSource, LogsResponse,
   AutopilotStatus, AutopilotProgress,
   Deliverable, DeliverablesResponse,
   Provider, ProvidersResponse,
@@ -719,6 +720,55 @@ export const episodesApi = {
       `/novels/${encodeURIComponent(novelId)}/episodes/generate`,
       { method: 'POST' }
     ),
+};
+
+/** P2-2 分集断点提议（与生产口径同源；不传 opts 即默认参数，提议 ≡ 实际生成） */
+export const novelsSplitPlanApi = {
+  get: (
+    novelId: string,
+    opts?: { maxSec?: number; maxShots?: number; fixedParts?: number }
+  ) => {
+    const qs = new URLSearchParams();
+    if (opts?.maxSec != null) qs.set('max_sec', String(opts.maxSec));
+    if (opts?.maxShots != null) qs.set('max_shots', String(opts.maxShots));
+    if (opts?.fixedParts != null) qs.set('fixed_parts', String(opts.fixedParts));
+    const q = qs.toString();
+    return request<NovelSplitPlanResponse>(
+      `/novels/${encodeURIComponent(novelId)}/split-plan${q ? `?${q}` : ''}`
+    );
+  },
+};
+
+// --- ComfyUI 模型 / 插件扫描（全局，与具体项目无关） ---
+export const comfyuiModelsApi = {
+  /** 扫描 ComfyUI 实际可用的模型槽位候选与已装自定义节点包。
+   *  refresh=true 会绕过后端 object_info 缓存重新拉取（「重新扫描」按钮）。 */
+  scan: (refresh = false) =>
+    request<ComfyUIModelsResponse>(`/comfyui/models${refresh ? '?refresh=1' : ''}`),
+  /** 手选模型。patch 形如 { unet_main: '<模型名>' }；
+   *  传空串/null 表示清空该槽位，回落到工作流模板自身的取值。 */
+  select: (patch: Record<string, string | null>) =>
+    request<{ success: boolean; selection: Record<string, string> }>('/comfyui/models', {
+      method: 'POST',
+      body: JSON.stringify(patch),
+    }),
+};
+
+// --- 后台服务日志 ---
+export const logsApi = {
+  sources: () => request<{ success: boolean; sources: LogSource[] }>('/logs/sources'),
+  /** source 只接受白名单 key；since>0 时只返回新增内容（自动刷新用） */
+  tail: (opts?: { source?: string; tail?: number; since?: number;
+                  q?: string; level?: string }) => {
+    const qs = new URLSearchParams();
+    if (opts?.source) qs.set('source', opts.source);
+    if (opts?.tail) qs.set('tail', String(opts.tail));
+    if (opts?.since) qs.set('since', String(opts.since));
+    if (opts?.q) qs.set('q', opts.q);
+    if (opts?.level) qs.set('level', opts.level);
+    const q = qs.toString();
+    return request<LogsResponse>(`/logs${q ? `?${q}` : ''}`);
+  },
 };
 
 // --- Continuity ---

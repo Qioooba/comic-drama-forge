@@ -493,6 +493,105 @@ export interface EpisodeListResponse {
   total: number;
 }
 
+/** P2-2 分集断点提议：与生产 autopilot.episode_units 同源（默认不带参数时完全一致）。
+ *  来自 GET /api/novels/<id>/split-plan。 */
+export interface NovelSplitPlanUnit {
+  part: number;
+  start: number;
+  end: number;
+  char_count: number;
+  preview?: string;
+  est_shots?: number;
+  est_sec?: number;
+  over_redline?: boolean;
+  [k: string]: unknown;
+}
+
+export interface NovelSplitPlanChapter {
+  index?: number;
+  title?: string;
+  char_count?: number;
+  needs_confirm: boolean;
+  total_parts: number;
+  units: NovelSplitPlanUnit[];
+  message?: string;
+  [k: string]: unknown;
+}
+
+export interface NovelSplitPlanResponse {
+  success: boolean;
+  novel_id: string;
+  chapter_count?: number;
+  total_episodes?: number;
+  needs_confirm_chapters?: number[];
+  episodes_per_chapter?: Array<{ chapter_index?: number; title?: string; total_parts: number }>;
+  params?: { max_sec?: number | null; max_shots?: number | null; fixed_parts?: number | null };
+  chapters: NovelSplitPlanChapter[];
+  [k: string]: unknown;
+}
+
+// --- ComfyUI 模型 / 插件扫描（手选生成模型） ---
+
+export interface ComfyUIModelSlot {
+  /** 槽位 key（如 unet_main），面向用户职责而非模板节点 id */
+  key: string;
+  label: string;
+  hint: string;
+  node_type: string;
+  field: string;
+  /** ComfyUI object_info 给出的**权威合法值**（含目录前缀） */
+  values: string[];
+  /** 当前已选；空串表示未覆盖，沿用工作流模板原值 */
+  selected: string;
+  /** 已选值是否仍在合法值列表内 —— 丢弃头工艺检测失效 hand-pick */
+  selected_valid: boolean;
+  available: boolean;
+}
+
+export interface ComfyUIPlugin {
+  id: string;
+  node_count: number;
+  nodes: string[];
+}
+
+export interface ComfyUIModelsResponse {
+  success: boolean;
+  scanned_at?: string;
+  slots: ComfyUIModelSlot[];
+  plugins: ComfyUIPlugin[];
+  core_node_count?: number;
+  node_type_count?: number;
+  elapsed_sec?: number;
+  error?: string;
+}
+
+// --- 后台服务日志（只读查看） ---
+
+export interface LogSource {
+  key: string;
+  label: string;
+  desc: string;
+  size: number;
+  modified_at: string;
+  exists: boolean;
+}
+
+export interface LogsResponse {
+  success: boolean;
+  source?: string;
+  path?: string;
+  size?: number;
+  modified_at?: string;
+  /** 读到该处的文件字节偏移；下次拿它作 since 即可只取新增内容 */
+  offset?: number;
+  encoding?: string;
+  truncated?: boolean;
+  lines: string[];
+  counts?: Record<string, number>;
+  error?: string;
+  available?: string[];
+}
+
 // --- Autopilot ---
 /** 当前正在生产的一集（`current`）的字段，对应后端 `_set_current` 写入 + status() 增强。
  *  step 是英文技术标识符（script/assets/storyboard/...），前端用 i18n 映射成展示名。 */

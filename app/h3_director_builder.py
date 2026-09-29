@@ -287,6 +287,66 @@ class H3DirectorBuilder:
             node["widgets_values_named"] = named
         return removed
 
+    @staticmethod
+    def _widget_pos_map(node: dict) -> Dict[str, int]:
+        """推导 widget 名 → ``widgets_values`` 下标的映射。
+
+        UI 工作流里 ``widgets_values`` 的排列顺序 == inputs 中**带 widget 键**的
+        声明顺序（非 widget 的输入是从别处连线过来的，不占位）。
+
+        既有代码多用硬编码 pos_map（如 ``_DIRECTOR_POS``）；这里改成通用推导，
+        免得每新增一个模型槽位就要手工维护一份下标常量、且极易写错。
+        """
+        pm: Dict[str, int] = {}
+        idx = 0
+        for inp in node.get("inputs") or []:
+            if not isinstance(inp, dict):
+                continue
+            name = inp.get("name")
+            if not name:
+                continue
+            if isinstance(inp.get("widget"), dict):
+                pm[name] = idx
+                idx += 1
+        return pm
+
+    def apply_model_overrides(self, overrides: dict) -> List[dict]:
+        """按 ``{node_id: {field: value}}`` 覆盖模板里模型加载节点的取值。
+
+        用途：用户在前端扫到的 ComfyUI 合法模型里手选后，用这里把选择覆盖到
+        工作流模板上，避免模板写死文件名与实际磁盘布局（子目录会带前缀）不符
+        导致的节点校验失败。
+
+        ``overrides`` 为空时什么也不做，保证「未手选」== 改动前行为。
+        返回实际发生变更的记录列表，便于调用方打日志。
+        """
+        if not overrides:
+            return []
+        by_id = {n.get("id"): n for n in self.template.get("nodes") or []}
+        applied: List[dict] = []
+        for nid, patch in (overrides or {}).items():
+            node = by_id.get(nid)
+            if node is None:
+                logger.warning(f"[H3-Director] 模型覆盖跳过：模板里没有节点 id={nid}")
+                continue
+            if not isinstance(patch, dict) or not patch:
+                continue
+            pos_map = self._widget_pos_map(node)
+            named_before = dict(node.get("widgets_values_named") or {})
+            for field, value in patch.items():
+                old = named_before.get(field)
+                if str(old) == str(value):
+                    continue  # 已是目标值，不产生噪音日志
+                self._set_widget(node, pos_map, field, value)
+                applied.append({
+                    "node": nid,
+                    "type": node.get("type"),
+                    "field": field,
+                    "from": old,
+                    "to": value,
+                })
+        return applied
+
     # ------------------------------------------------------------------ 帧数
     def _segment_frames(self, seg: dict, fps: float) -> int:
         """单段帧数：显式 ``frames`` > ``duration``（走官方换算）。"""
