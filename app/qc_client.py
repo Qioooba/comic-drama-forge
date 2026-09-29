@@ -717,6 +717,9 @@ CONFIG_KEYS = (
     "endpoint_override",   # 被其它模块（如分镜链路）自动写入的接口，记录以便「恢复为 AI 设置」
     "image_prompt", "video_prompt", "audio_prompt", "script_prompt",
     "pass_score", "max_retries", "video_frame_count",
+    # best-of-N 分镜候选数（2026-09-29 新增，借 ViMax best_image_selector）：
+    # >1 时固定生成 N 张候选、按质检分选最佳入库；1=关闭（默认，保持「通过即停」现行为）
+    "best_of",
     "image_max_side", "timeout", "api_retries", "api_backoff", "updated_at",
     "script_categories",  # 剧本质检各维度权重和合格线
     # 推理模型控制（2026-09-17 新增，确保配置能正确落盘）
@@ -759,6 +762,10 @@ def _empty_config() -> dict:
         "audio_max_drift": 0.50,          # 与预期时长偏差上限（比例，超限扣分）
         "pass_score": 70,            # 合格线（0-100），score >= pass_score 且 pass != false 视为达标
         "max_retries": 2,            # 不达标最大重试次数
+        # best-of-N 分镜候选数（借 ViMax best_image_selector）：固定生成 N 张候选，
+        # 按质检分选**最佳**那张入库，替代「第一个通过即停」。1=关闭（默认，保持现行为），
+        # 上限 4（N 倍 GPU 渲染，慎调）。仅对**分镜图**生效（视频链路未接入）。
+        "best_of": 1,
         "video_frame_count": 3,      # 视频抽帧数量（1-6）
         "image_max_side": 1024,      # 送检前压缩的最长边（控制 token 与耗时）
         # 图片质检是否附带「本镜出现的角色/物品/场景」的设定图：
@@ -1000,7 +1007,7 @@ def _save_config_impl(config_path: str, patch: dict, keep_key_if_blank: bool = T
             #    非法值沿用当前（已归一化的）取值，绝不静默翻转开关。
             cfg[k] = _as_bool(v, bool(cfg.get(k, False)))
         elif k in ("pass_score", "max_retries", "video_frame_count", "image_max_side",
-                   "timeout", "api_retries"):
+                   "timeout", "api_retries", "best_of"):
             try:
                 cfg[k] = int(v)
             except Exception:  # noqa: BLE001
@@ -1045,6 +1052,29 @@ def load_config_dict(raw: dict) -> dict:
                  if k in CONFIG_KEYS and k not in ("endpoint_override",)})
     base["endpoint_override"] = _normalize_override((raw or {}).get("endpoint_override"))
     return _normalize(base)
+
+
+def pick_best_candidate(scores: list) -> int:
+    """best-of-N 选最佳候选（2026-09-29，借 ViMax ``best_image_selector``）：返回**最高分**索引。
+
+    - 分数为 ``None`` / 非数值 → 视为最低（不参与竞争）；
+    - 平局取**较后者**：更晚的那次尝试经过更多轮缺陷教训改写，通常更贴合要求；
+    - 全无有效分数 → 返回**最后一个索引**（保证总有一张被选中，绝不返回 -1 造成空选）。
+
+    ⚠️ 只比分数、**不判是否合格**：「最高分仍未达合格线」时的入库策略（是否仍入库并标记
+    未达标）由调用方决定 —— 本函数与 :func:`_qc_gate` 的 accept 判定**解耦**，便于单测。
+    """
+    if not scores:
+        return -1
+    best_i, best_s = len(scores) - 1, None
+    for i, s in enumerate(scores):
+        try:
+            v = float(s)
+        except (TypeError, ValueError):
+            continue
+        if best_s is None or v >= best_s:
+            best_i, best_s = i, v
+    return best_i
 
 
 def _as_bool(v, default: bool = False) -> bool:
@@ -1098,7 +1128,9 @@ def _normalize(cfg: dict) -> dict:
     for key, default, lo, hi in (("pass_score", 70, 0, 100), ("max_retries", 2, 0, 10),
                                  ("video_frame_count", 3, 1, 6), ("image_max_side", 1024, 256, 2048),
                                  ("timeout", 180, 10, 900),
-                                 ("api_retries", API_RETRY_ATTEMPTS, 0, 5)):
+                                 ("api_retries", API_RETRY_ATTEMPTS, 0, 5),
+                                 # best-of-N 候选数：1=关闭（默认），上限 4（N 倍 GPU 渲染）
+                                 ("best_of", 1, 1, 4)):
         try:
             cfg[key] = max(lo, min(hi, int(cfg.get(key, default))))
         except Exception:  # noqa: BLE001
