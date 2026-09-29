@@ -362,6 +362,7 @@ class H3DirectorBuilder:
                         seg_refs: Optional[Sequence[Sequence[str]]],
                         seg_audios: Optional[Sequence[Sequence[str]]],
                         common_enabled: bool,
+                        seg_ref_start: int = 0,
                         width: int, height: int, fps: float,
                         frames_each: List[int], ref_max_size: int,
                         continuity: bool, overlap: int,
@@ -380,6 +381,13 @@ class H3DirectorBuilder:
         base_output = dict(tpl_tl.get("output") or {})
         base_video = dict(tpl_tl.get("video") or {})
 
+        # ⭐ 公共参考图（global.refs）必须**先**算出来：它占 index 0..K-1，
+        #    段级 refs 要从 index K 起编号，两边的 index 空间必须严格错开，
+        #    否则插件 merge_indexed_refs 会按同 index 让段级把公共项逐槽覆盖
+        #    （公共图一张不生效且零报错）。K 由调用方传入（= len(global refs)）。
+        ref_items = self._ref_items(refs)
+        _seg_start = max(0, int(seg_ref_start or 0))
+
         segments: List[dict] = []
         start = 0
         for i, (seg, frames) in enumerate(zip(seg_list, frames_each)):
@@ -397,9 +405,10 @@ class H3DirectorBuilder:
                 # ⭐ 逐段参考图：``prompt_batch`` 时插件强制 edit_mode=segment，
                 #    refs 只认 ``segment.refs``（``gen_timeline.py:392/529``）。
                 #    这就是「每个镜头用自己的分镜图」得以成立的机制。
+                #    index 从 _seg_start 起 = 让开公共块（见上方注释）。
                 "refs": self._ref_items((seg_refs or [])[i]
                                         if seg_refs is not None and i < len(seg_refs)
-                                        else ()),
+                                        else (), start=_seg_start),
                 # ⭐ 段级参考音频（audioMode=source 时驱动 H3 口型/节奏）：
                 #    逐镜 QwenTTS 配音，``<Audio N>`` 标签对应。见 _ref_audio_items。
                 "refAudios": self._ref_audio_items((seg_audios or [])[i]
@@ -438,8 +447,6 @@ class H3DirectorBuilder:
             for s in segments:
                 s["continuityFromPrev"] = False
 
-        ref_items = self._ref_items(refs)
-
         tl = {
             **tpl_tl,
             "version": 5,
@@ -454,12 +461,18 @@ class H3DirectorBuilder:
             "global": {
                 **(tpl_tl.get("global") or {}),
                 "taskType": TASK_TYPE_R2V,
-                # 留空：commonEnabled 时插件会把全局提示词拼在段提示词**前面**，
+                # 留空：commonEnabled 时插件会把全局提示词拼在段提示词**前面**
+                # （``plan.py:concat_common_segment_prompt``，``gen_timeline.py:524``），
                 # 置空才能让 seg_prompt 精确等于项目自己构建的提示词。
+                # ⚠️ 这条是 commonEnabled=true 时的**隐性耦合**：一旦这里被填上内容，
+                #    每段提示词都会被加上同一段前缀（且顺序在段提示词之前）——
+                #    build() 末尾有守卫，见 ``_guard_global_prompt``。
                 "prompt": "",
-                # ⭐ 全局 refs 只在 commonEnabled 时才会 merge 进每段（``gen_timeline.py:530``）。
-                #    项目逐镜分镜图各不相同 → 默认**不用**全局 refs，
-                #    common_enabled=False：段提示词也不会被全局提示词污染。
+                # ⭐ 全局 refs = **公共参考图**（用户 2026-09-30 拍板），只在
+                #    commonEnabled=true 时才会 merge 进每段（``gen_timeline.py:530``）：
+                #    插件按 index 合并、同 index 段级优先，故公共项占 index 0..K-1，
+                #    段级项从 K 起（见 _ref_items / _build_timeline 顶部注释）。
+                #    common_enabled=False（默认）时 global.refs 不参与任何段。
                 "refs": ref_items,
                 "referenceVideo": {"videoFile": "", "fileName": "",
                                    "type": "input", "subfolder": ""},
@@ -493,13 +506,30 @@ class H3DirectorBuilder:
         return tl
 
     @staticmethod
-    def _ref_items(names: Sequence[str]) -> List[dict]:
-        """参考图相对文件名 → 插件 ``refs`` 条目（index 从 0 起 = ``<Picture N+1>``）。"""
+    def _ref_items(names: Sequence[str], start: int = 0) -> List[dict]:
+        """参考图相对文件名 → 插件 ``refs`` 条目。
+
+        ``index`` **从 ``start`` 起** = ``<Picture {index+1}>``。
+        为什么需要 ``start``（2026-09-30）：开了公共参数（``global.refs`` +
+        ``commonEnabled``）时，公共项占 index ``0..K-1``，段级项必须从 ``K`` 起 ——
+        插件 ``merge_indexed_refs`` 是**按 index 合并、同 index 段级优先**
+        （``director/plan.py:214``），段级若也从 0 起会把公共项**逐槽覆盖**：
+        一张公共图都不生效，而且**不报任何错**（静默失效，最难查的一类）。
+        另外 ``_load_refs`` 会丢掉 index ≥ 9 的条目，故上限按剩余槽位算。
+
+        ⚠️ 先**清洗再编号**（而非编号后过滤）：官方的 ``<Picture N>`` 是**位置序号**
+        （``comfy/text_encoders/minimax.py`` 里按 ``minimax_ref_items`` 的出现次序
+        ``counters["image"] += 1`` 打标签），一旦 index 出现空洞，位置与 ``index+1``
+        就不再相等 —— 提示词按 ``index+1`` 写的标签会整体指错图。原实现
+        ``enumerate`` 后过滤，遇到空串就会留洞。
+        """
+        base = max(0, int(start or 0))
+        room = max(0, MAX_REFERENCE_IMAGES - base)
+        clean = [str(x).strip() for x in (names or []) if str(x or "").strip()][:room]
         return [
-            {"index": i, "imageFile": str(name), "fileName": "",
+            {"index": base + i, "imageFile": name, "fileName": "",
              "type": "input", "subfolder": ""}
-            for i, name in enumerate(list(names or [])[:MAX_REFERENCE_IMAGES])
-            if str(name or "").strip()
+            for i, name in enumerate(clean)
         ]
 
     @staticmethod
@@ -993,10 +1023,14 @@ class H3DirectorBuilder:
                   → 该段提示词里的 ``<Audio {j+1}>``（最多 3 个）。仅当
                   ``audio_mode="source"`` 时插件才会用参考音频驱动口型/节奏；
                   逐镜 QwenTTS 配音走这里。长度可与 segments 不等（短的按空处理）。
-        refs:     可选**全局**参考图（同格式）。仅当 ``common_enabled=True`` 时才
-                  会 merge 进每段（同 index 段级优先）。项目逐镜参考图不同，
-                  默认留空即可。
-        common_enabled: 是否把 ``global.prompt`` 前缀拼接到段提示词。
+        refs:     可选**全局**参考图（同格式）= **公共参考图**（2026-09-30 用户拍板）：
+                  一次提交里「每一段都在用、且用的是同一张图」的资产。开启后
+                  （``common_enabled=True``）它们占 index ``0..K-1``
+                  （K = ``len(refs)``），各段自带的 ``seg_refs`` 从 index ``K`` 起 ——
+                  调用方必须先按同一顺序把公共项排进每段提示词的 ``<Picture 1..K>``。
+                  不传（默认）＝完全走原路径（段级 index 从 0 起、``commonEnabled=false``）。
+        common_enabled: 是否把 ``global.prompt`` 前缀拼接到段提示词，
+                  并让 ``global.refs`` merge 进每段。
                   默认 ``bool(refs)``——没传全局 refs 就不拼，段提示词 = 原样。
         seed:     采样种子；None = 沿用模板值。
         """
@@ -1007,21 +1041,42 @@ class H3DirectorBuilder:
         if fps <= 0:
             raise ValueError(f"H3DirectorBuilder.build: frame_rate 非法 {frame_rate}")
 
+        if common_enabled is None:
+            common_enabled = bool([x for x in (refs or []) if str(x or "").strip()])
+        common_enabled = bool(common_enabled)
+        # ⭐ 公共块占用 index 0..K-1（K = 公共图张数，与 _ref_items 的清洗口径一致）。
+        #    段级 refs 的 index 必须让开这 K 个槽位（见 _ref_items / _build_timeline）。
+        ref_offset = len(self._ref_items(refs))
+        if refs and not common_enabled:
+            logger.warning(
+                "H3DirectorBuilder：传了 %d 张公共参考图但 common_enabled=False，"
+                "它们会被插件完全忽略（每段仍只有自己的图）", ref_offset)
+        if common_enabled and ref_offset == 0:
+            logger.warning("H3DirectorBuilder：common_enabled=True 但没有公共参考图 → "
+                           "段级 refs 仍从 index 0 起，与不开启时等价")
+
         # ⭐ 段级参考图条数上限 = 该段提示词实际声明的 ``<Picture N>`` 个数。
         #    多塞的图会以「有 tag、无声明」的状态进 conditioning（见 picture_capacity）。
         #    段自带的 ``reference_images`` 只用来提示「提示词声明数 < 传图数」这种不一致。
+        #    ⚠️ 开了公共块后，提示词里声明的编号是「公共 1..K + 本段 K+1..K+m」，
+        #    故本段**自己的**预算是 ``cap - ref_offset``（而不是 cap），
+        #    否则这道闸门会被公共块抬高而失效。同时受 9 槽总量约束。
         seg_ref_lists: List[List[str]] = []
+        room = max(0, MAX_REFERENCE_IMAGES - ref_offset)
         for i, seg in enumerate(seg_list):
             raw = list((seg_refs[i] if seg_refs is not None and i < len(seg_refs) else []) or [])
             names = [str(x).strip() for x in raw if str(x or "").strip()]
             cap = picture_capacity(seg.get("prompt") or "")
+            own_cap = room if cap is None else max(0, min(room, cap - ref_offset))
             declared = len(seg.get("reference_images") or [])
-            if cap is not None and len(names) > cap:
+            if len(names) > own_cap:
                 logger.warning(
-                    "段%d(%s)：参考图 %d 张 > 提示词声明的 <Picture> 数 %d，多余 %d 张已丢弃",
-                    i + 1, seg.get("name") or f"seg{i + 1}", len(names), cap,
-                    len(names) - cap)
-                names = names[:cap]
+                    "段%d(%s)：参考图 %d 张 > 本段可用槽位 %d（提示词声明至 <Picture %s>，"
+                    "其中前 %d 张为公共图），多余 %d 张已丢弃",
+                    i + 1, seg.get("name") or f"seg{i + 1}", len(names), own_cap,
+                    cap if cap is not None else "?", ref_offset,
+                    len(names) - own_cap)
+                names = names[:own_cap]
             if declared and len(names) < declared:
                 logger.warning(
                     "段%d(%s)：可用参考图 %d 张 < 传入 %d 张（部分文件缺失或未上传成功）",
@@ -1042,9 +1097,6 @@ class H3DirectorBuilder:
         frames_each = [self._segment_frames(s, fps) for s in seg_list]
         total = sum(frames_each)
 
-        if common_enabled is None:
-            common_enabled = bool([x for x in (refs or []) if str(x or "").strip()])
-
         # 段级参考音频：normalize 成与 segments 等长（缺的按空），供 _build_timeline 注入 refAudios
         seg_audio_lists: List[List[str]] = [
             [str(x).strip() for x in ((seg_audios[i] if seg_audios is not None
@@ -1055,11 +1107,41 @@ class H3DirectorBuilder:
 
         timeline = self._build_timeline(
             seg_list, refs=refs, seg_refs=seg_ref_lists, seg_audios=seg_audio_lists,
-            common_enabled=bool(common_enabled),
+            common_enabled=common_enabled, seg_ref_start=ref_offset,
             width=w, height=h, fps=fps, frames_each=frames_each,
             ref_max_size=rmax, continuity=continuity, overlap=continuity_overlap,
             audio_mode=audio_mode, export_mode=export_mode,
             live_tae_preview=live_tae_preview)
+
+        # ---- 守卫 A：commonEnabled 时 global.prompt 会被**拼在段提示词前面** ----
+        # 插件 ``concat_common_segment_prompt(common, segment)``（plan.py:201）在
+        # r2v/r2i + commonEnabled 时把全局提示词接到每段提示词**之前**。项目自己的
+        # 完整提示词放在 seg.prompt 里，全局那句一旦非空就会污染全集 → 这里守卫。
+        _gbl_prompt = str((timeline.get("global") or {}).get("prompt") or "").strip()
+        if timeline.get("global", {}).get("commonEnabled") and _gbl_prompt:
+            logger.warning(
+                "H3DirectorBuilder：commonEnabled=true 但 global.prompt 非空（%d 字），"
+                "插件会把它拼在每段提示词前面 → 已强制清空", len(_gbl_prompt))
+            timeline["global"]["prompt"] = ""
+
+        # ---- 守卫 B：槽位 index 与提示词 ``<Picture N>`` 必须一一对应 ----
+        # 这是本特性最容易静默出错的地方（公共块少一张 → 后续编号整体左移），
+        # 故在构建期就把「提示词声明了几张图 / 实际槽位是哪些」对齐检查一遍并落进 layout。
+        ref_layout_issues = self.check_ref_layout(timeline)
+        for _iss in ref_layout_issues:
+            # 未开公共块时只记 info：既有路径（keyframe 模式的「首帧+尾帧」两句式 refs、
+            # 无分镜图分支的全局 refs）历史上本就不保证「声明数 == 槽位数」，那是**存量**
+            # 问题，不该借本次改动制造一片 warning 噪音；新特性（common_enabled）才升级为
+            # 阻断，因为它一旦错位就是整集静默错图。
+            (logger.warning if common_enabled else logger.info)(
+                "H3DirectorBuilder 参考图槽位自检：%s", _iss)
+        if ref_layout_issues and common_enabled:
+            # 开了公共块还错位 → 提示词的 <Picture N> 会成片指错图，没有「凑合跑」的余地。
+            raise ValueError(
+                "H3DirectorBuilder：公共参考图槽位自检未通过（"
+                + "；".join(ref_layout_issues[:3])
+                + "）。公共项 index 必须 0..K-1 连续、段级项紧随其后，"
+                  "且与提示词 <Picture N> 一一对应；请检查调用方传入的 prompt/seg_refs 是否同序。")
 
         # ---- Director 节点注入 ----
         self._set_widget(director, _DIRECTOR_POS, "task_type", TASK_TYPE_R2V)
@@ -1152,9 +1234,14 @@ class H3DirectorBuilder:
             "total_frames": total,
             "duration_sec": round(total / fps, 6),
             "refs": [r.get("imageFile") for r in timeline["global"]["refs"]],
-            "segment_refs": [self._ref_items(names) for names in seg_ref_lists],
-            "segment_audios": [self._ref_audio_items(names) for names in seg_audio_lists],
+            # 段级 refs 的 index 起点（= 公共图张数 K）。报表/自检都按它读，
+            # 不要再假设「段级 index 从 0 起」。
+            "seg_ref_start": ref_offset,
             "common_enabled": bool(common_enabled),
+            "ref_layout_issues": ref_layout_issues,
+            "segment_refs": [self._ref_items(names, start=ref_offset)
+                             for names in seg_ref_lists],
+            "segment_audios": [self._ref_audio_items(names) for names in seg_audio_lists],
             "continuity": timeline["output"]["continuityEnabled"],
             "continuity_overlap_frames": timeline["output"]["continuityOverlapFrames"],
             "export_mode": export_mode,
@@ -1185,6 +1272,69 @@ class H3DirectorBuilder:
             layout["continuity"], layout["continuity_overlap_frames"],
             len(wf["nodes"]), len(wf["links"]))
         return wf, layout
+
+    @staticmethod
+    def check_ref_layout(timeline: dict) -> List[str]:
+        """自检：参考图槽位 index 与提示词 ``<Picture N>`` 是否一一对应 → 问题列表。
+
+        ## 为什么必须有这道检查（2026-09-30）
+
+        插件的编号规则是**位置制**：``comfy/text_encoders/minimax.py`` 按
+        ``minimax_ref_items`` 的出现次序打标签（``counters["image"] += 1``），而
+        ``minimax_ref_items`` 的顺序 = 插件合并后 refs 的 **index 升序**
+        （``director/executor_core.py`` 逐槽 ``ref_image_{idx}`` → 官方节点
+        ``for img in ref_images.values()``）。也就是说：
+
+            ``<Picture N>`` 里的 N = 该图在「合并后 index 升序列表」里的**第几位**。
+
+        index 连续（0..N-1）时它恰好等于 ``index+1``（官方 tooltip 的口径），
+        但**一旦出现空洞，位置就与 index+1 脱节**，提示词按 index+1 写的标签会整体
+        指错图 —— 而且模型照样出片，没有任何报错。历史上 ``_drop_missing_director_refs``
+        摘图就属于这类「静默错位」。所以构建期先自己核一遍。
+
+        判据（逐段）：
+          1. 合并后槽位（global.refs ∪ segment.refs，同 index 段级优先）的 index
+             必须是连续的 ``0..N-1``；
+          2. 提示词里 ``<Picture>`` 声明的最大编号必须等于 N（声明少了 = 有图没声明，
+             声明多了 = 声明了没图）；
+          3. index 必须 < ``MAX_REFERENCE_IMAGES``（插件 ``_load_refs`` 直接丢 ≥9 的）。
+        """
+        issues: List[str] = []
+        gbl_refs = (timeline.get("global") or {}).get("refs") or []
+        for i, seg in enumerate(timeline.get("segments") or []):
+            name = seg.get("id") or f"seg{i + 1}"
+            by_idx: Dict[int, dict] = {}
+            bad_idx = []
+            for item in list(gbl_refs) + list(seg.get("refs") or []):
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    idx = int(item.get("index", 0))
+                except (TypeError, ValueError):
+                    bad_idx.append(repr(item.get("index")))
+                    continue
+                by_idx[idx] = item
+            if bad_idx:
+                issues.append(f"{name}：refs 出现非数字 index {bad_idx[:3]}")
+                continue
+            if any(k >= MAX_REFERENCE_IMAGES for k in by_idx):
+                issues.append(
+                    f"{name}：index ≥ {MAX_REFERENCE_IMAGES} 会被插件直接丢弃"
+                    f"（{sorted(k for k in by_idx if k >= MAX_REFERENCE_IMAGES)}）")
+            idxs = sorted(by_idx)
+            if idxs and idxs != list(range(len(idxs))):
+                issues.append(f"{name}：槽位 index 不连续 {idxs} → 提示词编号会整体错位")
+            declared = picture_capacity(seg.get("prompt") or "")
+            if declared is None:
+                if idxs:
+                    issues.append(f"{name}：挂了 {len(idxs)} 张参考图但提示词没有任何 "
+                                  f"<Picture N> 声明（会被插件补标签，用途不可控）")
+                continue
+            if declared != len(idxs):
+                issues.append(
+                    f"{name}：提示词声明到 <Picture {declared}>，但实际槽位 {len(idxs)} 个"
+                    f"（index {idxs[:12]}）")
+        return issues
 
     # ------------------------------------------------------------------ 落盘
     def build_to_file(self, out_path: str, segments: Sequence[dict],

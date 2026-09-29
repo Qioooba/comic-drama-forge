@@ -2331,6 +2331,7 @@ class ComfyUIClient:
         qc_stop_cb=None,
         seg_audios: List[List[str]] = None,
         audio_mode: str = None,
+        common_refs: List[str] = None,
     ) -> dict:
         """H3 整集视频生成（N 段一个工作流，原生 H3ContinuousSeamlessJoinV14 衔接）
         + 整片 QC 门控。
@@ -2389,6 +2390,7 @@ class ComfyUIClient:
                     size=size,
                     seg_audios=seg_audios,
                     audio_mode=audio_mode,
+                    common_refs=common_refs,
                 )
             except RuntimeError as e:
                 # S12：确定性输入错误（如某段无可用参考图被拒绝提交）——
@@ -2504,7 +2506,8 @@ class ComfyUIClient:
                              save_build_to: str = None,
                              size=None,
                              seg_audios: List[List[str]] = None,
-                             audio_mode: str = None) -> dict:
+                             audio_mode: str = None,
+                             common_refs: List[str] = None) -> dict:
         """H3 多段一次生成：**工作流段数 = len(segments)**，一个分镜对应一段。
 
         两条实现路径（按**模板结构**自动分流，见 `_use_director_builder`）：
@@ -2522,6 +2525,10 @@ class ComfyUIClient:
                     非空时 audio_mode 默认切 ``source``（H3 用参考音频驱动口型/节奏），
                     音频写进 ``segment.refAudios``。
         audio_mode: 可选显式指定 ``generate|mute|source``；None 时自动推导。
+        common_refs: 可选，**公共参考图**本地绝对路径列表（有序，H3 Director 公共参数，
+                    2026-09-30）。仅 Director 路径支持；旧连续拼接路径忽略该参数并告警。
+                    调用方必须已按同一顺序把它们排进每段提示词的 ``<Picture 1..K>``。
+                    见 :meth:`_generate_h3_sequence_director`。
         timeout:  总超时（秒）；None 时按 1200 + timeout_per_segment × 段数 估算
         timeout_per_segment: 单段预估耗时（默认 900s，用于总超时兜底）
         save_build_to: 可选，把重建后的 UI 工作流落盘（便于复现/排障）
@@ -2541,7 +2548,16 @@ class ComfyUIClient:
                 filename_prefix=filename_prefix, emit_audio=emit_audio, seed=seed,
                 timeout=timeout, timeout_per_segment=timeout_per_segment,
                 save_build_to=save_build_to, size=size,
-                seg_audios=seg_audios, audio_mode=audio_mode)
+                seg_audios=seg_audios, audio_mode=audio_mode,
+                common_refs=common_refs)
+
+        if common_refs:
+            # 旧连续拼接路径按段重建子图、没有「公共参数」概念（global.refs 零引用）。
+            # 静默丢弃会把「公共资产锁定」悄悄变成「没锁定」，故显式告警。
+            logger.warning(
+                "[H3] 旧连续拼接路径不支持公共参考图（MJSCXT_H3_BUILDER=%s），"
+                "已忽略 %d 张公共图；如需公共参数请用 Director 模板",
+                os.environ.get("MJSCXT_H3_BUILDER") or "auto", len(common_refs))
 
         builder = H3EpisodeBuilder(tpl_path)
         default_duration = float((segs[0] or {}).get("duration") or 5.0)
@@ -2759,7 +2775,7 @@ class ComfyUIClient:
         return val
 
     def _drop_missing_director_refs(self, wf: dict, seg_ref_names, seg_audio_names,
-                                    seg_count: int) -> None:
+                                    seg_count: int, common_names=None) -> None:
         """提交前校验 Director timeline 声明的参考图/音频是否已落到 ComfyUI ``input/``。
 
         根因竞态：``_upload_h3_director_ref`` 走 HTTP 上传（``upload_image``），返回的是
@@ -2772,6 +2788,10 @@ class ComfyUIClient:
         声明的每段 ``imageFile`` / ``audioFile`` 是否真实存在于
         ``COMFYUI_INPUT_DIR`` 下；缺失的从该段摘掉并记日志。插件读到的是
         「实际在位的图」，不再有「声明了却没图」的段 → 彻底消除该竞态告警。
+
+        ``common_names``：``global.refs``（公共参考图）的预期内容。公共块缺一张会
+        **整体左移后续所有 ``<Picture N>``**（比段级少一张严重得多），故这里用
+        ``logger.error`` 明确喊出来（编号已与提示词不一致，人工复核时优先看这条）。
 
         安全性：
         - 整次提交的 ref 全缺 → 上游已有 S12 红线（``not any(seg_ref_names)`` 直接抛
@@ -2796,6 +2816,39 @@ class ComfyUIClient:
         if not base or not os.path.isdir(base):
             return  # 拿不到 input 目录（远端 ComfyUI 场景）则不校验，保持原行为
         changed = False
+
+        def _on_disk(item: dict, key_name: str) -> str:
+            rel = str(item.get(key_name) or item.get("fileName") or "") \
+                .replace("\\", "/").strip()
+            if not rel:
+                return ""
+            return rel if os.path.isfile(os.path.join(base, rel.replace("/", os.sep))) else ""
+
+        # ---- 公共参考图（global.refs）：缺一张即整体错位，必须显式报警 ----
+        _gbl = tl.get("global") or {}
+        if common_names is not None:
+            keep_common = []
+            _missing_common = []
+            for r in (_gbl.get("refs") or []):
+                if not isinstance(r, dict):
+                    keep_common.append(r)
+                    continue
+                rel = str(r.get("imageFile") or r.get("fileName") or "").replace("\\", "/").strip()
+                if not rel:
+                    continue
+                if _on_disk(r, "imageFile"):
+                    keep_common.append(r)
+                else:
+                    _missing_common.append(rel)
+            if _missing_common:
+                changed = True
+                _gbl["refs"] = keep_common
+                tl["global"] = _gbl
+                logger.error(
+                    "[H3-Director] 公共参考图 %s 尚未就位于 %s，已摘除 —— "
+                    "⚠️ 公共块少图会让后续所有 <Picture N> 编号整体错位（提示词与实际图不一致），"
+                    "本次产物请人工复核编号，必要时重跑该集", _missing_common, base)
+
         for i, seg in enumerate(segs_tl):
             keep_refs = []
             for r in (seg.get("refs") or []):
@@ -2845,7 +2898,8 @@ class ComfyUIClient:
         continuity: bool = True, continuity_overlap: int = None,
         export_mode: str = None, ref_max_size: int = None,
         seg_audios: Optional[List[List[str]]] = None,
-        audio_mode: str = None) -> dict:
+        audio_mode: str = None,
+        common_refs: Optional[List[str]] = None) -> dict:
         """Director 路径实现：一条 ``timeline_data`` 承载 N 段，返回结构对齐旧路径。
 
         与旧连续拼接路径的**语义差异（务必知道）**：
@@ -2858,6 +2912,22 @@ class ComfyUIClient:
           可选公共底图（``commonEnabled=true`` 时才 merge）。
         * 帧数用插件同一套换算（``max(5, round(sec*fps))`` → 17k+5 网格），
           因此 ``timeline.totalFrames`` 诚实等于各段实际帧数之和。
+
+        ⭐ ``common_refs``（2026-09-30 用户拍板）：**公共参考图**本地路径列表（有序）。
+        这些图**先于段级图上传**，成功者写进 ``timeline.global.refs``（index
+        ``0..K-1``）+ ``commonEnabled=true``；各段自带的 refs 由 builder 从 index
+        ``K`` 起编号 —— 与插件前端 ``batch.r2v.slotContinueHint``（「公共参数已占用
+        图片1–K；本组从图片 K+1 继续」）同一套约定。调用方（``app.py``）必须先按
+        同一顺序把公共项排进每段提示词的 ``<Picture 1..K>``（见
+        ``_h3_picture_defs``）。
+
+        ⚠️ 上传失败时的**退化路径**：公共图少上传成功一张，K 就会小于提示词里声明的
+        公共编号数，后面所有 ``<Picture N>`` 整体错位（**静默错图**，最坏那类）。
+        故此处一旦发现 ``K_eff != len(common_refs)``，就把公共图**内联**进每段 refs
+        最前（index 从 0 起）、并关掉 ``commonEnabled``：段内顺序
+        「公共 → 分镜 → 私有」与提示词编号**逐位一致**，只是不走 global 通道，
+        编号语义零变化；同时 warning 说明已退化。宁可少一次「显式声明」，
+        不可错位。
         """
         n = len(segs)
         emit_audio = H3_EMIT_AUDIO if emit_audio is None else bool(emit_audio)
@@ -2869,9 +2939,39 @@ class ComfyUIClient:
         if fps <= 0:
             fps = float(h3_director_builder.FPS_DEFAULT)
 
+        # ---------------- 公共参考图：先上传（H3 Director 公共参数，2026-09-30） ----------------
+        # ⚠️ 必须先于段级图：公共项的 index 是 0..K-1，段级项的 index 由 K 起 ——
+        #    只有先把 K 落实，段级编号才能算准（见 builder.build 的 seg_index_base）。
+        #    同一个本地路径跨镜共用很常见，故与段级共用一个 up_cache（跨段不重复上传）。
+        up_cache: Dict[str, Optional[str]] = {}
+        common_want: List[str] = []
+        for _cp in (common_refs or []):
+            _local = self.resolve_local_path(_cp)
+            if not _local or not os.path.exists(_local):
+                if _cp:
+                    logger.warning("[H3-Director] 公共参考图不可用，已跳过: %s", _cp)
+                continue
+            _dkey = os.path.normcase(os.path.normpath(os.path.abspath(_local)))
+            if _dkey in common_want:
+                continue
+            common_want.append(_dkey)
+        common_names: List[str] = []
+        for _key in common_want:
+            _val = self._upload_h3_director_ref(_key, up_cache)
+            if _val:
+                common_names.append(_val)
+        # K_eff < 声明数 → 公共块会整体少一位，后面所有 <Picture N> 静默错位。
+        # 退化为「内联公共图」：公共图搬进每段 refs 最前、index 从 0 起，编号语义不变。
+        inline_common = bool(common_want) and len(common_names) != len(common_want)
+        if common_want:
+            logger.info(
+                "[H3-Director] 公共参考图 %d 张（声明 %d）→ %s",
+                len(common_names), len(common_want),
+                "已内联进各段 refs（上传不全，退化为逐段携带）" if inline_common
+                else "走 global.refs + commonEnabled")
+
         # ---------------- 参考图：逐段解析 + 上传 ----------------
         # 同一个本地路径（跨镜共用同一张角色锚点图很常见）只上传一次。
-        up_cache: Dict[str, Optional[str]] = {}
         seg_ref_names: List[List[str]] = []
         empty_idx: List[int] = []
         for i, seg in enumerate(segs):
@@ -2979,8 +3079,18 @@ class ComfyUIClient:
                 _eff_audio_mode = "source"
             else:
                 _eff_audio_mode = "generate" if emit_audio else "mute"
+        # ⭐ 公共参考图走 global.refs（commonEnabled=true）时，段级 refs 的 index 必须
+        #    从 K 起（K = 公共张数）—— 否则 merge_indexed_refs 会按同 index 逐槽覆盖，
+        #    公共图一张不生效且**不报任何错**（见 h3_director_builder.build 的注释）。
+        #    退化路径（上传不全）：公共图内联进每段最前，index 从 0 起、不开 commonEnabled。
+        _use_global_common = bool(common_names) and not inline_common
+        _seg_refs_for_build = (
+            [list(common_names) + list(x or []) for x in seg_ref_names]
+            if inline_common else seg_ref_names)
         wf, layout = builder.build(
-            segs, seg_refs=seg_ref_names, seg_audios=seg_audio_names,
+            segs, seg_refs=_seg_refs_for_build, seg_audios=seg_audio_names,
+            refs=list(common_names) if _use_global_common else (),
+            common_enabled=_use_global_common,
             width=w, height=h, frame_rate=fps, seed=seed,
             filename_prefix=filename_prefix,
             continuity=bool(continuity), continuity_overlap=continuity_overlap,
@@ -2997,16 +3107,23 @@ class ComfyUIClient:
 
         # 提交前校验参考图/音频是否已落到 ComfyUI input/：消除「图未落地首采误报
         # no reference media」的竞态（详见 _drop_missing_director_refs）。正常全就位时 no-op。
-        self._drop_missing_director_refs(wf, seg_ref_names, seg_audio_names, n)
+        # ⚠️ 公共参考图也一起校验：global.refs 缺一张同样会让后续 <Picture N> 错位。
+        self._drop_missing_director_refs(wf, seg_ref_names, seg_audio_names, n,
+                                         common_names=(common_names
+                                                       if _use_global_common else None))
 
         if save_build_to:
             os.makedirs(os.path.dirname(save_build_to), exist_ok=True)
             with open(save_build_to, "w", encoding="utf-8") as f:
                 json.dump(wf, f, ensure_ascii=False)
             layout["build_path"] = save_build_to
+        layout["common_refs"] = list(common_names)
+        layout["common_inline"] = bool(inline_common)
         logger.info(
             f"H3(Director) 工作流已就绪：{n} 段 / {layout['total_frames']} 帧"
             f"（{layout['duration_sec']}s）/ 二采 {'开' if layout.get('refine_node') else '关'} / "
+            f"公共参考图 {len(common_names)} 张"
+            f"{'（内联退化）' if inline_common else ''} / "
             f"节点 {layout['node_total']} 连线 {layout['link_total']}")
 
         # ---------------- 落 API 并自检 ----------------
@@ -3083,26 +3200,50 @@ class ComfyUIClient:
                 "audio_mode": layout.get("audio_mode"),
                 "refs": layout.get("refs"),
                 "segment_refs": layout.get("segment_refs"),
-                "segment_audios": layout.get("segment_audios")}
+                "segment_audios": layout.get("segment_audios"),
+                # ---- 公共参考图（H3 Director 公共参数，2026-09-30）----
+                # common_refs = 实际生效的公共图（相对名，index 0..K-1）；
+                # common_inline=True 表示上传不全已退化为「逐段内联携带」，编号语义不变。
+                "common_refs": layout.get("common_refs") or [],
+                "common_inline": bool(layout.get("common_inline")),
+                "common_enabled": bool(layout.get("common_enabled"))}
 
     @staticmethod
     def _h3_picture_defs(char_refs: List[dict], scene_refs: List[dict],
                          storyboard_ref: dict = None, end_frame_ref: dict = None,
-                         item_refs: List[dict] = None):
+                         item_refs: List[dict] = None,
+                         common_refs: List[dict] = None):
         """把参考图列表映射成 H3 的 ``(<Picture N>, 用途说明)`` 与 ``<Subject N>`` 定义
 
-        语义约定：
-            storyboard_ref 非空 → <Picture 1> = 分镜图（构图/景别/机位/人物姿态基准）
+        返回 ``(picture_defs, subjects, storyboard_label)``。
+
+        语义约定（顺序即 ``<Picture N>`` 编号）：
+            common_refs 非空     → 先排**公共参考图**（H3 Director 公共参数）：``<Picture 1..K>``
+            storyboard_ref 非空 → 紧随其后 = 分镜图（构图/景别/机位/人物姿态基准）
                                   其后 = 本镜出场角色三视图（每人一张）+ 物品 + 场景
-            否则                 → <Picture 1..n> = 角色外观锚点，其后为场景环境参考
-            end_frame_ref 非空   → 追加 <Picture K> = 结束帧（尾帧），keyframe 模式用，
+            否则                 → ``<Picture 1..n>`` = 角色外观锚点，其后为场景环境参考
+            end_frame_ref 非空   → 追加 ``<Picture K>`` = 结束帧（尾帧），keyframe 模式用，
                                   让 Ref2VA 在首帧与尾帧之间插值（FL2V 首尾一致的软手段）
 
         2026-09-27 扩展：``char_refs`` 不再截断到 ``[:2]``，本镜**所有**出场角色
         每人一张三视图独立锚点；``item_refs`` 新增物品锚点（形状/材质/配色）。
-        分镜图（<Picture 1>）仍是构图基准，但角色身份/外观改由各自的三视图锚点
-        独立锁定（分镜图只承载构图/机位/姿态，不再当「唯一外观锚点」）——
-        解决「配角外观缺失/串味」与「物品走样」的质检重灾区。
+        分镜图（仅构图/机位/姿态基准）仍是构图基准，但角色身份/外观改由各自的三视图
+        锚点独立锁定（分镜图不再当「唯一外观锚点」）—— 解决「配角外观缺失/串味」与
+        「物品走样」的质检重灾区。
+
+        ⭐ 2026-09-30 ``common_refs``（H3 Director 公共参数，用户拍板）：
+        全段都在用、且用的是同一张图的资产（角色/物品/场景）。插件在
+        ``commonEnabled=true`` 时按槽位 index 把 ``global.refs`` merge 进每一段
+        （``director/plan.py:merge_indexed_refs``，同 index 段级优先）：公共项占
+        index ``0..K-1``、段级私有项从 index ``K`` 起。提示词侧**必须与槽位同序** ——
+        公共项排最前、编号 ``1..K`` 在全集恒定，分镜图与私有项排在后面。
+        「同一角色在整集里 Picture 编号不漂移」靠的就是这一处排序。
+
+        ⚠️ 第三个返回值 ``storyboard_label``：分镜图的标签**不再等于** ``<Picture 1>``
+        （公共块会占掉前面的编号），调用方必须把真实标签交给 ``h3_prompt_kit``，
+        否则「构图/景别以某图为基准」那句会指错图。旧实现靠「``<Picture 1>`` 在不在
+        picture_refs 里」硬判 —— 那是一条**隐含同序约定**，公共块一加入就静默失效，
+        正是本次把标签显式化的原因。无分镜图时返回空串。
 
         ⚠️ ``subjects`` 里的 ``picture`` 字段是给 ``h3_prompt_kit`` 用的**归属声明**：
         ``<Subject N> is X in <Picture M>`` 与 retention_analysis 的保留项措辞
@@ -3112,6 +3253,7 @@ class ComfyUIClient:
         """
         picture_defs: List[tuple] = []
         subjects: List[Dict[str, str]] = []
+        storyboard_label = ""
 
         def _appearance(ref: dict) -> str:
             return str(ref.get("appearance") or ref.get("description")
@@ -3120,20 +3262,47 @@ class ComfyUIClient:
         def _next_label() -> str:
             return f"<Picture {len(picture_defs) + 1}>"
 
+        def _char_desc(name: str) -> str:
+            # 有分镜图时角色是「三视图独立锚点」（2026-09-27 策略）；无分镜图时它同时
+            # 承担构图锚点，措辞不同（两句都与历史逐字一致，零回归）。
+            if storyboard_ref:
+                return (f"{name} 的三视图设定图，定义其面部身份、发型、体型、服装与画风，"
+                        f"并作为其出场镜头的身份锚点")
+            return (f"{name} 的外观参考，定义其五官、发型、服装与画风，"
+                    f"并作为其出场镜头的构图锚点")
+
+        # ---- 0) 公共参考图（H3 Director 公共参数）：必须排在段级图之前 ----
+        # 顺序即槽位：global.refs 的 index 0..K-1 → <Picture 1..K>，全段一致。
+        for _i, ref in enumerate(common_refs or []):
+            ref = ref or {}
+            name = str(ref.get("name") or "").strip() or f"公共资产{_i + 1}"
+            kind = str(ref.get("kind") or "").strip()
+            label = _next_label()
+            if kind == "scene":
+                picture_defs.append((
+                    label, f"{name} 的环境参考，定义场景结构、材质氛围与光照基调"))
+                continue
+            if kind == "item":
+                picture_defs.append((
+                    label, f"物品「{name}」的设定图，定义其形状、材质与配色"))
+            else:
+                # character（kind 缺省也走这里：公共池主体就是角色锚点）
+                picture_defs.append((label, _char_desc(name)))
+            subjects.append({"name": name, "appearance": _appearance(ref),
+                             "picture": label})
+
         if storyboard_ref:
             sb_name = storyboard_ref.get("name") or "本镜头分镜图"
-            # <Picture 1> = 分镜图（仅构图/机位/姿态基准）；角色外观改由各自三视图锚点锁定。
+            # 分镜图 = 构图/机位/姿态基准（角色外观由各自三视图锚点锁定）。
+            storyboard_label = _next_label()
             picture_defs.append((
-                "<Picture 1>",
+                storyboard_label,
                 f"该镜头的分镜图（{sb_name}），定义本镜的构图、景别、机位、环境与人物姿态基准"))
             # 本镜出场角色：每人一张三视图锚点（不再截断 [:2]），Subject 归属各自 <Picture M>。
             for ref in (char_refs or []):
                 name = ref.get("name", f"角色{len(subjects) + 1}")
                 label = _next_label()
-                picture_defs.append((
-                    label,
-                    f"{name} 的三视图设定图，定义其面部身份、发型、体型、服装与画风，"
-                    f"并作为其出场镜头的身份锚点"))
+                picture_defs.append((label, _char_desc(name)))
                 subjects.append({"name": name, "appearance": _appearance(ref),
                                  "picture": label})
             # 本镜物品：形状/材质/配色锚点（Subject 归属，走「材质/配色」保留语义）。
@@ -3159,19 +3328,16 @@ class ComfyUIClient:
                     end_frame_ref.get("desc") or
                     "该镜头的尾帧（结束画面），定义本镜结束时的构图、人物姿态与表情，"
                     "最后一帧必须落在本图上"))
-            return picture_defs, subjects
+            return picture_defs, subjects, storyboard_label
 
         for ref in (char_refs or []):
-            name = ref.get("name", f"角色{len(picture_defs) + 1}")
+            name = ref.get("name", f"角色{len(subjects) + 1}")
             label = _next_label()
-            picture_defs.append((
-                label,
-                f"{name} 的外观参考，定义其五官、发型、服装与画风，"
-                f"并作为其出场镜头的构图锚点"))
+            picture_defs.append((label, _char_desc(name)))
             subjects.append({"name": name, "appearance": _appearance(ref),
                              "picture": label})
         for ref in (item_refs or []):
-            name = ref.get("name", f"物品{len(picture_defs) + 1}")
+            name = ref.get("name", f"物品{len(subjects) + 1}")
             label = _next_label()
             picture_defs.append((
                 label,
@@ -3189,12 +3355,14 @@ class ComfyUIClient:
                 end_frame_ref.get("desc") or
                 "该镜头的尾帧（结束画面），定义本镜结束时的构图、人物姿态与表情，"
                 "最后一帧必须落在本图上"))
-        return picture_defs, subjects
+        return picture_defs, subjects, storyboard_label
+
 
     def resolve_h3_prompt(self, shot: dict, char_refs: List[dict],
                           scene_refs: List[dict], storyboard_ref: dict = None,
                           end_frame_ref: dict = None,
-                          item_refs: List[dict] = None) -> str:
+                          item_refs: List[dict] = None,
+                          common_refs: List[dict] = None) -> str:
         """生成期**权威**的 H3 提示词入口（修「薄英文顶掉结构化构建器」）
 
         择优规则：
@@ -3211,11 +3379,14 @@ class ComfyUIClient:
         end_frame_ref：可选，尾帧参考图信息（keyframe 模式），含 ``desc`` 用途说明；
         传入时把尾帧声明为 <Picture K> 并在提示词末拍锚定结束帧（FL2V 首尾一致）。
         item_refs：可选，本镜物品参考图（形状/材质/配色锚点，2026-09-27 扩展）。
+        common_refs：可选，**公共参考图**（H3 Director 公共参数，2026-09-30）：
+        全段都在用、且同一张图的资产，排在 ``<Picture 1..K>``；分镜图与私有项顺延。
+        见 :meth:`_h3_picture_defs`。
         """
         shot = shot or {}
-        picture_defs, subjects = self._h3_picture_defs(char_refs, scene_refs,
-                                                       storyboard_ref, end_frame_ref,
-                                                       item_refs)
+        picture_defs, subjects, sb_label = self._h3_picture_defs(
+            char_refs, scene_refs, storyboard_ref, end_frame_ref, item_refs,
+            common_refs)
         style = h3_prompt_kit.style_of(shot)
         # 尾帧标签：end_frame_ref 存在时，它是 picture_defs 里最后一张图
         end_label = ""
@@ -3235,11 +3406,13 @@ class ComfyUIClient:
                 existing if verdict["valid"] else h3_prompt_kit.merge_detail(built, existing))
         return h3_prompt_kit.clamp_h3_prompt(
             h3_prompt_kit.resolve(shot, picture_defs, subjects, style=style,
-                                  end_frame_ref=end_label))
+                                  end_frame_ref=end_label,
+                                  storyboard_ref_label=sb_label))
 
     def _build_h3_prompt(self, shot: dict, char_refs: List[dict], scene_refs: List[dict],
                          storyboard_ref: dict = None, end_frame_ref: dict = None,
-                         item_refs: List[dict] = None) -> str:
+                         item_refs: List[dict] = None,
+                         common_refs: List[dict] = None) -> str:
         """构建规范 H3 Ref2VA 提示词（无条件重建，忽略剧本里的既有 prompt_h3）
 
         需要一个「干净重建」的调用点时用它（例如风格纠偏重试）；日常生成请用
@@ -3247,11 +3420,13 @@ class ComfyUIClient:
 
         end_frame_ref：可选，尾帧参考图信息（keyframe 模式），含 ``desc`` 用途说明。
         item_refs：可选，本镜物品参考图（形状/材质/配色锚点，2026-09-27 扩展）。
+        common_refs：可选，公共参考图（H3 Director 公共参数，2026-09-30），
+        排在 ``<Picture 1..K>``，全段同序同编号；见 :meth:`_h3_picture_defs`。
         """
         shot = shot or {}
-        picture_defs, subjects = self._h3_picture_defs(char_refs, scene_refs,
-                                                       storyboard_ref, end_frame_ref,
-                                                       item_refs)
+        picture_defs, subjects, sb_label = self._h3_picture_defs(
+            char_refs, scene_refs, storyboard_ref, end_frame_ref, item_refs,
+            common_refs)
         style = h3_prompt_kit.style_of(shot)
         end_label = ""
         if end_frame_ref and picture_defs:
@@ -3263,4 +3438,5 @@ class ComfyUIClient:
                 h3_prompt_kit.build_base(shot, "T2VA", style=style))
         return h3_prompt_kit.clamp_h3_prompt(
             h3_prompt_kit.build_ref2va(shot, picture_defs, subjects, style=style,
-                                       end_frame_ref=end_label))
+                                       end_frame_ref=end_label,
+                                       storyboard_ref_label=sb_label))

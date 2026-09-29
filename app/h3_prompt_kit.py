@@ -689,7 +689,8 @@ def _style_opening(style: str) -> str:
 
 def build_detailed_description(shot: dict, duration: float, style: str = "",
                                picture_refs: Optional[Dict[str, str]] = None,
-                               end_frame_ref: str = "") -> str:
+                               end_frame_ref: str = "",
+                               storyboard_ref_label: str = "") -> str:
     """``detailed_description``：按 ``[Shot N]`` 逐节拍写画面（本地模板同格式）
 
     与本地手跑模板（``H3信号10段测试001.json``）对齐的要点：
@@ -709,6 +710,12 @@ def build_detailed_description(shot: dict, duration: float, style: str = "",
       作 ``Opening frame`` 前置声明、``motion`` 显式区分「摄影机运动 vs 画面内运动」、
       ``last_frame`` 作文字末态兜底（**仅在无 ``end_frame_ref`` 尾帧图时写入**，有图时图已锚定
       末态、不叠文字避免图文打架）。旧剧本三字段缺失 → 各段整块不出现，零回归。
+    - **构图基准改用 ``storyboard_ref_label`` 显式指定**（2026-09-30）：旧实现硬判
+      「``<Picture 1>`` 在不在 picture_refs 里」，等于把「分镜图 = 第 1 张参考图」
+      这个**隐含同序约定**写死在提示词侧 —— 一旦参考图序列前面多出公共参考图
+      （H3 Director 公共参数，分镜图会落到 ``<Picture K+1>``），构图基准就会指错图。
+      现在由调用方（``comfyui_client``，它知道 picture_defs 的实际顺序）把分镜图的
+      真实标签传进来；**不传时回退旧判据**，零回归。
     """
     camera = str(shot.get("camera") or "中景").strip()
     # A1：景别/运镜优先读权威字段（新剧本 shot_type / camera_motion）；旧剧本两字段为空 →
@@ -722,8 +729,15 @@ def build_detailed_description(shot: dict, duration: float, style: str = "",
     picture_refs = picture_refs or {}
     end_frame_ref = str(end_frame_ref or "").strip()
 
-    # 构图基准声明只挂在首节拍，后续节拍不必重复
-    first_ref = "<Picture 1>" if "<Picture 1>" in picture_refs else ""
+    # 构图基准声明只挂在首节拍，后续节拍不必重复。
+    # ⚠️ 标签必须**由调用方显式给出**（分镜图在 picture_defs 里的真实位置），
+    #    不能再靠「<Picture 1> 在不在」硬判 —— 公共参考图会让分镜图不再排第 1
+    #    （见本函数 docstring）。未传标签时才走旧判据（零回归）。
+    _sb_label = str(storyboard_ref_label or "").strip()
+    if _sb_label:
+        first_ref = _sb_label if _sb_label in picture_refs else ""
+    else:
+        first_ref = "<Picture 1>" if "<Picture 1>" in picture_refs else ""
 
     beats = _beats(shot, duration)
     spoken = _spoken_clause(lines, slots)
@@ -1055,7 +1069,8 @@ def build_summary(shot: dict, duration: float, subjects: Sequence[Dict[str, str]
 
 def build_ref2va(shot: dict, picture_defs: Sequence[Tuple[str, str]],
                  subjects: Sequence[Dict[str, str]] = (), duration: Any = None,
-                 style: str = "", end_frame_ref: str = "") -> str:
+                 style: str = "", end_frame_ref: str = "",
+                 storyboard_ref_label: str = "") -> str:
     """构建 Ref2VA 六段式提示词（有参考图时使用）
 
     end_frame_ref：可选，尾帧参考图的标签（如 ``<Picture 2>``）。提供时：
@@ -1063,6 +1078,11 @@ def build_ref2va(shot: dict, picture_defs: Sequence[Tuple[str, str]],
     - ``retention_analysis`` 追加尾帧保留声明。
     用于 keyframe 模式把「首帧 + 尾帧」两张图喂进 Ref2VA 后，用提示词把
     首尾一致性拉回来（Ref2VA 对参考图是软约束，需显式声明，2026-09-26）。
+
+    storyboard_ref_label：可选，**分镜图的真实标签**（如 ``<Picture 4>``）。
+    由调用方从 ``picture_defs`` 的实序里取，供 ``detailed_description`` 把
+    「构图/景别/人物站位以某图为基准」指向正确的图；不传时回退旧的
+    「``<Picture 1>``」硬判（零回归）。见 ``build_detailed_description``。
     """
     shot = shot or {}
     dur = duration if duration is not None else (shot.get("duration") or 5)
@@ -1084,7 +1104,8 @@ def build_ref2va(shot: dict, picture_defs: Sequence[Tuple[str, str]],
         ("retention_analysis", _retention_analysis(list(picture_defs), list(subjects),
                                                     style, shots, end_frame_ref)),
         ("detailed_description", build_detailed_description(shot, dur_f, style, pic_map,
-                                                            end_frame_ref)),
+                                                            end_frame_ref,
+                                                            storyboard_ref_label)),
         ("overall_soundscape", build_soundscape(shot)),
         ("non_diegetic_music", build_music(shot, style)),
     ]
@@ -1178,12 +1199,15 @@ def merge_detail(prompt: str, detail: str) -> str:
 
 def resolve(shot: dict, picture_defs: Sequence[Tuple[str, str]] = (),
             subjects: Sequence[Dict[str, str]] = (), duration: Any = None,
-            style: str = "", end_frame_ref: str = "") -> str:
+            style: str = "", end_frame_ref: str = "",
+            storyboard_ref_label: str = "") -> str:
     """生成期择优：合规的既有 ``prompt_h3`` 直接用，否则用构建器重建
 
     这是修「薄英文提示词把结构化构建器整个顶掉」的落点：
     - 既有提示词通过 :func:`validate`（六段/三段齐全）→ 尊重它（LLM 写的散文往往更生动）
     - 不合规（历史裸英文句、缺段）→ 用构建器产出规范提示词，并把旧文本并入细节
+
+    ``storyboard_ref_label``：分镜图的真实标签（见 :func:`build_ref2va`）。
     """
     shot = shot or {}
     style = str(style or shot.get("style") or "").strip()
@@ -1191,7 +1215,8 @@ def resolve(shot: dict, picture_defs: Sequence[Tuple[str, str]] = (),
 
     if picture_defs:
         built = build_ref2va(shot, picture_defs, subjects, duration=duration, style=style,
-                             end_frame_ref=end_frame_ref)
+                             end_frame_ref=end_frame_ref,
+                             storyboard_ref_label=storyboard_ref_label)
     else:
         built = build_base(shot, "T2VA", duration=duration, style=style)
 

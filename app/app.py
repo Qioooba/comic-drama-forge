@@ -39,6 +39,7 @@ from config import (
     CHARACTER_HALF_VIEWS,
     SCENE_VIEW_KEYS, SCENE_VIEW_LABELS, SCENE_VIEW_ANGLE_ZH,
     SCENE_ANGLE_TO_VIEW, SCENE_VIEWS_ENABLED, SCENE_VIEW_MAX_RETRIES,
+    H3_COMMON_REFS, H3_COMMON_REFS_MAX,
     PROJECT_DEFAULT_CONFIG,
 )
 from script_generator import ScriptGenerator
@@ -98,6 +99,8 @@ import tts_client
 import dub_mix
 import dialogue_utils
 import h3_prompt_kit
+import h3_common_refs
+import h3_director_builder
 import autonomous
 import cancellation
 import ai_memory
@@ -4023,6 +4026,158 @@ def _pick_scene_view(scene_payload: dict, shot) -> str:
     return _first_existing(*cands) or ""
 
 
+def _h3_shot_ref_components(shot: dict, char_idx: dict, item_idx: dict, scene_idx: dict,
+                            character_refs: list = None,
+                            main_char_img: list = None) -> list:
+    """把一个分镜解析成**有序参考图组件**（不构建提示词、不决定槽位）。
+
+    返回 ``[{"kind": "character"|"item"|"scene", "name": str,
+             "path": 本地路径, "appearance": str}, ...]``，
+    顺序恒为「角色 → 物品 → 场景」——与 ``comfyui_client._h3_picture_defs`` 里
+    三段的排放顺序一致（提示词的 ``<Picture N>`` 就按这个序推下去）。
+
+    ## 为什么要抽出来（2026-09-30，H3 Director 公共参考图）
+
+    「公共参考图」的判据是「全段都在用、且用的是同一张图」，要在 worker 循环**之前**
+    先把每个镜头的资产解析一遍才能求交集；而 ``_shot_segment`` 里原来那段解析是
+    内联的。两处各写一份必然漂移（公共池按 A 口径选、段级按 B 口径挂 → 公共图挂错镜）。
+    故收敛到本函数：公共池规划与段级挂图**共用同一份解析结果**，
+    并且解析只做一次（``_match_shot_chars`` / ``_resolve_item_names`` /
+    ``_resolve_scene_entry`` 都会往 ``shot["_ref_warnings"]`` 记账，
+    重复调用会把同一句告警记两遍）。
+
+    ⚠️ 解析口径必须是**逐镜对档**后的结果，不能退化成「资产的基准图」：
+      · 角色按景别取半身/全身档（``_pick_char_view``，2026-09-25「景别对档」）；
+      · 场景按机位取 front/left45/right45/top 档（``_pick_scene_view``，2026-09-29）。
+    公共池要的是「同一张图」，所以上图**按路径**判交集——档位不同的同一资产
+    天然不满足，这正是「公共锁定」不会把对档工作废掉的原因（见 h3_common_refs）。
+    """
+    if not isinstance(shot, dict):
+        return []
+    out: list = []
+
+    # ---- 本镜角色：每人一张（按景别对档），去重保序 ----
+    _want_half = _framing_wants_half_shot(shot)
+    _seen_paths: set = set()
+    for _mc in (_match_shot_chars(shot, char_idx) or []):
+        _entry = char_idx.get(_mc) or {}
+        _p = _pick_char_view(_entry, _want_half)
+        if not _p or _p in _seen_paths:
+            continue
+        _seen_paths.add(_p)
+        out.append({"kind": "character", "name": _mc, "path": _p,
+                    "appearance": _entry.get("appearance")
+                    or _entry.get("description") or ""})
+
+    # ---- 本镜物品（与角色图重复的丢弃，保持旧口径）----
+    for _it in (_resolve_item_names(shot, item_idx, "H3视频段") or []):
+        _entry = item_idx.get(_it) or {}
+        _p = _entry.get("image")
+        if not _p or _p in _seen_paths:
+            continue
+        _seen_paths.add(_p)
+        out.append({"kind": "item", "name": _it, "path": _p,
+                    "appearance": _entry.get("appearance")
+                    or _entry.get("description") or ""})
+
+    # ---- 本镜场景（按机位取档）----
+    _loc, _scene_entry = _resolve_scene_entry(shot, scene_idx, "H3视频段")
+    _scene_img = _pick_scene_view(_scene_entry, shot) if _scene_entry else None
+    if _scene_img:
+        out.append({"kind": "scene", "name": _loc or "本镜场景", "path": _scene_img,
+                    "appearance": ""})
+
+    # ---- 兜底：逐镜角色一张都没解析出来 → 退回全局主角锚点（保持原行为）----
+    # ⚠️ 旧实现把整个 refs 直接替换成 `[sb] + main_char_img`，于是本镜的**物品/场景锚点
+    #    连同「提示词已声明」一起被丢掉**（声明在、图不在 → 编号错位）。这里改成
+    #    「主角锚点排到最前、其余组件保留」，发送的图只多不少、且每一张都有声明。
+    # ⚠️ 旧实现是 `refs = [sb] + main_char_img` 但提示词只声明 1 个角色 —— 图比声明的多，
+    #    多出来的那张「有图无声明」（模型拿到一张没说用途的图）。这里按**实际张数**
+    #    逐个声明，把编号对齐。
+    if not any(c["kind"] == "character" for c in out) and main_char_img:
+        _ref0 = (character_refs or [{}])[0] if character_refs else {}
+        _nm = (_ref0.get("name") if isinstance(_ref0, dict) else None) or "主角"
+        _ap = (_ref0.get("appearance") or _ref0.get("description") or "") \
+            if isinstance(_ref0, dict) else ""
+        _fb = []
+        for _p in list(main_char_img):
+            if not _p or _p in _seen_paths:
+                continue
+            _seen_paths.add(_p)
+            _fb.append({"kind": "character", "name": _nm, "path": _p,
+                        "appearance": _ap})
+        out = _fb + out      # 角色在前（与 _h3_picture_defs 的段序一致，且保序）
+    return out
+
+
+def _h3_plan_common_refs(shots: list, char_idx: dict, item_idx: dict, scene_idx: dict,
+                         character_refs: list = None, main_char_img: list = None,
+                         sb_map: dict = None, use_storyboard: bool = True):
+    """按「全段都在用、且同一张图」挑出公共参考图（H3 Director 公共参数）。
+
+    返回 ``(common, comps_map)``：
+      · ``common``: 公共组件列表（顺序 = 第 1 镜的出现顺序，已按上限截断）；
+      · ``comps_map``: ``{shot_id: [组件, ...]}`` —— 每镜的解析结果，
+        供 ``_shot_segment`` 复用（避免解析两遍造成重复告警）。
+
+    ⚠️ 关掉开关或只有 1 个镜头时返回 ``([], {})``：**完全走原路径**，零行为变更。
+    单镜头（per_shot 重跑）没有「跨段公共」可言，硬开公共池只会把段级图挪到全局，
+    收益为零还多一层 ``commonEnabled`` 耦合。
+
+    ⚠️ **要求每个镜头都有分镜图**，否则整集公共化会被整体放弃（返回 ``([], {})``）：
+    公共图由客户端写进 ``global.refs``，它被 merge 进**每一段**，而提示词侧的
+    ``<Picture 1..K>`` 只有在「分镜图分支」（``sb_local`` 为真）才会被生成。
+    只要有一镜走了无分镜图的兜底分支，它的 ``<Picture N>`` 就从 1 起重新数，
+    与槽位（公共块从 0 起）整体错位 —— 那是**静默错图**，宁可不做这个特性。
+    """
+    if not H3_COMMON_REFS or len(shots or []) < 2:
+        return [], {}
+    _shots = [s for s in shots if isinstance(s, dict)]
+    # 逐镜解析结果按 shot_id 缓存复用（避免解析两遍），故 shot_id 必须唯一且非空 ——
+    # 一旦重复/缺失（历史剧本偶有），缓存会互相覆盖 → 公共池按 A 镜选、B 镜挂错图。
+    _ids = [str(s.get("shot_id") or "") for s in _shots]
+    if "" in _ids or len(set(_ids)) != len(_ids):
+        app.logger.warning(
+            "[H3公共参考图] 镜号缺失或重复（%s…）→ 放弃公共化（逐镜缓存需要唯一镜号）",
+            [x or "<空>" for x in _ids[:8]])
+        return [], {}
+    if sb_map is not None:
+        _missing_sb = [s.get("shot_id") for s in _shots
+                       if not (use_storyboard
+                               and sb_map.get(_norm_shot_key(s.get("shot_id"))))]
+        if _missing_sb:
+            app.logger.info(
+                "[H3公共参考图] %d 个镜头没有分镜图（%s…）→ 放弃公共化"
+                "（公共图会被 merge 进每一段，缺分镜图的段编号会整体错位）",
+                len(_missing_sb), _missing_sb[:5])
+            return [], {}
+    comps_map = {}
+    per_shot_assets = []
+    for _s in _shots:
+        _sid = str(_s.get("shot_id") or "")
+        _comps = _h3_shot_ref_components(_s, char_idx, item_idx, scene_idx,
+                                         character_refs, main_char_img)
+        comps_map[_sid] = _comps
+        per_shot_assets.append(_comps)
+    common = h3_common_refs.plan_common_refs(
+        per_shot_assets, max_common=H3_COMMON_REFS_MAX,
+        limit=h3_director_builder.MAX_REFERENCE_IMAGES)
+    if common:
+        app.logger.info(
+            "[H3公共参考图] %d 镜中 %d 项全段共用 → 走 global.refs + commonEnabled：%s",
+            len(per_shot_assets), len(common), h3_common_refs.describe(common))
+    else:
+        app.logger.info(
+            "[H3公共参考图] %d 镜无「全段都在用且同一张图」的资产 → 维持逐段 refs",
+            len(per_shot_assets))
+    return common, comps_map
+
+
+def _h3_is_common_comp(comp: dict, common_keys: set) -> bool:
+    """该组件是否属于公共池（身份键 = 种类 + 名称 + 图片路径，与 h3_common_refs 同源）。"""
+    return h3_common_refs.asset_key(comp) in common_keys
+
+
 def _allocate_storyboard_refs(shot: dict, char_idx: dict, item_idx: dict, scene_idx: dict,
                                project_name: str = None) -> list:
     """为单个镜头分配参考图（Qwen-Image-2.1 reference stack，最多 9 张）
@@ -5442,18 +5597,39 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
             app.logger.info(f"[keyframe] 尾帧就绪 {len(set(kf_end_map.values()))}/{len(shots)} 镜"
                             f"；链式模式 {_cm}，串帧 {sum(1 for v in kf_start_map.values() if v) // 2} 镜")
 
-        def _shot_segment(shot, seq, qc_cfg=None):
+        # H3 Director **公共参考图**（2026-09-30）：episode 模式会在循环前填这里
+        # （见 _h3_plan_common_refs）。per_shot 模式保持空 = 完全走原路径。
+        # ``_comps_map`` 让「公共池规划」与「段级挂图」共用同一份逐镜解析结果
+        # （重复解析会把 _ref_warnings 同一句告警记两遍，且两边口径可能漂移）。
+        _comps_map: dict = {}
+
+        def _shot_segment(shot, seq, qc_cfg=None, common=None, common_keys=None):
             """把一个分镜转成 H3 工作流的一个「段」（提示词 + 时长 + 参考图）
 
             keyframe 模式：参考图 = [首帧(分镜图), 尾帧]，让 H3 在两端之间插值运动；
             缺尾帧时自动退化为首帧单锚（并在返回值中标记，便于前端提示）。
+
+            ``common`` / ``common_keys``：本次提交的**公共参考图**（H3 Director 公共
+            参数，2026-09-30）。公共项由客户端写进 ``global.refs``（index
+            ``0..K-1``）+ ``commonEnabled=true``，因此：
+              · 提示词按 ``<Picture 1..K>`` **先声明公共项**（``common_refs=`` 传给
+                ``comfyui_client._h3_picture_defs``）；
+              · 本段 ``reference_images`` **不含**公共项 —— 同一张图挂两处会被插件
+                按 index 当成两张（槽位白白翻倍，还可能挤掉本镜自己的锚点）；
+              · 9 槽预算先扣掉 K，再留给「分镜图 + 本镜资产」。
+            不传（默认）＝完全走原路径，零行为变更。
             """
             sid = shot.get('shot_id')
             sb_local = sb_map.get(_norm_shot_key(sid)) if use_storyboard else None
+            _c_keys = common_keys if common_keys is not None else set()
+            _c_refs = []          # 公共项的「提示词载荷」（kind/name/appearance）
+            if common:
+                _c_refs = [dict(c) for c in common]
             # 按镜匹配的参考图 refs（供提示词构建），非 sb_local 分支默认走全局 refs
             _shot_char_refs = character_refs
             _shot_item_refs = []
             _shot_scene_refs = scene_refs
+            _seg_comps = []       # 本段**私有**组件（不含公共项）
             if mode == 'keyframe' and sb_local:
                 sb_local = sb_map.get(_norm_shot_key(seq)) or sb_map.get(
                     f"shot_{seq:02d}") or sb_local
@@ -5462,65 +5638,50 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
                            or kf_start_map.get(f"shot_{seq:02d}") or sb_local)
                 end_p = kf_end_map.get(str(sid)) or kf_end_map.get(f"shot_{seq:02d}")
                 refs = [start_p] + ([end_p] if end_p else [])
+                # ⚠️ keyframe 的 refs 是「首帧+尾帧」两句式，与 char/item/scene 三段式
+                #    声明不是同一套编号，公共块不参与（公共池在 _h3_plan_common_refs
+                #    已按 mode 前置挡掉，见 episode 分支的调用点）。
+                _c_refs = []
             elif sb_local:
                 # 2026-09-27「分镜 + 本镜资产」参考图策略：分镜图(构图基准) +
                 # 本镜出场角色三视图(每人一张) + 本镜物品 + 场景图。
                 # H3 Director 每段最多 9 张（ref_image_0..8），去掉旧的「上限 2 张」保守限制。
-                _matched_chars = _match_shot_chars(shot, char_idx)
-                # 本镜角色参考图（每人一张，景别对档取半身/全身）
-                _want_half = _framing_wants_half_shot(shot)
-                _shot_char_imgs = []
-                _shot_char_refs = []      # 供提示词构建（含 name/appearance）
-                for _mc in (_matched_chars or []):
-                    _p = _pick_char_view(char_idx.get(_mc) or {}, _want_half)
-                    if _p and _p not in _shot_char_imgs:
-                        _shot_char_imgs.append(_p)
-                        _entry = char_idx.get(_mc) or {}
-                        _shot_char_refs.append({
-                            "name": _mc,
-                            "appearance": _entry.get("appearance")
-                            or _entry.get("description") or ""})
-                # 本镜物品参考图
-                _items_in = _resolve_item_names(shot, item_idx, "H3视频段")
-                _shot_item_imgs = []
-                _shot_item_refs = []
-                for _it in _items_in:
-                    _p = (item_idx.get(_it) or {}).get("image")
-                    if _p and _p not in _shot_item_imgs and _p not in _shot_char_imgs:
-                        _shot_item_imgs.append(_p)
-                        _entry = item_idx.get(_it) or {}
-                        _shot_item_refs.append({
-                            "name": _it,
-                            "appearance": _entry.get("appearance")
-                            or _entry.get("description") or ""})
-                # 场景参考图
-                _loc, _scene_entry = _resolve_scene_entry(shot, scene_idx, "H3视频段")
-                # 与分镜同口径：按本镜机位取场景档（视频段继承分镜的机位意图）
-                _scene_img = _pick_scene_view(_scene_entry, shot) if _scene_entry else None
-                _shot_scene_refs = ([{"name": _loc, "appearance": ""}]
-                                    if _scene_img else [])
-                refs = [sb_local] + _shot_char_imgs + _shot_item_imgs + \
-                    ([_scene_img] if _scene_img else [])
-                if not _shot_char_imgs:
-                    # 兜底：逐镜角色匹配失败时回退到全局主角锚点（保持原行为）
-                    refs = [sb_local] + main_char_img
-                    _shot_char_refs = (character_refs[:1]
-                                       if character_refs else [])
-                # ⭐ 9 张上限：H3 Director 每段 ref_image_0..8（与
-                # h3_director_builder.MAX_REFERENCE_IMAGES=9 保持一致）。超出时按
-                # 「角色→物品→场景」优先级截断（分镜图恒保留），并同步截断提示词的
-                # char/item/scene refs，避免「提示词声明的 <Picture N> > 实际传入的图」错位。
-                _max_refs = 9
-                if len(refs) > _max_refs:
-                    refs = refs[:_max_refs]
-                    _kept = _max_refs - 1  # 分镜图占 1 张
-                    _shot_char_refs = _shot_char_refs[:_kept]
-                    _kept -= len(_shot_char_refs)
-                    _shot_item_refs = _shot_item_refs[:_kept] if _kept > 0 else []
-                    _kept -= len(_shot_item_refs)
-                    _shot_scene_refs = _shot_scene_refs[:_kept] if _kept > 0 else []
+                # 2026-09-30：解析收敛到 _h3_shot_ref_components（公共池规划与段级挂图
+                # 共用同一份结果），并在这里把**公共项摘掉**（它们由客户端走 global.refs）。
+                _comps = (_comps_map.get(str(sid))
+                          if isinstance(_comps_map, dict) else None)
+                if _comps is None:
+                    _comps = _h3_shot_ref_components(shot, char_idx, item_idx, scene_idx,
+                                                     character_refs, main_char_img)
+                _seg_comps = [c for c in _comps if not _h3_is_common_comp(c, _c_keys)]
+                _shot_char_refs = [c for c in _seg_comps if c.get("kind") == "character"]
+                _shot_item_refs = [c for c in _seg_comps if c.get("kind") == "item"]
+                _shot_scene_refs = [c for c in _seg_comps if c.get("kind") == "scene"]
+                # ⭐ 槽位预算：9 格总量里先扣公共块（K 张），再扣分镜图 1 张，
+                #    剩下的才是本镜资产的额度。超出按「角色→物品→场景」截断
+                #    （分镜图恒保留），并同步截断提示词的 char/item/scene refs，
+                #    避免「声明的 <Picture N> > 实际传入的图」错位。
+                _own_room = max(0, h3_director_builder.MAX_REFERENCE_IMAGES
+                                - len(_c_refs) - 1)
+                if len(_seg_comps) > _own_room:
+                    _dropped = len(_seg_comps) - _own_room
+                    _seg_comps = _seg_comps[:_own_room]
+                    _shot_char_refs = [_c for _c in _seg_comps
+                                       if _c.get("kind") == "character"]
+                    _shot_item_refs = [_c for _c in _seg_comps
+                                       if _c.get("kind") == "item"]
+                    _shot_scene_refs = [_c for _c in _seg_comps
+                                        if _c.get("kind") == "scene"]
+                    app.logger.warning(
+                        "[H3公共参考图] 镜头 %s：公共 %d 张 + 分镜图占位后，本镜资产"
+                        "可挂 %d 张，已按「角色→物品→场景」丢弃 %d 项",
+                        sid, len(_c_refs), _own_room, _dropped)
+                refs = [sb_local] + [c["path"] for c in _seg_comps]
             else:
+                # 无分镜图的兜底分支：编号从 1 起重新数，公共块不参与
+                # （_h3_plan_common_refs 已要求全镜有分镜图，故开启公共时走不到这里）。
                 refs = ref_imgs
+                _c_refs = []
             try:
                 dur = float(shot.get('duration') or 5)
             except (TypeError, ValueError):
@@ -5541,20 +5702,25 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
             for _si, _sub in enumerate(_seg_shots):
                 _sub_dur = float(_sub.get("duration") or dur)
                 # 提示词按子段重建（keyframe / reference 两条参考图分支共用同一构建入口）
+                # ``common_refs=_c_refs``：公共参考图排在 ``<Picture 1..K>``，与客户端写进
+                # ``global.refs`` 的槽位 0..K-1 同序同编号（H3 Director 公共参数）。
                 if mode == 'keyframe' and sb_local:
                     _sub_prompt = comfyui_client._build_h3_prompt(
                         _sub, _shot_char_refs, _shot_scene_refs,
                         storyboard_ref={"name": f"shot_{sid}"},
-                        item_refs=_shot_item_refs)
+                        item_refs=_shot_item_refs,
+                        common_refs=_c_refs)
                 elif sb_local:
                     _sub_prompt = comfyui_client._build_h3_prompt(
                         _sub, _shot_char_refs, _shot_scene_refs,
                         storyboard_ref={"name": f"shot_{sid}"},
-                        item_refs=_shot_item_refs)
+                        item_refs=_shot_item_refs,
+                        common_refs=_c_refs)
                 else:
                     _sub_prompt = comfyui_client.resolve_h3_prompt(
                         _sub, _shot_char_refs, _shot_scene_refs,
-                        item_refs=_shot_item_refs)
+                        item_refs=_shot_item_refs,
+                        common_refs=_c_refs)
                 # ---- 提示词预检（生成前质检）----
                 # ⚠️ 这里**只自愈 + 记录，不阻断**：整集模式一次提交 N 段，为一条提示词的问题把
                 #    整集生成打断，代价远大于收益；且 H3 提示词由构建器产出、结构必然齐全，
@@ -5611,10 +5777,25 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
             qc_declared = bool(qc_cfg.get("enabled") and qc_cfg.get("video_enabled"))
             max_retries = int(qc_cfg.get("max_retries", 0)) if qc_on else 0
             segs, shot_meta_map = [], []
+            # ⭐ H3 Director 公共参考图（2026-09-30，用户拍板）：整集里「每一段都在用、
+            #    且用的是同一张图」的资产走插件公共参数（global.refs + commonEnabled），
+            #    使同一资产的 <Picture N> 在全集恒定（不再随每镜声明顺序漂移），
+            #    也让「公共用哪些资产」在工作流 JSON 里显式可查。
+            #    ⚠️ keyframe 模式的 refs 是「首帧+尾帧」两句式（与 char/item/scene 三段式
+            #    声明不是同一套编号），公共块不参与 —— 故该模式整集放弃公共化。
+            _common = []
+            if mode != 'keyframe':
+                _common, _comps_map = _h3_plan_common_refs(
+                    shots, char_idx, item_idx, scene_idx,
+                    character_refs=character_refs, main_char_img=main_char_img,
+                    sb_map=sb_map, use_storyboard=use_storyboard)
+            _common_keys = {h3_common_refs.asset_key(c) for c in _common}
+            _common_keys.discard(None)
             for i, shot in enumerate(shots):
                 shot_id = shot.get('shot_id', i + 1)
                 seq = _shot_seq(shot_id, i + 1)
-                seg, sb_local = _shot_segment(shot, seq, qc_cfg)
+                seg, sb_local = _shot_segment(shot, seq, qc_cfg,
+                                              common=_common, common_keys=_common_keys)
                 # ⚠️ 整集模式**每个分镜可能产出多个段**（长镜切段，见 _shot_segment）。
                 # 必须 extend 而非 append：H3 工作流段数 = len(segments)，少一段就等于
                 # 该镜只生成了一半时长；且段顺序即时间轴顺序，extend 保持镜头内子段连续。
@@ -5780,6 +5961,10 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
                 qc_style=eff_style,
                 max_retries=max_retries,
                 qc_stop_cb=(_ep_qc_stop_cb if qc_on else None),
+                # ⭐ 公共参考图（有序本地路径）：客户端先上传 → 写 global.refs
+                #   （index 0..K-1）+ commonEnabled=true → 各段的 reference_images
+                #   从 index K 起编号。顺序必须与提示词里的 <Picture 1..K> 一致。
+                common_refs=[c["path"] for c in _common if c.get("path")],
             )
             files = result.get("files") or []
             episode_failed = bool(result.get("failed"))
@@ -5846,6 +6031,11 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
                     "attempts_used": attempts_used,
                     "path": dst, "url": f"{_vurl}/{ep_name}",
                     "shots": shot_meta_map,
+                    # 公共参考图（H3 Director 公共参数）：名字列表，便于前端/排查时
+                    # 一眼看到「本集把哪几项锁成公共底图」（2026-09-30）。
+                    "common_refs": [c.get("name") for c in _common],
+                    "common_enabled": bool(_common) and not result.get("common_inline"),
+                    "common_inline": bool(result.get("common_inline")),
                     "qc": _qc_summary([], qc_declared, qc_on, max_retries),
                     "qc_results": qc_results,
                     "prompt_id": result.get("prompt_id")}

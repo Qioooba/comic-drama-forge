@@ -443,6 +443,25 @@ H3_AUDIO_SOURCE = _env_bool("H3_AUDIO_SOURCE", False)
 #   True  = 维持完整二采链（1088×720 latent 补采样）。
 H3_ENABLE_REFINE = _env_bool("H3_ENABLE_REFINE", False)
 
+# H3 Director **公共参考图**（2026-09-30 用户拍板：默认开）。
+#   True  = 一次提交里**每一段都在用、且用的是同一张图**的资产（角色/物品/场景）
+#           走插件公共参数（``timeline.global.refs`` + ``commonEnabled=true``），
+#           占槽位 index 0..K-1 且全段编号恒定；各段自带的私有项从 index K 起。
+#           收益：同一资产的 ``<Picture N>`` 在整集里一致（不再随每镜声明顺序漂移），
+#           且「公共用哪些资产」在工作流 JSON 里显式可查（便于人工排查）。
+#           ⚠️ 判据是**交集**（全段都在）+ **图片路径一致**，不是「出场多」：
+#              公共图会被 merge 进每一段，放一个只在部分镜头出场的配角进去，
+#              其余镜头都会多出它的锚点（模型会把锚点里的人画进画面）。
+#              路径一致的要求也不能省 —— 角色按景别取半身/全身档、场景按机位取
+#              四档，只按资产名判交集会把某一镜的档位焊死给全集，等于废掉
+#              2026-09-25「景别对档」与 2026-09-29「场景按机位出图」两轮工作。
+#   False = 完全走原路径（逐段 refs 从 index 0 起，``commonEnabled=false``）。
+#           一键回退用，不改任何其它口径。
+H3_COMMON_REFS = _env_bool("H3_COMMON_REFS", True)
+# 公共池上限（槽位）：9 格总量里要给「1 张分镜图 + 至少 1 个段级私有项」留位，
+# 故实际生效值被 clamp 到 ``H3_COMMON_REFS_MAX <= 9 - 2 = 7``（见 h3_common_refs.plan_common_refs）。
+H3_COMMON_REFS_MAX = max(0, _env_int("H3_COMMON_REFS_MAX", 6))
+
 # AI 对话（创作总控）：多轮对话历史 + 已生效的项目创作设定
 AI_CHAT_DIR = os.path.join(PROJECT_OUTPUT_DIR, "ai_chat")
 AI_CHAT_HISTORY_PATH = os.path.join(AI_CHAT_DIR, "chat_history.json")
