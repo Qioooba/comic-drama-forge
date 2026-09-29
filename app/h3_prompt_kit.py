@@ -542,6 +542,11 @@ _CAMERA_EN = {
     "特写": "A close-up",
     "大特写": "An extreme close-up",
     "微距": "A macro close-up",
+    # 局部（插入镜）：只拍手部/道具/身体局部，不出现完整人脸。参考片 92 镜拆解里
+    # 「局部」是主力景别（第 8/16/19/25/28/31/35/37/38/42/50/65/67/72/76/78/88/90/92 镜），
+    # 旧口径下表达不出来。取值与 config.SHOT_TYPES / SHOT_CAMERA_SPECS 对齐（本模块
+    # 刻意零项目依赖、保持纯函数，故此处是**镜像表**，由 verify_shot_type_registry.py 守卫对齐）。
+    "局部": "A detail shot",
     # ---- 「运镜在前」的复合词（术语表里 real 存在，如 handheld close-up）----
     # ⚠️ 必须放进来：:func:`_camera_en` 是**子串**匹配，``手持跟拍`` 里没有景别词，
     #    不加这几条就会返回空串 → 景别整段丢失（实测 ``手持跟拍`` 曾翻成 ``''``）。
@@ -617,6 +622,47 @@ _CAMERA_MOVE_EN = {
     "手持": "with a subtle handheld shake that keeps the frame alive",
     "俯冲": "with a fast downward push into the scene",
     "仰冲": "with a fast upward push into the scene",
+    # ---- 强度/方式变体（参考片 92 镜拆解的真实写法：轻推/轻摇/跟随/轻手持）----
+    # ⚠️ 为什么必须逐条列出：词典是「子串命中」，但命中的必须是**词表里的整颗词**。
+    #    旧词表里没有「轻推」「轻摇」「跟随」—— 于是参考片里占非固定运镜绝大多数的
+    #    这三个词**整段翻译失败**（返回空串），提示词里运镜一个字母都没有，模型只能
+    #    自行猜运动（「出片运镜随机」的直接原因）。此处补全 + 下方 _MOVE_CORE 兜底。
+    "跟随": "the camera tracks the subject and keeps pace with the movement",
+    "跟移": "the camera tracks the subject and keeps pace with the movement",
+    "轻推": "with a gentle dolly-in toward the subject",
+    "缓推": "with a slow dolly-in toward the subject",
+    "慢推": "with a slow dolly-in toward the subject",
+    "推近": "with a slow dolly-in toward the subject",
+    "轻摇": "with a gentle horizontal pan across the scene",
+    "缓摇": "with a slow horizontal pan across the scene",
+    "慢摇": "with a slow horizontal pan across the scene",
+    "上摇": "with a smooth upward tilt across the scene",
+    "下摇": "with a smooth downward tilt across the scene",
+    "甩镜": "with a fast whip pan across the scene",
+    "轻移": "with a gentle lateral tracking move alongside the subject",
+    "横移": "with a lateral tracking move alongside the subject",
+    "左移": "with a lateral tracking move to the left",
+    "右移": "with a lateral tracking move to the right",
+    "拉出": "with a slow dolly-out away from the subject",
+    # ---- 「固定/定格」的口语变体与剪辑转场词（2026-09-29 按 106 份真实剧本统计补）----
+    # 实测「定拍 / 静止 / 静态 / 定帧 / 快切 / 叠化」共 30+ 个镜头：不补这些词，
+    # 它们与「轻推 / 跟随」一样**整段丢运镜**（返回空串）→ 模型自行猜运动。
+    # 注意分工：**术语表（continuity.CAMERA_TERMS）只放规范词**给模型取词，
+    # 词典在这里**宽容收编**真实写法 —— 两端职责不同，不要为了收编而放宽术语表。
+    # 「快切 / 叠化 / 硬切」是**剪辑层**转场：单段生成里表达不了「切」，本段一律锁死
+    # 机位并显式声明段内不动（切点由成片剪辑完成）。
+    "定拍": "the camera stays locked off on a fixed tripod",
+    "静止": "the camera stays locked off on a fixed tripod",
+    "静态": "the camera stays locked off on a fixed tripod",
+    "定帧": "the frame freezes on a held moment",
+    "快切": ("the camera stays locked off on a fixed tripod, with no camera "
+             "move inside this segment"),
+    "叠化": ("the camera stays locked off on a fixed tripod, with no camera "
+             "move inside this segment"),
+    "硬切": ("the camera stays locked off on a fixed tripod, with no camera "
+             "move inside this segment"),
+    "切镜": ("the camera stays locked off on a fixed tripod, with no camera "
+             "move inside this segment"),
     # ---- 机位/角度（与景别正交，qc_client 剧本 QC 明确要求「机位与景别正交」）----
     "俯拍": "shot from a high angle looking down on the subject",
     "俯视": "shot from a high angle looking down on the subject",
@@ -632,21 +678,142 @@ _CAMERA_MOVE_EN = {
 }
 
 
-def _camera_move_en(camera: str) -> str:
+#: 机位/角度类词条（与「运镜」正交，二者可同时出现）。
+#:
+#: ⚠️ 必须与运动类词条**分开检索**：旧实现把两类词放在同一张表里做「最长词优先」
+#: 子串匹配，「俯拍缓推」会先命中「俯拍」（机位）→ 真正的运镜「缓推」被整段吞掉，
+#: 提示词里只剩「高角度俯视」，镜头**怎么动一个字都没有**。
+_CAMERA_ANGLE_KEYS = ("俯拍", "俯视", "仰拍", "仰视", "平视", "斜角", "侧面", "侧拍",
+                      "背拍", "过肩", "主观")
+
+#: 运镜**强度/方式**修饰词 → 英文副词（长词优先）。
+#: 真实剧本与参考片里「轻推 / 轻摇 / 缓推 / 慢摇 / 急推 / 轻手持」这类带程度的写法
+#: 占非固定运镜的多数，而旧词典只认不带修饰的规范词（推入 / 摇镜 / 跟拍）。
+_MOVE_INTENSITY = (
+    ("轻轻", "very gently"),
+    ("缓缓", "slowly"),
+    ("徐徐", "slowly"),
+    ("轻", "gently"),
+    ("缓", "slowly"),
+    ("慢", "slowly"),
+    ("急", "quickly"),
+    ("猛", "forcefully"),
+    ("快", "quickly"),
+)
+
+#: 运镜**核心动作**兜底表 (核心词, 默认副词, 英文模板)；模板里的 {how} 由
+#: :data:`_MOVE_INTENSITY` 命中值或默认副词填充。
+#:
+#: 为什么要有这一层：词典永远追不上真实写法（「缓缓下摇」「轻微横移」「推近」…）。
+#: **认得出核心动作就绝不丢运镜**；只有连核心动作都认不出才告警 ——
+#: 「静默丢运镜 → 模型自行猜 → 出片运镜随机」是历史根因，丢失必须可见。
+_MOVE_CORE = (
+    ("推", "steady", "with a {how} dolly-in toward the subject"),
+    ("拉", "steady", "with a {how} dolly-out away from the subject"),
+    ("摇", "smooth", "with a {how} horizontal pan across the scene"),
+    ("移", "steady", "with a {how} lateral tracking move alongside the subject"),
+    ("跟", "", "the camera tracks the subject and keeps pace with the movement"),
+    ("升降", "", "with a vertical crane move through the space"),
+    ("环绕", "", "with a slow orbiting move around the subject"),
+    ("旋转", "", "with a slow orbiting move around the subject"),
+    ("变焦", "", "with a slow zoom that tightens the framing"),
+    ("手持", "", "with a subtle handheld shake that keeps the frame alive"),
+    ("升", "", "with a rising crane move upward"),
+    ("降", "", "with a descending crane move downward"),
+)
+
+#: 只表示「取景 / 机位 / 空镜 / 转场」而**不含运动含义**的词。
+#: 仅用于回答「认不出运镜时要不要告警」：整串都是这类词 → 本镜就是没有运镜，
+#: 静默返回空串（不瞎猜、也不刷日志）；还有剩余成分才说明是**没认出来的运镜写法**，
+#: 那才是必须可见的丢失。
+_FRAMING_ONLY_WORDS = tuple(_CAMERA_EN) + ("中近景", "局部", "空镜", "全黑", "转场",
+                                           "黑场", "微距", "大特写",
+                                           "广角", "广景", "超广角", "大全景")
+
+#: 段间运镜延续声明。同一镜头被切成多段时，只有**首段**重新声明运镜起手；
+#: 其余段必须显式写成「同一运镜继续」，否则 H3 会在每一段重新起步 ——
+#: 观感就是「推一半跳回起点再推」「跟一半跳回起点再跟」。
+_MOVE_CONTINUE_EN = ("continuing the same camera move from the previous moment — "
+                     "carry it forward from where it left off; do not restart, reset "
+                     "or cut the camera move")
+
+
+def _move_core_en(camera: str) -> str:
+    """核心动作兜底：强度副词 + 核心动作 拼出运镜从句；认不出返回空串。"""
+    t = str(camera or "").strip()
+    if not t:
+        return ""
+    how = ""
+    for zh, adv in sorted(_MOVE_INTENSITY, key=lambda x: len(x[0]), reverse=True):
+        if zh in t:
+            how = adv
+            break
+    for zh, default_how, tpl in sorted(_MOVE_CORE, key=lambda x: len(x[0]), reverse=True):
+        if zh in t:
+            return tpl.format(how=how or default_how)
+    return ""
+
+
+def _camera_move_en(camera: str, continuation: bool = False) -> str:
     """运镜 → 英文从句；认不出返回空串（宁可不说，也不瞎猜运镜）
 
-    ⚠️ 匹配顺序：**长词优先**。``升降`` 必须比 ``升``/``降`` 先命中，否则
-    「全景升降」会被 ``升`` 抢先翻成「rising crane move」而丢掉「降」。
-    同样 ``推入``/``推进`` 要先于 ``推镜`` 之外的单字 ``推`` 判定。
+    三层匹配，逐层兜底：
+
+    ① **运动词表**（最长词优先，**排除机位词**）—— 历史取值逐字不变；
+    ② **核心动作兜底**（推/拉/摇/移/跟/升降/环绕/变焦/手持 + 强度副词）——
+       「缓缓下摇」「轻微横移」「推近」这类词典追不上的写法也能落到运镜；
+    ③ **机位词并行追加**（俯拍/仰拍/过肩…）—— 与运动**正交**，不再互相吞掉。
+
+    continuation=True：本段不是镜头的第一段 → 追加「同一运镜继续、不得重启」
+    声明（见 :data:`_MOVE_CONTINUE_EN`），避免每 4 秒把运镜从头再来一遍。
+
+    ⚠️ 匹配顺序：**长词优先**。「升降」必须比「升」/「降」先命中，否则
+    「全景升降」会被「升」抢先翻成「rising crane move」而丢掉「降」。
+    同样「推入」/「推进」要先于「推镜」之外的单字「推」判定。
+
+    ⚠️ 三层全落空时**必须打 warning**：静默丢弃运镜会让模型自行猜运动 ——
+    这是「出片运镜随机」的历史根因，丢失必须在日志里可见。
     """
     t = str(camera or "").strip()
     if not t:
         return ""
-    # 已经是英文（调用方直接给英文运镜）→ 原样用，避免被中文表误伤
-    for zh in sorted(_CAMERA_MOVE_EN, key=len, reverse=True):
+    _angles = set(_CAMERA_ANGLE_KEYS)
+    # ① 运动词表（最长词优先；机位词留给第 ③ 层，二者互不吞并）
+    move = ""
+    for zh in sorted((k for k in _CAMERA_MOVE_EN if k not in _angles),
+                     key=len, reverse=True):
         if zh in t:
-            return _CAMERA_MOVE_EN[zh]
-    return ""
+            move = _CAMERA_MOVE_EN[zh]
+            break
+    # ② 核心动作兜底（「轻推近」「缓缓下摇」这类词典外的写法）
+    if not move:
+        move = _move_core_en(t)
+    # ③ 机位并行追加（与运动正交：俯拍缓推 = 高角度 + 缓推，两条都留下）
+    angle = ""
+    for zh in sorted(_angles, key=len, reverse=True):
+        if zh in t:
+            angle = _CAMERA_MOVE_EN[zh]
+            break
+    parts = [p for p in (move, angle) if p]
+    if not parts:
+        # 纯景别/机位（中景、近景、俯拍、空镜…）本来就没有运镜 → 静默返回空串。
+        # 只有「剥掉景别与机位词后仍有剩余」才说明这是一条**没认出来的运镜写法**，
+        # 那种丢失必须告警（模型会自行猜运动）。
+        _residual = t
+        for _zh in sorted(_FRAMING_ONLY_WORDS, key=len, reverse=True):
+            _residual = _residual.replace(_zh, "")
+        for _zh in sorted(_angles, key=len, reverse=True):
+            _residual = _residual.replace(_zh, "")
+        if _residual.strip(" /·、,，。+&"):
+            logger.warning(
+                "运镜无法翻译（模型只能自行猜运动，出片运镜会随机）：%r —— "
+                "请在 h3_prompt_kit._CAMERA_MOVE_EN / _MOVE_CORE 补该写法，"
+                "或让剧本改用术语表内的运镜词", t)
+        return ""
+    clause = ", ".join(parts)
+    if continuation:
+        clause = f"{clause} ({_MOVE_CONTINUE_EN})"
+    return clause
 
 
 def _mid_sentence(clause: str) -> str:
@@ -723,8 +890,11 @@ def build_detailed_description(shot: dict, duration: float, style: str = "",
     # 回退整个 camera 复合串，行为与改动前逐字一致（零回归）。
     _st = str(shot.get("shot_type") or "").strip()
     _mo = str(shot.get("camera_motion") or "").strip()
+    # 段间运镜延续（segment_shot 置位）：非首段必须声明「同一运镜继续」，
+    # 否则 H3 会在每 4 秒的子段重新起步 —— 观感是「推一半跳回起点再推」。
+    _seg_continue = bool(shot.get("_seg_continue"))
     camera_en = _camera_en(_st or camera)
-    camera_move = _camera_move_en(_mo or camera)
+    camera_move = _camera_move_en(_mo or camera, continuation=_seg_continue)
     lines = dialogue_lines(shot.get("dialogue"))
     slots = speaker_slots(lines)
     picture_refs = picture_refs or {}
@@ -813,10 +983,13 @@ def build_detailed_description(shot: dict, duration: float, style: str = "",
     # ⚠️ 与句首 camera_move（景别+运镜复合词）不同处：这里是**本镜整体运动定性**，
     # 句首是逐拍镜头声明；两者互补不重复（句首不写本镜无运镜时的画面内动作）。
     if _motion:
+        # 非首段：同一条运动是**延续**而非重新开始（与句首 camera_move 的延续声明同源）。
+        _cont = (" This segment continues the same camera move and the same action from "
+                 "the previous moment; do not restart them." if _seg_continue else "")
         out.append(
             "Motion: strictly separate camera movement (push-in / pull-out / pan / "
             f"track / follow / tilt) from movement within the frame (character or "
-            f"object action). Guiding motion for this shot — {_motion}.")
+            f"object action). Guiding motion for this shot — {_motion}.{_cont}")
 
     return "\n".join(out)
 
@@ -934,6 +1107,15 @@ def segment_shot(shot: dict, duration, max_sec: float = None) -> List[dict]:
       同一句会被念 N 遍。因此首段起清空 ``dialogue``，只保留最后一段的台词 ——
       这也符合「动作推进 → 最后开口说话」的时序直觉（与 :func:`_beats` 的收尾约定一致）。
       同时清掉 ``narration``，避免旧剧本走「画外音延续」分支重复念白。
+    - ⭐ **段间锚点按段位分配**（2026-09-29 续修）：``first_frame`` / ``last_frame`` /
+      ``motion`` 是**整镜级**锚点，历史实现 ``sub = dict(shot)`` 把它们逐字复制给
+      每一个子段 —— 于是前段被要求提前演到整镜末态、后段被要求回到整镜开场
+      （画面倒带），段与段之间必然跳变。现在：
+        首段 = 唯一持有 ``first_frame``（开场快照）的段；
+        末段 = 唯一持有 ``last_frame``（收尾终态）的段；中间段两者皆无。
+    - ⭐ **运镜只由首段重新起手**：非首段置 ``_seg_continue``，提示词写成
+      「同一运镜继续、不得重启/不得切」（见 :data:`_MOVE_CONTINUE_EN`），
+      否则每 4 秒的接缝处运镜都会从头再来一遍。
 
     返回的每个 dict 供 :func:`segment_to_dicts` 转成 comfyui_client 的 segments 元素。
     """
@@ -943,6 +1125,7 @@ def segment_shot(shot: dict, duration, max_sec: float = None) -> List[dict]:
         dur = 0.0
     durs = segment_durations(dur, max_sec=max_sec)
     last = len(durs) - 1
+    multi = len(durs) > 1
     out: List[dict] = []
     for i, d in enumerate(durs):
         sub = dict(shot or {})
@@ -951,7 +1134,18 @@ def segment_shot(shot: dict, duration, max_sec: float = None) -> List[dict]:
         sub["duration"] = d
         sub["_seg_index"] = i
         sub["_seg_count"] = len(durs)
-        if len(durs) > 1 and i != last:
+        if multi:
+            # ---- 段间锚点按段位分配（见函数 docstring）----
+            # 历史缺陷：dict(shot) 把整镜的 first_frame / last_frame / motion 逐字复制给
+            # 每个子段 → 每段都同时声明「开场快照」与「收尾终态」：前段被迫提前演到末态、
+            # 后段被迫回到开场（倒带），接缝必然跳变，运镜也被迫从头再来一遍。
+            sub["_seg_continue"] = i > 0
+            sub["first_frame"] = str(shot.get("first_frame") or "") if i == 0 else ""
+            sub["last_frame"] = str(shot.get("last_frame") or "") if i == last else ""
+            if i > 0:
+                # 非首段：运动定性由句首的「运镜延续」声明承担，不再逐字重复整镜运动
+                sub["motion"] = ""
+        if multi and i != last:
             # 非末段：不带台词（否则同一句会被 H3 在每段各念一遍）。
             # 清空而非删除键，保持下游 ``shot.get("dialogue")`` 的类型稳定。
             sub["dialogue"] = []
@@ -959,9 +1153,13 @@ def segment_shot(shot: dict, duration, max_sec: float = None) -> List[dict]:
             sub["narration"] = ""
             # 画面内容降调为「进程推进」：段内不需要再复述完整动作起手，
             # 用一句承接语把动作往下一段推（与 _beats 的中间节拍同一写法）。
+            # ⚠️ 首段没有「上一段」：写成「from the start of this shot」，否则模型会
+            #    去承接**上一个镜头**的动作（首段是镜头的起手，不是承接）。
             sub["description"] = (
-                "the action continues to advance from the previous moment, keeping the "
-                "characters' appearance, wardrobe and scene lighting exactly consistent")
+                ("the action continues to advance from the start of this shot, keeping the "
+                 if i == 0 else
+                 "the action continues to advance from the previous moment, keeping the ")
+                + "characters' appearance, wardrobe and scene lighting exactly consistent")
             sub["visual_detail"] = ""
         out.append(sub)
     return out

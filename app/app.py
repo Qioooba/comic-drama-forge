@@ -875,11 +875,16 @@ def api_projects_create():
             app.logger.warning(f"读取小说元信息失败 {novel_id}: {e}")
             meta = {}
         novel_name = str(meta.get('title') or meta.get('name') or '').strip()
+    # 视频生成方式（项目级）：允许前端放在 config 里，也允许顶层 video_mode 直传；
+    # 两者都走 create_project 内的 norm_video_mode 归一（非法值回落 episode）。
+    _cfg_in = dict(data.get('config')) if isinstance(data.get('config'), dict) else {}
+    if str(data.get('video_mode') or '').strip():
+        _cfg_in['video_mode'] = data.get('video_mode')
     rec = project_store.create_project(
         name,
         novel_id=novel_id,
         novel_name=novel_name or name,
-        config=data.get('config') if isinstance(data.get('config'), dict) else None,
+        config=_cfg_in or None,
         pid=pid,
     )
     return jsonify({"success": True, "project": project_store.summarize(rec["id"]),
@@ -907,7 +912,12 @@ def api_projects_ensure_for_novel():
     raw_name = (data.get('name') or meta.get('title') or meta.get('name')
                 or novel_id)
     name = re.sub(r"[《》〈〉【】「」『』\s]+", "", str(raw_name)).strip() or novel_id
-    rec = project_store.ensure_project_for_novel(novel_id, name)
+    # 同一个「新建项目」入口可能走本接口（上传小说后自动建项目）→ 同样要能带上
+    # 用户选的视频生成方式，否则只有「显式创建」那条路生效、这条路悄悄回落默认值。
+    _cfg_in = dict(data.get('config')) if isinstance(data.get('config'), dict) else {}
+    if str(data.get('video_mode') or '').strip():
+        _cfg_in['video_mode'] = data.get('video_mode')
+    rec = project_store.ensure_project_for_novel(novel_id, name, config=_cfg_in or None)
     if not rec:
         return jsonify({"success": False, "error": "项目创建失败"}), 500
     return jsonify({"success": True, "project": project_store.summarize(rec["id"]),
@@ -2683,10 +2693,12 @@ def _video_retry_shot_impl():
     _rs_segs = []
     for _rsi, _rsub in enumerate(_rs_sub_shots):
         if mode == 'keyframe':
+            # ⚠️ 与 worker 内 _shot_segment 同口径：尾帧锚定句只挂最后一段
+            #    （每段都挂 = 每段都演完整镜，接缝倒带重启）。
             _rp = comfyui_client._build_h3_prompt(
                 _rsub, _r_char_refs, _r_scene_refs,
                 storyboard_ref={"name": f"shot_{seq}"}, item_refs=_r_item_refs,
-                end_frame_ref=_r_end_ref)
+                end_frame_ref=(_r_end_ref if _rsi == len(_rs_sub_shots) - 1 else None))
         elif sb_local:
             _rp = comfyui_client._build_h3_prompt(
                 _rsub, _r_char_refs, _r_scene_refs,
@@ -3946,6 +3958,14 @@ def _match_shot_chars(shot: dict, char_idx: dict) -> list:
     return resolved
 
 
+#: 取「半身档」角色参考图的景别集合（近景类）。
+#: 为什么是这些：角色立绘是**全身**，而近景类镜头要求参考图与目标取景同向 ——
+#: 全身立绘会把模型往全景方向拉（见 _framing_wants_half 的长注释，实测 shot_24）。
+#: ⚠️ 景别取值来自 config.SHOT_TYPES（唯一权威表）；新增近景类景别时要同步加进来，
+#:    否则该景别会静默走全身档、重新引入「画幅对抗」。
+_FRAMING_HALF_SHOT = ("大特写", "特写", "近景", "中近景", "局部", "中景")
+
+
 def _framing_wants_half(camera) -> bool:
     """本镜的景别是否该用「半身档」参考图（近景/特写/中景 → 半身；全景/远景 → 全身）。
 
@@ -3971,7 +3991,7 @@ def _framing_wants_half(camera) -> bool:
     if not _raw:
         return False
     k = _camera_key(_raw)
-    return k in ("特写", "近景", "中景")
+    return k in _FRAMING_HALF_SHOT
 
 
 def _framing_wants_half_shot(shot: dict) -> bool:
@@ -3985,11 +4005,11 @@ def _framing_wants_half_shot(shot: dict) -> bool:
         return False
     st = str(shot.get("shot_type") or "").strip()
     if st:
-        return st in ("特写", "近景", "中景")
+        return st in _FRAMING_HALF_SHOT
     _raw = str(shot.get("camera") or "").strip()
     if not _raw:
         return False
-    return _camera_key(_raw) in ("特写", "近景", "中景")
+    return _camera_key(_raw) in _FRAMING_HALF_SHOT
 
 
 def _pick_char_view(char_payload: dict, want_half: bool) -> str:
@@ -5388,10 +5408,16 @@ def api_generate_videos():
     #   per_shot（默认）= 逐镜头提交，工作流段数=1（一个分镜一段）
     #   episode        = 整集一次提交，工作流段数=该集分镜数（如第 4 集 22 段）
     #   keyframe       = 逐镜头提交，参考图槽位改为 [首帧=分镜图, 尾帧]（P1-2 关键帧驱动）
-    mode = str(data.get('mode') or 'per_shot').strip().lower()
-    if mode not in ('per_shot', 'episode', 'keyframe'):
-        return jsonify({"error": f"mode 参数非法: {mode}"
+    # ⭐ 2026-09-29：模式优先级 = 本次请求显式 mode → **项目级设定**（新建项目时
+    #    用户选择，见 project_store.video_mode）→ per_shot。
+    #    历史缺陷：前端「整集生成视频」按钮固定发 mode=episode，而这里缺省 per_shot，
+    #    项目级又没有任何选择入口 —— 同一件事三处口径，用户选了也不生效。
+    #    显式传了非法值仍然 400（错误必须可见），缺省才走项目设定回落。
+    _mode_req = str(data.get('mode') or '').strip().lower()
+    if _mode_req and _mode_req not in ('per_shot', 'episode', 'keyframe'):
+        return jsonify({"error": f"mode 参数非法: {_mode_req}"
                                  f"（仅支持 per_shot / episode / keyframe）"}), 400
+    mode = _mode_req or project_store.video_mode(project_name) or 'per_shot'
     timeout_per_segment = int(data.get('timeout_per_segment') or 900)
     episode_tag = str(data.get('episode_tag') or '').strip()
     # 跨镜链式：上一镜尾帧 = 下一镜首帧（auto / always / off，默认取 KEYFRAME_CHAIN_MODE）
@@ -5783,12 +5809,18 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
                 # ``common_refs=_c_refs``：公共参考图排在 ``<Picture 1..K>``，与客户端写进
                 # ``global.refs`` 的槽位 0..K-1 同序同编号（H3 Director 公共参数）。
                 if mode == 'keyframe' and sb_local:
+                    # ⚠️ 尾帧锚定句只挂**最后一段**（2026-09-29 续修）：
+                    #    尾帧图是**整镜**的收尾终态。过去每个子段都带 end_frame_ref，
+                    #    等于每一段都被要求「最后一帧落在整镜末态」—— 切段后每 4 秒
+                    #    就演完一遍整镜，接缝处必然倒带重启（运镜也跟着从头再来）。
+                    #    交由末段独占这条锚定，前段靠「运镜延续」声明继续推进。
+                    _sub_is_last = (_si == len(_seg_shots) - 1)
                     _sub_prompt = comfyui_client._build_h3_prompt(
                         _sub, _shot_char_refs, _shot_scene_refs,
                         storyboard_ref={"name": f"shot_{sid}"},
                         item_refs=_shot_item_refs,
                         common_refs=_c_refs,
-                        end_frame_ref=_end_frame_ref)
+                        end_frame_ref=(_end_frame_ref if _sub_is_last else None))
                 elif sb_local:
                     _sub_prompt = comfyui_client._build_h3_prompt(
                         _sub, _shot_char_refs, _shot_scene_refs,

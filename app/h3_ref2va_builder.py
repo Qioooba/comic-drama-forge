@@ -71,6 +71,12 @@ SEGMENT_TYPES = frozenset({
     "easy cleanGpuUsed",
 })
 
+#: 段内**可选**节点：用户模板可能把它删掉或旁路（例如改用别的方式清显存）。
+#: ⚠️ 硬要求可选节点会把「用户对模板的无害小改」变成构建期硬失败 —— 实测用户的
+#: 「多参模式 .json」里就没有 easy cleanGpuUsed，视频链是 CreateVideo → SaveVideo 直连。
+#: 缺失时**跳过并告警**（不影响成片链路），不再抛 RuntimeError。
+OPTIONAL_SEGMENT_TYPES = frozenset({"easy cleanGpuUsed"})
+
 # 每段参考图槽位（autogrow：ref_image_0..8 共 9 张）
 REF_SLOT_NAMES = [f"ref_images.ref_image_{i}" for i in range(9)]
 
@@ -375,7 +381,8 @@ class H3Ref2VABuilder:
             create_video = self._clone_seg_node(seg_tpl, "CreateVideo", base_x + 800,
                                                 base_y + 300, index, new_nodes)
             clean_gpu = self._clone_seg_node(seg_tpl, "easy cleanGpuUsed", base_x + 900,
-                                             base_y + 300, index, new_nodes)
+                                             base_y + 300, index, new_nodes,
+                                             optional=True)
             save_video = self._clone_seg_node(seg_tpl, "SaveVideo", base_x + 1000,
                                               base_y + 300, index, new_nodes)
             # SaveVideo 独立文件名前缀
@@ -449,11 +456,17 @@ class H3Ref2VABuilder:
             # adec.AUDIO -> create_video.audio
             self._connect(new_links, index, self._new_link_id(),
                           adec["id"], "AUDIO", create_video["id"], "audio")
-            # create_video.VIDEO -> clean_gpu.anything -> clean_gpu.output -> save_video.video
-            self._connect(new_links, index, self._new_link_id(),
-                          create_video["id"], "VIDEO", clean_gpu["id"], "anything")
-            self._connect(new_links, index, self._new_link_id(),
-                          clean_gpu["id"], "output", save_video["id"], "video")
+            # 成片链：create_video.VIDEO → [clean_gpu.anything → clean_gpu.output →] save_video.video
+            # ⚠️ clean_gpu 是**可选**节点（见 OPTIONAL_SEGMENT_TYPES）：模板没有它时直连，
+            #    否则整条链会因为一个「清显存的小工具节点」缺失而构建失败。
+            if clean_gpu is not None:
+                self._connect(new_links, index, self._new_link_id(),
+                              create_video["id"], "VIDEO", clean_gpu["id"], "anything")
+                self._connect(new_links, index, self._new_link_id(),
+                              clean_gpu["id"], "output", save_video["id"], "video")
+            else:
+                self._connect(new_links, index, self._new_link_id(),
+                              create_video["id"], "VIDEO", save_video["id"], "video")
 
             seg_layout.append({
                 "index": i,
@@ -490,9 +503,14 @@ class H3Ref2VABuilder:
     # ------------------------------------------------------------------ 辅助
     def _clone_seg_node(self, seg_tpl: Dict[str, dict], ttype: str,
                         x: int, y: int, index: Dict[int, dict],
-                        new_nodes: List[dict]) -> dict:
+                        new_nodes: List[dict],
+                        optional: bool = False) -> Optional[dict]:
         tpl = seg_tpl.get(ttype)
         if tpl is None:
+            if optional or ttype in OPTIONAL_SEGMENT_TYPES:
+                # 可选节点缺失：跳过（调用方必须处理 None —— 见成片连线处的直连分支）
+                logger.warning("模板缺少可选段内节点 %s → 跳过（成片链路改直连）", ttype)
+                return None
             raise RuntimeError(f"模板中未找到段内节点 {ttype}")
         n = copy.deepcopy(tpl)
         n["id"] = self._new_node_id()

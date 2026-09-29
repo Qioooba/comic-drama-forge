@@ -57,6 +57,33 @@
 > ⚠️ 未用到的尾部槽位在生成端**留空**（`generate_storyboard` 的 `slot_cleared`），
 > 不复用锚点图 —— 官方「容量不是目标」。（紧凑模板 ≤4 槽才沿用复用行为。）
 
+## 景别（取景档）唯一权威表 `config.SHOT_TYPES`（2026-09-29 统一）
+
+**一处定义，处处派生**。景别（取景档）此前在**五处**各写一份且互不相同（审计 P2 #14）：
+
+| 位置 | 修复前 | 现在 |
+|------|--------|------|
+| `config.SHOT_TYPES` | 不存在 | **唯一权威表**（9 值，由近到远） |
+| `comfyui_client.SHOT_CAMERA_SPECS` | 5 值 | 由权威表对齐（含构图规范 + 严禁退档） |
+| `comfyui_client._CAMERA_KEY_ORDER` | 手写 5 词 | `sorted(SHOT_TYPES, key=len, reverse=True)`（长词优先） |
+| `novel_to_script._SHOT_TYPE_WHITELIST` | 手写 5 值 | 由权威表派生（长词优先） |
+| `continuity.CAMERA_TERMS["景别"]` | 6 值（含大特写） | `list(SHOT_TYPES)` |
+| `prompt_qc.SB_FRAMING_KEYS` | 5 值 | 由权威表派生 |
+| `te_3d_director._FRAMING_SPAN` | 5 值 | 覆盖全部景别（含取景区间换算） |
+| `h3_prompt_kit._CAMERA_EN` | 缺「局部」 | 全覆盖（该模块保持零项目依赖，属**镜像表**，由守卫断言对齐） |
+| `app._FRAMING_HALF_SHOT` | 硬编码 3 值 | 由权威表取近景类 6 值 |
+
+现状取值：`大特写 / 特写 / 近景 / 中近景 / 局部 / 中景 / 全景 / 远景 / 大远景`。
+
+- 为什么必须补齐「**中近景 / 局部**」：`REWRITE_RULES` 本来就要求模型
+  「景别以中景/中近景/近景为主，局部近景用于情感道具回环」—— 模型照规则写出「中近景」，
+  却被 5 值白名单判成**枚举漂移丢弃**，只能靠下游重解析 camera 复合串救回。
+  参考片 92 镜拆解里这两个景别是主力（**局部 = 手部/道具插入镜**，用于把叙事重心压到道具上）。
+- ⚠️ **长词优先是硬要求**：解析顺序若把 `近景` 排在 `中近景` 前，「中近景轻推」会被解析成近景；
+  `大特写`/`大远景` 同理。
+- 改任意一处 → 跑 `.workbuddy/test/verify_shot_type_registry.py`（断言各消费点与权威表
+  逐字对齐 + 复合写法解析 + 端到端分镜提示词）。
+
 ## 景别对档：角色参考图按镜头景别选「半身档 / 全身档」（2026-09-25）
 
 ### 根因
@@ -84,9 +111,12 @@ cover 到 9:16 竖屏（544×960）要**左右各裁一半** → 模型为保住
 
 | 景别 | 取哪档 | 理由 |
 |------|--------|------|
-| 特写 / 近景 / 中景 | `half.png`（正面半身胸像） | 画幅与景别**同向**，画幅对抗消失 |
-| 全景 / 远景 | `front.png`（全身） | 与「拍全身」同向 |
+| 大特写 / 特写 / 近景 / 中近景 / 局部 / 中景 | `half.png`（正面半身胸像） | 画幅与景别**同向**，画幅对抗消失 |
+| 全景 / 远景 / 大远景 | `front.png`（全身） | 与「拍全身」同向 |
 | **未指定**（camera 只有机位/运镜） | `front.png` | 不猜档位；全身档是画幅对抗最小的默认 |
+
+> 判据单一口径是 `app._FRAMING_HALF_SHOT`（景别取自 `config.SHOT_TYPES`）——
+> 新增近景类景别时必须同步加进去，否则该景别静默走全身档、重新引入画幅对抗。
 
 实现见 `app._framing_wants_half` / `app._pick_char_view` / `app._allocate_storyboard_refs`。
 
@@ -139,6 +169,18 @@ N 个子段提交给 `comfyui_client.generate_h3_sequence(segments=[...])`，由
 - ⭐ **台词只留最后一段**：H3 每段独立生成（都带音轨），若每段都带台词，
   同一句话会被说 N 遍。非末段的 `dialogue` / `dialogue_text` / `narration` **清空**，
   `description` 降级为过场子句（「动作自上一刻继续推进…」），`visual_detail` 清空。
+- ⭐ **整镜级锚点按段位分配**（2026-09-29 续修）：`first_frame` / `last_frame` / `motion`
+  是**整镜**的锚点，旧实现 `sub = dict(shot)` 逐字复制给每一段 —— 前段被迫提前演到
+  整镜末态、后段被迫回到整镜开场（**画面倒带**），接缝必跳变。现在：
+  首段 = 唯一持有 `first_frame`；末段 = 唯一持有 `last_frame`；中间段两者皆无。
+  单段（≤4s）时**一个字段都不动**（零行为变更）。
+- ⭐ **尾帧锚定句只挂最后一段**（`app._shot_segment` / 单镜重跑两处）：`end_frame_ref`
+  过去传给每个子段 → 每段都被要求「最后一帧落在整镜末态」= 每 4 秒演完一遍整镜。
+  现在只在 `_si == len(_seg_shots) - 1`（单镜重跑 `_rsi == len(...) - 1`）时传。
+- ⭐ **运镜只由首段起手**：非首段置 `_seg_continue`，提示词写成
+  `…(continuing the same camera move from the previous moment — carry it forward from
+  where it left off; do not restart, reset or cut the camera move)`。
+  否则每 4 秒接缝处运镜从头再来（观感：推一半跳回起点再推）。
 
 ### 运镜注入（`_camera_move_en` / `movement_hint`）
 
@@ -152,9 +194,34 @@ N 个子段提交给 `comfyui_client.generate_h3_sequence(segments=[...])`，由
   绝不在句尾重复（重复会让模型理解成「运镜两次」）。
 - ⚠️ **运镜打头的复合词要单独进 `_CAMERA_EN`**：`手持跟拍` / `定格特写` 这类
   没有景别词 → 走通用分支会返回 `""` → **景别整条丢失**。
+
+#### 三层匹配 + 丢失可见（2026-09-29 续修）
+
+历史缺陷（用户反馈「运镜还是有问题」的根因）：词典只认**规范词**（推入/摇镜/跟拍），
+而真实剧本与参考片（92 镜拆解）写的是**带强度的口语写法** —— 参考片非固定运镜几乎全是
+「轻推 / 轻摇 / 跟随 / 轻手持」，这类写法在旧词典里**一个都认不出** → `_camera_move_en`
+返回 `""` → 提示词里运镜一个字母都没有 → 模型自行猜运动（= 出片运镜随机）。
+
+现在 `_camera_move_en(camera, continuation=False)` 三层兜底：
+
+1. **运动词表**（最长词优先，**排除机位词**）—— 历史取值逐字不变；
+2. **核心动作兜底**（`_MOVE_CORE` + `_MOVE_INTENSITY`）：推/拉/摇/移/跟/升降/环绕/变焦/手持
+   配「轻→gently / 缓·慢→slowly / 急·快→quickly」——「轻轻推近」「缓缓下摇」也能落成运镜；
+3. **机位词并行追加**（`_CAMERA_ANGLE_KEYS`）：机位与运动**正交**。
+   旧实现在一张表里做最长词匹配，`俯拍缓推` 会先命中 `俯拍` → **真正的运镜「缓推」被吞掉**。
+
+- ⚠️ **认不出必须告警**（`运镜无法翻译…`）：静默丢运镜是「运镜随机」的根因，丢失要可见。
+  但**纯景别/纯机位**（中景/近景/俯拍/广角/空镜…）本就无运镜 → 静默返回 `""`，不刷日志。
+- ⭐ **术语表只管「让模型写什么」，词典只管「模型写了什么都要认」**：
+  `continuity.CAMERA_TERMS.运镜` 收规范词（固定/定格/轻推/缓推/推镜/轻摇/缓摇/摇镜/
+  跟随/跟镜/轻移/移镜/横移/升降/环绕/变焦/手持/轻手持），**不为收编口语而放宽**；
+  词典侧另行宽容收编真实写法（定拍/静止/静态/定帧/硬切/快切/叠化/横移/推近/甩镜…）。
+- ⚠️ `ensure_camera_terms` 对**存量项目按并集升级**（不是原样返回旧文件）：
+  否则已建项目永远拿不到新词，出现「模型按旧词表写、词典按新词表认」的两端漂移。
 - **尾帧（`keyframe.movement_hint`）**：`build_end_frame_prompt` 生成尾帧图时同样要
   体现「机位已位移」，否则 H3 在首尾帧之间插值不出运动 → 视频是「静帧微动」。
-  `_MOVEMENT_BY_CAMERA` 表与 `_CAMERA_MOVE_EN` 同口径（同样最长词优先）。
+  `_MOVEMENT_BY_CAMERA` + `_MOVEMENT_CORE` 与 `_CAMERA_MOVE_EN` 同口径；
+  且运镜取值**优先读权威字段 `camera_motion`**（缺失才回退 `camera` 复合串）。
 
 ## 质检层新增：跨镜连续性 + 剧本叙事节奏（2026-09-25）
 
@@ -237,12 +304,22 @@ N 个子段提交给 `comfyui_client.generate_h3_sequence(segments=[...])`，由
   （断言分节顺序、景别前置、`<imageN>` 编号一致性、身份锚点句式、blanket 保留子句、
   无文字禁令 + 边界镜头：未指定景别 / 无参考图 / 无风格 / 多角色 / 越界编号）。
 - 改工作流槽位数后必须跑 `verify_storyboard_ref_canvas.py` + `verify_qwen21_migration.py`。
-- 改景别/机位标准 `SHOT_CAMERA_SPECS`/`_CAMERA_ANGLE_SPECS` 前跑 `verify_camera_framing.py`。
+- 改景别/机位标准 `SHOT_CAMERA_SPECS`/`_CAMERA_ANGLE_SPECS` 前跑 `verify_camera_framing.py`；
+  **增删景别值**（`config.SHOT_TYPES`）后必须跑 `verify_shot_type_registry.py`
+  （九处消费点逐一对齐 + 长词优先 + 端到端分镜提示词）。
+- 改「视频生成方式」（`config.VIDEO_MODES` / 项目配置 `video_mode`）后必须跑
+  `verify_video_mode_project.py`（新建项目落盘 / 生成接口优先级 / 托管计划同源 / 前端接线与构建产物）。
 - **改视频段切分 / 运镜注入 / 跨镜连续性 / 剧本叙事判据后**必须跑
   `verify_shot_segment_motion.py`（A 运镜注入 · B 切分守恒与无残尾 · C 尾帧运镜 ·
-  D app.py 接线含单镜重跑与「不得 `segments=[seg]`」· E 质检新增项 · F 连续性接线）。
+  D app.py 接线含单镜重跑与「不得 `segments=[seg]`」· E 质检新增项 · F 连续性接线 ·
+  **A9+ 参考片运镜词表与三层兜底** · **B11+ 段间锚点分配与运镜延续** ·
+  **G 尾帧锚定只挂最后一段** · **H 术语表与尾帧词表同步**）。
   ⚠️ 断言口径：`_camera_move_en` 最长词优先、运镜在提示词里**恰好出现一次**、
-  非末段**必须**无台词。
+  非末段**必须**无台词；**纯景别不产运镜、纯机位只产机位从句**；
+  **认不出的运镜必须告警、纯景别不得告警**。
+  ⚠️ 2026-09-29 同时修掉本文件 3 条**恒假**的旧断言（B8c 判 "speaks" 被无台词句式误伤、
+  D5 判 A1 改造前的字面调用、F1b 判旧的 `_same = (a == b)` 字面串）——
+  守则：接线/行为断言不要绑定会被合法重构改掉的字面串，否则守卫会长期假红而失去意义。
 - **改角色设定图版式或景别对档后**必须跑 `verify_sheet_split_views.py`（切分正确性 +
   cells/views 同序 + 兜底开关 + 景别对档取图与降级）与 `verify_character_sheet_ratio.py`
   （画幅不变 + 版式提示词约束齐全 + 幂等标记）。

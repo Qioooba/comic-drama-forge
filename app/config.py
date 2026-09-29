@@ -202,6 +202,77 @@ PROJECT_INDEX_PATH = os.path.join(PROJECTS_DIR, "index.json")           # 项目
 PROJECT_TRASH_DIR = os.path.join(PROJECTS_DIR, "_trash")               # 删除项目的回收站（可恢复）
 PROJECT_MIGRATE_REPORT = os.path.join(PROJECTS_DIR, "migration_report.json")   # 历史数据归属迁移报告
 
+#: 景别（取景档）**唯一权威表**：按「由近到远」排列。
+#:
+#: 所有环节都必须以本表为源，禁止各写一份：剧本枚举（novel_to_script 白名单 +
+#: 提示词文案）/ 运镜术语表（continuity.CAMERA_TERMS）/ 生成端构图规范
+#: （comfyui_client.SHOT_CAMERA_SPECS）/ 分镜质检取景判定（prompt_qc.SB_FRAMING_KEYS）/
+#: H3 英文名（h3_prompt_kit._CAMERA_EN）/ 3D 导演台取景档（te_3d_director._FRAMING_SPAN）。
+#:
+#: ⚠️ 2026-09-29 统一（审计 P2 #14）：此前五处口径互不相同 —— 术语表 6 值（含大特写）、
+#: 剧本白名单 5 值、SB_FRAMING_KEYS 5 值、SHOT_CAMERA_SPECS 5 值、3D 导演台 5 值。
+#: 而 REWRITE_RULES 明确要求模型「景别以中景/中近景/近景为主，局部近景用于情感道具回环」，
+#: 模型真写了「中近景」却被白名单判为**枚举漂移丢弃**（生成端 H3 表里明明支持它）。
+#: 参考片 92 镜拆解里「中近景 / 局部」正是主力景别（局部 = 手部/道具插入镜），
+#: 旧口径下根本表达不出来。
+SHOT_TYPES = ("大特写", "特写", "近景", "中近景", "局部", "中景", "全景", "远景", "大远景")
+
+#: 景别中文说明（剧本提示词 / 前端展示共用；生成端构图规范另见
+#: comfyui_client.SHOT_CAMERA_SPECS —— 那份是给模型看的「判定标准」）
+SHOT_TYPE_LABELS = {
+    "大特写": "极近距离：眼睛、手指等单点细节占满画面",
+    "特写": "面部或手部/道具占画面 70% 以上，背景明显虚化",
+    "近景": "人物胸部以上至头顶，面部细节清晰",
+    "中近景": "腰部以上、胸部以下（介于近景与中景之间）",
+    "局部": "只拍手部/道具/身体局部，不出现完整人脸（插入镜）",
+    "中景": "人物腰部或膝部以上至头顶，可带部分环境",
+    "全景": "完整全身及其所处环境",
+    "远景": "人物较小、环境为主体，强调空间感",
+    "大远景": "人物极小，环境与空间关系为主",
+}
+
+#: 视频生成方式（**项目级设定**，新建项目时由用户选择；全链路唯一口径）。
+#:
+#:   episode  = 整集一次提交，H3 原生段间衔接产出「一条连续整集视频」（默认，观感最连贯）
+#:   per_shot = 逐镜独立生成，便于「某一镜不满意单独返工」
+#:   keyframe = 首尾帧驱动（先生成尾帧图，H3 在首尾帧之间插值）
+#:
+#: ⚠️ 为什么放在**项目配置**而不是托管计划（2026-09-29）：过去它只是 pipeline /
+#: PLAN_DEFAULTS 里的一个内部默认值，用户在「新建项目」时无从选择；前端「整集生成
+#: 视频」按钮又固定发 mode=episode，后端缺省 per_shot —— 同一件事三处口径，
+#: 用户的选择没有任何入口。现在以项目配置为单一事实来源，托管计划里的该字段
+#: 由 autopilot.get_plan 派生、set_plan 写回（见 app/autopilot.py）。
+VIDEO_MODES = ("episode", "per_shot", "keyframe")
+
+#: 视频生成方式的中文标签（后端日志 / 提示文案口径，避免与前端 i18n 两处文字漂移）
+VIDEO_MODE_LABELS = {
+    "episode": "整集一次生成（连续无缝）",
+    "per_shot": "逐镜生成（便于单镜返工）",
+    "keyframe": "首尾帧驱动（关键帧插值）",
+}
+
+#: 视频生成方式的近义写法（前端 / 接口历史值 / 用户口头词的容错映射）
+_VIDEO_MODE_ALIASES = {
+    "整集": "episode", "整集生成": "episode", "episode_full": "episode", "full": "episode",
+    "逐镜": "per_shot", "per-shot": "per_shot", "single": "per_shot", "shot": "per_shot",
+    "关键帧": "keyframe", "keyframes": "keyframe", "fl2v": "keyframe", "首尾帧": "keyframe",
+}
+
+
+def norm_video_mode(value, default: str = "episode") -> str:
+    """视频生成方式归一：非法/缺失一律回落 default（绝不把脏值透传给段数计算）
+
+    历史坑：mode 参数直接进 segment_shot / 工作流段数计算，脏值会导致段数算错
+    或整段静默不生成 —— 必须在**入口**收敛，而不是在深处兜底。
+    """
+    v = str(value or "").strip().lower()
+    if v in VIDEO_MODES:
+        return v
+    if v in _VIDEO_MODE_ALIASES:
+        return _VIDEO_MODE_ALIASES[v]
+    return default if default in VIDEO_MODES else "episode"
+
+
 # 新项目默认配置（每项目一份，落在 output/projects/<项目ID>/config.json）
 PROJECT_DEFAULT_CONFIG = {
     "style": "3D动漫渲染",              # 创作风格
@@ -218,6 +289,9 @@ PROJECT_DEFAULT_CONFIG = {
     "aspect_ratio": "16:9 横屏",         # 画面比例（视频/分镜画幅，如「16:9 横屏」；空=未设置沿用默认（2026-09-28 默认由 9:16 翻转为 16:9））
     "fps": 24,
     "duration_per_shot": 5,             # 单镜头默认秒数
+    # 视频生成方式（项目级）：**新建项目时由用户选择**，之后「整集生成视频」
+    # 与托管生产都按它执行（取值见 VIDEO_MODES / norm_video_mode）。
+    "video_mode": "episode",
     "voice_map": {},                    # 角色→音色映射（按项目隔离）
     "qc_enabled": False,                # 质检开关（按项目隔离）
     # 成片硬字幕开关（按项目隔离）：默认关闭。

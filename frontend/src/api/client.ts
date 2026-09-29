@@ -90,6 +90,17 @@ export const projectsApi = {
       method: 'POST',
       body: JSON.stringify({ name }),
     }),
+  /**
+   * 项目配置（含 **video_mode 视频生成方式** —— 新建项目时用户选择的那一项）。
+   * 「生成视频」按它决定 episode（整集一次生成）/ per_shot（逐镜）/ keyframe（首尾帧）。
+   */
+  getConfig: (id: string) =>
+    request<{ success: boolean; project: string; config: Record<string, any>; config_path?: string }>(
+      `/projects/${id}/config`),
+  /** 局部更新项目配置（后端会归一 video_mode，非法值回落默认，不会写脏值） */
+  updateConfig: (id: string, patch: Record<string, any>) =>
+    request<{ success: boolean; project: string; config: Record<string, any> }>(
+      `/projects/${id}/config`, { method: 'POST', body: JSON.stringify(patch) }),
   coverUrl: (id: string) => `${API_BASE}/projects/${id}/cover`,
   generateCover: (id: string, seed?: number) =>
     request<{ success: boolean; cover_path: string; cover_url: string }>(`/projects/${id}/cover/generate`, {
@@ -520,6 +531,12 @@ export const storyboardApi = {
     ),
 };
 
+/** 视频生成方式（**项目级**设定，与后端 config.VIDEO_MODES 一致）
+ *  - episode  整集一次提交，H3 原生段间衔接出一条连续整集视频
+ *  - per_shot 逐镜独立生成，便于单镜返工
+ *  - keyframe 首尾帧驱动（先生成尾帧，再在首尾之间插值出运动） */
+export type VideoMode = 'episode' | 'per_shot' | 'keyframe';
+
 // --- Video（单镜视频） ---
 // 接口：POST /api/video/retry-shot（同步，直到 ComfyUI 出片才返回）
 // 之前后端早已可用，但前端零引用 —— 用户对某一镜不满意时无法只重做这一镜。
@@ -549,15 +566,18 @@ export const videoApi = {
     }>('/video/retry-shot', { method: 'POST', body: JSON.stringify(data) }),
 
   /**
-   * 整集一次提交（mode=episode）：把该集 N 个镜头塞进一个 H3 工作流，
-   * H3 原生段间衔接直接产出**一条连续整集视频**（`<episode_tag>_full.mp4`）。
+   * 生成该集视频：把该集 N 个镜头一次提交给 H3，**生成方式由 mode 决定**
+   * （episode 整集一次出连续片 / per_shot 逐镜独立 / keyframe 首尾帧插值）。
    * 后端在 shots 为空时按 project_name + episode_no 自动读剧本兜底。
    * 异步：返回 task_id，进度走 generation/status/<task_id>。
+   *
+   * ⚠️ 历史缺陷：这里曾**硬编码 mode='episode'**，用户在任何地方都改不了生成方式；
+   * 现在不传 mode 时由后端读**项目配置**（新建项目时选择），传了则以本次为准。
    */
   generateEpisode: (data: {
     project_name: string;
     episode_no?: number;
-    mode?: 'episode';
+    mode?: VideoMode;
     timeout_per_segment?: number;
   }) =>
     request<{
@@ -568,7 +588,7 @@ export const videoApi = {
       mode: string;
       project_name: string;
       episode_no: number;
-    }>('/videos/generate', { method: 'POST', body: JSON.stringify({ ...data, mode: 'episode' }) }),
+    }>('/videos/generate', { method: 'POST', body: JSON.stringify(data) }),
 };
 
 // --- TTS ---

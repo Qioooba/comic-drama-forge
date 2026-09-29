@@ -1,8 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import { useApp } from '@/context/AppContext';
 import { t } from '@/i18n';
-import { projectsApi, keyframesApi, storyboardApi, videoApi, ttsApi, mixApi, qcApi, exportApi, autopilotApi, upscaleApi, chatApi, agentApi, episodesApi, novelsSplitPlanApi } from '@/api/client';
-import { Button, Input, EmptyState, ErrorState, Skeleton, Modal } from '@/components/ui';
+import { projectsApi, keyframesApi, storyboardApi, videoApi, ttsApi, mixApi, qcApi, exportApi, autopilotApi, upscaleApi, chatApi, agentApi, episodesApi, novelsSplitPlanApi, type VideoMode } from '@/api/client';
+import { Button, Input, EmptyState, ErrorState, Skeleton, Modal, Select } from '@/components/ui';
 // tab 图标統一走线性 SVG（方案 P2-10）：此前是 emoji，字号受系统字体影响且观感与全站割裂
 import {
   AlertTriangle, BarChart3, Box, Check, CheckCircle2, Clapperboard, ClipboardCheck, ClipboardList, FileText,
@@ -2040,6 +2040,14 @@ function KeyframesTab({ projectKey, episodeNo }: { projectKey: string; episodeNo
 // 单镜重做闭环：后端 /api/storyboard/retry-shot（分镜图）与 /api/video/retry-shot（视频）
 // 早已实现，但前端此前**零入口** —— 用户对某一镜不满意只能整集重跑。
 // 这里把两个入口放到每张分镜卡上，并在视频重做成功后提示「同集成片已过期」。
+// 项目级视频生成方式（写入 config.video_mode；取值与后端 config.VIDEO_MODES 一致）。
+// 与每镜的 reference/keyframe 重做模式无关：那个只管「这一镜怎么重做」。
+const PROJECT_VIDEO_MODE_OPTIONS: { value: VideoMode; labelKey: string }[] = [
+  { value: 'episode', labelKey: 'project.videoModeEpisode' },
+  { value: 'per_shot', labelKey: 'project.videoModePerShot' },
+  { value: 'keyframe', labelKey: 'project.videoModeKeyframe' },
+];
+
 function StoryboardTab({ projectKey, episodeNo }: { projectKey: string; episodeNo?: number | null }) {
   const { t } = useApp();
   const toast = useToast();
@@ -2058,6 +2066,9 @@ function StoryboardTab({ projectKey, episodeNo }: { projectKey: string; episodeN
   /** 整集一次提交（mode=episode）：触发中标记 + 返回的 task_id */
   const [episodeGenerating, setEpisodeGenerating] = useState(false);
   const [episodeTaskId, setEpisodeTaskId] = useState<string | null>(null);
+  /** 项目级视频生成方式（新建项目时选的 video_mode）：本页「生成视频」按它执行。
+   *  ⚠️ 不要与上面每镜的 videoMode（reference/keyframe 单镜重做）混用，两者不是一个东西。 */
+  const [projectVideoMode, setProjectVideoMode] = useState<VideoMode>('episode');
 
   const fetchCanvas = async () => {
     if (!projectKey) return;
@@ -2083,6 +2094,14 @@ function StoryboardTab({ projectKey, episodeNo }: { projectKey: string; episodeN
 
   // 换集必须重拉：cards 是按集落盘的分镜图/视频，混用会张冠李戴
   useEffect(() => { fetchCanvas(); }, [projectKey, episodeNo]);
+
+  // 项目级视频生成方式：进页面就回显（用户「新建项目」时选的），改成什么就按什么生成
+  useEffect(() => {
+    if (!projectKey) return;
+    projectsApi.getConfig(projectKey)
+      .then((d) => setProjectVideoMode(((d.config?.video_mode as VideoMode) || 'episode')))
+      .catch(() => null);
+  }, [projectKey]);
 
   const handleRetryImage = async (card: any) => {
     const key = `${card.shot_id}:image`;
@@ -2139,7 +2158,25 @@ function StoryboardTab({ projectKey, episodeNo }: { projectKey: string; episodeN
     }
   };
 
-  // 整集一次提交（mode=episode）：把当前集 N 镜塞进一个 H3 工作流，直接出整集成片。
+  /** 改项目级视频生成方式：写进项目配置，之后「生成视频」与托管生产都按它执行 */
+  const handleProjectVideoModeChange = async (v: string) => {
+    if (!projectKey) return;
+    const prev = projectVideoMode;
+    setProjectVideoMode(v as VideoMode);
+    try {
+      const d = await projectsApi.updateConfig(projectKey, { video_mode: v });
+      const saved = (d.config?.video_mode as VideoMode) || (v as VideoMode);
+      setProjectVideoMode(saved);
+      toast.success(t('sb.videoModeSaved'));
+    } catch (e) {
+      // 保存失败必须回滚 UI，否则界面显示的模式与实际生成方式不一致（最难查的一类漂移）
+      setProjectVideoMode(prev);
+      toast.error(e instanceof Error ? e.message : t('sb.videoModeSaveFailed'));
+    }
+  };
+
+  // 生成该集视频：方式取**项目级设定**（episode 整集一次出连续片 / per_shot 逐镜 /
+  // keyframe 首尾帧插值）。旧实现把 mode 写死成 episode，用户在新建设置里选什么都无效。
   const handleGenerateEpisode = async () => {
     if (!projectKey) return;
     setEpisodeGenerating(true);
@@ -2148,6 +2185,7 @@ function StoryboardTab({ projectKey, episodeNo }: { projectKey: string; episodeN
       const r = await videoApi.generateEpisode({
         project_name: projectKey,
         episode_no: episodeNo ?? undefined,
+        mode: projectVideoMode,
       });
       setEpisodeTaskId(r.task_id);
       toast.success(t('sb.episodeGenerateStarted', { total: r.total }));
@@ -2163,13 +2201,21 @@ function StoryboardTab({ projectKey, episodeNo }: { projectKey: string; episodeN
       <div className="flex justify-between items-center">
         <h3 className="text-lg font-semibold">{t('wb.storyboardHub')}</h3>
         <div className="flex items-center gap-2">
+          {/* 视频生成方式（项目级）：默认取「新建项目」时选的值，这里可改并即刻落盘 */}
+          <Select
+            value={projectVideoMode}
+            onChange={handleProjectVideoModeChange}
+            options={PROJECT_VIDEO_MODE_OPTIONS.map(o => ({ value: o.value, label: t(o.labelKey) }))}
+            disabled={loading || episodeGenerating}
+            className="w-40"
+          />
           <Button
             size="sm"
             onClick={handleGenerateEpisode}
             disabled={loading || episodeGenerating}
             className="bg-brand hover:bg-brand-strong"
           >
-            {episodeGenerating ? t('common.generating') : t('sb.episodeGenerate')}
+            {episodeGenerating ? t('common.generating') : t('sb.generateVideo')}
           </Button>
           <Button size="sm" onClick={fetchCanvas} disabled={loading}>{t('common.refresh')}</Button>
         </div>

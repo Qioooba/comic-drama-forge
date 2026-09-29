@@ -37,6 +37,8 @@ from config import (
     PROJECTS_DIR, PROJECT_INDEX_PATH, PROJECT_TRASH_DIR, PROJECT_MIGRATE_REPORT,
     PROJECT_DEFAULT_CONFIG, AI_CHAT_DIR, AI_SETTINGS_PATH, AI_CHAT_HISTORY_PATH,
     NOVELS_DIR, TASKS_DB_PATH,
+    # 视频生成方式（项目级，新建项目时用户选择）：常量与归一同源，避免两处口径漂移
+    VIDEO_MODES, norm_video_mode,
 )
 
 INDEX_VERSION = 1
@@ -408,6 +410,9 @@ def create_project(name: str, novel_id: str = "", novel_name: str = "",
     cfg = dict(PROJECT_DEFAULT_CONFIG)
     if isinstance(config, dict):
         cfg.update({k: v for k, v in config.items() if v is not None})
+    # 视频生成方式：新建项目时即归一（前端选的值直接落盘；脏值/缺失回落 episode），
+    # 后续「整集生成视频」与托管生产都从这里取，不再各自写死默认值。
+    cfg["video_mode"] = norm_video_mode(cfg.get("video_mode"))
     _write_json(p["config"], cfg)
     if not os.path.exists(p["ai_settings"]):
         _write_json(p["ai_settings"], {"version": 1, "projects": {}, "active_project": dir_key})
@@ -474,13 +479,31 @@ def read_config(ref: str) -> dict:
     return merged
 
 
+def video_mode(ref: str) -> str:
+    """项目级视频生成方式（新建项目时用户选择）——**全链路唯一权威取值**。
+
+    消费方：/api/videos/generate（mode 缺省时的回落）、autopilot.get_plan（把项目选择
+    派生进托管计划）、UI 展示。旧项目 config.json 没有该字段 → read_config 用
+    PROJECT_DEFAULT_CONFIG 补齐并归一，零迁移成本。
+    """
+    try:
+        return norm_video_mode((read_config(ref) or {}).get("video_mode"))
+    except Exception as e:                     # noqa: BLE001 - 读配置失败不该让出片入口 500
+        logger.warning("读取项目视频生成方式失败（回落 episode）：%s", e)
+        return "episode"
+
+
 @_locked
 def update_config(ref: str, patch: dict) -> dict:
     rec = get_project(ref)
     if not rec:
         raise KeyError("项目不存在")
     cfg = read_config(rec["dir_key"])
-    cfg.update({k: v for k, v in (patch or {}).items() if v is not None})
+    _patch = {k: v for k, v in (patch or {}).items() if v is not None}
+    # 视频生成方式走归一（同 create_project）：入口收敛，脏值绝不进生成链路。
+    if "video_mode" in _patch:
+        _patch["video_mode"] = norm_video_mode(_patch["video_mode"])
+    cfg.update(_patch)
     _write_json(paths(rec["dir_key"])["config"], cfg)
     fields = {}
     for src, dst in (("shots_per_episode", "shots_per_episode"),

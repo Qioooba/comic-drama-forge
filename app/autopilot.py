@@ -238,6 +238,19 @@ def get_plan(project_name: str) -> dict:
                      project_name, e)
         return plan
     plan.update(data)
+    # ⭐ 视频生成方式以**项目级设定**为唯一权威（新建项目时用户选择，2026-09-29）。
+    #    为什么必须在这里派生：plan.json 一旦被写过，就永久带着 PLAN_DEFAULTS 的
+    #    video_mode='episode'；若直接采信它，用户在「新建项目」里选的「逐镜生成」
+    #    在托管生产里会被静默顶成整集 —— 表现为「我选了但没生效」。
+    #    set_plan 会把显式传入的 video_mode 写回项目配置（见下），因此 AI 总控 /
+    #    一键启动对它的覆盖仍然生效，且全项目只有一个事实来源。
+    try:
+        import project_store as _ps          # 函数内导入：autopilot 由 app 反向导入，
+        _vm = _ps.video_mode(project_name)   # 模块级导入链越短越不容易踩到顺序问题
+        if _vm:
+            plan["video_mode"] = _vm
+    except Exception as e:                     # noqa: BLE001 - 派生失败沿用计划值，不阻断
+        logger.debug("读取项目视频生成方式失败（沿用计划值）：%s", e)
     return plan
 
 
@@ -247,6 +260,15 @@ def set_plan(project_name: str, patch: dict, novel_id: str = "") -> dict:
     for k, v in (patch or {}).items():
         if k in PLAN_DEFAULTS:
             plan[k] = v
+    # ⭐ video_mode 是**项目级**设定：显式改动时同步写回项目配置（单一事实来源）。
+    #    不写回的话，下一次 get_plan 会按项目配置把这次修改顶掉 —— 「设置不生效」
+    #    且没有任何报错，是最难查的一类漂移。
+    if "video_mode" in (patch or {}):
+        try:
+            import project_store as _ps
+            _ps.update_config(project_name, {"video_mode": plan.get("video_mode")})
+        except Exception as e:                 # noqa: BLE001 - 写回失败不影响计划本身
+            logger.warning("写回项目视频生成方式失败（计划内仍生效）：%s", e)
     if novel_id:
         plan["novel_id"] = novel_id
     plan["updated_at"] = _now()

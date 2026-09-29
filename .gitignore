@@ -144,3 +144,8 @@ packaging/*.zip
 # extraResources），是生成件（可 node pack_backend.js 重建），且体积大/含环境相关
 # python 运行时 → 一律不入库；收集器脚本本身照提交
 electron-app/_backend/
+
+# ===================== 误建的系统盘目录残留 =====================
+# 某次脚本把 `%SystemDrive%` 当字面量用，在仓库根建出 `%SystemDrive%/` 目录
+# （内含 Windows Caches 缓存库），属误建残留，不入库。
+%SystemDrive%/

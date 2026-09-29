@@ -393,6 +393,13 @@
     "aspect9x16": "9:16 竖屏（短视频）",
     "aspect16x9": "16:9 横屏（宽屏）",
     "aspect21x9": "21:9 超宽（电影感）",
+    "videoMode": "视频生成方式",
+    "videoModeEpisode": "整集一次生成",
+    "videoModeEpisodeDesc": "一次提交整集，段间原生衔接，出片最连贯",
+    "videoModePerShot": "逐镜生成",
+    "videoModePerShotDesc": "每镜独立出片，便于单镜返工重做",
+    "videoModeKeyframe": "首尾帧驱动",
+    "videoModeKeyframeDesc": "先生成尾帧，再在首尾之间插值出运动",
     "coverGen": "生成封面",
     "coverRedo": "换封面",
     "coverGenerating": "生成中…",
@@ -1322,7 +1329,10 @@
     "chapterN": "第 {n} 章",
     "episodeGenerate": "整集生成视频",
     "episodeGenerateStarted": "整集视频生成已启动（{total} 镜）",
-    "episodeGenerateFailed": "整集视频生成启动失败"
+    "episodeGenerateFailed": "整集视频生成启动失败",
+    "generateVideo": "生成视频",
+    "videoModeSaved": "视频生成方式已保存",
+    "videoModeSaveFailed": "视频生成方式保存失败"
   },
   "toolLabel": {
     "apply_creative_settings": "套用创作设定",

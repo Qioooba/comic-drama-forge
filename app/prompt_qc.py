@@ -41,6 +41,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import h3_prompt_kit
 import style_kit
+# 景别唯一权威表（分镜取景段判定必须与生成端同源，否则又是一次「两端口径不同」）
+from config import SHOT_TYPES
 
 logger = logging.getLogger(__name__)
 
@@ -114,8 +116,10 @@ SB_VAGUE_REF_RE = re.compile(
     r"the first image|the second image|image\s+[A-C]\b)",
     re.IGNORECASE)
 
-#: 分镜图「取景段」判定用：景别中文词（新协议里 FRAMING 行仍写中文景别词）
-SB_FRAMING_KEYS: Tuple[str, ...] = ("特写", "近景", "中景", "全景", "远景")
+#: 分镜图「取景段」判定用：景别中文词（新协议里 FRAMING 行仍写中文景别词）。
+#: ⚠️ 由 config.SHOT_TYPES 派生（长词优先，便于逐个匹配）：若这里漏了某个景别，
+#:    生成端写了「局部」而质检端不认 —— 该镜会被判「缺景别」而**永远过不了预检**。
+SB_FRAMING_KEYS: Tuple[str, ...] = tuple(sorted(SHOT_TYPES, key=len, reverse=True))
 
 #: H3 提示词里的无文字声明（build_detailed_description 结尾固定句）
 H3_NO_TEXT = "严禁出现任何文字、字幕、台词文本、水印"

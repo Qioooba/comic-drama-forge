@@ -25,6 +25,7 @@ import re
 import time
 from datetime import datetime
 
+from config import SHOT_TYPES
 from fs_atomic import atomic_write_json, read_json_strict
 from llm_client import LLMError, LLMTruncatedError
 from llm_client import thinking_token_floor as _thinking_token_floor
@@ -64,11 +65,27 @@ SYSTEM_CONTINUITY = ("你是漫剧编剧组的『连贯性总监』，精通长�
                      "只输出严格合法的 JSON。")
 
 # C⑧ 运镜术语表（规则式内置，稳定可复用；分镜 camera 字段必须在此取词）
+#
+# ⚠️ 为什么要把「轻推 / 轻摇 / 跟随 / 轻手持」显式收进表里（2026-09-29）：生成端
+# （h3_prompt_kit._CAMERA_MOVE_EN）与术语表是**同一条链的两端** —— 模型只写表内词，
+# 词典只认表内词。参考片 92 镜拆解的运镜列里，非固定运镜几乎全是「轻推 / 轻摇 /
+# 跟随 / 轻手持」，旧术语表却只有规范词（推镜 / 摇镜 / 跟镜 / 手持），于是
+#   ① 模型按表取词，永远写不出参考片那种「轻推」的克制口气；
+#   ② 模型偶尔越界写出「轻推 / 跟随」时，生成端词典又认不出 → 运镜整段丢失。
+# 现在两端同词，且强度词（轻/缓/慢/急）有明确映射，克制运镜才真正落得到提示词里。
 CAMERA_TERMS = {
-    "景别": ["远景", "全景", "中景", "近景", "特写", "大特写"],
-    "运镜": ["固定", "推镜", "拉镜", "摇镜", "移镜", "跟镜", "升降", "环绕", "变焦", "手持", "定格"],
-    "常用组合": ["远景推进", "全景升降", "中景跟拍", "中景固定", "近景环绕", "特写推入",
-                 "手持跟拍", "环绕中景", "拉镜远景", "定格特写"],
+    # ⚠️ 由 config.SHOT_TYPES（景别唯一权威表）派生，别再手写一份 —— 手写必然漂移
+    #    （历史：此处 6 值含大特写、剧本白名单 5 值、分镜质检 5 值，三处互不相同）。
+    "景别": list(SHOT_TYPES),
+    # ⚠️ 只增不减：原有规范词（固定/推镜/拉镜/摇镜/移镜/跟镜/升降/环绕/变焦/手持/
+    # 定格）一个都不能删 —— 存量剧本已按旧表写词，删词等于让它们「自造术语」；
+    # 新词只是**追加**可选口径（含参考片的强度写法）。
+    "运镜": ["固定", "定格", "推镜", "拉镜", "推入", "拉远", "摇镜", "移镜", "跟镜",
+             "升降", "环绕", "变焦", "手持", "轻推", "缓推", "轻摇", "缓摇",
+             "跟随", "轻移", "横移", "轻手持"],
+    "常用组合": ["中景固定", "近景固定", "全景固定", "特写固定", "远景推进", "全景升降",
+                 "中景跟拍", "中景跟随", "近景轻推", "特写推入", "近景环绕", "中景轻摇",
+                 "手持跟拍", "手持跟随", "环绕中景", "拉镜远景", "定格特写"],
 }
 
 # 服装/外观颜色词（用于规则化的外观一致性校验，评估报告中最典型的冲突证据即颜色漂移）
@@ -1109,10 +1126,29 @@ def camera_terms_path(continuity_dir: str, project_key: str) -> str:
 
 
 def ensure_camera_terms(continuity_dir: str, project_key: str) -> dict:
-    """⑧ 运镜术语表（内置规则式，落盘可查，供分镜取词）"""
+    """⑧ 运镜术语表（内置规则式，落盘可查，供分镜取词）
+
+    ⚠️ 存量项目按**并集升级**，不是原样返回：内置词表扩充后（2026-09-29 补入
+    「跟随 / 轻推 / 轻摇 / 轻手持」等），已有项目若继续读旧文件，生成端就永远
+    拿不到新词 —— 术语表与生成端词典必须同步演进，否则「模型按旧词表写、
+    词典按新词表认」两端漂移，运镜照样丢。并集只增不减，不推翻项目自定词。
+    """
     cur = load_json(camera_terms_path(continuity_dir, project_key), None)
     if isinstance(cur, dict) and cur.get("景别"):
-        return cur
+        merged = dict(cur)
+        added = {}          # {维度: 本次新并入的词}，仅用于日志
+        for _k, _vals in CAMERA_TERMS.items():
+            _old = [str(x) for x in (merged.get(_k) or []) if str(x).strip()]
+            _new = [x for x in _vals if x not in _old]
+            if _new:
+                merged[_k] = _old + _new
+                added[_k] = _new
+        if added:
+            merged["updated_at"] = _now()
+            save_json(camera_terms_path(continuity_dir, project_key), merged)
+            logger.info("运镜术语表并集升级：%s 新增 %s",
+                        project_key, {k: len(v) for k, v in added.items()})
+        return merged
     data = {**CAMERA_TERMS, "created_at": _now(), "note": "分镜 camera 字段必须从此表取词或组合"}
     save_json(camera_terms_path(continuity_dir, project_key), data)
     return data

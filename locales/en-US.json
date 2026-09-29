@@ -393,6 +393,13 @@
     "aspect9x16": "9:16 Portrait Widescreen",
     "aspect16x9": "16:9 Widescreen",
     "aspect21x9": "21:9 UltraWide",
+    "videoMode": "Video generation mode",
+    "videoModeEpisode": "Whole episode at once",
+    "videoModeEpisodeDesc": "One submission for the episode, seamlessly stitched",
+    "videoModePerShot": "Shot by shot",
+    "videoModePerShotDesc": "Each shot generated on its own, easy to redo a single shot",
+    "videoModeKeyframe": "Keyframe driven",
+    "videoModeKeyframeDesc": "Generate the end frame first, then interpolate motion",
     "coverGen": "Cover",
     "coverRedo": "New Cover",
     "coverGenerating": "Generating…",
@@ -1322,7 +1329,10 @@
     "chapterN": "Ch. {n}",
     "episodeGenerate": "Generate whole episode",
     "episodeGenerateStarted": "Episode video generation started ({total} shots)",
-    "episodeGenerateFailed": "Failed to start episode video generation"
+    "episodeGenerateFailed": "Failed to start episode video generation",
+    "generateVideo": "Generate video",
+    "videoModeSaved": "Video generation mode saved",
+    "videoModeSaveFailed": "Failed to save video generation mode"
   },
   "toolLabel": {
     "apply_creative_settings": "Apply creative settings",

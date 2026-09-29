@@ -183,6 +183,14 @@ const ASPECT_PRESETS: { value: string; labelKey: string }[] = [
   { value: '21:9 \u8d85\u5bbd', labelKey: 'project.aspect21x9' },
 ];
 
+// 视频生成方式（写入 config.video_mode；取值与后端 config.VIDEO_MODES 一致）。
+// 新建项目时选一次，之后「生成视频」与托管生产都按它执行，不再各处写死默认值。
+const VIDEO_MODE_OPTIONS: { value: string; labelKey: string; descKey: string }[] = [
+  { value: 'episode', labelKey: 'project.videoModeEpisode', descKey: 'project.videoModeEpisodeDesc' },
+  { value: 'per_shot', labelKey: 'project.videoModePerShot', descKey: 'project.videoModePerShotDesc' },
+  { value: 'keyframe', labelKey: 'project.videoModeKeyframe', descKey: 'project.videoModeKeyframeDesc' },
+];
+
 const ACCEPT_EXTS = '.txt,.docx,.pdf,.epub,.md';
 
 export function ProjectsPage() {
@@ -210,6 +218,8 @@ export function ProjectsPage() {
   // 默认 16:9 横屏（2026-09-28 由 9:16 翻转，与后端 style_kit.DEFAULT_RATIO 一致）。
   // ⚠️ 不要写 ASPECT_PRESETS[0]：预设按截图顺序排列后第一项是 1:1。
   const [aspectRatio, setAspectRatio] = useState('16:9 \u6a2a\u5c4f');
+  // 视频生成方式（项目级，写入 config.video_mode）：默认整集一次生成
+  const [videoMode, setVideoMode] = useState<string>('episode');
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // --- 编辑项目弹窗 ---
@@ -254,6 +264,7 @@ export function ProjectsPage() {
     setStyleCat('all');
     setCustomStyle('');
     setAspectRatio('16:9 \u6a2a\u5c4f');
+    setVideoMode('episode');
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
@@ -326,6 +337,8 @@ export function ProjectsPage() {
           ...DEFAULT_CONFIG,
           style: finalStyle,
           aspect_ratio: aspectRatio,
+          // 视频生成方式：整集一次生成 / 逐镜生成 / 首尾帧驱动（后端会归一校验）
+          video_mode: videoMode,
         },
       } as any);
       const key = res?.project?.dir_key || res?.project?.id || '';
@@ -691,6 +704,35 @@ export function ProjectsPage() {
               label={t('project.aspectRatio')}
               options={ASPECT_PRESETS.map(p => ({ value: p.value, label: t(p.labelKey) }))}
             />
+          </div>
+
+          {/* 视频生成方式：新建时就定下来（整集一次生成 / 逐镜生成 / 首尾帧驱动），
+              之后「生成视频」与托管生产都按它执行 —— 避免「功能有、入口没有」。 */}
+          <div>
+            <label className="block text-sm font-medium text-ink-1 mb-1">
+              {t('project.videoMode')}
+            </label>
+            <div className="grid grid-cols-3 gap-2">
+              {VIDEO_MODE_OPTIONS.map((opt) => (
+                <button
+                  key={opt.value}
+                  type="button"
+                  onClick={() => { setVideoMode(opt.value); setFormError(''); }}
+                  className={`rounded-lg border px-3 py-2 text-left transition-colors ${
+                    videoMode === opt.value
+                      ? 'border-brand bg-brand/10'
+                      : 'border-line-strong hover:bg-surface-2'
+                  }`}
+                >
+                  <span className={`block text-sm font-medium ${videoMode === opt.value ? 'text-brand' : 'text-ink-2'}`}>
+                    {t(opt.labelKey)}
+                  </span>
+                  <span className="mt-0.5 block text-[11px] leading-tight text-ink-3">
+                    {t(opt.descKey)}
+                  </span>
+                </button>
+              ))}
+            </div>
           </div>
 
           {/* 小说来源切换 */}

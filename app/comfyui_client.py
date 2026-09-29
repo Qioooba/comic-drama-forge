@@ -28,6 +28,7 @@ import logging
 import threading
 import requests
 import cancellation  # S9：远端任务取消（中止信号贯穿 ComfyUI 轮询，与 pipeline/llm_client 同一套）
+import comfyui_job_store as job_store  # 崩溃免重渲检查点（2026-09-29：台账复用 + 重连，不重复提交）
 from typing import Dict, List, Optional, Any, Tuple, Sequence
 # ⚠️ Sequence 曾被漏导入：类级注解 `_LIGHT_KEYWORDS: Sequence[...]` 在类创建时**不求值**，
 # 所以模块照常导入、py_compile 也通过，但一旦有工具读取
@@ -44,6 +45,8 @@ from config import (
     ENABLE_BLOCKING_ANNOTATION,
     H3_ENABLE_REFINE,
     COMFYUI_INPUT_DIR,
+    # 景别唯一权威表（分镜构图规范 / 解析顺序都必须由它派生，见 SHOT_CAMERA_SPECS 上方注释）
+    SHOT_TYPES,
 )
 # 模板路径一律走 resolve_workflow_path()（项目内优先，回落 ComfyUI 目录）。
 # COMFYUI_WORKFLOWS_DIR 在本模块内已不再直接使用，但**必须保留为模块属性**：
@@ -244,20 +247,45 @@ def _slot_index(key) -> int:
     return int(m.group(1)) if (m and m.group(1)) else 0
 
 
-# 分镜图景别强约束：仅写「特写」二字时模型容易退化为中景/近景，这里给出显式构图规范
+# 分镜图景别强约束：仅写「特写」二字时模型容易退化为中景/近景，这里给出显式构图规范。
+#
+# ⚠️ 键集合必须与 config.SHOT_TYPES（景别唯一权威表）**逐字对齐**：少一个景别 =
+#    生成端没有构图规范（模型自由发挥）+ 质检端没有判定标准（判「不符」也没依据），
+#    正是历史「景别判定把 43% 镜头误判为不合格」的土壤。下方 _MISSING_SPECS 会在
+#    两表漂移时打 error 日志，配套守卫 .workbuddy/test/verify_shot_type_registry.py
+#    会直接断言两表相等。
 SHOT_CAMERA_SPECS = {
+    "大特写": ("大特写镜头（extreme close-up）：只拍眼睛/手指/道具的一个点，该局部占据画面 85% 以上，"
+               "背景完全虚化；**严禁退为特写、近景或中景**"),
     "特写": ("特写镜头（close-up）：镜头极贴近主体，人物面部（或手部、道具局部）占据画面 70% 以上面积，"
              "背景明显虚化，只呈现局部，严禁退为近景、中景或全景"),
     "近景": ("近景镜头（medium close-up）：取景自人物胸部以上至头顶，面部细节清晰，"
              "严禁退为中景或全景"),
+    "中近景": ("中近景镜头（medium close-up，略松）：取景自人物腰部以上至头顶，比近景多带一点身体与手势，"
+               "**严禁退为中景/全景**（不得出现腰部以下部位或大片地面）"),
+    "局部": ("局部镜头（detail / insert shot）：只拍手部、道具或身体局部，**画面中不出现完整人脸**、"
+             "不交代人物全身与所处环境；用于把叙事重心压到道具上（如递出的手绘纸币、电子秤、抽屉里的纸），"
+             "**严禁退为近景/中景**"),
     "中景": ("中景镜头（medium shot）：取景自人物腰部或膝部以上至头顶，人物占画面一半左右，"
              "可带入部分环境；**严禁退为全景/远景**（不得出现膝盖以下部位、脚部或大片地面）"),
     "全景": "全景镜头（wide shot）：完整呈现人物全身及其所处环境，人物占画面高度的大半；**不得退为远景色块**",
     "远景": "远景镜头（long shot）：人物在画面中较小、环境为主体，强调空间感与氛围；**不得推成中景/近景**",
+    "大远景": ("大远景镜头（extreme long shot）：人物在画面中极小（可为剪影或色点），"
+               "环境与空间关系为主体；**不得推成中景/近景**"),
 }
-#: 景别关键字的解析顺序（**具体优先**）：剧本里 camera 字段常是「景别+运镜」的复合写法
-#: （如「特写推入」「全景升降」「中景跟拍」），必须按关键字解析，不能只做精确匹配。
-_CAMERA_KEY_ORDER = ("特写", "远景", "全景", "近景", "中景")
+
+#: 景别权威表与生成端规范的一致性检查（漂移必须**可见**：error 日志 + 守卫断言）
+_MISSING_SPECS = [k for k in SHOT_TYPES if k not in SHOT_CAMERA_SPECS]
+_EXTRA_SPECS = [k for k in SHOT_CAMERA_SPECS if k not in SHOT_TYPES]
+if _MISSING_SPECS or _EXTRA_SPECS:
+    logger.error("景别权威表 config.SHOT_TYPES 与 SHOT_CAMERA_SPECS 不一致：缺规范=%s 多出=%s",
+                 _MISSING_SPECS, _EXTRA_SPECS)
+
+#: 景别关键字的解析顺序（**长词优先**）：剧本里 camera 字段常是「景别+运镜」的复合写法
+#: （如「特写推入」「全景升降」「中景跟拍」「中近景轻推」），必须按关键字解析，不能只做精确匹配。
+#: ⚠️ 必须长词优先：否则「中近景」会被「近景」抢先命中、「大特写」会被「特写」抢先命中。
+#: 由权威表派生，杜绝手写顺序漏词（历史缺陷：手写顺序里没有新景别 → 永远解析不出来）。
+_CAMERA_KEY_ORDER = tuple(sorted(SHOT_TYPES, key=len, reverse=True))
 
 #: 机位/视角关键字。与景别**正交**：剧本 camera 字段里既有景别（中景/特写）也有机位（俯拍/仰拍）。
 #: ⚠️ 历史缺陷：机位以前完全没人解析，等于白写在剧本里 —— 生成端不知道要俯拍，
@@ -1123,6 +1151,109 @@ class ComfyUIClient:
         self.interrupt(prompt_id)
         _bump("waited_seconds", round(time.time() - start, 2))
         return {}
+
+    def _resume_history(self, outputs: List[str]) -> dict:
+        """把台账里存的**产物绝对路径**还原成 get_output_files 认得的 history 结构。
+
+        为什么要还原而不是另开一条返回通道：get_output_files 是按
+        COMFYUI_OUTPUT_DIR + subfolder + filename 解析的，只要把绝对路径反推回
+        «子目录 + 文件名»，复用路径就能**零改动**地穿过现有 6 处调用方 ——
+        这也是本功能刻意选择「返回 history」而不是「返回文件表」的原因。
+
+        不在 ComfyUI output 目录下的产物（人为挪过位置）无法用 history 语义表达，
+        直接跳过 → 该文件不计入复用集合，调用方按「没拿到文件」正常处理。
+        """
+        outs: Dict[str, Any] = {}
+        for i, p in enumerate(outputs or []):
+            try:
+                rel = os.path.relpath(str(p), COMFYUI_OUTPUT_DIR)
+            except (ValueError, TypeError):
+                continue
+            if rel.startswith(".."):
+                logger.warning("免重渲：产物不在 ComfyUI output 目录下，跳过复用：%s", p)
+                continue
+            sub = os.path.dirname(rel).replace("\\", "/")
+            outs["_resume%d" % i] = {"files": [{"filename": os.path.basename(rel),
+                                                "subfolder": sub}]}
+        return outs
+
+    def submit_resumable(self, api_prompt: dict, *, job_key: str = "",
+                         timeout: int = None, file_ext: str = "",
+                         label: str = "") -> Tuple[dict, str, bool]:
+        """提交并等待，**带崩溃免重渲检查点**。返回 (history, prompt_id, resumed)。
+
+        三种分流（见 comfyui_job_store 模块文档）：
+
+        * **已完成**：台账里的产物仍存在 → 构造 history 直接返回，resumed=True，零渲染；
+        * **在跑中**：远端仍有该 prompt → wait_for_completion **重连**，不重复提交；
+        * **不可复用**：无台账 / 哈希不符 / 产物已删 / 远端报错 → 正常提交（现状行为）。
+
+        job_key 为空 → 完全等价于旧的 queue_prompt + wait_for_completion，
+        这样未接入任务键的路径行为零变化。
+
+        fail-open 口径：台账或远端 history 查询任何异常都只降级为「本次不复用」，
+        绝不阻断生产 —— 缓存是加速器，不是依赖。
+        """
+        timeout = timeout or 1800
+        if not job_key:
+            pid = self.queue_prompt(api_prompt)
+            return self.wait_for_completion(pid, timeout=timeout), pid, False
+
+        wf_hash = job_store.workflow_hash(api_prompt)
+        rec = job_store.find(job_key)
+        if rec and wf_hash and rec.get("workflow_hash") == wf_hash and rec.get("prompt_id"):
+            old_pid = rec["prompt_id"]
+            # ① 台账产物仍在磁盘上 → 零渲染复用
+            outs = [p for p in (rec.get("outputs") or []) if p]
+            if outs and all(os.path.isfile(p) and os.path.getsize(p) > 0 for p in outs):
+                logger.info("[免重渲] %s 命中台账，复用 %d 个已完成产物（prompt=%s）",
+                            label or job_key, len(outs), old_pid)
+                return ({"outputs": self._resume_history(outs),
+                         "status": {"completed": True, "status_str": "success"}},
+                        old_pid, True)
+            # ② 台账产物被清理 → 问远端 history：完成则复用，仍在跑则重连
+            entry = None
+            try:
+                hist = self.get_history(old_pid) or {}
+                entry = hist.get(old_pid) if isinstance(hist, dict) else None
+            except Exception as e:                       # noqa: BLE001
+                logger.debug("免重渲：远端 history 查询失败，按重渲处理：%s", e)
+            if isinstance(entry, dict):
+                st = entry.get("status") or {}
+                if st.get("completed") or st.get("status_str") == "success":
+                    got = self.get_output_files(entry, file_ext)
+                    if got and all(os.path.isfile(p) and os.path.getsize(p) > 0 for p in got):
+                        job_store.mark_done(job_key, got)
+                        logger.info("[免重渲] %s 远端已完成且产物有效，复用 %d 个（prompt=%s）",
+                                    label or job_key, len(got), old_pid)
+                        return entry, old_pid, True
+                elif st.get("status_str") == "error":
+                    job_store.mark_failed(job_key, "remote_error")
+                    logger.info("[免重渲] %s 远端该任务已失败，重新提交", label or job_key)
+                else:
+                    logger.info("[免重渲] %s 远端仍在队列/执行中，**重连等待**（不重复提交，prompt=%s）",
+                                label or job_key, old_pid)
+                    hist2 = self.wait_for_completion(old_pid, timeout=timeout)
+                    got2 = self.get_output_files(hist2, file_ext)
+                    if got2:
+                        job_store.mark_done(job_key, got2)
+                    return hist2, old_pid, False
+
+        pid = self.queue_prompt(api_prompt)
+        try:
+            job_store.remember(job_key, wf_hash, pid, label=label or job_key)
+        except Exception as e:                           # noqa: BLE001
+            logger.debug("免重渲：台账登记失败（不影响生成）：%s", e)
+        history = self.wait_for_completion(pid, timeout=timeout)
+        try:
+            got = self.get_output_files(history, file_ext)
+            if got:
+                job_store.mark_done(job_key, got)
+            else:
+                job_store.mark_failed(job_key, "no_output")
+        except Exception as e:                           # noqa: BLE001
+            logger.debug("免重渲：台账收尾记录失败（不影响生成）：%s", e)
+        return history, pid, False
 
     def get_output_files(self, history: dict, file_ext: str = "") -> List[str]:
         files = []
@@ -2650,8 +2781,12 @@ class ComfyUIClient:
 
         timeout = timeout or int(1200 + timeout_per_segment * n)
         logger.info(f"H3 提交：{n} 段，总超时 {timeout}s（单段预估 {timeout_per_segment}s）")
-        prompt_id = self.queue_prompt(api_prompt)
-        history = self.wait_for_completion(prompt_id, timeout=timeout)
+        # 崩溃免重渲（2026-09-29）：同 Director 路径，见 submit_resumable 文档。
+        history, prompt_id, resumed = self.submit_resumable(
+            api_prompt, job_key=f"h3-legacy|{filename_prefix}",
+            timeout=timeout, file_ext=".mp4", label=f"H3 {n} 段")
+        if resumed:
+            logger.info("H3(旧连续拼接路径) 本次为**免重渲复用**（未消耗 GPU）")
         files = self.get_output_files(history, ".mp4")
 
         audio_check = []
@@ -3176,8 +3311,13 @@ class ComfyUIClient:
         logger.info(f"H3(Director) 提交：{n} 段，总超时 {timeout}s（单段预估 {timeout_per_segment}s），"
                     f"段间引导 {'开' if layout.get('continuity') else '关'}"
                     f"（{layout.get('continuity_overlap_frames')} 帧）")
-        prompt_id = self.queue_prompt(api_prompt)
-        history = self.wait_for_completion(prompt_id, timeout=timeout)
+        # 崩溃免重渲（2026-09-29）：整集一次提交要跑几十分钟，崩溃/重启后先查台账与
+        # 远端 history —— 能复用就复用、还在跑就重连，绝不重复提交白烧 GPU。
+        history, prompt_id, resumed = self.submit_resumable(
+            api_prompt, job_key=f"h3-director|{filename_prefix}",
+            timeout=timeout, file_ext=".mp4", label=f"H3(Director) {n} 段")
+        if resumed:
+            logger.info("H3(Director) 本次为**免重渲复用**（未消耗 GPU）")
         files = self.get_output_files(history, ".mp4")
 
         audio_check = []
