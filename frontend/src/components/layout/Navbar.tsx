@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useApp } from '@/context/AppContext';
 import { useTheme, type ThemeMode } from '@/context/ThemeContext';
 
@@ -28,12 +28,68 @@ const THEME_ICONS: Record<ThemeMode, React.ReactNode> = {
 };
 
 const THEME_MODES: ThemeMode[] = ['light', 'dark', 'system'];
+/** 连接状态：Navbar 右上角药丸，30s 轮询 /api/status（与 ServiceMonitor 同节奏） */
+export type LinkStatus = 'checking' | 'online' | 'offline';
+
+export function useServiceLink(): { backend: LinkStatus; comfy: LinkStatus; lastCheck: string } {
+  const [backend, setBackend] = useState<LinkStatus>('checking');
+  const [comfy, setComfy] = useState<LinkStatus>('checking');
+  const [lastCheck, setLastCheck] = useState('');
+  useEffect(() => {
+    let alive = true;
+    const check = async () => {
+      try {
+        const resp = await fetch('/api/status', { signal: AbortSignal.timeout(4000) });
+        if (!alive) return;
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const data: any = await resp.json().catch(() => ({}));
+        if (!alive) return;
+        setBackend('online');
+        // /api/status 里 comfyui.status 为 "online"/"offline"（见 comfyui_client.get_status）
+        setComfy(data?.comfyui?.status === 'online' ? 'online' : 'offline');
+        setLastCheck(new Date().toLocaleTimeString('zh-CN'));
+      } catch {
+        if (!alive) return;
+        setBackend('offline');
+        setComfy('offline');
+      }
+    };
+    check();
+    const iv = setInterval(check, 30000);
+    return () => { alive = false; clearInterval(iv); };
+  }, []);
+  return { backend, comfy, lastCheck };
+}
 
 export function Navbar() {
   const { t, lang, setLang } = useApp();
   const { mode: themeMode, setMode: setThemeMode } = useTheme();
   const [showLangMenu, setShowLangMenu] = useState(false);
   const [showThemeMenu, setShowThemeMenu] = useState(false);
+  const { backend, comfy, lastCheck } = useServiceLink();
+
+  /** 连接状态药丸：圆点 + 文字，窄屏只留圆点（组件内定义：依赖 t / lastCheck） */
+  const StatusPill: React.FC<{
+    status: LinkStatus; label: string; offlineLabel: string; checkingLabel: string; title: string;
+  }> = ({ status, label, offlineLabel, checkingLabel, title }) => {
+    const text = status === 'online' ? label : status === 'offline' ? offlineLabel : checkingLabel;
+    const dot = status === 'online' ? 'bg-success'
+      : status === 'offline' ? 'bg-danger'
+      : 'bg-warning animate-pulse';
+    const border = status === 'online' ? 'border-success/20 bg-success-subtle text-success-strong'
+      : status === 'offline' ? 'border-danger/30 bg-danger-subtle text-danger'
+      : 'border-warning/30 bg-warning-subtle text-ink-2';
+    const tip = title + (lastCheck ? String.fromCharCode(10) + t('common.statusLastCheck', { time: lastCheck }) : '');
+    return (
+      <div
+        className={'flex shrink-0 items-center gap-1.5 rounded-full border px-2 py-1 text-xs sm:gap-2 sm:px-2.5 ' + border}
+        title={tip}
+      >
+        <span className={'h-1.5 w-1.5 shrink-0 rounded-full ' + dot} />
+        <span className="hidden whitespace-nowrap sm:inline">{text}</span>
+      </div>
+    );
+  };
 
   return (
     <nav className="sticky top-0 z-sticky flex items-center justify-between gap-2 border-b border-line bg-surface/80 px-4 py-3 backdrop-blur-xl sm:px-6">
@@ -47,11 +103,21 @@ export function Navbar() {
       </div>
 
       <div className="flex shrink-0 items-center gap-2 sm:gap-4">
-        {/* Status indicator：窄屏只留呼吸圆点，文字让位给标题 */}
-        <div className="flex shrink-0 items-center gap-2 rounded-full border border-success/20 bg-success-subtle px-2.5 py-1.5 text-xs text-success-strong sm:px-3">
-          <span className="h-2 w-2 animate-pulse rounded-full bg-success" />
-          <span className="hidden sm:inline">Online</span>
-        </div>
+        {/* 后端 / ComfyUI 连接状态：30s 轮询 /api/status；窄屏只留圆点 */}
+        <StatusPill
+          status={backend}
+          label={t('common.statusBackendOnline')}
+          offlineLabel={t('common.statusBackendOffline')}
+          checkingLabel={t('common.statusChecking')}
+          title="后端"
+        />
+        <StatusPill
+          status={comfy}
+          label={t('common.statusComfyOnline')}
+          offlineLabel={t('common.statusComfyOffline')}
+          checkingLabel={t('common.statusChecking')}
+          title="ComfyUI"
+        />
 
         {/* Theme selector：与语言选择器同款交互，窄屏只留图标 */}
         <div className="relative">

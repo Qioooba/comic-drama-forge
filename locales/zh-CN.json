@@ -97,6 +97,12 @@
     "loadFailed": "加载失败",
     "retry": "重试",
     "ok": "确定",
+    "statusBackendOnline": "后端在线",
+    "statusBackendOffline": "后端离线",
+    "statusComfyOnline": "ComfyUI 在线",
+    "statusComfyOffline": "ComfyUI 离线",
+    "statusChecking": "检测中…",
+    "statusLastCheck": "上次检测 {time}",
     "preview": "预览"
   },
   "mode": {

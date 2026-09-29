@@ -97,6 +97,12 @@
     "loadFailed": "Failed to load",
     "retry": "Retry",
     "ok": "OK",
+    "statusBackendOnline": "Backend online",
+    "statusBackendOffline": "Backend offline",
+    "statusComfyOnline": "ComfyUI online",
+    "statusComfyOffline": "ComfyUI offline",
+    "statusChecking": "Checking...",
+    "statusLastCheck": "Last checked {time}",
     "preview": "Preview"
   },
   "mode": {

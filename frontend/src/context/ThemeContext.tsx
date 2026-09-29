@@ -1,0 +1,89 @@
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
+
+/**
+ * 界面主题（浅色 / 深色 / 跟随系统）
+ *
+ * 设计要点：
+ * - 三档 mode，默认 system；持久化在 localStorage。key 与判定逻辑必须和
+ *   index.html 的防闪烁脚本保持一致（两边改一边要同步另一边）。
+ * - 深色的落地方式 = 给 <html> 注入 .dark 类，配合 index.css 的 :root.dark
+ *   token 覆盖层整站换肤；组件层不感知主题，禁止散落 dark: 变体类。
+ * - mode=system 时监听 prefers-color-scheme，系统切换外观实时跟随。
+ * - 监听 storage 事件，多标签页之间保持一致。
+ */
+
+export type ThemeMode = 'light' | 'dark' | 'system';
+
+/** localStorage key：index.html 防闪烁脚本读取的是同一个 */
+const STORAGE_KEY = 'theme-mode';
+
+interface ThemeContextType {
+  /** 用户选择的三档偏好 */
+  mode: ThemeMode;
+  /** 实际生效的主题（mode=system 解析后的结果） */
+  resolved: 'light' | 'dark';
+  setMode: (mode: ThemeMode) => void;
+}
+
+const ThemeContext = createContext<ThemeContextType>({
+  mode: 'system',
+  resolved: 'light',
+  setMode: () => {},
+});
+
+function readStoredMode(): ThemeMode {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (raw === 'light' || raw === 'dark' || raw === 'system') return raw;
+  } catch {
+    // localStorage 不可用（隐私模式等）：退回跟随系统
+  }
+  return 'system';
+}
+
+export function ThemeProvider({ children }: { children: React.ReactNode }) {
+  const [mode, setModeState] = useState<ThemeMode>(readStoredMode);
+  // 系统偏好单独存一份：mode=system 时跟随它实时变化
+  const [sysDark, setSysDark] = useState(() => window.matchMedia('(prefers-color-scheme: dark)').matches);
+
+  const resolved: 'light' | 'dark' = mode === 'system' ? (sysDark ? 'dark' : 'light') : mode;
+
+  // .dark 挂在 <html> 上；index.css 的 :root.dark 覆盖层随之生效
+  useEffect(() => {
+    document.documentElement.classList.toggle('dark', resolved === 'dark');
+  }, [resolved]);
+
+  // 系统主题变化实时跟随（始终监听，mode 非 system 时只是暂不使用）
+  useEffect(() => {
+    const mql = window.matchMedia('(prefers-color-scheme: dark)');
+    const onChange = (e: MediaQueryListEvent) => setSysDark(e.matches);
+    mql.addEventListener('change', onChange);
+    return () => mql.removeEventListener('change', onChange);
+  }, []);
+
+  // 其他标签页改了主题 → 本页跟进
+  useEffect(() => {
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === STORAGE_KEY) setModeState(readStoredMode());
+    };
+    window.addEventListener('storage', onStorage);
+    return () => window.removeEventListener('storage', onStorage);
+  }, []);
+
+  const setMode = useCallback((m: ThemeMode) => {
+    setModeState(m);
+    try {
+      localStorage.setItem(STORAGE_KEY, m);
+    } catch {
+      // 存不进去就只在当前页生效
+    }
+  }, []);
+
+  const value = useMemo(() => ({ mode, resolved, setMode }), [mode, resolved, setMode]);
+
+  return <ThemeContext.Provider value={value}>{children}</ThemeContext.Provider>;
+}
+
+export function useTheme() {
+  return useContext(ThemeContext);
+}
