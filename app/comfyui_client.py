@@ -2783,7 +2783,7 @@ class ComfyUIClient:
         logger.info(f"H3 提交：{n} 段，总超时 {timeout}s（单段预估 {timeout_per_segment}s）")
         # 崩溃免重渲（2026-09-29）：同 Director 路径，见 submit_resumable 文档。
         history, prompt_id, resumed = self.submit_resumable(
-            api_prompt, job_key=f"h3-legacy|{filename_prefix}",
+            api_prompt, job_key=f"h3|{filename_prefix}",
             timeout=timeout, file_ext=".mp4", label=f"H3 {n} 段")
         if resumed:
             logger.info("H3(旧连续拼接路径) 本次为**免重渲复用**（未消耗 GPU）")
@@ -3314,7 +3314,7 @@ class ComfyUIClient:
         # 崩溃免重渲（2026-09-29）：整集一次提交要跑几十分钟，崩溃/重启后先查台账与
         # 远端 history —— 能复用就复用、还在跑就重连，绝不重复提交白烧 GPU。
         history, prompt_id, resumed = self.submit_resumable(
-            api_prompt, job_key=f"h3-director|{filename_prefix}",
+            api_prompt, job_key=f"h3|{filename_prefix}",
             timeout=timeout, file_ext=".mp4", label=f"H3(Director) {n} 段")
         if resumed:
             logger.info("H3(Director) 本次为**免重渲复用**（未消耗 GPU）")

@@ -210,26 +210,50 @@ def forget(job_key: str) -> None:
         _save(data)
 
 
-def get_or_create_seed(job_key: str, gen: Callable[[], int],
-                       *, ttl_sec: int = DEFAULT_TTL_SEC) -> int:
-    """取该任务的种子：**有则沿用、无则生成并落盘**。
+def get_or_create_seed(job_key: str, gen: Callable[[], int], *,
+                       live_key: str = None,
+                       ttl_sec: int = DEFAULT_TTL_SEC) -> int:
+    """取该任务的种子：**崩溃后可复原**，但**任务一旦完成就不再复用**。
 
-    为什么种子要单独持久化：`workflow_hash` 包含种子，崩溃后若要命中台账复用，
-    重建出的工作流必须与崩溃前逐字节一致 —— 种子漂了哈希就不一致，
-    检查点等于白存。TTL 与台账一致（默认 7 天），过期种子不复用（避免老任务串味）。
+    为什么种子要单独持久化
+    ---------------------
+    workflow_hash 包含种子。崩溃后若要命中台账复用，重建出的工作流必须与崩溃前
+    逐字节一致 —— 种子漂了哈希就不一致，检查点等于白存。
+
+    为什么**不能一直**沿用落盘的种子（关键取舍）
+    -----------------------------------------
+    沿用种子 = 沿用同一张图。若"任务完成后仍复用"，用户点「重新生成」会**秒回上一
+    次的成片**、看不出任何变化 —— 这违背本项目 O3「第 1 轮也用真随机 seed 并始终
+    注入」的既有口径，是一次静默回归。
+
+    因此复用条件收紧为「**该任务的台账记录仍处于 submitted（在飞）**」：
+
+    * 崩溃/重启时记录仍是 submitted → 沿用种子 → 工作流逐字节一致 → 命中检查点 → 免重渲；
+    * 任务已 completed / failed，或记录被 TTL 淘汰 → 生成**新**种子 → 正常重渲。
+
+    这样「崩溃恢复」与「用户主动重做」两个诉求不再互相打架。
+
+    live_key：判定「是否在飞」所用的台账键（默认与 job_key 同值）。
+    需要分开的原因：种子键按「镜 + 第几轮」细分，而 ComfyUI 台账键按「输出前缀」
+    聚合 —— 两个命名空间不同，必须显式指定，否则永远判不出 in-flight。
     """
     if not job_key:
         return int(gen())
+    live = live_key or job_key
     now = time.time()
     with _lock:
         data = _load()
+        jobs = _prune(data.get("jobs") or {}, now)
+        rec = jobs.get(live)
+        in_flight = isinstance(rec, dict) and str(rec.get("status") or "") == "submitted"
         seeds = data.get(_SEED_KEY) or {}
-        rec = seeds.get(job_key)
-        if isinstance(rec, dict):
+        prev = seeds.get(job_key)
+        if in_flight and isinstance(prev, dict):
             try:
-                ts = float(rec.get("at") or 0)
-                val = int(rec.get("value"))
+                ts = float(prev.get("at") or 0)
+                val = int(prev.get("value"))
                 if ts and (now - ts) <= ttl_sec:
+                    logger.info("[免重渲] 任务仍在飞，沿用种子 %s（%s）", val, job_key)
                     return val
             except (TypeError, ValueError):
                 pass
@@ -241,10 +265,10 @@ def get_or_create_seed(job_key: str, gen: Callable[[], int],
                              reverse=True)
             seeds = dict(ordered[:DEFAULT_MAX_ENTRIES])
         data[_SEED_KEY] = seeds
+        data["jobs"] = jobs          # 把淘汰结果一并落回，避免过期条目"复活"
         data["updated_at"] = now
         _save(data)
         return val
-
 
 def stats() -> dict:
     """台账概况（给诊断/看板用）。"""

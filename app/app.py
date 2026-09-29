@@ -44,6 +44,7 @@ from config import (
 from script_generator import ScriptGenerator
 from comfyui_client import (ComfyUIClient, camera_spec as _camera_spec,
                             camera_key as _camera_key, camera_angle as _camera_angle)
+import comfyui_job_store  # 崩溃免重渲检查点（2026-09-29）：种子沿用判据 + 台账查询
 # ⚠️ 注意：本文件里 `comfyui_client` 这个名字是**实例**（见下方 `comfyui_client = ComfyUIClient()`），
 # 不是模块。因此**模块级函数**（camera_spec / camera_key / get_call_stats 等）必须像上面这样
 # 直接 import 后用别名调用 —— 写成 `comfyui_client.camera_spec(...)` 会在运行时抛
@@ -6064,7 +6065,14 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
             result = comfyui_client.generate_h3_sequence_sequential(
                 segments=segs,
                 filename_prefix=f"comic_drama/{project_name}_{episode_tag or 'episode'}",
-                seed=None,
+                # 崩溃免重渲（2026-09-29）：整集一次提交要跑几十分钟，若中途崩溃/重启，
+                # 种子必须还能复原 —— 否则重建出的工作流哈希变了、检查点直接失效。
+                # 种子只在「该任务仍在飞」时沿用（见 comfyui_job_store.get_or_create_seed）；
+                # 任务一旦完成就换新种子，保证用户主动「重新生成」不会秒回旧片。
+                seed=comfyui_job_store.get_or_create_seed(
+                    f"video|{project_name}|{episode_tag or 'episode'}|episode",
+                    lambda: random.randint(1, 2 ** 31 - 1),
+                    live_key=f"h3|comic_drama/{project_name}_{episode_tag or 'episode'}"),
                 timeout_per_segment=timeout_per_segment,
                 size=_size,
                 qc_fn=_seg_qc_fn if qc_on else None,
@@ -6242,7 +6250,11 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
                                     qc_cfg.get("enabled"), qc_cfg.get("video_enabled"))
                 attempts = []
                 # O3：第 1 轮也用真实随机 seed 并始终注入（不再 None），视频 qc.history[0].seed 不再为 null
-                seed = random.randint(1, 2 ** 31 - 1)
+                # 崩溃免重渲：种子走台账（在飞时沿用、完成后换新），见 comfyui_job_store.get_or_create_seed
+                _v_live = f"h3|comic_drama/{project_name}_shot_{seq:02d}"
+                seed = comfyui_job_store.get_or_create_seed(
+                    f"{_v_live}|a0",
+                    lambda: random.randint(1, 2 ** 31 - 1), live_key=_v_live)
                 dst = os.path.join(videos_dir, f"shot_{seq:02d}.mp4")
                 video_item = {"shot_id": shot_id, "success": False,
                               "mode": "per_shot", "segment_count": len(segs_list),
@@ -6252,7 +6264,10 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
 
                 for attempt in range(max_retries + 1):
                     if attempt > 0:
-                        seed = random.randint(1, 2 ** 31 - 1)
+                        # 每一轮重试独立命名空间（a{n}）：某轮崩了能单独复原，也不会串到下一轮
+                        seed = comfyui_job_store.get_or_create_seed(
+                            f"{_v_live}|a{attempt}",
+                            lambda: random.randint(1, 2 ** 31 - 1), live_key=_v_live)
                         # 从教训库召回「上一轮质检哪里不对」，据此改写视频提示词再生成
                         try:
                             learned = prompt_memory.learned_prompt(
