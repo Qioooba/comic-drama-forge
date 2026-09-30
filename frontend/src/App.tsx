@@ -78,7 +78,7 @@ function AppContent() {
         <div className="flex-1 flex flex-col overflow-hidden">
           <Navbar />
           {/* 超宽屏下限宽居中，避免一行文字拉到 2000px+ 难以阅读 */}
-          <main className="mx-auto w-full max-w-[1600px] flex-1 overflow-y-auto p-6">
+          <main className="w-full flex-1 overflow-y-auto p-6">
             {activeSection === 'project-workbench' && projectKey ? (
               // 审计 P2-36（2026-09-29）：key={projectKey} 强制切项目时整页重挂 ——
               // 旧实现组件实例复用，OverviewTab/QcTab/StoryboardTab 等保留上一个

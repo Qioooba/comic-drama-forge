@@ -42,6 +42,7 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -55,7 +56,29 @@ logger = logging.getLogger(__name__)
 # --------------------------------------------------------------------------- #
 
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
-_PAGE_SRC = os.path.join(_APP_DIR, "static", "te_3d_render", "render.html")
+
+# 渲染页（我们手写维护的代码，由 app/static 提供）。
+# ⚠️ 这里踩过两个坑，都属于「静默降级、没人发现」那一类：
+#  1) 冻结态 __file__ = <_MEIPASS>/te_3d_render.pyc，_APP_DIR 就等于 _MEIPASS，
+#     而静态资源按 spec 落在 <_MEIPASS>/app/static —— 原来只拼 "static/…"，
+#     exe 里恒「渲染页缺失」，站位图悄悄降级成文字锚点；
+#  2) 这个文件原本住在 app/static 下，而 vite.config.ts 是 outDir=../app/static
+#     + emptyOutDir=true：**每次 vite build 都会清空该目录**，它不在构建图里、
+#     也不是 public/ 的产物，于是被删过（见提交 bc6ab37：322 deletions）。
+#     现已复制一份到 frontend/public/te_3d_render/，构建会把它带回来。
+_PAGE_SRC_CANDIDATES = tuple(dict.fromkeys([
+    os.path.join(_APP_DIR, "app", "static", "te_3d_render", "render.html"),  # 冻结态（spec: app/static → app/static）
+    os.path.join(_APP_DIR, "static", "te_3d_render", "render.html"),        # 源码态（app/static/…）
+    os.path.join(os.path.dirname(_APP_DIR), "frontend", "public", "te_3d_render", "render.html"),
+]))
+
+
+def _page_src() -> str:
+    """渲染页路径：按候选顺序取第一个存在的（每次调用都重探，便于热修复）。"""
+    for _c in _PAGE_SRC_CANDIDATES:
+        if os.path.isfile(_c):
+            return _c
+    return _PAGE_SRC_CANDIDATES[0]
 
 #: 本机 ComfyUI 的 TE MAN 插件 web 目录（按顺序探测，第一个存在的胜出）
 _TE_MAN_JS_CANDIDATES = (
@@ -151,10 +174,11 @@ def ensure_assets(root_dir: str) -> Optional[str]:
             os.makedirs(os.path.join(dst, "three", "utils"), exist_ok=True)
             os.makedirs(os.path.join(dst, "assets"), exist_ok=True)
             # 渲染页永远以 app/static 里的版本为准（我们自己维护的代码）
-            if os.path.isfile(_PAGE_SRC):
-                _copy_if_newer(_PAGE_SRC, os.path.join(dst, "render.html"))
+            _src_page = _page_src()
+            if os.path.isfile(_src_page):
+                _copy_if_newer(_src_page, os.path.join(dst, "render.html"))
             else:
-                logger.warning("[3D站位图] 渲染页缺失：%s", _PAGE_SRC)
+                logger.warning("[3D站位图] 渲染页缺失（已尝试）：%s", " | ".join(_PAGE_SRC_CANDIDATES))
                 return None
             src = _te_man_js_dir()
             if not src:

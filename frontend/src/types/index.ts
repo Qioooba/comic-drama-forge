@@ -750,12 +750,25 @@ export interface ProvidersResponse {
 }
 
 // --- AI Config (Unified: text / qc / chat) ---
+export interface AIFallbackModel {
+  base_url: string;
+  model: string;
+  label?: string;
+  reasoning_effort?: string;
+  api_key?: string;        // 编辑中（未保存）
+  api_key_masked?: string; // 已保存（脱敏）
+  has_api_key?: boolean;
+  index?: number;
+}
+
 export interface AIConfigModule {
   base_url: string;
   api_key: string;    // masked on read
   model: string;
   /** 思考档位：'' = 不注入（服务端默认），其余为 low / high / max。思考不可关闭的模型用 */
   reasoning_effort?: string;
+  /** 备用模型故障转移链（顺序即优先级），主模型挂 3 次自动切下一个 */
+  fallbacks?: AIFallbackModel[];
   updated_at: string | null;
   has_api_key?: boolean;  // whether a real key is stored
   key?: string;       // module key

@@ -317,7 +317,7 @@ class ScriptGenerator:
       "category": "武器/法宝/道具/服饰",
       "appearance": "物品外观描述：形状、材质、颜色、纹理、尺寸",
       "owner": "所属角色（可为空）",
-      "reference_prompt_zh": "中文物品图生成提示词（含：3D渲染、白底展示、材质细节）",
+      "reference_prompt_zh": "中文物品图生成提示词。只写物品本体：造型/材质/颜色/纹样/尺寸感，外加 3D渲染、白底展示、材质细节；严禁写容器、托盘、盒子、底座、承托物、摆放位置、所处环境、光照氛围、人物或手。原因：这些属于分镜内容，写进参考图会让它变成「物品在某容器里」，并被当成该物品的规范外观带进后面每一镜。",
       "reference_prompt_en": "English item image generation prompt"
     }}
   ],

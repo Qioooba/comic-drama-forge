@@ -21,6 +21,29 @@ const updater = require('./updater');
 const updateConfig = require('./update-config');
 
 // ---------------------------------------------------------------------------
+// 启动日志
+// ---------------------------------------------------------------------------
+// ⚠️ Windows 的 GUI 子系统程序**没有控制台**，stdout/stderr 会被系统直接丢弃：
+// 打包版一旦在 whenReady 之前抛异常，表现就是「双击没反应 / 一闪而过」，
+// 看不到任何输出（实测：Start-Process 重定向出来的 log 是空的）。
+// 所以这里把关键节点落盘，启动失败至少有据可查。
+function bootLog(msg) {
+  try {
+    const dir = app.getPath('userData');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.appendFileSync(path.join(dir, 'desktop.log'),
+      `[${new Date().toISOString()}] ${msg}\n`);
+  } catch { /* 日志失败绝不影响启动 */ }
+}
+
+process.on('uncaughtException', (e) => {
+  bootLog(`uncaughtException: ${(e && e.stack) || e}`);
+});
+process.on('unhandledRejection', (e) => {
+  bootLog(`unhandledRejection: ${(e && e.stack) || e}`);
+});
+
+// ---------------------------------------------------------------------------
 // 常量
 // ---------------------------------------------------------------------------
 
@@ -134,7 +157,12 @@ function resolveBackendLayout() {
     const useMirror = fs.existsSync(mirrorServe);
     return {
       pythonExe: path.join(res, 'python', exeName), // python 归整包管理，永远走安装区
-      servePy: useMirror ? mirrorServe : path.join(res, 'app', 'serve.py'),
+      // 安装区：resources/app = Electron 应用目录（asar:false 的产物），
+      // 后端源码在 resources/backend —— 刻意避开 'app' 这个名字：
+      // 之前 asar=true 时 electron-builder 会把应用打成**名为 app.asar 的目录**，
+      // 而 Electron 对含 .asar 的路径一律按存档解析，目录不是合法存档 →
+      // package.json 读不到 → 双击无反应、静默退出。改普通目录 + 改名即可根治。
+      servePy: useMirror ? mirrorServe : path.join(res, 'backend', 'serve.py'),
       dataDir: app.getPath('userData'), // 可写数据区（output/novels/*.config.json/密钥）
       cwd: useMirror ? mirror : res,
     };
@@ -254,14 +282,17 @@ function seedResourceMirror() {
   if (!app.isPackaged) return null; // 开发态直接用项目根，无镜像
   const res = process.resourcesPath;
   const mirror = resourceMirrorDir();
-  for (const sub of ['app', 'workflows', 'locales']) {
-    const src = path.join(res, sub);
-    const dst = path.join(mirror, sub);
+  // 安装区目录名 → 镜像目录名：后端源码在安装区叫 backend，镜像内仍叫 app
+  // （后端代码里的相对引用不变，只有安装区这层名字避让 .asar / app 冲突）。
+  const subs = [['backend', 'app'], ['workflows', 'workflows'], ['locales', 'locales']];
+  for (const [srcName, dstName] of subs) {
+    const src = path.join(res, srcName);
+    const dst = path.join(mirror, dstName);
     if (!fs.existsSync(src)) continue;
     if (!fs.existsSync(dst)) {
       fs.mkdirSync(path.dirname(dst), { recursive: true });
       fs.cpSync(src, dst, { recursive: true });
-      console.log(`[更新] 播种资源镜像 ${sub} -> ${dst}`);
+      console.log(`[更新] 播种资源镜像 ${srcName} -> ${dst}`);
     }
   }
   return mirror;
@@ -688,6 +719,22 @@ function registerIpc() {
       return { ok: false, error: String(e.message || e) };
     }
   });
+  // 原生窗口按钮（最小化/最大化/关闭）的配色跟随前端主题。
+  // titleBarOverlay 由主进程绘制，前端切浅色主题时不同步就会出现
+  // 「深色按钮压在浅色页面上」的割裂感 —— 桌面软件不该有这种破绽。
+  ipcMain.on('window:titlebar-theme', (e, payload) => {
+    const win = BrowserWindow.fromWebContents(e.sender);
+    if (!win || typeof win.setTitleBarOverlay !== 'function') return;
+    const isLight = payload && payload.theme === 'light';
+    try {
+      win.setTitleBarOverlay({
+        color: isLight ? '#f5f7fb' : TITLEBAR_COLOR,
+        symbolColor: isLight ? '#334155' : TITLEBAR_SYMBOL,
+        height: TITLEBAR_HEIGHT,
+      });
+    } catch { /* 该平台不支持覆盖层时静默忽略 */ }
+  });
+
   ipcMain.handle('shell:openExternal', (_e, url) => {
     if (String(url).startsWith('http')) shell.openExternal(url);
   });
@@ -697,18 +744,73 @@ function registerIpc() {
 // 窗口
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// 窗口外观：像「桌面软件」而不是「一个网页窗口」
+// ---------------------------------------------------------------------------
+// 依据（用户反复反馈「桌面版看起来就是浏览器」）：
+//   1. 系统标题栏 + 常显菜单栏 = 最像浏览器的两处；
+//   2. 启动瞬间的白底闪烁 = 典型的网页观感；
+//   3. 没有应用图标，任务栏里认不出来；
+//   4. 每次打开都是默认大小位置，不像装好的软件。
+// 这里逐条处理：隐藏系统标题栏（保留原生最小化/最大化/关闭的覆盖层）+
+// 菜单栏改为 Alt 唤出 + 深色底先铺 + 应用图标 + 窗口尺寸位置记忆。
+const APP_ICON = path.join(__dirname, 'build', 'icon.ico');
+const TITLEBAR_HEIGHT = 44;          // 与前端 .electron-titlebar 的高度保持一致
+const TITLEBAR_COLOR = '#0b0f19';    // 深色底：和前端 bg-canvas 同色系，避免接缝
+const TITLEBAR_SYMBOL = '#c7d2e0';   // 最小化/最大化/关闭 的图标色（浅色，深底可见）
+
+function windowStateFile() {
+  return path.join(app.getPath('userData'), 'window-state.json');
+}
+
+function loadWindowState() {
+  try {
+    const s = JSON.parse(fs.readFileSync(windowStateFile(), 'utf8'));
+    if (s && Number.isFinite(s.width) && Number.isFinite(s.height)) return s;
+  } catch { /* 首次运行或文件损坏 → 用默认值 */ }
+  return null;
+}
+
+function saveWindowState(win) {
+  try {
+    // getNormalBounds：最大化状态下取「还原后」的尺寸，否则记下来的是全屏大小
+    const b = typeof win.getNormalBounds === 'function' ? win.getNormalBounds() : win.getBounds();
+    fs.writeFileSync(windowStateFile(),
+      JSON.stringify({ ...b, maximized: win.isMaximized() }), 'utf8');
+  } catch { /* 落盘失败不影响使用 */ }
+}
+
 function createWindow() {
+  const saved = loadWindowState();
   const win = new BrowserWindow({
-    width: 1440,
-    height: 900,
+    width: saved ? saved.width : 1440,
+    height: saved ? saved.height : 900,
+    x: saved ? saved.x : undefined,
+    y: saved ? saved.y : undefined,
+    minWidth: 1120,
+    minHeight: 700,
     title: '漫剧工坊',
-    autoHideMenuBar: false,
+    icon: fs.existsSync(APP_ICON) ? APP_ICON : undefined,
+    backgroundColor: TITLEBAR_COLOR,   // 先铺深色，消除启动白闪
+    show: false,                        // 等 ready-to-show 再显示，避免先白后黑
+    autoHideMenuBar: true,              // 菜单栏收起，按 Alt 唤出（内容更满、更像应用）
+    titleBarStyle: 'hidden',            // 去掉系统标题栏
+    titleBarOverlay: {                  // 但保留原生窗口按钮的覆盖层（自绘按钮易做错）
+      color: TITLEBAR_COLOR,
+      symbolColor: TITLEBAR_SYMBOL,
+      height: TITLEBAR_HEIGHT,
+    },
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
     },
   });
+  if (saved && saved.maximized) win.maximize();
+  win.once('ready-to-show', () => win.show());
+  win.on('resize', () => saveWindowState(win));
+  win.on('move', () => saveWindowState(win));
+  win.on('close', () => saveWindowState(win));
   const port = backend.port || DEFAULT_PORT;
   win.loadURL(`http://127.0.0.1:${port}/`);
   return win;
@@ -763,7 +865,9 @@ function buildMenu() {
 // App 生命周期
 // ---------------------------------------------------------------------------
 
+bootLog(`boot pid=${process.pid} isPackaged=${app.isPackaged} resourcesPath=${process.resourcesPath} execPath=${process.execPath}`);
 const gotLock = app.requestSingleInstanceLock();
+bootLog(`singleInstanceLock=${gotLock}`);
 if (!gotLock) {
   app.quit();
 } else {

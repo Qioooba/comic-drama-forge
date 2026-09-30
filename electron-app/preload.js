@@ -22,6 +22,10 @@ contextBridge.exposeInMainWorld('mjscxt', {
     setProjectRoot: (root) => ipcRenderer.invoke('config:setProjectRoot', root),
     get: () => ipcRenderer.invoke('config:get'),
   },
+  // 窗口外观：让标题栏覆盖层（原生窗口按钮）的配色跟随前端主题
+  window: {
+    setTitleBarTheme: (theme) => ipcRenderer.send('window:titlebar-theme', { theme }),
+  },
   // 更新系统（纯数据，不弹窗；菜单「检查更新」走独立通道）
   updater: {
     check: () => ipcRenderer.invoke('updater:check'),

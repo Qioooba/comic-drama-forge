@@ -32,6 +32,11 @@ from urllib.parse import urlparse
 
 import requests
 
+# 单镜时长等口径的**唯一权威**（2026-09-30 提到 config）：质检期的 OK 区间必须与生成期同源，
+# 否则出现「剧本端 3~12 秒 vs 质检端 1~15 秒」互相打架、正常剧本反被判不可执行的历史缺陷。
+# config 只依赖 env_loader，不会形成循环导入。
+import config
+
 # 音频客观层（ffmpeg 指标 + 频谱/波形渲染）。⚠️ audio_qc **不反向依赖本模块**，
 # 因此这里 import 不会形成循环；硬阈值与渲染逻辑都由它持有（谁消费谁定义）。
 import audio_qc
@@ -731,6 +736,7 @@ CONFIG_KEYS = (
     "keyframe_qc_enabled",
     # 图片质检是否附带「本镜出现的角色/物品/场景」设定图做一致性核对（2026-09-20 新增）
     "image_ref_compare",
+    "image_blocking_ref_compare",
     # 图片质检「二次复核」：首次判不过时同图再判一次，任一判过即放行（2026-09-25 新增）
     "image_qc_recheck",
     # G9/O1 图片/视频客观层阈值（2026-09-20 新增）
@@ -773,6 +779,7 @@ def _empty_config() -> dict:
         # 这类问题只能靠猜。开启后按 shot.characters_in_shot / items_in_shot 顺序附带
         # 最多 MAX_REF_IMAGES 张设定图，并要求逐张核对是否变形、与设定是否一致。
         "image_ref_compare": True,
+    "image_blocking_ref_compare": True,
         # ★ 图片质检「二次复核」（判官自洽性检查），默认开：
         #   实测同一张图 + 同一组设定图 + temperature=0 重复送检，score 可为
         #   45 / 78 / 85 / 92（同一张图通过率 2/4），还会出现「景别完美符合」与
@@ -999,6 +1006,7 @@ def _save_config_impl(config_path: str, patch: dict, keep_key_if_blank: bool = T
             new_key = v
             continue
         if k in ("enabled", "image_enabled", "video_enabled", "image_ref_compare",
+    "image_blocking_ref_compare",
                  "image_qc_recheck"):
             # ⚠️ 审计 G2：这里原本是 `bool(v)` —— 字符串 "false"/"0"/"no"/"off"/"none"
             #    都是**非空字符串**，`bool()` 一律判 True。用户在页面或第三方脚本里把开关
@@ -1110,6 +1118,9 @@ def _normalize(cfg: dict) -> dict:
     cfg["prompt_enabled"] = _as_bool(cfg.get("prompt_enabled"), True)
     # 图片质检是否附带设定图（save_config 的布尔组里也有它，读取侧必须同口径归一化）
     cfg["image_ref_compare"] = _as_bool(cfg.get("image_ref_compare"), True)
+    # 3D 构图基准核对：2026-10-01 起**不再送无面人偶预演图**（会污染判定，实测 88→35），
+    # 改为送 te_3d_director.blocking_spec_text() 生成的确定性文字规格，故可以安全默认开启。
+    cfg["image_blocking_ref_compare"] = _as_bool(cfg.get("image_blocking_ref_compare"), True)
     # 图片质检二次复核（默认开；同上：字符串 "false" 必须能真正关掉）
     cfg["image_qc_recheck"] = _as_bool(cfg.get("image_qc_recheck"), True)
     _pmode = str(cfg.get("prompt_mode") or "repair").strip().lower()
@@ -2052,7 +2063,7 @@ def check_image(image_path: str, shot_desc: str = "", cfg: dict = None,
                 override: dict = None, style: str = "",
                 ref_images: list = None,
                 prev_shot_desc: str = "", prev_shot_ref: str = "",
-                blocking_ref: str = "") -> dict:
+                blocking_ref: str = "", blocking_spec: str = "") -> dict:
     """单张图片质检。永不抛异常：失败时返回 ok=False 并带 error。
     override 仅用于「测试连通性」临时传参，不落盘。
     style：目标风格串（用户与总控敲定），用于「风格达标」判定；为空则不做风格检测。
@@ -2091,11 +2102,29 @@ def check_image(image_path: str, shot_desc: str = "", cfg: dict = None,
     if _should_check_gender(shot_desc):
         prompt = prompt + GENDER_CHECK_NOTE
     # ---- 构图基准图（3D 导演台站位/机位）：不占设定图名额，单独一条口径 ----
-    blocking_used = bool(blocking_ref) and os.path.isfile(blocking_ref) \
-        and os.path.abspath(blocking_ref) != os.path.abspath(image_path)
+    # ⚠️⚠️ 2026-09-30 实测紧急关闭（默认 False，需显式 image_blocking_ref_compare=true 才开）：
+    #     把 3D 基准图（灰/蓝色**无面人偶**预演图）与成品图一起送进视觉模型，会**严重污染**
+    #     判定 —— 同一张合格图实测：不传基准图 score=88 通过；传了基准图 score=35 拒绝，
+    #     且模型开始**凭空捏造**缺陷（「白色双眼」「彩色球体水系法术」「逻辑自相矛盾」）。
+    #     更早那批「画面内容为蓝色无面人偶」「提交图为构图预演人偶」的荒谬判定也是同一原因：
+    #     模型把送检的第 2 张人偶图当成了待检成品图。这正是分镜 2 连续 6 次、分镜 1~7
+    #     反复「质检不过→重试」的**真正元凶**（并非出图质量问题）。
+    #     基准图仍照常用于**出图**（构图约束有效）；只是不再作为质检输入。
+    #     如确需核对构图，必须走**独立的一次专用调用**，绝不能与成品图同批送检。
+    _blk_cmp_on = bool(cfg.get("image_blocking_ref_compare", False))
+    # ⛔️ 不再把「无面人偶预演图」送进视觉质检（2026-10-01 定论）。
+    # 实测：同一张合格分镜图，不送基准图 score=88 通过；送了 score=35 拒绝 ——
+    # 污染来自**图像本身**（灰蓝人偶、纯色底被当成画面内容），怎么加强提示词口径都压不住。
+    # 解法：改送 `blocking_spec`（te_3d_director.blocking_spec_text 生成的**确定性**文字规格：
+    # 人数 / 左右顺序 / 景别 / 机位），既保住「有没有照构图出图」的核对能力，又零视觉污染。
+    blocking_used = False
+    if _blk_cmp_on and str(blocking_spec or "").strip():
+        prompt = prompt + "\n" + str(blocking_spec).strip()
+        blocking_used = True
     # ---- 设定一致性核对：把生成时用的参考图一并送检 ----
     ref_list = []
-    if ref_images and cfg.get("image_ref_compare", True):
+    if ref_images and cfg.get("image_ref_compare",
+    "image_blocking_ref_compare", True):
         seen = {os.path.abspath(image_path)}
         if blocking_used:
             seen.add(os.path.abspath(blocking_ref))
@@ -2493,6 +2522,114 @@ def image_objective(image_path: str, cfg: dict = None) -> dict:
     base["passed"] = not base["fatal"]
     return base
 
+
+# =====================================================================
+# 景别后处理（C 方案，2026-09-30）
+# =====================================================================
+# 背景：实测 18 次分镜质检里 16 次因「景别不符」被拒 —— 模型默认给全景/远景，
+# 而镜头要求中近景/近景。自动裁剪：检测主体在画面中的垂直占比，若超出目标景别
+# 取景范围则裁掉多余空间，**不改变画面内容**，只做取景范围修正。
+
+# 景别 → 主体应占画面高度的比例范围（实测调参；偏保守，避免把脸切掉）
+_FRAMING_RANGE: dict = {
+    "特写":  (0.45, 1.0),
+    "近景":  (0.35, 0.75),
+    "中近景": (0.30, 0.65),
+    "中景":  (0.20, 0.55),
+    "全景":  (0.10, 0.45),
+    "远景":  (0.05, 0.30),
+}
+
+
+def _detect_subject_bbox(image_path: str) -> dict:
+    """检测主体（人物）在画面中的边界框。
+
+    优先用 YOLOv8n（若已安装 ultralytics）；否则回退到 PIL + numpy 的简单梯度检测
+    （找非背景区域的行范围）。返回 {x, y, w, h, method}（归一化 0~1）；失败返回 fallback。
+    """
+    import os
+    try:
+        from ultralytics import YOLO
+        model = YOLO("yolov8n.pt")
+        results = model(image_path, verbose=False)
+        if results[0].boxes is not None and len(results[0].boxes) > 0:
+            persons = results[0].boxes[results[0].boxes.cls == 0]
+            if len(persons) > 0:
+                cx, cy, w, h = persons[0].xywh[0].tolist()
+                W, H = results[0].orig_shape[1], results[0].orig_shape[0]
+                return {"x": cx - w / 2 / W, "y": cy - h / 2 / H,
+                        "w": w / W, "h": h / H, "method": "yolo"}
+    except Exception:
+        pass
+    try:
+        import PIL.Image
+        import numpy as np
+        with PIL.Image.open(image_path) as im:
+            arr = np.array(im.convert("L"), dtype=np.float32)
+            H, W = arr.shape
+            col_grad = np.abs(np.diff(arr, axis=0)).max(axis=1)
+            thresh = col_grad.mean() * 0.8
+            rows = np.where(col_grad > thresh)[0]
+            if len(rows) < 10:
+                return {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0, "method": "gradient_fallback"}
+            y_top, y_bot = int(rows.min()), int(rows.max())
+            return {"x": 0.0, "y": y_top / H, "w": 1.0,
+                    "h": max(0.05, (y_bot - y_top) / H), "method": "gradient"}
+    except Exception:
+        return {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0, "method": "fallback"}
+
+
+def auto_crop_framing(image_path: str, shot_type: str, out_path: str = None) -> dict:
+    """若画面主体**偏小**（构图太松/退成全景），自动裁剪收紧到目标景别。
+
+    ⚠️ 只处理「主体偏小」这一个方向（2026-09-30 修正）：主体**偏大**时裁剪只会让它
+    更大，方向相反 —— 要靠拉远/重出图才能解决，本函数无能为力，直接跳过（fail-open）。
+    旧实现两个方向都走同一条裁剪公式，主体占 96% 时会算出 min(H, 2.0*H)=H → 裁出
+    与原图等大的一张图却返回 cropped=True，日志「自动裁剪至 1216x672」是**假动作**，
+    掩盖了「这镜其实景别过近」的真实问题。
+
+    返回 {"cropped": bool, "out_path": str, "method": str, "bbox": dict, "reason": str}
+    """
+    import os
+    import PIL.Image
+    if not shot_type or shot_type not in _FRAMING_RANGE:
+        return {"cropped": False, "out_path": image_path, "method": "unknown_shot_type",
+                "bbox": {}, "reason": f"未知景别类型：{shot_type}"}
+    lo, hi = _FRAMING_RANGE[shot_type]
+    bbox = _detect_subject_bbox(image_path)
+    if bbox.get("method") in ("fallback", "gradient_fallback"):
+        return {"cropped": False, "out_path": image_path, "method": bbox.get("method", "fallback"),
+                "bbox": bbox, "reason": "主体检测失败，不裁剪（fail-open）"}
+    subject_h = bbox["h"]
+    if lo <= subject_h <= hi:
+        return {"cropped": False, "out_path": image_path, "method": "in_range",
+                "bbox": bbox, "reason": f"主体占 {subject_h:.0%}，在 [{lo:.0%},{hi:.0%}] 内"}
+    if subject_h > hi:
+        # 主体比目标景别**更近**（该镜实际是特写却要求中近景）→ 裁剪方向相反，跳过。
+        return {"cropped": False, "out_path": image_path, "method": "subject_too_large",
+                "bbox": bbox,
+                "reason": f"主体占 {subject_h:.0%} > 上限 {hi:.0%}（比目标景别更近）"
+                          f"→ 裁剪只会更近，跳过（fail-open）"}
+    with PIL.Image.open(image_path) as im:
+        W, H = im.size
+        cx, cy = bbox["x"] + bbox["w"] / 2, bbox["y"] + bbox["h"] / 2
+        target_h = (lo + hi) / 2
+        new_h = min(H, int(bbox["h"] * H / target_h))
+        new_w = min(W, int(new_h * (W / H)))
+        if new_h >= H and new_w >= W:
+            # 算出的裁剪区不比原图小 → 没有可裁的空间，别写一张等大的假产物。
+            return {"cropped": False, "out_path": image_path, "method": "no_room",
+                    "bbox": bbox, "reason": "裁剪区域不小于原图，跳过"}
+        x1 = max(0, min(int(cx - new_w / 2), W - new_w))
+        y1 = max(0, min(int(cy - new_h / 2), H - new_h))
+        cropped_im = im.crop((x1, y1, x1 + new_w, y1 + new_h))
+        out = out_path or os.path.join(os.path.dirname(image_path),
+                                       "auto_cropped_" + os.path.basename(image_path))
+        cropped_im.save(out)
+        return {"cropped": True, "out_path": out, "method": bbox["method"],
+                "bbox": bbox,
+                "reason": f"主体占 {subject_h:.0%}，目标景别 {shot_type} 需 [{lo:.0%},{hi:.0%}]"
+                          f" → 自动裁剪至 {new_w}x{new_h}"}
 
 # A-19（P2-8）：视频客观层缺陷的**结构化判定码** + 致命性由「检测逻辑」决定，
 # **不再靠中文字文案包含**。旧实现在 check_video 里写
@@ -3163,7 +3300,7 @@ def _validate_script_bloat(script: dict) -> list:
 
 
 # ======================================================================
-# 92 镜拆解法「三层全吸收」→ 剧本质检侧软告警（2026-09-28 新增）
+# 92 镜拆解法「五层全吸收」→ 剧本质检侧软告警（2026-09-28 三层 / 2026-09-30 补 ④⑤）
 #
 # 背景：写剧本层（novel_to_script.REWRITE_RULES 第 9/10 条 + edit_reason 字段）
 # 已按 92 镜短片的拆解口径约束了镜头语言克制 / 剪辑动机 / 视觉锚点道具回环。
@@ -3171,11 +3308,15 @@ def _validate_script_bloat(script: dict) -> list:
 # 只写进 issues 提示，不命中 CRITICAL_ISSUE_KEYWORDS、不进 structure/logic
 # critical 桶、不直接判 pass=false —— 避免判官抖动与百分比分布误伤重画。
 #
-# 三层：
+# 五层：
 #   ① edit_reason 覆盖率：镜头写了剪辑动机的占比，过低说明「为什么切」缺失；
 #   ② 镜头语言克制分布：固定机位占比下限 / 特写+全景占比上限（做情绪锚点，非主奏）；
 #   ③ 视觉锚点·道具回环：全片出现 ≥2 次的关键道具，其出现镜头是否在
-#      description 里落了「视觉锚点」标注或道具状态变化（位置/动作）。
+#      description 里落了「视觉锚点」标注或道具状态变化（位置/动作）；
+#   ④ 一镜一动作（2026-09-30）：单镜动作节拍数，过多说明模型把多个动作塞进同一镜
+#      （成片表现 = 一个分镜不切换、里面演好几件事），违背参考片「一镜一动作」口径；
+#   ⑤ 主力景别区间（2026-09-30）：近景/中近景/局部 合计占比下限、大特写/远景/大远景
+#      占比上限、「局部」插入镜占比下限，全部对齐参考片 92 镜实测分布。
 
 #: ① edit_reason 覆盖率下限：低于此值提示「剪辑动机缺失」。（样本 < 5 镜时跳过）
 EDIT_REASON_COVERAGE_MIN = 0.5
@@ -3185,6 +3326,20 @@ LOCKED_OFF_RATIO_MIN = 0.6
 ANCHOR_SHOT_RATIO_MAX = 0.10
 #: ③ 道具回环的最小出现次数：同一道具出现在 ≥ 该数镜头才认定「回环锚点」。
 PROP_RECURRENCE_MIN = 2
+
+#: ④ 一镜一动作（2026-09-30 新增）：单镜动作节拍数上限。参考片 92 镜几乎每镜只有
+#: 1 个动作节拍；description 里可数出的动作节拍 ≥ 此值即视为「一镜多动作」。
+ACTION_BEATS_MAX = 2
+#: ④ 触发阈值：出现「一镜多动作」的镜头数达到该值（或占比 > 20%）时提示，防单镜误伤。
+ACTION_BEATS_SHOT_MIN = 3
+#: ⑤ 主力景别（参考片 92 镜实测：近景 26% + 中近景 25% + 局部 25% ≈ 76%）。
+MAIN_SHOT_TYPES = ("近景", "中近景", "局部")
+MAIN_SHOT_RATIO_MIN = 0.55
+#: ⑤ 极端景别占比上限：参考片 92 镜里大特写/远景/大远景 = 0%。
+EXTREME_SHOT_TYPES = ("大特写", "远景", "大远景")
+EXTREME_SHOT_RATIO_MAX = 0.05
+#: ⑤「局部」插入镜下限：参考片 25%（只拍手部/道具、不出现完整人脸的插入镜）。
+LOCAL_SHOT_RATIO_MIN = 0.10
 
 
 def _shot_camera_kind(shot: dict) -> str:
@@ -3206,8 +3361,40 @@ def _shot_camera_kind(shot: dict) -> str:
     return "other"
 
 
+def _shot_action_beats(shot: dict) -> int:
+    """数一个镜头里可辨认的「动作节拍」个数（一镜多动作检测用）。
+
+    ⚠️ 口径与**生成期拆镜**（novel_to_script._split_multi_action_row）同源：
+    都走 config.count_action_beats / config.ACTION_WORDS（唯一权威表）。
+    动作词表若在两处各写一份，会出现「生成期拆了、质检期不认」（或反之），
+    拆镜与告警互相打架 —— 与景别白名单曾经五处漂移是同一类缺陷。
+    """
+    import config as _config
+    # ⚠️ 只看 description：它是 schema 里唯一的「谁做了什么」权威字段；
+    # visual_detail（补充细节/环境）与 motion（摄影机运动）会把**同一个动作**再写一遍，
+    # 合并计数会让「一个动作写三遍」被算成 3 个节拍（实测误报）。
+    # 必须与生成期拆镜（_split_multi_action_row 也只切 description）同口径。
+    return _config.count_action_beats(str(shot.get("description") or ""))
+
+
+def _shot_type_of(shot: dict) -> str:
+    """本镜景别：优先 shot_type 字段，其次从 camera 复合串里取景别词，最后返回空串。
+
+    ⚠️ 关键词顺序必须是「长词优先」（中近景在近景之前、大特写在大特写之前），
+    否则「中近景」会被「近景」抢先命中，分布统计随之失真。
+    """
+    st = str(shot.get("shot_type") or "").strip()
+    if st:
+        return st
+    cam = str(shot.get("camera") or "")
+    for name in ("大特写", "特写", "中近景", "近景", "局部", "中景", "全景", "大远景", "远景"):
+        if name in cam:
+            return name
+    return ""
+
+
 def _validate_script_92rules(script: dict) -> list:
-    """92 镜拆解法三层软告警（2026-09-28 新增，全部非 critical）。
+    """92 镜拆解法五层软告警（2026-09-28 三层 + 2026-09-30 补 ④⑤，全部非 critical）。
 
     返回的 issues 措辞刻意避开 CRITICAL_ISSUE_KEYWORDS（不用「错位/拼接/变形/崩坏」
     等硬缺陷词），仅作为提示写进 check_script 的 objective issues（进 prompt_quality
@@ -3227,7 +3414,7 @@ def _validate_script_92rules(script: dict) -> list:
         issues.append(
             f"剪辑动机缺失：仅 {with_reason}/{n} 镜写了 edit_reason（{coverage*100:.0f}% < "
             f"{EDIT_REASON_COVERAGE_MIN*100:.0f}%）。建议按 92 镜口径给每镜补一句「为什么切到这一镜」"
-            f"的剪辑动机（15 字以内），作为构图与取舍依据")
+            f"的剪辑动机（20~30 字，写具体叙事功能），作为构图与取舍依据")
 
     # ② 镜头语言克制分布
     kinds = [_shot_camera_kind(s) for s in shots]
@@ -3274,20 +3461,66 @@ def _validate_script_92rules(script: dict) -> list:
                 f"按 92 镜口径，反复出现的关键道具应作为跨镜头视觉锚点，"
                 f"在 description 里写道具的位置与状态变化（如「折叠/展开/递出/攥紧」）")
 
+    # ④ 一镜一动作（2026-09-30 新增）：单镜动作节拍过多 → 模型把多个动作塞进同一镜，
+    #    成片表现为「一个分镜不切换、里面却演了好几件事」。参考片口径是一镜只推进一个动作。
+    beats = [_shot_action_beats(s) for s in shots]
+    over = [i for i, b in enumerate(beats) if b >= ACTION_BEATS_MAX + 1]
+    # 双门槛：既要达到最小镜数，占比也要过线 —— 长剧本里 1~2 个镜头多动作不足以说明系统性问题
+    _min_shots = max(ACTION_BEATS_SHOT_MIN, int(0.15 * n + 0.5))
+    if len(over) >= _min_shots and (len(over) / float(n)) >= 0.15:
+        worst = sorted(over, key=lambda i: -beats[i])[:4]   # 只列举真正超标的镜头
+        _ids = [str(shots[i].get("shot_id") or (i + 1)) for i in worst]
+        issues.append(
+            f"一镜多动作：{len(over)}/{n} 镜的动作节拍 ≥{ACTION_BEATS_MAX + 1} 个"
+            f"（最多 {max(beats)} 个，如镜头 {'/'.join(_ids)}）。"
+            f"按参考片口径每镜只应承载 1 个动作节拍，连续动作必须拆成相邻镜头——"
+            f"否则成片会出现「一个分镜不切换、里面演好几件事」")
+
+    # ⑤ 主力景别区间（2026-09-30 新增，对齐参考片 92 镜实测分布：
+    #    近景 26% / 中近景 25% / 局部 25% / 中景 17% / 全景 3% / 特写 2% / 大特写·远景·大远景 0%）
+    types = [_shot_type_of(s) for s in shots]
+    _typed = [x for x in types if x]
+    if len(_typed) >= 5:
+        _main = sum(1 for x in types if x in MAIN_SHOT_TYPES)
+        _ext = sum(1 for x in types if x in EXTREME_SHOT_TYPES)
+        _loc = sum(1 for x in types if x == "局部")
+        main_ratio = _main / float(len(_typed))
+        ext_ratio = _ext / float(len(_typed))
+        local_ratio = _loc / float(len(_typed))
+        if main_ratio < MAIN_SHOT_RATIO_MIN:
+            issues.append(
+                f"主力景别偏少：近景/中近景/局部 仅 {_main}/{len(_typed)} 镜"
+                f"（{main_ratio*100:.0f}% < {MAIN_SHOT_RATIO_MIN*100:.0f}%）。"
+                f"参考片 92 镜里这三类合计约 76%，是叙事主力；"
+                f"建议把中景/全景承载的信息收进近景与中近景，补足主力景别")
+        if ext_ratio > EXTREME_SHOT_RATIO_MAX:
+            issues.append(
+                f"大特写/远景/大远景偏多：{_ext}/{len(_typed)} 镜"
+                f"（{ext_ratio*100:.0f}% > {EXTREME_SHOT_RATIO_MAX*100:.0f}%）。"
+                f"参考片 92 镜这三类一次未用，情绪锚点请只用特写与全景（各 ≤3%）")
+        if local_ratio < LOCAL_SHOT_RATIO_MIN:
+            issues.append(
+                f"「局部」插入镜偏少：仅 {_loc}/{len(_typed)} 镜"
+                f"（{local_ratio*100:.0f}% < {LOCAL_SHOT_RATIO_MIN*100:.0f}%）。"
+                f"参考片 25% 的镜头是只拍手部/道具、不出现完整人脸的插入镜——"
+                f"它能把叙事压到道具上，也是规避人脸崩坏的有效手段，建议适当补足")
+
     return issues
 
 
-#: 单镜时长下限/上限，与 novel_to_script.SHOT_DURATION_MIN/MAX 对齐（3~12 秒）。
-#: 历史缺陷：这里写 1~15 秒且「镜头数 > 30 就告警」，而剧本生成端的约束是 3~12 秒、
-#: 真实剧集单集可达 56 镜 —— 约束互相打架，正常剧本反被判不可执行。
+#: 单镜时长下限/上限：**直接从 config 取**，与生成期（novel_to_script）同源。
 #:
-#: ⚠️ 2026-09-25（需求 J / P0-1）：这里校验的是**剧本级**单镜时长，上限仍是 12 秒 ——
-#: 这是正确的：长镜本身不是剧本缺陷（叙事上长镜合理，且总时长守恒），
-#: **生成期**已由 ``h3_prompt_kit.segment_durations`` 自动切成 ≤4 秒的子段提交给模型
-#: （业界「AI 视频可信窗口约 4 秒」的红线在**单次生成**这一层，不是在剧本这一层）。
-#: 因此不要因为「剧本写了 12 秒」就判缺陷 —— 那会把正常剧本批量打成不可执行。
-SHOT_DURATION_MIN_OK = 3.0
-SHOT_DURATION_MAX_OK = 12.0
+#: 历史缺陷一：这里曾自己写一份（1~15 秒）且「镜头数 > 30 就告警」，而剧本生成端是 3~12 秒、
+#:   真实剧集单集可达 56 镜 —— 约束互相打架，正常剧本反被判不可执行。
+#: 历史缺陷二（2026-09-30）：旧口径 MIN 3s / 静默基准 3s / 描述 +2s / 动作 +1.5s / 高潮 +2s，
+#:   使每个镜头地板就是 4~6 秒，而**参考片单镜中位只有 2.08 秒** —— 剪辑点稀疏，
+#:   成片观感「一个分镜演半天不切换」。已按参考片重标定到 1.5~8 秒，故这里必须跟着 config 走。
+#:
+#: ⚠️ 这里校验的是**剧本级**单镜时长；**生成期**已由 ``h3_prompt_kit.segment_durations``
+#: 自动切成 ≤4 秒的子段提交给模型（「AI 视频可信窗口约 4 秒」的红线在**单次生成**这一层，
+#: 不在剧本这一层）。
+SHOT_DURATION_MIN_OK = config.SHOT_DURATION_MIN
+SHOT_DURATION_MAX_OK = config.SHOT_DURATION_MAX
 SHOT_DURATION_TOLERANCE = 2.0     # 超出边界的容差（模型四舍五入 / 台词长度微调）
 
 #: 每集总时长的**产品口径容差**（2026-09-26 新增）。
@@ -3449,8 +3682,9 @@ def check_script(script_path: str = None, script_data: dict = None,
     prompt_issues = _validate_script_prompts(script_data)
     bloat_issues = _validate_script_bloat(script_data)
     feasibility_issues = _validate_script_feasibility(script_data, target_duration)
-    # 92 镜拆解法三层软告警（2026-09-28）：镜头语言克制分布 / 剪辑动机覆盖率 /
-    # 道具回环锚点。全部非 critical，进 prompt_quality 桶软扣分，不短路判失败。
+    # 92 镜拆解法五层软告警（2026-09-28 三层 + 2026-09-30 补 ④⑤）：剪辑动机覆盖率 /
+    # 镜头语言克制分布 / 道具回环锚点 / 一镜一动作 / 主力景别区间。
+    # 全部非 critical，进 prompt_quality 桶软扣分，不短路判失败。
     rhythm_issues = _validate_script_92rules(script_data)
 
     all_objective_issues = (

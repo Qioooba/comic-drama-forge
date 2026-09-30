@@ -18,7 +18,10 @@
     "productName": "漫剧工坊",
     "files": [
       "main.js",
-      "preload.js"
+      "preload.js",
+      "updater.js",
+      "update-config.js",
+      "build/**"
     ],
     "extraResources": [
       {
@@ -27,7 +30,7 @@
       },
       {
         "from": "_backend/app",
-        "to": "app"
+        "to": "backend"
       },
       {
         "from": "_backend/workflows",
@@ -49,20 +52,35 @@
       "target": [
         {
           "target": "nsis",
-          "arch": ["x64"],
-          "artifactName": "漫剧工坊-Setup-${version}.${ext}"
+          "arch": [
+            "x64"
+          ]
         },
         {
           "target": "portable",
-          "arch": ["x64"],
-          "artifactName": "漫剧工坊-Portable-${version}.${ext}"
+          "arch": [
+            "x64"
+          ]
         }
       ],
-      "requestedExecutionLevel": "asInvoker"
+      "requestedExecutionLevel": "asInvoker",
+      "icon": "build/icon.ico",
+      "signAndEditExecutable": false
     },
     "nsis": {
       "oneClick": false,
-      "allowToChangeInstallationDirectory": true
-    }
-  }
+      "allowToChangeInstallationDirectory": true,
+      "artifactName": "漫剧工坊-Setup-${version}.${ext}"
+    },
+    "portable": {
+      "artifactName": "漫剧工坊-Portable-${version}.${ext}"
+    },
+    "electronDist": "C:/Users/liujianghua/mjscxt_desktop/electron",
+    "electronVersion": "33.4.11",
+    "directories": {
+      "output": "dist"
+    },
+    "asar": false
+  },
+  "author": "mjscxt"
 }

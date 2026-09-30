@@ -149,3 +149,15 @@ electron-app/_backend/
 # 某次脚本把 `%SystemDrive%` 当字面量用，在仓库根建出 `%SystemDrive%/` 目录
 # （内含 Windows Caches 缓存库），属误建残留，不入库。
 %SystemDrive%/
+
+# 插件映射缓存（运行期生成）
+plugin_mapping_cache.json
+
+# 提示词增强开关（运行期设置，非源码）
+prompt_enhance_config.json
+
+# 依赖目录
+**/node_modules/
+
+# 桌面打包产物
+electron-app/dist/

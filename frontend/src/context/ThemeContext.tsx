@@ -53,6 +53,13 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
     document.documentElement.classList.toggle('dark', resolved === 'dark');
   }, [resolved]);
 
+  // Electron 桌面壳：标题栏覆盖层是主进程画的，切主题要同步过去；
+  // 浏览器/exe 版没有 window.mjscxt，这里直接跳过。
+  useEffect(() => {
+    const shell = (window as unknown as { mjscxt?: { window?: { setTitleBarTheme?: (t: string) => void } } }).mjscxt;
+    shell?.window?.setTitleBarTheme?.(resolved);
+  }, [resolved]);
+
   // 系统主题变化实时跟随（始终监听，mode 非 system 时只是暂不使用）
   useEffect(() => {
     const mql = window.matchMedia('(prefers-color-scheme: dark)');

@@ -138,7 +138,7 @@ def _safe_run():
     """安全运行主服务，崩溃后返回 False"""
     try:
         host = (os.getenv("APP_HOST") or "127.0.0.1").strip()
-        port = _env_int("APP_PORT", 5000)
+        port = _env_int("APP_PORT", 5210)
         threads = _env_int("APP_THREADS", 8)
         channel_timeout = _env_int("APP_CHANNEL_TIMEOUT", 1800)
 

@@ -46,6 +46,7 @@ from novel_to_script import (
 # 旧实现 characters 裸相等（近名静默丢）、items 完全不过滤（未登记名直接写回），
 # 与「资产名匹配唯一实现 asset_name_match」的全库口径相反。
 import asset_name_match
+import chapter_preflight  # 前置解析（人物档案防 OOC）
 
 # 原文覆盖率校验（④⑤：逐句核对是否被镜头承载 + 低于阈值自动补生成；只增不改，不删原文）
 import coverage as coverage_mod
@@ -1225,7 +1226,7 @@ def _render_prev_block(prev_card: dict, prev_state: dict) -> str:
 
 
 CONTRACT_TEXT = (
-    "【衔接契约（硬性约束）】\n"
+    "【衔接契约（后续集·硬性约束）】\n"
     "1. 本集开场必须承接上一集结尾的状态（时间、地点、人物处境、情绪），不得跳接、不得倒退；\n"
     "2. 严禁重演上一集已经发生的事件（包括重生、觉醒、夺宝、首次登场等），如需提及只能用回忆/一句话带过；\n"
     "3. 上一集遗留的未回收伏笔，本集必须至少推进一条，且不得给出与设定库冲突的新设定；\n"
@@ -1240,6 +1241,15 @@ CONTRACT_TEXT = (
     "（走出战场、时空回溯、雨夜归途等），不得两个地点直接硬切，否则视为断裂；\n"
     "8. 本集结尾若仍有未回收伏笔（open_foreshadows），允许用一句旁白/字幕点出悬念以维持观感连续，"
     "但不得新增剧情事件、不得超前消耗后续剧情。"
+)
+
+CONTRACT_TEXT_FIRST_EPISODE = (
+    "【开篇契约（硬性约束）】\n"
+    "1. 本集是全剧第一集（开篇），**没有上一集**。开场直接从故事起点切入，**禁止**出现「承接上集」"
+    "「承接前情」「上集结尾」等字样，也**禁止**假设任何前情（如『此前负伤离场』『上集已发生的事件』）；\n"
+    "2. 如需交代背景，只能用**本集画面内**的物件/台词/一句旁白带过，不得引用「未发生」的上集剧情；\n"
+    "3. 同一句标志性台词不得在集内重复（除刻意回环呼应外，须改动措辞）；\n"
+    "4. 角色姓名 / 身份 / 外观 / 性格 / 称谓一律以设定库为准；道具外观首次定义后固定。"
 )
 
 
@@ -1261,13 +1271,34 @@ def _render_dialogue_block(style_guide: dict, voice_dict: dict, quotes: list) ->
     return "\n".join(lines)
 
 
+#: 参考片 92 镜实测的「克制运镜」白名单：非固定运镜 100% 落在这些词上。
+CAMERA_MOTION_PREFERRED = ("固定", "轻推", "轻摇", "跟随", "轻手持")
+#: 参考片 92 镜里**一次都没用**的运镜（保留在词表中供存量剧本/特殊需求使用，但提示慎用）。
+CAMERA_MOTION_DISCOURAGED = ("推镜", "拉镜", "摇镜", "移镜", "升降", "环绕", "变焦", "定格",
+                             "轻移", "横移", "缓推", "缓摇")
+
+
 def _render_camera_block(camera_terms: dict) -> str:
     if not camera_terms:
         return ""
     return ("【运镜术语表（camera 字段必须从此表取词或组合，禁止自造术语）】\n"
             f"景别：{'、'.join(camera_terms.get('景别') or [])}\n"
             f"运镜：{'、'.join(camera_terms.get('运镜') or [])}\n"
-            f"常用组合：{'、'.join(camera_terms.get('常用组合') or [])}")
+            f"常用组合：{'、'.join(camera_terms.get('常用组合') or [])}\n"
+            "【克制运镜·推荐】" + " / ".join(CAMERA_MOTION_PREFERRED) +
+            "（参考片 92 镜的非固定运镜全部是这 4 种；运镜以固定为主，约 75%）\n"
+            "【慎用运镜】" + " / ".join(CAMERA_MOTION_DISCOURAGED) +
+            "（参考片 92 镜一次未用；只在明确的空间意图下才用，日常默认固定）\n"
+            "【景别 × 运镜配对（越近越静，运镜长在中景）】\n"
+            "  · 特写 → 固定（把观众钉在表情上，参考片特写 100% 固定）\n"
+            "  · 局部 / 中近景 / 近景 → 基本固定\n"
+            "  · 中景 → 运镜主力：人物位移用「跟随」、关系变化用「轻摇」、情绪递进用「轻推」\n"
+            "  · 全景 → 只用于跟人走路（跟随）\n"
+            "【景别占比参考（参考片 92 镜实测）】近景 26% / 中近景 25% / 局部 25%"
+            "（局部 = 只拍手部/道具、不出现完整人脸的插入镜）/ 中景 17% / 全景 3% / 特写 2%"
+            " / 大特写·远景·大远景 0%\n"
+            "【一镜一动作】每镜只推进 1 个动作节拍；一段里连续完成 2 个以上动作时，"
+            "按动作先后拆成相邻两镜，不要在一镜内堆叠多个动作")
 
 
 def build_continuity_context(continuity_dir: str, project_key: str, episode_no: int,
@@ -1279,6 +1310,9 @@ def build_continuity_context(continuity_dir: str, project_key: str, episode_no: 
     camera_terms = ensure_camera_terms(continuity_dir, project_key)
     prev_card = load_summary_card(continuity_dir, project_key, int(episode_no) - 1)
     prev_state = load_state(continuity_dir, project_key, int(episode_no) - 1)
+    # 前置解析（若已运行）：人物档案 / 情绪基线 / 关键事件注入生成约束
+    _preflight = chapter_preflight.load_preflight(continuity_dir, project_key, int(episode_no))
+    _preflight_block = chapter_preflight.build_preflight_injection_block(_preflight)
     return {
         "enabled": True,
         "version": CONTINUITY_VERSION,
@@ -1287,7 +1321,9 @@ def build_continuity_context(continuity_dir: str, project_key: str, episode_no: 
         "prev_episode_no": int(episode_no) - 1 if prev_card or prev_state else None,
         "bible_block": _render_bible_block(bible),
         "prev_block": _render_prev_block(prev_card, prev_state),
-        "contract_block": CONTRACT_TEXT,
+        # 首集（无上集 state/摘要卡）用「开篇契约」：禁止 LLM 编造不存在的上集前情；
+        # 后续集才用「衔接契约」（承接上集结尾）。
+        "contract_block": CONTRACT_TEXT if (prev_card or prev_state) else CONTRACT_TEXT_FIRST_EPISODE,
         "style_block": _render_dialogue_block(style_guide, voice_dict, quotes or []),
         "dialogue_block": _render_dialogue_block(style_guide, voice_dict, quotes or []),
         "camera_block": _render_camera_block(camera_terms),
@@ -1299,6 +1335,8 @@ def build_continuity_context(continuity_dir: str, project_key: str, episode_no: 
         "camera_terms": camera_terms,
         "prev_card": prev_card,
         "prev_state": prev_state,
+        "preflight_block": _preflight_block,
+        "preflight": _preflight,
         "built_at": _now(),
     }
 
@@ -1350,7 +1388,10 @@ def extract_episode_state(client, script: dict, prev_state: dict = None, episode
                     + json.dumps(prev_state.get("open_foreshadows")
                                  or (prev_state.get("state_out") or {}).get("open_foreshadows") or [],
                                  ensure_ascii=False))
-    prompt = f"""【任务】下面是漫剧第 {episode_no} 集《{script.get('episode_title') or ''}》的分镜脚本。请抽取本集的「时间线锚点」：state_in（开场状态）与 state_out（结尾状态）。
+    _first_note = ('' if prev_state else
+        '\n【重要】本集是全剧第一集（开篇），没有上一集：state_in 必须基于本集分镜内容本身书写（如「本集正午·开篇」），'
+        '禁止出现「承接上集」「承接前情」「上集结尾」等字样，不得假设任何前情。')
+    prompt = f"""【任务】下面是漫剧第 {episode_no} 集《{script.get('episode_title') or ''}》的分镜脚本。请抽取本集的「时间线锚点」：state_in（开场状态）与 state_out（结尾状态）。{_first_note}
 {prev_txt}
 【本集角色表】{json.dumps(chars, ensure_ascii=False)}
 【本集分镜】{json.dumps(brief, ensure_ascii=False)}

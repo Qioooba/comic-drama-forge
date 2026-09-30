@@ -1,7 +1,7 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useApp } from '@/context/AppContext';
 import { t } from '@/i18n';
-import { projectsApi, keyframesApi, storyboardApi, videoApi, ttsApi, mixApi, qcApi, exportApi, autopilotApi, upscaleApi, chatApi, agentApi, episodesApi, novelsSplitPlanApi, type VideoMode } from '@/api/client';
+import { projectsApi, keyframesApi, storyboardApi, videoApi, ttsApi, mixApi, qcApi, exportApi, autopilotApi, upscaleApi, chatApi, agentApi, episodesApi, novelsSplitPlanApi, preflightApi, type VideoMode, type ChapterPreflightResult } from '@/api/client';
 import { Button, Input, EmptyState, ErrorState, Skeleton, Modal, Select } from '@/components/ui';
 // tab 图标統一走线性 SVG（方案 P2-10）：此前是 emoji，字号受系统字体影响且观感与全站割裂
 import {
@@ -275,6 +275,7 @@ function sanitizeError(err: unknown, fallback = t('wb.actionFailed')): string {
 // 生产流水线步骤序列：与后端 pipeline.STEP_SEQUENCE 对齐（技术标识符 → i18n 键）。
 const PRODUCTION_STEPS: { id: string; labelKey: string }[] = [
   { id: 'script', labelKey: 'wb.stepScript' },
+  { id: 'tts_pre', labelKey: 'wb.stepTtsPre' },
   { id: 'assets', labelKey: 'wb.stepAssets' },
   { id: 'storyboard', labelKey: 'wb.stepStoryboard' },
   { id: 'keyframe', labelKey: 'wb.stepKeyframe' },
@@ -322,7 +323,10 @@ function ProductionProgress({ projectKey }: { projectKey: string }) {
   const stalled = Number(cur.step_stalled_sec) || 0;
   const stalledMin = Math.floor(stalled / 60);
   const stalledSec = stalled % 60;
-  const currentStepId = (cur.step || '').split(':')[0];
+  // step 可能是环节内子阶段（如 outline 提炼大纲属 script 步骤）——子阶段
+  // 不在步骤表里，此时不点亮任何环节（百分比与描述行仍准确），避免步骤链错位
+  const _rawStep = (cur.step || '').split(':')[0];
+  const currentStepId = PRODUCTION_STEPS.some(s => s.id === _rawStep) ? _rawStep : null;
   const currentStep = PRODUCTION_STEPS.find(s => s.id === currentStepId);
 
   return (
@@ -421,6 +425,7 @@ function OverviewTab({
   onRefreshAssets: () => Promise<void> | void;
 }) {
   const { t } = useApp();
+  const toast = useToast();
   const [preview, setPreview] = useState<{ item: AssetItem; type: 'character' | 'item' | 'scene' } | null>(null);
 
   // 剧本相关状态
@@ -440,6 +445,39 @@ function OverviewTab({
   const [splitPlan, setSplitPlan] = useState<any | null>(null);
   const [splitPlanLoading, setSplitPlanLoading] = useState(false);
   const [splitPlanError, setSplitPlanError] = useState('');
+  // 前置解析（chapter pre-flight）：人物档案 + 故事梗概 + 关键事件 + 情绪基线
+  const [preflightDone, setPreflightDone] = useState<number[]>([]);
+  const [preflightRunning, setPreflightRunning] = useState<number | null>(null);
+  const [preflightDetail, setPreflightDetail] = useState<ChapterPreflightResult | null>(null);
+  const [preflightOpen, setPreflightOpen] = useState(false);
+
+  const runPreflight = async (chIdx: number) => {
+    if (!novelId) return;
+    setPreflightRunning(chIdx);
+    try {
+      const d = await preflightApi.analyze(novelId, chIdx);
+      if (d.success && d.result) {
+        setPreflightDetail(d.result);
+        setPreflightDone(prev => [...new Set([...prev, chIdx])].sort((a, b) => a - b));
+        toast.success(t('wb.preflightDone', { n: chIdx, chars: d.result.characters?.length ?? 0 }));
+      } else {
+        toast.error(t('wb.preflightFailed', { err: (d as any).error ?? '' }));
+      }
+    } catch (err: any) {
+      toast.error(t('wb.preflightFailed', { err: err?.message ?? '' }));
+    } finally {
+      setPreflightRunning(null);
+    }
+  };
+
+  const openPreflightDetail = async (chIdx: number) => {
+    if (!novelId) return;
+    const d = await preflightApi.get(novelId, chIdx);
+    if (d.exists && d.result) {
+      setPreflightDetail(d.result);
+      setPreflightOpen(true);
+    }
+  };
 
   // 加载剧集列表
   // 抽成具名函数：错误态需要「重试」入口，而 useEffect 无法被手动重新触发。
@@ -610,9 +648,12 @@ function OverviewTab({
                       <span className="text-xs text-ink-3">· {shot.duration}s</span>
                     )}
                   </div>
-                  {shot.description && (
-                    <p className="text-sm text-ink-1">{shot.description}</p>
-                  )}
+                  <ShotPromptEditor
+                      shot={shot}
+                      novelId={novelId}
+                      episodeNo={selectedEpisode!}
+                      onSaved={() => loadEpisodeDetail(selectedEpisode!)}
+                    />
                   {shot.dialogue_text && (
                     <p className="text-sm text-ink-1 mt-1 pl-2 border-l-2 border-line-strong">
                       {shot.dialogue_text}
@@ -795,22 +836,90 @@ function OverviewTab({
               </div>
             )}
 
+            {/* 前置解析卡片：人物档案 + 故事梗概 + 关键事件 + 情绪基线 */}
+            {preflightOpen && (
+              <div className="bg-surface rounded-lg border border-line p-4 mb-4">
+                <div className="flex items-center justify-between mb-3">
+                  <div>
+                    <h4 className="font-semibold text-ink-1">{t('wb.preflightTitle')}</h4>
+                    <p className="text-xs text-ink-3 mt-0.5">{t('wb.preflightDesc')}</p>
+                  </div>
+                  <button onClick={() => setPreflightOpen(false)}
+                    className={`p-1.5 rounded-md text-ink-3 hover:bg-surface-2 transition-colors ${FOCUS_RING}`}>
+                    <X className="h-4 w-4" />
+                  </button>
+                </div>
+                {preflightDetail ? (
+                  <div className="space-y-3">
+                    <div className="text-sm text-ink-2">
+                      <strong className="text-ink-1">{t('wb.preflightSummary')}</strong>
+                      <p className="mt-1 text-ink-2">{preflightDetail.story_summary}</p>
+                    </div>
+                    {preflightDetail.key_events?.length > 0 && (
+                      <div>
+                        <strong className="text-sm text-ink-1">{t('wb.preflightKeyEvents')}</strong>
+                        <ol className="mt-1 space-y-0.5 text-xs text-ink-2 list-decimal list-inside">
+                          {preflightDetail.key_events.map((ev, i) => <li key={i}>{ev}</li>)}
+                        </ol>
+                      </div>
+                    )}
+                    {preflightDetail.characters?.length > 0 && (
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                        {preflightDetail.characters.map(c => (
+                          <div key={c.name} className="p-2.5 rounded-lg bg-surface-2 border border-line">
+                            <div className="flex items-center gap-1.5 mb-1">
+                              <span className="text-sm font-medium text-ink-1">{c.name}</span>
+                              {c.gender && <span className="text-xs text-ink-3">{c.gender}</span>}
+                              {c.identity && <span className="text-xs text-ink-3">· {c.identity}</span>}
+                            </div>
+                            {c.personality && (
+                              <p className="text-xs text-ink-2"><strong>{t('wb.preflightPersonality')}：</strong>{c.personality}</p>
+                            )}
+                            {c.emotions?.length > 0 && (
+                              <p className="text-xs text-ink-2 mt-0.5">
+                                <strong>{t('wb.preflightEmotion')}</strong>{' '}
+                                {c.emotions.slice(0, 4).map(e => e.emotion).join(' / ')}
+                              </p>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div className="text-xs text-ink-3">{t('wb.preflightNoData')}</div>
+                )}
+              </div>
+            )}
             {/* 剧集列表 */}
             <div className="bg-surface rounded-lg border border-line">
               <div className="p-4 border-b border-line">
                 <div className="flex items-center justify-between">
                   <h4 className="font-semibold text-ink-1">{t('wb.episodeList')}</h4>
-                  <button
-                    onClick={() => (splitPlanOpen ? setSplitPlanOpen(false) : fetchSplitPlan())}
-                    title={t('wb.splitPlanHint')}
-                    className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-all ${FOCUS_RING} ${
-                      splitPlanOpen
-                        ? 'bg-brand text-white'
-                        : 'bg-surface-2 text-ink-2 hover:bg-line hover:text-ink-1 border border-line'
-                    }`}
-                  >
-                    {splitPlanOpen ? t('wb.splitPlanCollapse') : t('wb.splitPlan')}
-                  </button>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => (splitPlanOpen ? setSplitPlanOpen(false) : fetchSplitPlan())}
+                      title={t('wb.splitPlanHint')}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-all ${FOCUS_RING} ${
+                        splitPlanOpen
+                          ? 'bg-brand text-white'
+                          : 'bg-surface-2 text-ink-2 hover:bg-line hover:text-ink-1 border border-line'
+                      }`}
+                    >
+                      {splitPlanOpen ? t('wb.splitPlanCollapse') : t('wb.splitPlan')}
+                    </button>
+                    <button
+                      onClick={() => setPreflightOpen(v => !v)}
+                      title={t('wb.preflightHint')}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-all ${FOCUS_RING} ${
+                        preflightOpen
+                          ? 'bg-success text-white'
+                          : 'bg-surface-2 text-ink-2 hover:bg-line hover:text-ink-1 border border-line'
+                      }`}
+                    >
+                      {t('wb.preflight')}
+                    </button>
+                  </div>
                 </div>
                 <p className="text-xs text-ink-2 mt-1">{t('wb.clickEpisodeHint')}</p>
               </div>
@@ -915,10 +1024,30 @@ function OverviewTab({
                             {ep.episode_no}
                           </span>
                           <div>
-                            <p className="font-medium text-ink-1">
-                              {t('wb.episodeNo', { n: ep.episode_no })}
-                              {ep.chapter_title && <span className="ml-2 text-sm text-brand">《{ep.chapter_title}》</span>}
-                            </p>
+                            <div className="flex items-center gap-1.5">
+                              <p className="font-medium text-ink-1">
+                                {t('wb.episodeNo', { n: ep.episode_no })}
+                                {ep.chapter_title && <span className="ml-2 text-sm text-brand">《{ep.chapter_title}》</span>}
+                              </p>
+                              {/* 前置解析状态：绿点=已完成（点击查看） / 灰点=可运行 / 转圈=运行中 */}
+                              {preflightDone.includes(ep.episode_no) && (
+                                <button
+                                  onClick={e => { e.stopPropagation(); openPreflightDetail(ep.episode_no); }}
+                                  title={t('wb.preflightView')}
+                                  className="h-2.5 w-2.5 rounded-full bg-success border-0 p-0 cursor-pointer"
+                                />
+                              )}
+                              {preflightRunning === ep.episode_no && (
+                                <div className="w-3 h-3 border-2 border-brand border-t-transparent rounded-full animate-spin" />
+                              )}
+                              {!preflightDone.includes(ep.episode_no) && preflightRunning !== ep.episode_no && (
+                                <button
+                                  onClick={e => { e.stopPropagation(); runPreflight(ep.episode_no); }}
+                                  title={t('wb.preflightRun')}
+                                  className="h-2.5 w-2.5 rounded-full bg-line border border-ink-3 cursor-pointer hover:bg-brand transition-colors"
+                                />
+                              )}
+                            </div>
                             <p className="text-xs text-ink-2 mt-0.5">
                               {t('wb.chapterNo', { n: ep.chapter_index ?? ep.episode_no })}
                             </p>
@@ -1831,6 +1960,173 @@ function EpisodeSwitcher({
           {cur.episode_title || cur.title || ''}
         </span>
       )}
+    </div>
+  );
+}
+
+
+// =====================================================================
+// 分镜提示词编辑器（2026-09-30）
+// 每行 shot 的 description + motion 可编辑，保存调 PUT /api/episodes/...
+// 保存成功后可触发单镜重新生成分镜图
+// =====================================================================
+function ShotPromptEditor({ shot, novelId, episodeNo, onSaved }: {
+  shot: any; novelId?: string; episodeNo: number; onSaved: () => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [desc, setDesc] = useState(shot.description || '');
+  const [motion, setMotion] = useState(shot.motion || '');
+  const [saving, setSaving] = useState(false);
+  const [regenerating, setRegenerating] = useState(false);
+  const toast = useToast();
+
+  // G10b（2026-09-30）：质检改写的提示词**实时渲染** —— 出图/重试循环每改写一次 prompt，
+  // 后端任务状态里的 live 字段就更新一次；本组件启动「重新生成分镜」后每 3s 轮询一次，
+  // 把「当前正在用的提示词」渲染到本镜头卡片下（不再等任务收尾才可见）。
+  const [live, setLive] = useState<any>(null);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const mountedRef = useRef(true);
+  useEffect(() => () => { mountedRef.current = false; stopPolling(); }, []);
+
+  const stopPolling = () => {
+    if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+  };
+
+  const pollTask = (taskId: string) => {
+    stopPolling();
+    const tick = async () => {
+      if (!mountedRef.current) return stopPolling();
+      try {
+        const r = await fetch(`/api/generation/status/${encodeURIComponent(taskId)}`);
+        const d: any = await r.json();
+        if (!mountedRef.current) return stopPolling();
+        const lv = d?.live;
+        if (lv && lv.shot === shot.shot_id && lv.prompt) {
+          setLive(lv);
+        }
+        if (d?.status && d.status !== 'running') {
+          // 任务结束：若最后一帧 live 还没标记定稿，补上；停止轮询；刷新剧本数据
+          setLive((prev: any) => (prev && prev.shot === shot.shot_id && !prev.done
+            ? { ...prev, done: true } : prev));
+          stopPolling();
+          onSaved();
+        }
+      } catch { /* 网络抖动：继续下一轮 */ }
+    };
+    tick();
+    pollRef.current = setInterval(tick, 3000);
+  };
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      const r = await fetch(
+        `/api/episodes/${encodeURIComponent(novelId || '')}/${episodeNo}`,
+        {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ shots: [{ shot_id: shot.shot_id, description: desc.trim() || null, motion: motion.trim() || null }] }),
+        }
+      );
+      const d = await r.json();
+      if (!d.success) throw new Error(d.error || '保存失败');
+      toast.success(`镜头 ${shot.shot_id} 提示词已保存`);
+      onSaved();
+    } catch (e: any) {
+      toast.error(e.message || '保存失败');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const regenerate = async () => {
+    setRegenerating(true);
+    try {
+      const r = await fetch('/api/storyboards/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          project_name: novelId || '',
+          shots: [{ shot_id: shot.shot_id }],
+          limit: 1,
+        }),
+      });
+      const d = await r.json();
+      if (d.task_id) {
+        setLive(null);
+        pollTask(d.task_id);
+        toast.info(`分镜 ${shot.shot_id} 重新生成任务已启动（提示词随质检实时刷新）`);
+      } else {
+        throw new Error(d.error || '启动失败');
+      }
+    } catch (e: any) {
+      toast.error(e.message || '重新生成失败');
+    } finally {
+      setRegenerating(false);
+    }
+  };
+
+  // G10b：live 面板 —— 正在跑的出图任务实时暴露「当前提示词」（含质检改写后的版本）
+  const livePanel = live && live.shot === shot.shot_id ? (
+    <div className={`mt-2 rounded border p-2 ${live.done ? 'border-success/40' : 'border-brand/40'}`}>
+      <div className="flex items-center gap-2 text-xs">
+        <span className={`font-medium ${live.done ? 'text-success' : 'text-brand'}`}>
+          {live.done
+            ? '定稿提示词（本轮出图实际使用）'
+            : `QC 实时改写 · 第 ${(live.attempt ?? 0) + 1} 次尝试 · ${live.phase === 'regenerating' ? '改写后重新生成中' : live.phase === 'checking' ? '质检判定中' : '生成中'}`}
+        </span>
+        {!live.done && <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-brand" />}
+      </div>
+      <pre className="mt-1 max-h-32 overflow-y-auto whitespace-pre-wrap text-[11px] leading-4 text-ink-2">{live.prompt}</pre>
+    </div>
+  ) : null;
+
+  if (!editing) {
+    return (
+      <div className="mt-1 space-y-1">
+        <div className="flex items-start gap-2">
+          <p className="text-sm text-ink-1 flex-1">{shot.description}</p>
+          <button
+            className="text-xs text-brand hover:underline shrink-0 cursor-pointer"
+            onClick={() => { setDesc(shot.description || ''); setMotion(shot.motion || ''); setEditing(true); }}
+          >
+            编辑
+          </button>
+        </div>
+        {shot.motion && <p className="text-xs text-ink-3 ml-2">{shot.motion}</p>}
+        {livePanel}
+      </div>
+    );
+  }
+
+  return (
+    <div className="mt-2 bg-surface rounded border border-line p-3 space-y-2">
+      <label className="text-xs font-medium text-ink-2 block">镜头描述（提示词）</label>
+      <textarea
+        value={desc}
+        onChange={(e) => setDesc(e.target.value)}
+        rows={2}
+        className="w-full text-sm bg-surface border border-line rounded p-2 text-ink-1 resize-y"
+        placeholder="中近景（腰部以上取景），赵天霸右手食指伸出指向右前方…"
+      />
+      <label className="text-xs font-medium text-ink-2 block">画面内动作（motion）</label>
+      <textarea
+        value={motion}
+        onChange={(e) => setMotion(e.target.value)}
+        rows={2}
+        className="w-full text-sm bg-surface border border-line rounded p-2 text-ink-1 resize-y"
+        placeholder="【摄影机】无；【画面内】赵天霸右手食指前伸，左手丹丸位于胸前"
+      />
+      {livePanel}
+      <div className="flex items-center gap-2">
+        <Button size="sm" onClick={save} disabled={saving || !desc.trim()}>
+          {saving ? '保存中…' : '保存提示词'}
+        </Button>
+        <Button size="sm" variant="secondary" onClick={regenerate} disabled={regenerating || !desc.trim()}>
+          {regenerating ? '生成中…' : '重新生成分镜'}
+        </Button>
+        <button className="text-xs text-ink-3 hover:text-ink-1 cursor-pointer" onClick={() => setEditing(false)}>取消</button>
+      </div>
     </div>
   );
 }
@@ -3160,6 +3456,52 @@ function ChatPanel({ projectKey, onClose }: { projectKey: string; onClose: () =>
     return () => { panelAliveRef.current = false; };
   }, []);
 
+  // 拖拽调宽（2026-09-29 用户需求）：面板左缘手柄，按住左右拖改宽度，
+  // 钳制 [300, 600]；松手落 localStorage 记住偏好；双击恢复默认 340。
+  // 宽度经 CSS 变量 --chat-w 注入 lg:w-[var(--chat-w)] —— 小屏（<lg）本就
+  // w-full 全宽堆叠，变量与手柄都不生效，行为零变化。
+  const CHAT_W_DEFAULT = 340;
+  const CHAT_W_MIN = 300;
+  const CHAT_W_MAX = 600;
+  const [chatW, setChatW] = useState<number>(() => {
+    try {
+      const v = Number(window.localStorage.getItem('mjscxt.chatPanelWidth'));
+      if (Number.isFinite(v) && v >= CHAT_W_MIN && v <= CHAT_W_MAX) return Math.round(v);
+    } catch { /* localStorage 不可用：用默认宽度 */ }
+    return CHAT_W_DEFAULT;
+  });
+  const chatWRef = React.useRef(chatW);
+  chatWRef.current = chatW;
+
+  const onHandleMouseDown = (e: React.MouseEvent) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = chatWRef.current;
+    const prevCursor = document.body.style.cursor;
+    const prevSelect = document.body.style.userSelect;
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+    const onMove = (ev: MouseEvent) => {
+      // 面板在右侧：往左拖（clientX 变小）= 变宽
+      const next = Math.round(startW + (startX - ev.clientX));
+      setChatW(Math.max(CHAT_W_MIN, Math.min(CHAT_W_MAX, next)));
+    };
+    const onUp = () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+      document.body.style.cursor = prevCursor;
+      document.body.style.userSelect = prevSelect;
+      try { window.localStorage.setItem('mjscxt.chatPanelWidth', String(chatWRef.current)); } catch { /* ignore */ }
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  };
+
+  const onHandleDoubleClick = () => {
+    setChatW(CHAT_W_DEFAULT);
+    try { window.localStorage.setItem('mjscxt.chatPanelWidth', String(CHAT_W_DEFAULT)); } catch { /* ignore */ }
+  };
+
   // 追加消息：session 是唯一真源，state 只是它的投影——组件卸载后 session 仍会更新，
   // 回来时轨迹不丢（直接写 setMessages 的话，卸载期间发生的事就没人记了）。
   const pushMsg = (m: ChatMsg) => {
@@ -3302,8 +3644,18 @@ function ChatPanel({ projectKey, onClose }: { projectKey: string; onClose: () =>
       // h-[calc(100vh-7rem)] = 视口高 −（顶栏 ~63px + main 上下 padding 48px），
       // 让面板与左列内容等高、上下贯通；sticky 使其随页面滚动保持停靠。
       // glass：半透明 + 背景模糊，盖在科技感氛围层上（常驻 chrome 才用 blur）。
-      className="glass flex w-full flex-col overflow-hidden rounded-xl border border-line lg:sticky lg:top-0 lg:h-[calc(100vh-7rem)] lg:w-[340px] lg:shrink-0 min-h-[420px]"
+      // 2026-09-29：宽度可拖拽 —— lg 宽度由 CSS 变量 --chat-w 注入（左缘手柄拖动
+      // 调节，双击恢复 340，偏好落 localStorage）；小屏 <lg 仍 w-full 全宽堆叠。
+      className="glass relative flex w-full flex-col overflow-hidden rounded-xl border border-line lg:sticky lg:top-0 lg:h-[calc(100vh-7rem)] lg:w-[var(--chat-w)] lg:shrink-0 min-h-[420px]"
+      style={{ '--chat-w': `${chatW}px` } as React.CSSProperties}
     >
+      {/* 拖拽调宽手柄：贴左缘 6px 竖条，hover 高亮；小屏堆叠全宽无意义 → hidden，lg 才显示 */}
+      <div
+        onMouseDown={onHandleMouseDown}
+        onDoubleClick={onHandleDoubleClick}
+        title={t('chat.resizeHint')}
+        className="absolute left-0 top-0 z-10 hidden h-full w-1.5 cursor-col-resize bg-transparent transition-colors hover:bg-brand/40 lg:block"
+      />
       {/* 头部：与工作台其他面板一致的白底 + 灰边 + indigo 强调 */}
       <div className="flex items-center justify-between px-4 py-3 border-b border-line shrink-0">
         <div className="flex items-center gap-2 min-w-0">

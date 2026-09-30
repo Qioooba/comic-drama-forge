@@ -24,6 +24,11 @@ issue 就拦），``warn`` 为诊断模式（只记录、连自愈都不做）�
 而真实缺陷的大头（缺风格、缺景别、结构缺段、台词泄漏、禁词）恰好都是确定性可判的。
 语义层面的判断留给生成后的图片/视频质检（那时有真图可看，判断也更准）。
 
+（2026-09-30 更新：应「所有图片/视频生成前先做 LLM 提示词增强 + 质检模型提示词质检」
+的需求，preflight 外围补了两道**可选**的模型侧闸门——LLM 增强 + 质检模型语义复审，
+见 ``prompt_enhance.py``。两者 fail-open、可独立关闭、结果必须过本层的确定性检查才被
+采纳；本层仍是唯一裁判，上面的设计理由不变。）
+
 ## 判据来源
 
 全部对齐生成端的同一个单一事实源，避免「生成端一个标准、质检端另一个标准」的历史坑
@@ -1227,6 +1232,25 @@ def preflight(kind: str, prompt: str, ctx: dict = None, style: str = "",
                 "label": "提示词预检未启用（跳过）",
                 "reason": "提示词预检未启用（跳过）"}
 
+    # ---- 生成前 LLM 增强（2026-09-30 需求：所有图片/视频生成前先做提示词增强） ----
+    # 放在确定性检查之前：增强结果同样要过整套确定性检查 + 自愈 + 钳制。
+    # 台词（audio）绝不改写；失败/未配置/骨架不符一律按原文继续（fail-open，
+    # 见 prompt_enhance 模块文档）。此层只在预检启用时执行——预检关掉即整层旁路。
+    enhance_meta: dict = {}
+    if kind in ("storyboard", "asset", "keyframe", "h3") and text:
+        try:
+            import prompt_enhance  # 函数内导入：避免模块级循环依赖
+            _er = prompt_enhance.enhance_prompt(kind, text, ctx=ctx, style=style)
+            if _er.get("applied") and _er.get("prompt"):
+                text = _er["prompt"]
+                enhance_meta = {"applied": True, "note": str(_er.get("note") or "")}
+            else:
+                enhance_meta = {"applied": False, "note": str(_er.get("note") or "")}
+        except Exception as _enh_err:  # noqa: BLE001  增强层故障绝不阻断生成
+            logger.warning("提示词增强层异常（按原文继续）：%s: %s",
+                           type(_enh_err).__name__, _enh_err)
+            enhance_meta = {"applied": False, "note": "增强层异常"}
+
     before = check_prompt(kind, text, ctx=ctx, style=style, cfg=cfg,
                           ref_count=ref_count, expect_refs=expect_refs)
     repairs: List[str] = []
@@ -1278,6 +1302,50 @@ def preflight(kind: str, prompt: str, ctx: dict = None, style: str = "",
                 f"（截断致）{c}" for c in _induced]
             logger.warning("提示词预检[%s] 钳制新增致命缺陷已降级为非阻断（%d 项）：%s",
                            kind, len(_induced), "；".join(_induced)[:200])
+
+    # ---- 质检模型语义复审（2026-09-30 需求：确定性检查通过后再过一遍质检模型） ----
+    # 只在默认的 repair 模式做（warn=纯诊断不改动；block=严格模式保持纯确定性语义）。
+    # 复审「不通过且给出改进版」时：改进版必须先自愈 + 复检，分数不降才采纳——
+    # 模型的改写不可信，确定性检查才是最终裁判。
+    verdict["llm_enhance"] = enhance_meta
+    if (mode == "repair" and not verdict.get("critical_issues") and final
+            and kind in ("storyboard", "asset", "keyframe", "h3")):
+        try:
+            import prompt_enhance as _pe  # 函数内导入：避免模块级循环依赖
+            _rv = _pe.model_review(kind, final, ctx=ctx, style=style)
+            verdict["model_review"] = {
+                "passed": bool(_rv.get("passed", True)),
+                "issues": list(_rv.get("issues") or []),
+                "note": str(_rv.get("note") or ""),
+            }
+            _imp = str(_rv.get("improved_prompt") or "").strip()
+            if (not _rv.get("passed", True)) and _imp and _imp != final:
+                _imp_final, _imp_repairs = repair_prompt(kind, _imp, ctx=ctx, style=style)
+                _imp_final = h3_prompt_kit.clamp_prompt(_imp_final,
+                                                        label=f"prompt_qc.{kind}.review")
+                _v2 = check_prompt(kind, _imp_final, ctx=ctx, style=style, cfg=cfg,
+                                   ref_count=ref_count, expect_refs=expect_refs)
+                if not _v2.get("critical_issues") \
+                        and int(_v2.get("score") or 0) >= int(verdict.get("score") or 0):
+                    _prev_issues = list(verdict.get("issues") or [])
+                    # ⚠️ _v2 是 check_prompt 的新鲜产物，没有 model_review 键 ——
+                    #    直接 verdict["model_review"]["adopted"]=True 会 KeyError（实测）。
+                    #    把旧 verdict 上的复审结论带上 adopted 标记整体搬过来。
+                    _mr = dict(verdict.get("model_review") or {})
+                    _mr["adopted"] = True
+                    final = _imp_final
+                    repairs = list(dict.fromkeys(
+                        list(repairs) + list(_imp_repairs) + ["采纳质检模型的改进版提示词"]))
+                    _v2["llm_enhance"] = enhance_meta
+                    _v2["model_review"] = _mr
+                    verdict = _v2
+                    verdict["repairs"] = repairs
+                    logger.info("提示词预检[%s] 已采纳质检模型改进版（原 issues：%s）",
+                                kind, "；".join(_prev_issues[:2]))
+        except Exception as _rv_err:  # noqa: BLE001  复审故障不影响本次生成
+            logger.warning("质检模型复审异常（跳过）：%s: %s",
+                           type(_rv_err).__name__, _rv_err)
+
     verdict["before_issues"] = list(before.get("issues") or [])
     verdict["before_score"] = before.get("score")
     verdict["mode"] = mode

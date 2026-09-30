@@ -34,7 +34,7 @@ from __future__ import annotations
 import contextvars
 import time
 
-__all__ = ["Cancelled", "push", "reset", "should_stop", "check", "sleep", "active"]
+__all__ = ["Cancelled", "push", "reset", "clear", "should_stop", "check", "sleep", "active"]
 
 #: 默认不可变空元组（contextvars 的默认值在多个上下文间共享，必须是不可变的）
 _CHECKS: contextvars.ContextVar = contextvars.ContextVar("mjscxt_cancel_checks",
@@ -66,6 +66,21 @@ def reset(token) -> None:
         # 跨上下文 reset（例如在别的线程里 reset）会抛错；此时按「已失效」处理，
         # 不能让它影响主流程。真正的泄漏由 push/reset 成对调用避免。
         pass
+
+
+def clear() -> None:
+    """清空当前上下文里继承的**全部**中止判定器（线程池上下文污染兜底）。
+
+    为什么需要（2026-09-30 实测）：waitress / 任务线程池会复用线程，线程创建时
+    contextvars 会随**副本**继承创建方上下文 —— 先前某个请求 push 过、且未随请求
+    结束 reset 的判定器，会泄漏进之后落到同一线程的任何任务。实测表现：总控 AI
+    「停止生产」（全局暂停）后再「生产一集」，泄漏的暂停判定器让新生产线程的
+    每次 cancellation.check 都立即抛 Cancelled，3 次重试秒级烧完，整集失败。
+
+    在「发起一条全新生产」的入口先 clear() 再 push 自己的判定器即可根治；
+    clear 只影响当前调用链的副本，不影响其它线程。
+    """
+    _CHECKS.set(())
 
 
 def active() -> bool:

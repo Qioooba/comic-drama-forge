@@ -1,8 +1,9 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { useApp } from '@/context/AppContext';
-import { exportApi, autopilotApi } from '@/api/client';
+import { exportApi, autopilotApi, qualityApi, type QualityEpisodeRow } from '@/api/client';
 import { Button, Textarea, Skeleton, EmptyState, ErrorState } from '@/components/ui';
-import { ClipboardCheck, FileText, Film, FolderOpen } from '@/components/ui/icons';
+import { ChevronDown, ChevronRight, ClipboardCheck, FileText, Film, FolderOpen } from '@/components/ui/icons';
+import { EpisodeReviewPanel, STATUS_DOT } from '@/components/EpisodeReviewPanel';
 import { useToast } from '@/components/ui/toast';
 import type { Deliverable } from '@/types';
 
@@ -32,6 +33,10 @@ export function OutputReviewTab({ projectKey, assets }: OutputReviewTabProps) {
   const [rejecting, setRejecting] = useState<number | null>(null);
   const [reason, setReason] = useState('');
   const [playing, setPlaying] = useState<string | null>(null);
+  // 审片：每集四层状态（行内画 A/B/C/D 状态点，并决定该集是否有可复核内容）
+  const [quality, setQuality] = useState<QualityEpisodeRow[]>([]);
+  // 当前展开了「四层状态 · 逐镜复核」的集号（一次只展开一集，避免整页被撑得过长）
+  const [expanded, setExpanded] = useState<number | null>(null);
   const toast = useToast();
 
   const loadAll = useCallback(async () => {
@@ -45,6 +50,13 @@ export function OutputReviewTab({ projectKey, assets }: OutputReviewTabProps) {
       setExportFiles(exportRes?.files || []);
       setDeliverables(deliverRes?.items || []);
       setPending(deliverRes?.pending || 0);
+      // 审片数据是「增补」：取不到时成片验收照常可用，不把整页打成硬错误态
+      try {
+        const q = await qualityApi.episodes(projectKey);
+        setQuality(q?.episodes || []);
+      } catch {
+        setQuality([]);
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : t('common.loadFailed'));
     } finally {
@@ -121,8 +133,24 @@ export function OutputReviewTab({ projectKey, assets }: OutputReviewTabProps) {
   };
 
   const finals = assets?.final || [];
+  /** 成片验收行 = 有成片的集 ∪ 有审片数据的集（按集号升序）。
+   *  为什么取并集：只列成片会漏掉「已有产物、但还没成片」的集 —— 那恰恰是最需要人工复核的
+   *  那些集（例如视频刚出、卡在成片前）。若只列成片，「审片」合并进来后就等于没有入口了。 */
+  const reviewRows = React.useMemo(() => {
+    const byEp = new Map<number, { episode_no: number; deliverable?: Deliverable; quality?: QualityEpisodeRow }>();
+    for (const q of quality) {
+      if (!byEp.has(q.episode_no)) byEp.set(q.episode_no, { episode_no: q.episode_no });
+      byEp.get(q.episode_no)!.quality = q;
+    }
+    for (const d of deliverables) {
+      if (!byEp.has(d.episode_no)) byEp.set(d.episode_no, { episode_no: d.episode_no });
+      byEp.get(d.episode_no)!.deliverable = d;
+    }
+    return [...byEp.values()].sort((a, b) => a.episode_no - b.episode_no);
+  }, [quality, deliverables]);
   /** 是否还有任何数据可展示：决定 error 走「硬失败 ErrorState」还是「软失败行内提示条」 */
-  const hasContent = finals.length > 0 || exportFiles.some((f) => f.exists) || deliverables.length > 0;
+  const hasContent = finals.length > 0 || exportFiles.some((f) => f.exists)
+    || deliverables.length > 0 || reviewRows.length > 0;
 
   // 加载态：沿用标题 + 两个区块卡片的形态
   if (loading) {
@@ -238,7 +266,9 @@ export function OutputReviewTab({ projectKey, assets }: OutputReviewTabProps) {
         </div>
       </div>
 
-      {/* 区域 2: 成片验收 */}
+      {/* 区域 2: 成片验收（每集行内可展开「四层状态 + 逐镜复核」）
+          2026-09-29：原独立「审片」标签页并入这里 —— 复核与验收是同一件事的前后两步；
+          展开的是**该集自己的**四层状态与逐镜并排画面，不再另起一块。 */}
       <div className="bg-surface rounded-lg border border-line p-4">
         <h4 className="font-semibold text-ink-1 mb-3 flex items-center gap-2">
           <ClipboardCheck className="h-4 w-4" /> {t('deliver.finalReview')}
@@ -247,7 +277,7 @@ export function OutputReviewTab({ projectKey, assets }: OutputReviewTabProps) {
           </span>
         </h4>
 
-        {deliverables.length === 0 ? (
+        {reviewRows.length === 0 ? (
           error ? (
             /* 硬失败：该区块没有任何数据可展示，且加载出错 → 整块错误态 + 重试 */
             <ErrorState
@@ -264,118 +294,158 @@ export function OutputReviewTab({ projectKey, assets }: OutputReviewTabProps) {
           )
         ) : (
           <div className="space-y-3">
-            {deliverables.map((d) => {
-              const b = statusBadge(d);
+            {reviewRows.map(({ episode_no, deliverable: d, quality: q }) => {
+              const b = d ? statusBadge(d) : null;
               const canReview = busy === null;
-              const playable = !!d.url && d.exists !== false;
+              const playable = !!d?.url && d?.exists !== false;
+              const isOpen = expanded === episode_no;
+              const meta = d?.meta;
+              const st = q?.state || {};
               return (
-                <div
-                  key={`${d.project}-${d.episode_no}`}
-                  className="border border-line rounded-lg p-3"
-                >
+                <div key={episode_no} className="border border-line rounded-lg p-3">
                   <div className="flex items-start justify-between gap-3">
                     <div className="min-w-0 flex-1">
                       <div className="flex items-center gap-2 flex-wrap">
                         <span className="font-semibold text-ink-1">
-                          {t('deliver.episodeNo', { n: d.episode_no })}
+                          {t('deliver.episodeNo', { n: episode_no })}
                         </span>
-                        {d.meta?.title && (
-                          <span className="text-sm text-ink-2">{d.meta.title}</span>
+                        {meta?.title && (
+                          <span className="text-sm text-ink-2">{meta.title}</span>
                         )}
-                        <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${b.cls}`}>{b.text}</span>
-                        {d.exists === false && (
+                        {b && (
+                          <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${b.cls}`}>{b.text}</span>
+                        )}
+                        {!d && (
+                          <span className="px-2 py-0.5 rounded-full text-xs font-medium bg-surface-2 text-ink-2">
+                            {t('review.notDelivered')}
+                          </span>
+                        )}
+                        {d?.exists === false && (
                           <span className="px-2 py-0.5 rounded-full text-xs font-medium bg-danger-subtle text-danger-strong">
                             {t('deliver.missing')}
                           </span>
                         )}
-                        {d.meta?.stale && (
+                        {meta?.stale && (
                           <span
                             className="px-2 py-0.5 rounded-full text-xs font-medium bg-warning-subtle text-warning-strong"
-                            title={d.meta.stale.reason || t('deliver.stale')}
+                            title={meta.stale.reason || t('deliver.stale')}
                           >
                             {t('deliver.stale')}
                           </span>
                         )}
-                        {d.meta?.incomplete_shots && (
+                        {meta?.incomplete_shots && (
                           <span
                             className="px-2 py-0.5 rounded-full text-xs font-medium bg-warning-subtle text-warning-strong"
-                            title={d.meta?.warning || t('deliver.incompleteTitle')}
+                            title={meta?.warning || t('deliver.incompleteTitle')}
                           >
-                            {t('deliver.incompleteShots', { ready: d.meta?.shots_ready ?? '?', total: d.meta?.shots_total ?? '?' })}
+                            {t('deliver.incompleteShots', { ready: meta?.shots_ready ?? '?', total: meta?.shots_total ?? '?' })}
                           </span>
                         )}
+                        {/* 四层质量状态点：不展开也能一眼看出 A/B/C/D 卡在哪一层 */}
+                        <span className="flex items-center gap-1" title={t('review.stagesTitle')}>
+                          {(['A', 'B', 'C', 'D'] as const).map((s) => (
+                            <span
+                              key={s}
+                              className={`h-2 w-2 rounded-full ${STATUS_DOT[st[s]?.status || 'pending']}`}
+                              title={s + ': ' + (st[s]?.status || 'pending')}
+                            />
+                          ))}
+                        </span>
                       </div>
-                      <p className="text-xs text-ink-2 mt-1">
-                        {d.filename} · {sizeText(d.size)}
-                        {typeof d.meta?.duration_sec === 'number' && d.meta.duration_sec > 0 && (
-                          <span> · {d.meta.duration_sec.toFixed(1)}s</span>
-                        )}
-                      </p>
-                      {d.meta?.stale && (
+                      {d && (
+                        <p className="text-xs text-ink-2 mt-1">
+                          {d.filename} · {sizeText(d.size)}
+                          {typeof meta?.duration_sec === 'number' && meta.duration_sec > 0 && (
+                            <span> · {meta.duration_sec.toFixed(1)}s</span>
+                          )}
+                        </p>
+                      )}
+                      {!d && (
+                        <p className="text-xs text-ink-2 mt-1">
+                          {t('review.noDeliverableHint')}
+                        </p>
+                      )}
+                      {meta?.stale && (
                         <p className="text-xs text-warning-strong mt-1">
-                          {d.meta.stale.reason || t('deliver.staleReasonDefault')}
-                          {d.meta.stale.detail?.shot_id != null && (
-                            <span>{t('deliver.staleShotRef', { n: d.meta.stale.detail.shot_id })}</span>
+                          {meta.stale.reason || t('deliver.staleReasonDefault')}
+                          {meta.stale.detail?.shot_id != null && (
+                            <span>{t('deliver.staleShotRef', { n: meta.stale.detail.shot_id })}</span>
                           )}
                           {t('deliver.staleRerenderHint')}
                         </p>
                       )}
-                      {d.meta?.incomplete_shots && d.meta?.warning && (
+                      {meta?.incomplete_shots && meta?.warning && (
                         <p className="text-xs text-warning-strong mt-1">
-                          {d.meta.warning}
+                          {meta.warning}
                         </p>
                       )}
-                      {d.review === 'rejected' && d.review_note && (
+                      {d?.review === 'rejected' && d?.review_note && (
                         <p className="text-xs text-ink-2 mt-1">
                           {t('deliver.rejectNoteInline', { note: d.review_note })}
                         </p>
                       )}
                     </div>
 
-                    <div className="flex gap-2 shrink-0">
+                    <div className="flex flex-wrap justify-end gap-2 shrink-0">
                       {playable && (
                         <>
                           <Button
                             size="sm"
                             variant="secondary"
-                            onClick={() => setPlaying(playing === d.filename ? null : d.filename)}
+                            onClick={() => setPlaying(playing === d?.filename ? null : d!.filename)}
                           >
-                            {playing === d.filename ? t('common.close') : t('common.play')}
+                            {playing === d?.filename ? t('common.close') : t('common.play')}
                           </Button>
                           <a
-                            href={`${d.url}?download=1`}
+                            href={`${d!.url}?download=1`}
                             className="inline-flex items-center px-3 py-1.5 text-sm rounded-lg border border-line-strong text-ink-1 hover:bg-surface-2 transition-colors"
                           >
                             {t('common.download')}
                           </a>
                         </>
                       )}
-                      <Button
-                        size="sm"
-                        onClick={() => review(d.episode_no, 'accepted')}
-                        disabled={!canReview || d.review === 'accepted'}
-                      >
-                        {t('deliver.approve')}
-                      </Button>
+                      {d && (
+                        <>
+                          <Button
+                            size="sm"
+                            onClick={() => review(episode_no, 'accepted')}
+                            disabled={!canReview || d.review === 'accepted'}
+                          >
+                            {t('deliver.approve')}
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="secondary"
+                            onClick={() => {
+                              setRejecting(rejecting === episode_no ? null : episode_no);
+                              setReason('');
+                            }}
+                            disabled={!canReview || d.review === 'rejected'}
+                          >
+                            {t('deliver.reject')}
+                          </Button>
+                        </>
+                      )}
                       <Button
                         size="sm"
                         variant="secondary"
-                        onClick={() => {
-                          setRejecting(rejecting === d.episode_no ? null : d.episode_no);
-                          setReason('');
-                        }}
-                        disabled={!canReview || d.review === 'rejected'}
+                        onClick={() => setExpanded(isOpen ? null : episode_no)}
                       >
-                        {t('deliver.reject')}
+                        <span className="flex items-center gap-1">
+                          {isOpen
+                            ? <ChevronDown className="h-3.5 w-3.5" />
+                            : <ChevronRight className="h-3.5 w-3.5" />}
+                          {isOpen ? t('review.collapse') : t('review.expand')}
+                        </span>
                       </Button>
                     </div>
                   </div>
 
-                  {playing === d.filename && d.url && (
+                  {d && playing === d.filename && d.url && (
                     <video src={d.url} controls className="w-full mt-3 rounded-lg bg-black" />
                   )}
 
-                  {rejecting === d.episode_no && (
+                  {d && rejecting === episode_no && (
                     <div className="mt-3 pt-3 border-t border-line space-y-2">
                       <Textarea
                         value={reason}
@@ -385,7 +455,7 @@ export function OutputReviewTab({ projectKey, assets }: OutputReviewTabProps) {
                         placeholder={t('deliver.rejectReasonInput')}
                       />
                       <div className="flex gap-2">
-                        <Button size="sm" onClick={() => review(d.episode_no, 'rejected', reason)} disabled={!canReview}>
+                        <Button size="sm" onClick={() => review(episode_no, 'rejected', reason)} disabled={!canReview}>
                           {t('deliver.confirmReject')}
                         </Button>
                         <Button
@@ -399,6 +469,17 @@ export function OutputReviewTab({ projectKey, assets }: OutputReviewTabProps) {
                           {t('common.cancel')}
                         </Button>
                       </div>
+                    </div>
+                  )}
+
+                  {/* 行内展开：该集自己的四层状态 + 逐镜并排复核（C 层复核 / D 层发布） */}
+                  {isOpen && (
+                    <div className="mt-3 pt-3 border-t border-line">
+                      <EpisodeReviewPanel
+                        projectKey={projectKey}
+                        episode={episode_no}
+                        onChanged={loadAll}
+                      />
                     </div>
                   )}
                 </div>

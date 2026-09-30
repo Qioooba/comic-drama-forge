@@ -8,8 +8,10 @@
 P0-2 改造：原先硬编码的 ComfyUI / 模型路径已全部改为环境变量驱动，
 换机只需修改 .env（见项目根目录 .env.example），无需改代码。
 """
+import json
 import logging
 import os
+import re
 
 # 环境加载与项目根目录统一由 env_loader 负责（导入即生效，避免模块导入顺序导致 .env 未加载）
 from env_loader import PROJECT_ROOT_DIR, PROJECT_DATA_DIR, env as _env, env_int as _env_int  # noqa: E402
@@ -231,6 +233,121 @@ SHOT_TYPE_LABELS = {
     "大远景": "人物极小，环境与空间关系为主",
 }
 
+
+# ===================== 动作节拍（一镜一动作）唯一权威表 =====================
+#
+# 用途：① 生成期拆镜（novel_to_script._split_multi_action_row）—— 一镜塞了多个连续动作时
+#       拆成相邻两镜，让成片真正产生「切换」；② 质检软告警（qc_client 第 ④ 层）——统计
+#       多动作镜占比。
+#
+# ⚠️ 唯一权威表：两处必须都从这里取。历史教训：景别白名单曾在五处各写一份、口径互不相同
+#   （见上方 SHOT_TYPES 注释），最终导致模型写对了也被判「枚举漂移」丢弃。动作词表同理——
+#   生成期与质检期口径一旦漂移，拆镜与告警就会互相打架。
+#
+# 参考片口径：92 镜几乎每镜只有 1 个动作节拍，靠相邻镜切换推进。
+#
+# ⚠️ 只用**多字动作词**：单字词（冲/收/放/接/背/走/拍/看…）的误报率实测极高——
+#   「雨水**冲**刷得发亮」被算成动作、「收银台」里的「收」被算成动作、「**背**景」里的
+#   「背」被算成动作。而这个计数**会驱动生成期自动拆镜**，误报 = 把好镜头拆碎，
+#   比不拆更糟。故宁可少认，不可错认：所有单字词一律换成语境明确的二字/三字词。
+ACTION_WORDS = (
+    # 位移
+    "转身", "回头", "走近", "走到", "走向", "跑向", "奔向", "迈步", "跨过", "退后",
+    "后退", "转身而去", "停下", "躲开", "扑向", "追去", "冲上", "冲进", "冲出", "蹲下",
+    "躺下", "爬起", "起身", "坐下", "站起", "跪下", "站稳",
+    # 上身与手势
+    "弯腰", "俯身", "低头", "抬头", "抬起", "抬起手", "点头", "摇头", "侧身", "抬手", "伸手", "举手",
+    "挥手", "推开", "拉住", "拽住", "按住", "按在", "拍向", "拍在", "敲响", "敲了",
+    "翻找", "掏出", "取出", "收回", "收起", "收进", "递出", "接过", "攥紧", "握住",
+    "握紧", "拿起", "放下", "捡起", "扔下", "抢过", "抱起", "扶住", "擦去", "抹去",
+    "掀起", "举起", "撕开", "打开", "关上", "展开", "卷起",
+    # 表情与状态
+    "皱眉", "咬紧", "喘气", "颤抖", "苦笑", "冷笑", "笑了", "哭了", "落泪", "流泪",
+    "瘫坐", "瘫倒",
+    # 单字动作词：表达力强但误命中率高（「收」在收银台、「背」在背景、「冲」在冲刷、
+    # 「站」在车站…）。它们必须配合下面 ACTION_NEGATIVE_WORDS 的剔除使用，
+    # 见 action_clauses —— 绝不单独裸用。
+    "走", "跑", "推", "拉", "拽", "按", "拍", "敲", "握", "攥", "举", "递", "接", "收", "放",
+    "掏", "塞", "捡", "扔", "挥", "抢", "抱", "扶", "擦", "抹", "掀", "撕", "折", "看", "望",
+    "盯", "瞥", "笑", "哭", "咬", "喘", "退", "躲", "扑", "追", "站", "坐", "蹲", "跪", "披",
+    "戴", "背", "冲", "翻", "倒", "摔",
+)
+
+#: 非动作复合词：出现在短句里时，先从短句中**剔除**再做动作词匹配。
+#: 例：「石阶被雨水冲刷得发亮」剔除「冲刷」后不再误命中「冲」；「收银台」剔除「收银」后
+#: 不再误命中「收」。这是单字动作词能安全使用的前提。
+ACTION_NEGATIVE_WORDS = (
+    "冲刷", "冲突", "收银", "背景", "背影", "背书", "走廊", "直接",
+    "放心", "放弃", "节拍", "拍打", "难看", "转折", "玩笑", "节奏", "车站", "坐落", "倒影",
+    "翻涌", "披风", "摔打", "推敲", "拉锯", "接续", "抬头纹", "开口", "开口说", "站台",
+    "看台", "看客", "望族", "笑纹", "咬文", "气喘", "退路", "躲闪", "追问", "扑克", "翻看",
+)
+
+#: 动作短句的断句符（数节拍与拆镜共用的切分口径）
+ACTION_CLAUSE_RE = re.compile(r"[，,。；;！？!?\n]+")
+
+
+def action_clauses(text: str) -> list:
+    """切出文本里**含动作词**的短句列表（保序、去重）。
+
+    ⚠️ 必须先按短句去重再计数：模型常把同一个动作在 description / visual_detail / motion
+    里各写一遍（实测「林风握紧断剑」三处各写一次 → 旧口径算 3 个节拍，实际只有 1 个）。
+    去重后同一动作只算一次。
+    """
+    if not text:
+        return []
+    out, seen = [], set()
+    for seg in ACTION_CLAUSE_RE.split(str(text)):
+        seg = seg.strip()
+        if not seg or seg in seen:
+            continue
+        # 先剔除非动作复合词，再用词表匹配（单字动作词的安全前提）
+        probe = seg
+        for neg in ACTION_NEGATIVE_WORDS:
+            if neg in probe:
+                probe = probe.replace(neg, "")
+        if any(w in probe for w in ACTION_WORDS):
+            seen.add(seg)
+            out.append(seg)
+    return out
+
+
+def count_action_beats(text: str) -> int:
+    """数一段文本里可辨认的「动作节拍」个数（= 含动作词的互异短句数）。
+
+    口径：先按中文断句符切成短句并去重，含动作词的短句各算 1 个节拍；同一短句里出现
+    多个动作词仍只算 1 个节拍（「抬手擦了擦」是 1 个动作，不是 2 个）。
+
+    这是「一镜一动作」的唯一判定口径：生成期拆镜与质检期告警都调它。
+    """
+    return len(action_clauses(text))
+
+# ===================== 单镜时长模型（参考片口径·唯一权威）=====================
+#
+# 2026-09-30 按参考片 92 镜实测**重新标定**。
+#
+# 旧口径：MIN 3s / 静默基准 3s / 描述最多 +2s / 动作最多 +1.5s / 高潮 +2s ——
+# 于是每个镜头的地板就是 4~6 秒，而**参考片单镜中位只有 2.08 秒**。
+# 用户反馈的「分镜没有切换、一镜演好几件事」，根因就在这里，不在运镜：
+# 镜头被时长模型顶到 8~12 秒，剪辑点自然稀疏，再怎么调运镜也救不回来。
+#
+# ⚠️ 唯一权威：novel_to_script（生成期推算）与 qc_client（质检 OK 区间）都从这里取。
+# 历史缺陷：两处各写一份（剧本端 3~12 秒 vs 质检端 1~15 秒），约束互相打架、
+# 正常剧本反被判「不可执行」（见 qc_client 旧注释）。
+SHOT_DURATION_MIN = 2.0            # 单镜最短秒数（对齐参考片中位 2.08s；AI 视频段 <2s 画面运动不足，取 2.0s）
+SHOT_DURATION_MAX = 8.0            # 单镜最长秒数（参考片最长 6.57s，留余量给长台词）
+SHOT_DURATION_SILENT = 0.6         # 无台词纯画面镜头的基准秒数（旧值 3.0s）
+CHARS_PER_SECOND = 4.5             # 中文配音语速基准（字/秒），按台词长度推算时长
+BEAT_CLIMAX_BONUS_SEC = 0.7        # 「高潮」节拍镜的画面停留加成（旧值 2.0s）
+#: 画面描述带来的时长加成上限（旧值 2.0s）+ 折算系数（每多少字给 1 秒）
+SHOT_DURATION_DESC_SEC_MAX = 0.5
+SHOT_DURATION_DESC_CHARS_PER_SEC = 150.0
+#: 动作复杂度带来的时长加成上限（旧值 1.5s）
+SHOT_DURATION_ACTION_SEC_MAX = 0.5
+#: 单镜台词字数预算（16 字 ≈ 3.6 秒配音）。参考片的快节奏来自「一句短台词说完就切」——
+#: 旧值 30 字（≈6.7 秒配音）是「一镜不切换」的直接原因，配合规则 13 一起收紧。
+SHOT_SPEECH_BUDGET_CHARS = 16
+
 #: 视频生成方式（**项目级设定**，新建项目时由用户选择；全链路唯一口径）。
 #:
 #:   episode  = 整集一次提交，H3 原生段间衔接产出「一条连续整集视频」（默认，观感最连贯）
@@ -372,6 +489,30 @@ KEEP_MODEL_LOADED = _env_bool("MJSCXT_KEEP_MODEL_LOADED", True)
 CLEAR_COMFYUI_HISTORY = _env_bool("MJSCXT_CLEAR_COMFYUI_HISTORY", True)
 #: 两次清理之间的最小间隔（秒）。太频繁会让「刚跑完那一镜」的现场也被清掉。
 CLEAR_COMFYUI_HISTORY_INTERVAL_SEC = 300.0
+
+
+# ===================== 跨项目角色资产库（2026-09-29，借鉴 NiliX） =====================
+# 角色设定图（三视图 + 半身档）是**纯确定性**产物：同一段外貌描述 + 同一风格 +
+# 同一画幅 + 同一模板，目标形象就应当是同一张图。此前每个项目都要重新渲染一遍 ——
+# 同一角色的多项目复用、同一部小说的续集，全在重复烧 GPU。
+#
+# 开启后：生成角色基础图前先按「形象指纹」查库，命中直接复用（零渲染）；
+# 未命中则正常渲染，成功后入库。指纹**包含风格** —— 否则「国漫风」的角色图会被
+# 复用进「写实风」项目，直接把画风带错（最坏那类静默错）。
+#
+# 关掉即恢复原行为：MJSCXT_ASSET_LIBRARY=0
+ASSET_LIBRARY_ENABLED = _env_bool("MJSCXT_ASSET_LIBRARY", True)
+
+
+# ===================== 两级生产：预演 → 批准 → 正式（2026-09-29，借鉴 ai-manga-factory） =====================
+# 默认**关**（零行为变更）。打开后每集先出一版低成本预演（分辨率减半 + 每段时长压到
+# 上限，段数不变所以每一镜都看得到），人工看过并批准后才排正式生产。
+#
+# 铁律：预演产物**永不可交付** —— 它长得像成片但不是成片，混进交付物索引会让用户
+# 拿一版糊图去发布。该不变量由 app/preview_gate.deliverable_ok 在登记入口硬拦。
+#
+# 打开：MJSCXT_PREVIEW_BEFORE_FINAL=1
+PREVIEW_BEFORE_FINAL = _env_bool("MJSCXT_PREVIEW_BEFORE_FINAL", False)
 
 
 
@@ -569,6 +710,87 @@ WORKFLOW_TEMPLATE = {
     "multiview_gen": "分镜生成_Qwen21.json",     # QwenImage2.1 多视角编辑（角色多视图/物品场景3D多视角）
     "storyboard_gen": "分镜生成_Qwen21.json",    # QwenImage2.1 分镜生成（参考图编辑）
 }
+
+# ===================== 工作流映射外置（2026-09-29，借鉴 lumenx 的 workflow_mapping） =====================
+# 为什么外置：模板名此前**写死在源码里**。换一套工作流要改 Python + 重启，而且改完
+# 没有任何「这个项目跑的是哪套工作流」的留痕。
+#
+# 约定（刻意保守）：
+#   * 只允许覆盖**已存在的键** —— 打错的键名只 warning，绝不静默接受。
+#     否则一个 typo 会让人以为换了工作流、实际还在跑旧的（最坏那类静默错）；
+#   * 缺字段一律回落内置默认 → 可以只写想改的那一条；
+#   * 文件不存在 = 完全维持现状；**删掉该文件即回滚**，不需要改代码；
+#   * 解析失败 fail-open + warning：坏配置文件绝不阻断启动。
+#
+# 文件位置：<项目根>/config/workflow_mapping.json（可用 MJSCXT_WORKFLOW_MAPPING 换路径）
+# 格式（两种都认）：
+#   {"h3_video": "我的H3.json"}
+#   {"workflows": {"h3_video": {"template": "我的H3.json"}}}
+WORKFLOW_MAPPING_PATH = _norm_path(_env(
+    "MJSCXT_WORKFLOW_MAPPING",
+    os.path.join(PROJECT_ROOT_DIR, "config", "workflow_mapping.json")))
+
+
+def _load_workflow_mapping(path: str = None) -> dict:
+    """读取可选的 workflow_mapping.json，返回 {键: 文件名}（**只含合法覆盖项**）。
+
+    任何异常都 fail-open（返回空 dict = 沿用内置默认），绝不阻断启动。
+    """
+    p = path or WORKFLOW_MAPPING_PATH
+    try:
+        with open(p, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except FileNotFoundError:
+        return {}                       # 没有该文件 = 维持现状（最常见的情形）
+    except (OSError, ValueError) as e:
+        logger.warning("workflow_mapping.json 解析失败（沿用内置默认）：%s", e)
+        return {}
+    if not isinstance(raw, dict):
+        logger.warning("workflow_mapping.json 顶层必须是对象（沿用内置默认）")
+        return {}
+    table = raw.get("workflows") if isinstance(raw.get("workflows"), dict) else raw
+    out = {}
+    for k, v in table.items():
+        if k not in WORKFLOW_TEMPLATE:
+            logger.warning("workflow_mapping.json 含未知键 %r（已忽略）；合法键：%s",
+                           k, ", ".join(sorted(WORKFLOW_TEMPLATE)))
+            continue
+        name = v.get("template") if isinstance(v, dict) else v
+        if not isinstance(name, str) or not name.strip():
+            logger.warning("workflow_mapping.json 的 %r 取值非法（应为非空字符串），已忽略", k)
+            continue
+        out[k] = name.strip()
+    return out
+
+
+def apply_workflow_mapping(mapping: dict = None) -> dict:
+    """把外置映射**就地**覆盖进 WORKFLOW_TEMPLATE，返回实际生效的覆盖项。
+
+    ⚠️ 必须**就地 update**：其它模块写的是 `from config import WORKFLOW_TEMPLATE`，
+    拿到的是**同一个 dict 对象**。若这里改成重新绑定一个新 dict，那些模块仍指向旧对象，
+    外置配置会静默失效 —— 这是本功能最容易写错的一处（守卫 H 段专钉它）。
+    """
+    m = _load_workflow_mapping() if mapping is None else dict(mapping or {})
+    applied = {}
+    for k, v in m.items():
+        if k in WORKFLOW_TEMPLATE and isinstance(v, str) and v.strip():
+            old, new = WORKFLOW_TEMPLATE[k], v.strip()
+            WORKFLOW_TEMPLATE[k] = new
+            applied[k] = {"from": old, "to": new}
+            # 顺带体检：映射到的文件是否真的解析得到（解析不到只 warning，不阻断）
+            try:
+                if not os.path.isfile(resolve_workflow_path(new)):
+                    logger.warning("workflow_mapping.json 把 %r 指向 %r，但该工作流文件解析"
+                                   "不到（请确认它已在 workflows/ 下，或路径写对）", k, new)
+            except Exception as e:                           # noqa: BLE001
+                logger.warning("检查映射 %r → %r 时出错（忽略）：%s", k, new, e)
+    if applied:
+        logger.info("工作流映射外置已生效：%s", json.dumps(applied, ensure_ascii=False))
+    return applied
+
+
+# 导入时应用一次；没有该文件就是**零变化**（内置默认原样保留）
+APPLIED_WORKFLOW_MAPPING = apply_workflow_mapping()
 
 # 关键帧「跨镜链式」默认模式：上一镜尾帧 = 下一镜首帧（与参考工作流一致）
 #   auto   = 仅相邻两镜同场景时串帧（默认，跨场景切场不串，避免把上一场的画面带进新场）
@@ -783,6 +1005,56 @@ SCENE_VIEW_MAX_RETRIES = max(0, _env_int("SCENE_VIEW_MAX_RETRIES", 1))
 # 而正向提示词要求「国漫3D渲染风格」——正负自相矛盾会把 3D 风格压掉（画面风格撕裂）。
 # 提交前从负向槽位剔除这些词（按长度降序匹配，避免「3D渲染」被「3D」提前截断）。
 CONFLICT_NEGATIVE_TOKENS = ("3D渲染", "二次元动漫", "3D动漫", "3D渲染风格", "3D")
+
+# ===================== 生成前提示词 LLM 增强 + 质检模型复审（2026-09-30） =====================
+# 在 prompt_qc.preflight（确定性预检）之外补的两道模型侧闸门，对所有已接预检的生成
+# 路径生效（分镜图 / 资产图 / 尾帧 / H3 视频；台词 audio 永不参与——台词会被 TTS
+# 逐字念出，绝不能改写）。任何一层失败都 fail-open（按原提示词继续生成），绝不阻断管线。
+# 2026-09-30 晚曾因旧网关持续超时临时关闭；当晚用户更换 LLM 提供商后已恢复默认开启。
+#: 出图/出片前用「文本分析模型」增强提示词（动作/空间/光影更具体；协议骨架强制保留）
+PROMPT_ENHANCE_ENABLED = _env_bool("MJSCXT_PROMPT_ENHANCE", True)
+#: 增强后用「质检模型」对提示词做语义复审；复审不通过且给出改进版、改进版复检不降分才采纳
+PROMPT_MODEL_REVIEW_ENABLED = _env_bool("MJSCXT_PROMPT_MODEL_REVIEW", True)
+#: 单次增强/复审调用的超时（秒）。预检在生成链路里同步执行，超时给得保守，失败即回落原文
+PROMPT_ENHANCE_TIMEOUT_SEC = _env_int("PROMPT_ENHANCE_TIMEOUT_SEC", 90)
+#: 增强/复审结果的进程内缓存条数（同一条提示词的生成重试/质检重试不再重复打模型）
+PROMPT_ENHANCE_CACHE_SIZE = max(0, _env_int("PROMPT_ENHANCE_CACHE_SIZE", 256))
+
+# 提示词增强的**文件级总开关**（2026-09-30，前端「AI 配置」页可改，优先级：文件 > env > 代码默认）。
+# 文件缺失 = 跟随上方 env/默认值；文件存在则以其 enabled 为准 —— 这是给非运维用户的开关。
+PROMPT_ENHANCE_CONFIG_PATH = os.path.join(PROJECT_DATA_DIR, "prompt_enhance_config.json")
+PROMPT_ENHANCE_FILE_DEFAULTS = {"enhance_enabled": None, "review_enabled": None}
+
+
+def _prompt_enhance_file_flags() -> dict:
+    """读 prompt_enhance_config.json；缺失/损坏返回 {}（此时跟随 env 默认值）。"""
+    raw = {}
+    if os.path.isfile(PROMPT_ENHANCE_CONFIG_PATH):
+        try:
+            with open(PROMPT_ENHANCE_CONFIG_PATH, "r", encoding="utf-8") as f:
+                raw = json.load(f) or {}
+        except Exception as e:  # noqa: BLE001
+            logger.warning("提示词增强配置读取失败（跟随代码默认）：%s", e)
+            raw = {}
+    out = dict(PROMPT_ENHANCE_FILE_DEFAULTS)
+    for k in ("enhance_enabled", "review_enabled"):
+        v = raw.get(k)
+        out[k] = (None if v is None else bool(v))
+    return out
+
+
+def save_prompt_enhance_config(patch: dict) -> dict:
+    """保存提示词增强开关（只认 enhance_enabled / review_enabled 两个布尔字段）。"""
+    cfg = _prompt_enhance_file_flags()
+    for k in ("enhance_enabled", "review_enabled"):
+        if k in patch and patch.get(k) is not None:
+            cfg[k] = bool(patch.get(k))
+    import datetime as _dt
+    cfg["updated_at"] = _dt.datetime.now().isoformat(timespec="seconds")
+    os.makedirs(os.path.dirname(os.path.abspath(PROMPT_ENHANCE_CONFIG_PATH)), exist_ok=True)
+    with open(PROMPT_ENHANCE_CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    return cfg
 
 DEFAULT_PARAMS = {
     "resolution": "768p_vertical",  # 768p_vertical, 768p_horizontal, 480p

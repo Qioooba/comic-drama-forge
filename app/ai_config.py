@@ -162,7 +162,8 @@ def _now() -> str:
 
 def _empty_module() -> dict:
     return {"base_url": "", "api_key": "", "model": "",
-            "reasoning_effort": "", "updated_at": None}
+            "reasoning_effort": "", "updated_at": None,
+            "fallbacks": []}
 
 
 def _empty_config() -> dict:
@@ -180,6 +181,37 @@ def normalize_reasoning_effort(value) -> str:
     if v == REASONING_EFFORT_OFF:
         return REASONING_EFFORT_OFF
     return v if v in REASONING_EFFORT_LEVELS else ""
+
+
+def _normalize_fallbacks(raw, module: str = "") -> list:
+    """备用模型列表归一化（顺序即故障转移顺序）。
+
+    每项 = {base_url, model, reasoning_effort, label, api_key, api_key_masked,
+            has_api_key, secret_ns}。
+    - api_key 明文只在内存保留（首次迁移/保存时识别）；json 落盘恒为空；
+    - get_module 按 secret_ns（ai.<module>.fb.<i>）从加密库补明文；
+    - 对外视图一律脱敏（api_key_masked + has_api_key）。
+    """
+    out = []
+    if not isinstance(raw, list):
+        return out
+    for i, item in enumerate(raw):
+        if not isinstance(item, dict):
+            continue
+        _pk = str(item.get("api_key") or "").strip()
+        entry = {
+            "base_url": str(item.get("base_url") or "").strip(),
+            "model": str(item.get("model") or "").strip(),
+            "reasoning_effort": normalize_reasoning_effort(item.get("reasoning_effort")),
+            "label": str(item.get("label") or "").strip() or f"备用{i + 1}",
+            "api_key": "",
+            "secret_ns": f"ai.{module}.fb.{i}" if module else "",
+            "has_api_key": bool(_pk) or bool(item.get("has_api_key")),
+            "api_key_masked": mask_key(_pk) if _pk else "",
+        }
+        if entry["base_url"] and entry["model"]:
+            out.append(entry)
+    return out
 
 
 def _normalize_module(raw) -> dict:
@@ -282,7 +314,9 @@ def load_config(config_path: str, legacy_path: str = None) -> dict:
     cfg = _empty_config()
     modules = raw.get("modules") if isinstance(raw.get("modules"), dict) else {}
     for m in MODULES:
-        cfg["modules"][m] = _normalize_module(modules.get(m))
+        _m = _normalize_module(modules.get(m))
+        _m["fallbacks"] = _normalize_fallbacks((modules.get(m) or {}).get("fallbacks") if isinstance(modules.get(m), dict) else [], m)
+        cfg["modules"][m] = _m
     if raw.get("migrated_from"):
         cfg["migrated_from"] = str(raw["migrated_from"])
     cfg["version"] = int(raw.get("version") or 1)
@@ -328,7 +362,9 @@ def get_module(cfg: dict, module: str) -> dict:
     if module not in MODULES:
         raise ValueError(f"未知的 AI 模块：{module}")
     modules = (cfg or {}).get("modules") or {}
-    ep = _normalize_module(modules.get(module))
+    _raw_m = modules.get(module)
+    ep = _normalize_module(_raw_m)
+    ep["fallbacks"] = _normalize_fallbacks((_raw_m or {}).get("fallbacks") if isinstance(_raw_m, dict) else [], module)
     ns = f"ai.{module}"
     # ⭐ 单一事实源：DB（ai_credentials 表）优先。get_credentials 内部已按
     # env > DB 解析，直接信任其结果；DB 有非空字段就覆盖 json 值。
@@ -347,6 +383,12 @@ def get_module(cfg: dict, module: str) -> dict:
             ep["reasoning_effort"] = db_ep["reasoning_effort"]
     except Exception as e:  # noqa: BLE001  DB 不可用回落旧口径（json + 加密库槽 + env）
         logger.warning(f"AI 凭证 DB 读取失败，回落加密库/env：{e}")
+    # 备用模型密钥：从加密库槽 ai.<module>.fb.<i> 补明文（与主模块同口径）
+    for _i, _fb in enumerate(ep.get("fallbacks") or []):
+        if _fb.get("secret_ns"):
+            _fb_key = _store().get_api_key(_fb["secret_ns"])
+            if _fb_key:
+                _fb["api_key"] = _fb_key
     if db_key:
         return ep
     # ⚠️「DB 没有该模块的密钥」≠「没配过密钥」：本侧密钥写入点（save_module）落的是
@@ -371,7 +413,7 @@ def get_module(cfg: dict, module: str) -> dict:
 @_locked
 def save_module(config_path: str, module: str, base_url: str = None, model: str = None,
                 api_key: str = None, legacy_path: str = None,
-                reasoning_effort: str = None) -> dict:
+                reasoning_effort: str = None, fallbacks: list = None) -> dict:
     """保存单个模块。
 
     密钥处理（P0-3 加固）：
@@ -399,6 +441,62 @@ def save_module(config_path: str, module: str, base_url: str = None, model: str 
     if reasoning_effort is not None:
         ep["reasoning_effort"] = normalize_reasoning_effort(reasoning_effort)
     key = "" if api_key is None else str(api_key).strip()
+    # 备用模型：密钥逐个落加密库槽 ai.<module>.fb.<i>，json 里只留脱敏值
+    if fallbacks is not None:
+        _norm_fb = []
+        # 旧条目：按 (base_url, model) 索引 —— 用户「编辑」时前端回显的是脱敏值
+        # （含 *），必须能从旧条目把密钥续上；按签名而不是按位置匹配，
+        # 这样删掉中间一条、或调整顺序也不会把 A 的密钥接到 B 头上。
+        _old_fbs = list(ep.get("fallbacks") or [])
+        _old_by_sig = {}
+        for _o in _old_fbs:
+            if isinstance(_o, dict):
+                _old_by_sig[(str(_o.get("base_url") or "").strip(),
+                             str(_o.get("model") or "").strip())] = _o
+        for _i, _fb in enumerate(fallbacks or []):
+            if not isinstance(_fb, dict):
+                continue
+            _fk = str(_fb.get("api_key") or "").strip()
+            _masked_echo = "*" in _fk          # 脱敏回显 = 用户没改密钥
+            _entry = {
+                "base_url": str(_fb.get("base_url") or "").strip(),
+                "model": str(_fb.get("model") or "").strip(),
+                "reasoning_effort": normalize_reasoning_effort(_fb.get("reasoning_effort")),
+                "label": str(_fb.get("label") or "").strip() or f"备用{_i + 1}",
+                "api_key": "",
+                "has_api_key": bool(_fk) or bool(_fb.get("has_api_key")),
+                "api_key_masked": "" if _masked_echo else (mask_key(_fk) if _fk else ""),
+            }
+            if _entry["base_url"] and _entry["model"]:
+                if _fk and not _masked_echo:
+                    # 用户填了新的明文密钥 → 写加密库槽 + 刷新脱敏值
+                    if not _store().set_api_key(f"ai.{module}.fb.{_i}", _fk):
+                        logger.warning("备用模型密钥加密不可用（索引 %d），跳过该条", _i)
+                    else:
+                        _entry["has_api_key"] = True
+                        _entry["api_key_masked"] = mask_key(_fk)
+                else:
+                    # 脱敏回显 / 留空 → **不改动密钥**：从旧条目（按签名）或原索引槽续上，
+                    # 并按新索引把槽位重写一遍，保证「顺序变了槽位也跟着对」。
+                    _prev = _old_by_sig.get((_entry["base_url"], _entry["model"])) or {}
+                    _prev_key = str(_prev.get("api_key") or "").strip()
+                    if not _prev_key and module:
+                        try:
+                            _prev_key = str(_store().get_api_key(f"ai.{module}.fb.{_i}") or "").strip()
+                        except Exception:  # noqa: BLE001
+                            _prev_key = ""
+                    if _prev_key and module:
+                        try:
+                            if _store().set_api_key(f"ai.{module}.fb.{_i}", _prev_key):
+                                _entry["has_api_key"] = True
+                                _entry["api_key_masked"] = mask_key(_prev_key)
+                        except Exception as e:  # noqa: BLE001
+                            logger.warning("备用模型密钥续写失败（索引 %d）：%s", _i, e)
+                    else:
+                        _entry["has_api_key"] = bool(_prev.get("has_api_key"))
+                        _entry["api_key_masked"] = str(_prev.get("api_key_masked") or "")
+                _norm_fb.append(_entry)
+        ep["fallbacks"] = _norm_fb
     if key and "*" not in key:
         if not _store().set_api_key(f"ai.{module}", key):
             raise ValueError(
@@ -448,6 +546,10 @@ def clear_module(config_path: str, module: str = None, legacy_path: str = None) 
             raise ValueError(f"未知的 AI 模块：{module}")
         cfg["modules"][module] = _empty_module()
         _store().clear_api_key(f"ai.{module}")
+        # 备用模型密钥槽（ai.<module>.fb.<i>）一并清（加密库是扁平的，
+        # 没有前缀扫描 API，按已知上限 10 个逐条清）
+        for _i in range(10):
+            _store().clear_api_key(f"ai.{module}.fb.{_i}")
     else:
         cfg = _empty_config()
         for m in MODULES:
@@ -462,6 +564,24 @@ def clear_module(config_path: str, module: str = None, legacy_path: str = None) 
 
 
 # ===================== 对外视图 =====================
+
+def _fallbacks_public_view(fallbacks) -> list:
+    """备用模型的对外脱敏视图（base_url / model / label / has_api_key / api_key_masked）"""
+    out = []
+    for i, fb in enumerate(fallbacks or []):
+        if not isinstance(fb, dict):
+            continue
+        out.append({
+            "base_url": fb.get("base_url") or "",
+            "model": fb.get("model") or "",
+            "reasoning_effort": normalize_reasoning_effort(fb.get("reasoning_effort")),
+            "label": fb.get("label") or f"备用{i + 1}",
+            "has_api_key": bool(fb.get("has_api_key")) or bool(fb.get("api_key")),
+            "api_key_masked": fb.get("api_key_masked") or mask_key(fb.get("api_key") or ""),
+            "index": i,
+        })
+    return out
+
 
 def module_public_view(ep: dict) -> dict:
     """单个模块的对外视图（绝不含 api_key 明文）"""
@@ -478,6 +598,8 @@ def module_public_view(ep: dict) -> dict:
         "api_key_masked": mask_key(key),
         "chat_url": build_chat_url(base_url) if base_url else "",
         "updated_at": (ep or {}).get("updated_at"),
+        # 备用模型（脱敏视图：api_key 永不回显明文）
+        "fallbacks": _fallbacks_public_view(ep.get("fallbacks")),
     }
 
 

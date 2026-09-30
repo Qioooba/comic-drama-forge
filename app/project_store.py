@@ -687,9 +687,39 @@ def delete_project(ref: str, confirm: bool = False) -> dict:
                      key, e)
         db_purge["error"] = str(e)
 
+    # 关联清理（托管）：项目没了，其生产状态/死信/尝试计数一并清掉 ——
+    # 防止「删后重建同名项目」时，旧项目的生产进度被挂到新项目头上（用户实测缺陷）。
+    autopilot_purge = {"purged": False, "error": None}
+    try:
+        import autopilot
+        autopilot_purge.update(autopilot.purge_project(key))
+        autopilot_purge["purged"] = True
+    except Exception as e:  # noqa: BLE001 - 关联簿记：失败不阻断主删除，只响亮降级
+        logger.error("删除项目 %s 时清理 autopilot 状态失败（主删除已成功，不影响）：%s", key, e)
+        autopilot_purge["error"] = str(e)
+
+    # 关联清理（剧本连续性缓存）：output/continuity/<项目名>/ 存着设定集/镜头拆分/风格/配音词表，
+    # 不在 22 类产物目录清单内。不清的实测后果：删项目→重建同名→剧本「秒出」（命中旧缓存）、
+    # 视频步骤带着旧镜头结构开跑，而角色/物品/场景图已删光 —— 用户看到「资产 0 但直接生成视频」。
+    continuity_purge = {"purged": False, "path": "", "error": None}
+    try:
+        import shutil as _shutil
+        _cont_root = os.path.join(PROJECT_OUTPUT_DIR, "continuity", key)
+        if os.path.isdir(_cont_root):
+            _cont_trash = os.path.join(PROJECT_TRASH_DIR, f"{stamp}_{key}", "continuity")
+            os.makedirs(os.path.dirname(_cont_trash), exist_ok=True)
+            _shutil.move(_cont_root, _cont_trash)
+            continuity_purge["purged"] = True
+            continuity_purge["path"] = _cont_trash
+    except Exception as e:  # noqa: BLE001 - 关联簿记：失败不阻断主删除，只响亮降级
+        logger.error("删除项目 %s 时清理 continuity 缓存失败（主删除已成功，不影响）：%s", key, e)
+        continuity_purge["error"] = str(e)
+
     return {"project": rec, "trash_dir": trash_root, "moved": moved,
             "skipped": skipped, "recoverable": True,
-            "ai_chat_purge": ai_purge, "tasks_db_purge": db_purge}
+            "ai_chat_purge": ai_purge, "tasks_db_purge": db_purge,
+            "autopilot_purge": autopilot_purge,
+            "continuity_purge": continuity_purge}
 
 
 # =====================================================================

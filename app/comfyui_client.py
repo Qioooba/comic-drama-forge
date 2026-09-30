@@ -29,6 +29,7 @@ import threading
 import requests
 import cancellation  # S9：远端任务取消（中止信号贯穿 ComfyUI 轮询，与 pipeline/llm_client 同一套）
 import comfyui_job_store as job_store  # 崩溃免重渲检查点（2026-09-29：台账复用 + 重连，不重复提交）
+import asset_library  # 跨项目角色资产库（2026-09-29：形象指纹命中即零渲染复用）
 from typing import Dict, List, Optional, Any, Tuple, Sequence
 # ⚠️ Sequence 曾被漏导入：类级注解 `_LIGHT_KEYWORDS: Sequence[...]` 在类创建时**不求值**，
 # 所以模块照常导入、py_compile 也通过，但一旦有工具读取
@@ -614,9 +615,56 @@ class ComfyUIClient:
         resp.raise_for_status()
         return resp.json()
 
+    @staticmethod
+    def _http_error_detail(resp) -> str:
+        """把 ComfyUI 的错误响应体压成一行可读文本。
+
+        ⚠️ 2026-10-01 全流程实测补：`/prompt` 的 400 **不是网络抖动，而是工作流校验失败** ——
+        响应体里带着 `error.type / error.message` 和 `node_errors`（哪个节点、哪个输入不合法）。
+        原实现直接 `raise_for_status()`，异常里只剩
+        "400 Client Error: Bad Request for url: …"，**真正的原因被丢掉**：
+        整集视频挂掉时日志里完全看不出为什么，上层还在无意义地「换种子重试 6 次」
+        （校验错误换种子永远不可能成功）。所以这里把响应体解析出来带上。
+        """
+        try:
+            body = resp.json()
+        except Exception:  # noqa: BLE001
+            try:
+                return (resp.text or "").strip()[:600]
+            except Exception:  # noqa: BLE001
+                return ""
+        if not isinstance(body, dict):
+            return str(body)[:600]
+        bits = []
+        err = body.get("error")
+        if isinstance(err, dict):
+            bits.append(f"{err.get('type') or 'error'}: {err.get('message') or ''}".strip(": "))
+        elif err:
+            bits.append(str(err))
+        node_errors = body.get("node_errors")
+        if isinstance(node_errors, dict):
+            for nid, info in list(node_errors.items())[:6]:
+                if not isinstance(info, dict):
+                    bits.append(f"节点 {nid}: {info}")
+                    continue
+                msgs = []
+                for e in (info.get("errors") or []):
+                    if not isinstance(e, dict):
+                        continue
+                    extra = e.get("extra_info") if isinstance(e.get("extra_info"), dict) else {}
+                    where = extra.get("input_name") or extra.get("node_id") or ""
+                    msgs.append(f"{e.get('message') or e.get('type') or '不合法'}"
+                                + (f"[输入 {where}]" if where else ""))
+                bits.append(f"节点 {nid}({info.get('class_type') or '?'}): "
+                            + ("; ".join(msgs) or str(info)[:120]))
+        return " | ".join(x for x in bits if x)[:900]
+
     def _post(self, path: str, data: dict = None) -> Any:
         resp = requests.post(f"{self.base_url}{path}", json=data or {}, timeout=300)
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            raise RuntimeError(
+                f"ComfyUI POST {path} 失败：HTTP {resp.status_code}"
+                + (f" —— {self._http_error_detail(resp)}" if self._http_error_detail(resp) else ""))
         return resp.json()
 
     def get_status(self, timeout: int = 3) -> dict:
@@ -1152,6 +1200,32 @@ class ComfyUIClient:
         _bump("waited_seconds", round(time.time() - start, 2))
         return {}
 
+    def _stage_from_library(self, lib_files: List[str],
+                            filename_prefix: str = None) -> List[str]:
+        """把库里的产物**复制**到 ComfyUI output 目录，返回调用方期望的绝对路径。
+
+        为什么要复制、而不是直接返回库路径：调用方拿到产物后会 shutil.move 走
+        （见 app.py 资产链路：move 到 scratch 暂存区再质检）。若直接返回库路径，
+        **第一次复用就会把库条目移走**、库当场失效 —— 复制一份出去，库保持只读语义。
+        """
+        subdir, stem = "comic_drama", "asset"
+        if filename_prefix:
+            norm = str(filename_prefix).replace(os.sep, "/").replace("\\", "/").strip("/")
+            parts = [p for p in norm.split("/") if p]
+            if len(parts) > 1:
+                subdir, stem = "/".join(parts[:-1]), parts[-1]
+            elif parts:
+                stem = parts[0]
+        out_dir = os.path.join(COMFYUI_OUTPUT_DIR, *subdir.split("/"))
+        os.makedirs(out_dir, exist_ok=True)
+        staged: List[str] = []
+        for i, src in enumerate(lib_files):
+            ext = os.path.splitext(src)[1] or ".png"
+            dst = os.path.join(out_dir, "%s_reuse_%02d%s" % (stem, i + 1, ext))
+            shutil.copy2(src, dst)
+            staged.append(dst)
+        return staged
+
     def _resume_history(self, outputs: List[str]) -> dict:
         """把台账里存的**产物绝对路径**还原成 get_output_files 认得的 history 结构。
 
@@ -1525,9 +1599,39 @@ class ComfyUIClient:
                         and "filename_prefix" in _n["inputs"]:
                     _n["inputs"]["filename_prefix"] = filename_prefix
 
+        # ---- 跨项目角色资产库（2026-09-29）：角色设定图是确定性产物 → 命中指纹即零渲染 ----
+        # 只对 character 生效：物品/场景的「像不像」主观性更强、且各自携带机位与角度语义，
+        # 复用风险明显更高（口径见 asset_library 模块文档）。
+        _fp = ""
+        if asset_type == "character" and asset_library.enabled():
+            try:
+                _fp = asset_library.fingerprint(
+                    template=workflow_file, prompt=prompt_zh, style=style,
+                    size=size, kind=str(asset_type))
+                _hit = asset_library.lookup(_fp)
+                if _hit:
+                    _staged = self._stage_from_library(_hit, filename_prefix)
+                    if _staged:
+                        logger.info("[资产库] 角色基础图命中指纹 %s，复用 %d 张（零渲染）：%s",
+                                    _fp, len(_staged),
+                                    [os.path.basename(p) for p in _staged])
+                        return _staged
+            except Exception as e:                   # noqa: BLE001
+                logger.warning("资产库查询失败（按未命中处理，正常出图）：%s", e)
+                _fp = ""
+
         prompt_id = self.queue_prompt(api_prompt)
         history = self.wait_for_completion(prompt_id)
-        return self.get_output_files(history, ".png")
+        files = self.get_output_files(history, ".png")
+        if _fp and files:
+            try:
+                asset_library.store(_fp, files, meta={
+                    "template": os.path.basename(str(workflow_file)),
+                    "style": style, "size": list(size) if size else None,
+                    "type": str(asset_type)})
+            except Exception as e:                   # noqa: BLE001
+                logger.warning("角色资产入库失败（不影响出图）：%s", e)
+        return files
 
     def _append_style_negative(self, api_prompt: dict, style: str) -> None:
         """把「与目标风格冲突」的词追加到负向提示词**槽位**（找不到负向槽位则跳过）
@@ -1618,20 +1722,67 @@ class ComfyUIClient:
         base = base.rstrip("。，,.;； ")
         return (base + suffix) if base else suffix.lstrip("，")
 
+    #: 物品参考图里**不该出现**的承托物/位置描述。
+    #: 实测（2026-10-01）：筑基丹的 reference_prompt_zh 被剧本 LLM 写成
+    #: 「…，置于黑色玉盒中，玉盒有磨损痕迹。」→ 出图照着画成「黑碗盛丹药」，
+    #: 而质检拿「图 vs 提示词」比对，图与提示词完全一致 → **判通过**。
+    #: 物品参考图的职责只是「本体长什么样」，容器/承托物/摆放位置属于分镜内容，
+    #: 一旦画进参考图，就会被当成该物品的规范外观带进后面每一镜。
+    _ITEM_PLACEMENT_RE = re.compile(
+        r"[，,；;]?\s*(?:被)?(?:置于|放在|摆放于|装于|盛于|收纳于|存放于|陈列于|托在|捧在)"
+        r"[^，。；;]*")
+
+    @staticmethod
+    def _strip_item_placement(prompt_zh: str) -> str:
+        """剥掉物品提示词里「置于/放在 X 中」这类**位置与承托物**描述（幂等）。
+
+        只删「放在哪儿」这半句，物品本体（造型/材质/颜色/纹样/尺寸）一字不动。
+        """
+        text = str(prompt_zh or "")
+        cleaned = ComfyUIClient._ITEM_PLACEMENT_RE.sub("", text)
+        # 第二轮：按标点切子句，丢掉**以承托物开头**的子句。
+        # 只删「置于…中」是不够的：实测原文是「…置于黑色玉盒中，玉盒有磨损痕迹。」
+        # 删掉前半句后仍留着「玉盒有磨损痕迹」，模型照样会画出那个盒子。
+        parts = re.split(r"([，,；;。])", cleaned)
+        kept = []
+        for seg in parts:
+            s = seg.strip()
+            if re.match(r"^[^，,；;。]{0,4}(?:盒|匣|托盘|盘|底座|支架|展示台|台座|碗|碟|绸布|锦垫|垫)", s):
+                continue
+            # 与「纯白背景」不变量直接矛盾的子句（优化器实测写出过「严禁全白纯色背景」）：
+            # 留着会与守卫函数追加的「，纯白背景…」形成指令冲突，模型必然摇摆。
+            if re.search(r"(?:严禁|禁止|不要|避免|无需|去掉)[^，,；;。]{0,14}(?:白|纯色)[^，,；;。]{0,8}背景", s):
+                continue
+            # 承托物被写成画面核心/主体（实测：「画面核心为黑色玉盒及其内部丹药」）
+            if re.search(r"(?:盒|匣|托盘|底座|支架|展示台|台座|碗|碟|绸布|锦垫)", s) and \
+                    re.search(r"(核心|主体|中心|主要)", s):
+                continue
+            kept.append(seg)
+        cleaned = "".join(kept)
+        cleaned = cleaned.replace("。。", "。").replace("，。", "。").replace("；。", "。")
+        cleaned = cleaned.replace("，,", "，").replace("，，", "，")
+        cleaned = cleaned.replace("，；", "；").replace("。，", "。")
+        return cleaned
+
     @staticmethod
     def _ensure_item_white_bg(prompt_zh: str, style: str = "") -> str:
-        """给物品参考图提示词确定性地补「纯白背景」约束（幂等）。
+        """给物品参考图提示词确定性地补「只呈现本体 + 纯白背景」约束（幂等）。
 
         物品/道具参考图与角色设定图同理：后续要拿来做参考图编辑（多视角/分镜），
         背景越干净越利于一致性；带场景/贴图的物品图会把背景一起带进分镜。
+
+        2026-10-01 补「本体之外一律不要」：此前只约束了**背景**，没约束**承托物**，
+        于是「丹药置于玉盒中」这种提示词照画不误，还会被质检判通过（图符提示词）。
         """
-        text = str(prompt_zh or "").strip()
+        text = ComfyUIClient._strip_item_placement(str(prompt_zh or "").strip())
         marker = "纯白背景"
         base = text if marker in text else style_kit.with_style(text, style) if style else text
+        body_rule = ("，画面中只呈现该物品本体，不要任何容器、托盘、底座、支架、展示台、盒子、"
+                     "碗碟、绸布等承托物，不要手或人物，不得把物品放进另一个物体内部或上面")
         if marker in base:
-            return base
-        suffix = ("，纯白背景，无任何场景、地面、桌面、阴影与背景纹理，"
-                  "物品完整居中、边缘清晰")
+            return base if "只呈现该物品本体" in base else base + body_rule
+        suffix = (body_rule + "，纯白背景，无任何场景、地面、桌面、阴影与背景纹理，"
+                  "物品完整孤立居中、边缘清晰")
         base = base.rstrip("。，,.;； ")
         return (base + suffix) if base else suffix.lstrip("，")
 

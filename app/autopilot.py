@@ -63,6 +63,10 @@ _STATE = {
     "paused": False,               # 是否已暂停
     "current": None,               # {"project","episode","step","message","percent","started_at"}
     "last_error": "",
+    #: 项目名 → 上一次「真正跑完的一集」的结果（成功/失败都记，带项目归属、落盘可跨重启）。
+    #: 2026-09-30 新增：current 会被 _clear_current() 清空，之后总控/前端就再也无从
+    #: 知道上一集成没成 —— last_run 就是补这个洞的口径。
+    "last_runs": {},
     "cycle": 0,                    # 已完成多少轮轮转
     "started_at": "",
     "checked_at": "",
@@ -811,6 +815,76 @@ def _clear_current() -> None:
         _STATE["current"] = None
 
 
+def _last_run_path(project: str) -> str:
+    return os.path.join(_autopilot_dir(project), "last_run.json")
+
+
+def read_last_run(project: str) -> dict:
+    """读某项目「上一次真正跑完的一集」的结果（成功/失败都记）。
+
+    为什么要它（2026-09-30 实测）：总控 produce_episode 走 run-once，worker 失败时
+    只 logger.error 再 _clear_current()，既不落死信也不写 last_error ⇒ status() 返回
+    current=null / exceptions=0 / last_error=""，总控 get_status 看到的是「空闲且零异常」，
+    于是第1集的 401 失败永远汇报不出来。last_run 带项目归属并落盘，补上这个口径。
+    """
+    with _LOCK:
+        rec = (_STATE.get("last_runs") or {}).get(project)
+    if isinstance(rec, dict) and rec:
+        return rec
+    try:
+        path = _last_run_path(project)
+        if os.path.isfile(path):
+            data = read_json_strict(path, {})
+            return data if isinstance(data, dict) else {}
+    except Exception as e:  # noqa: BLE001  读不到就当没有，绝不阻断状态查询
+        logger.warning("读取 last_run 失败（%s）：%s", project, e)
+    return {}
+
+
+def latest_last_run() -> dict:
+    """全项目里最近一次跑完的结果（不带 project 查询 status 时用）。"""
+    with _LOCK:
+        runs = [r for r in (_STATE.get("last_runs") or {}).values()
+                if isinstance(r, dict) and r]
+    if not runs:
+        return {}
+    return max(runs, key=lambda r: str(r.get("finished_at") or ""))
+
+
+def record_run_result(project: str, episode_no: int, ok: bool, status: str = "",
+                      error: str = "", deliverable: str = "", elapsed_sec=0,
+                      title: str = "", source: str = "run-once") -> dict:
+    """登记「一次生产跑完了」的事实 —— 成功与失败都登记，落盘可跨重启。
+
+    与 _STATE["last_error"] 的区别：last_error 是**全局**的、无项目归属，
+    status(project) 只能以「可能是别的项目的报错」为由把它藏起来；
+    last_run 按项目存盘，因此总控在 current 为空时依然能如实播报上一集的结果。
+    """
+    rec = {
+        "project": project, "episode_no": int(episode_no), "ok": bool(ok),
+        "status": str(status or ("done" if ok else "failed")),
+        "error": "" if ok else str(error or "未知错误"),
+        "deliverable": str(deliverable or ""),
+        "elapsed_sec": round(float(elapsed_sec or 0), 1),
+        "title": str(title or ""), "source": str(source or ""),
+        "finished_at": _now(),
+    }
+    with _LOCK:
+        _STATE.setdefault("last_runs", {})[project] = rec
+        _STATE["last_error"] = "" if ok else rec["error"]
+    try:
+        atomic_write_json(_last_run_path(project), rec)
+    except Exception as e:  # noqa: BLE001  落盘失败不影响内存态与生产
+        logger.warning("last_run 落盘失败（%s）：%s", project, e)
+    if ok:
+        logger.info("生产结果登记：%s 第%s集 成功（%s）", project, episode_no,
+                    rec["deliverable"] or "无交付物")
+    else:
+        logger.warning("生产结果登记：%s 第%s集 失败（%s）", project, episode_no,
+                       rec["error"][:200])
+    return rec
+
+
 def _loop() -> None:
     """守护主循环：轮转推进各项目的下一待生产集"""
     logger.info("托管循环开始")
@@ -1118,15 +1192,78 @@ def _produce(project: str, plan: dict, pick: dict) -> None:
             logger.warning("第%s集生产失败（第 %d 次）：%s", episode_no,
                            _ATTEMPTS[project][episode_no], result.get("error"))
 
+    # 2026-09-30：托管路径同样登记 last_run（成功/失败都记），与 run-once 口径一致。
+    try:
+        record_run_result(project, episode_no, produced_ok,
+                          status=str(result.get("status") or ""),
+                          error=str(result.get("error") or ""),
+                          deliverable=str(result.get("deliverable") or ""),
+                          elapsed_sec=result.get("elapsed_sec") or 0,
+                          title=chapter.get("title") or "", source="autopilot")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("托管 last_run 登记失败：%s", e)
+
     _clear_current()
 
 
 # ===================== 对外状态 =====================
 
 
-def status(project: str = "") -> dict:
+def purge_project(project_name: str) -> dict:
+    """删除项目时由 project_store 调用：清掉该项目的托管运行态与死信。
+
+    ⭐ 为什么必须做：删项目 → 重建**同名**项目时，若不清：
+      ① current（正在生产的集/步骤/百分比）仍指向已删项目，同名重建后
+         status(project) 按名匹配会把**旧生产进度**挂在新项目头上（用户实测
+         「重新建项目上面进度条不对」的病根）；
+      ② last_error / 死信 / 尝试计数残留，会被误读为新项目的状态；
+      ③ 守护线程可能继续生产已删除的项目。
+    计划文件（plan.json）与历史流水（history.jsonl）保留——重建后仍可查看，
+    且计划默认 enabled=false，不会自动开闸生产。
+
+    线程安全：先撤任务再清状态，避免「撤任务期间 current 又被写回」。
+    """
+    _A().schedule_cancel(project_name)
+    try:
+        import pipeline
+        n_dead = 0
+        for d in (pipeline.list_dead_letters(project_name) or []):
+            try:
+                pipeline.resolve_dead_letter(project_name, int(d.get("episode_no") or 0),
+                                             note="项目已删除（自动清理）")
+                n_dead += 1
+            except Exception:  # noqa: BLE001
+                continue
+    except Exception as e:  # noqa: BLE001
+        logger.warning("删除项目 %s 时清理死信失败（不影响删除）：%s", project_name, e)
+    with _LOCK:
+        cur = dict(_STATE.get("current") or {})
+        if str(cur.get("project") or "") == project_name:
+            _clear_current()
+        _STATE["last_error"] = ""
+        (_STATE.get("last_runs") or {}).pop(project_name, None)
+        _ATTEMPTS.pop(project_name, None)
+        _LAST_RUN["key"] = None
+        _LAST_RUN["repeat"] = 0
+    # last_run 也要落盘清理：否则同名项目重建后会读到上一个项目的上一集结果
+    try:
+        _lp = _last_run_path(project_name)
+        if os.path.isfile(_lp):
+            os.remove(_lp)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("清理 last_run 失败（%s）：%s", project_name, e)
+    wake()
+    return {"project": project_name, "dead_letters_cleared": True}
+
+
+def status(project: str = "", brief: bool = False) -> dict:
     """托管总览（前端主视图据此渲染）
     若传入 project，则只返回该项目状态；否则聚合所有项目。
+
+    brief=True：只回「状态判断真正需要」的字段（AI 总控走这条）。
+    原因：agent_core._trim 只把 JSON **前 1600 字符**喂给模型，且 Flask jsonify 会按
+    字母序重排键 —— 键序不受我们控制，curve/totals 一旦变大就会把 last_run 挤出窗口。
+    所以与其赌位置，不如直接给总控一份短的。前端不受影响（默认 brief=False）。
     """
     _restore_once()
     with _LOCK:
@@ -1166,6 +1303,10 @@ def status(project: str = "") -> dict:
             st["other_project_running"] = True
             # last_error 无项目归属，同样可能是别的项目的报错，一并藏起来
             st["last_error"] = ""
+    # 上一次真正跑完的一集（成功/失败都记，带项目归属）：current 被清空之后，
+    # 这是总控/前端唯一能知道「上一集到底成没成」的口径，别省。
+    st.pop("last_runs", None)          # 只回单个项目的 last_run，避免 payload 膨胀
+    st["last_run"] = read_last_run(project) if project else latest_last_run()
     # P1-5 补口：基于「最近进度推进时刻」算停滞时长，超阈值上浮 stall_warning。
     # LLM 重试/ComfyUI 排队等场景会长时间停在同一 step，用户此前只能看到「执行中」干等；
     # 现在前端/总控能据此提示「当前步骤已运行多久、是否疑似卡住」。
@@ -1206,7 +1347,21 @@ def status(project: str = "") -> dict:
         "exceptions": len([e for e in exceptions if not e.get("resolved")]),
         "curve": production_curve(24, project=project),
     })
-    return st
+    # 2026-09-30：AI 总控读的是本接口 JSON 的**前 1600 字符**（agent_core._trim 是
+    # 头部截断，不是省略中间）。所以「当前在跑什么 / 上一集成没成 / 有没有异常」
+    # 必须排在最前面 —— 否则 last_run 落在 payload 尾部会被整段切掉，总控就又回到
+    # 「只知道空闲、不知道上一集失败了」的老毛病。
+    _front = ("running", "paused", "current", "last_run", "last_error",
+              "other_project_running", "exceptions", "pending_review",
+              "project", "scoped", "enabled_count", "plan_count")
+    _ordered = {k: st[k] for k in _front if k in st}
+    _ordered.update({k: v for k, v in st.items() if k not in _front})
+    if brief:
+        _brief_keys = ("running", "paused", "current", "last_run", "last_error",
+                       "other_project_running", "exceptions", "pending_review",
+                       "enabled_count", "plan_count", "project", "scoped", "pause_reason")
+        return {k: _ordered[k] for k in _brief_keys if k in _ordered}
+    return _ordered
 
 
 def pipeline_list_deliverables(project: str) -> list:

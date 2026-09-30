@@ -28,6 +28,13 @@ const THEME_ICONS: Record<ThemeMode, React.ReactNode> = {
 };
 
 const THEME_MODES: ThemeMode[] = ['light', 'dark', 'system'];
+/**
+ * 是否运行在 Electron 桌面壳里。
+ * 桌面版隐藏了系统标题栏（titleBarStyle:'hidden' + titleBarOverlay），
+ * 所以这一条 Navbar 要兼作窗口拖拽条，并给右上角的原生窗口按钮让出位置；
+ * 浏览器版 / exe 版没有系统标题栏问题，不加这个类，行为完全不变。
+ */
+const IS_ELECTRON = typeof navigator !== 'undefined' && /Electron/i.test(navigator.userAgent);
 /** 连接状态：Navbar 右上角药丸，30s 轮询 /api/status（与 ServiceMonitor 同节奏） */
 export type LinkStatus = 'checking' | 'online' | 'offline';
 
@@ -92,7 +99,7 @@ export function Navbar() {
   };
 
   return (
-    <nav className="sticky top-0 z-sticky flex items-center justify-between gap-2 border-b border-line bg-surface/80 px-4 py-3 backdrop-blur-xl sm:px-6">
+    <nav className={'sticky top-0 z-sticky flex items-center justify-between gap-2 border-b border-line bg-surface/80 px-4 py-3 backdrop-blur-xl sm:px-6' + (IS_ELECTRON ? ' electron-titlebar' : '')}>
       <div className="flex min-w-0 items-center gap-2 sm:gap-3">
         <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-brand text-sm font-bold text-white shadow-sm">
           {t('brand.mark')}

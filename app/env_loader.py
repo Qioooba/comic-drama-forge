@@ -21,8 +21,28 @@ import os
 
 logger = logging.getLogger(__name__)
 
+def _resolve_project_root() -> str:
+    """项目根目录（app/ 的上一级）—— 只读资源（locales/、workflows/）的基址。
+
+    ⚠️ 2026-09-30 修复（frozen）：旧实现无条件算 `dirname(__file__)/..`。
+    PyInstaller 单文件包把模块收进 PYZ，`__file__` = `<_MEIPASS>/env_loader.pyc`，
+    于是 `..` 拿到的是 **_MEIPASS 的父目录**（如 C:\\Users\\...\\Temp），
+    而只读资源实际被 spec 的 datas 打在 `<_MEIPASS>/locales`、`<_MEIPASS>/workflows`。
+    实测后果：exe 里 `GET /api/i18n/zh-CN` 恒 404 → 前端 loadLocale 失败 →
+    `t()` 全部回落成 key 原文（界面满是 `vault.fallbackTitle` 这种字样，
+    看起来像「新功能没上」）；工作流模板同样找不到。
+    现在 frozen 时按 `_MEIPASS` 解析（与 spec 布局一致）；非 frozen 行为一字不变。
+    """
+    import sys as _sys
+    if getattr(_sys, "frozen", False):
+        _mp = getattr(_sys, "_MEIPASS", "") or ""
+        if _mp and os.path.isdir(_mp):
+            return os.path.abspath(_mp)
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+
 # 项目根目录（app/ 的上一级）
-PROJECT_ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+PROJECT_ROOT_DIR = _resolve_project_root()
 
 # 数据根目录（可写）。
 #   默认 = 项目根（源码树里就地读写，开发/浏览器版行为完全不变）。

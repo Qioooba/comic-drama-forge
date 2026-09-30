@@ -30,7 +30,13 @@ import h3_prompt_kit
 import asset_prompt_kit
 import asset_name_match
 # 景别唯一权威表（写入侧白名单与提示词枚举都由它派生；config 是叶子模块，无循环依赖）
-from config import SHOT_TYPES
+from config import (
+    SHOT_TYPES, ACTION_WORDS, ACTION_CLAUSE_RE, count_action_beats,
+    SHOT_DURATION_MIN, SHOT_DURATION_MAX, SHOT_DURATION_SILENT, CHARS_PER_SECOND,
+    BEAT_CLIMAX_BONUS_SEC, SHOT_SPEECH_BUDGET_CHARS,
+    SHOT_DURATION_DESC_SEC_MAX, SHOT_DURATION_DESC_CHARS_PER_SEC,
+    SHOT_DURATION_ACTION_SEC_MAX,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -180,6 +186,16 @@ SHOT_FIELDS_DEFAULT = {
     "first_frame": "",
     "last_frame": "",
     "motion": "",
+    # 2026-10-01：**显式站位 + 动作 beat** —— 解决「3D 导演台没料可控」。
+    # 此前舞台只由「出场顺序 + 人数 + 景别」推导，同角色同景别的镜头恒得同一张基准图，
+    # 实测 8 个镜头折叠成 2 种舞台（shot 2/3/4 计划哈希完全相同）。
+    # te_3d_director 读这两个字段；blocking 缺省或名字不匹配 → 逐字回退旧的按序排布，
+    # 因此老剧本零影响。取值：
+    #   x     ∈ left / center / right  （画面左 / 中 / 右）
+    #   depth ∈ front / mid / back     （离镜头近 / 中 / 远）
+    #   facing∈ camera / left / right / back（面朝镜头 / 画面左 / 画面右 / 背对）；留空 = 向内稍转
+    "blocking": [],
+    "action": "",
 }
 
 #: **已废弃分镜字段登记表**（结构化，替代注释里的君子协定）。
@@ -371,7 +387,9 @@ REWRITE_RULES = (
     "世界观、势力背景、环境补叙、器物来历等**不推进剧情**的描写，一律不逐句复述、不单独成镜；\n"
     "2) 再落镜：把梗概里的关键情节改写成镜头。心理活动→可拍的表情/动作或该角色第一人称自语，"
     "叙述→画面动作，环境→画面与音效；**禁止**把第三人称背景补叙、世界观说明原样写进 description 当画面；\n"
-    "3) 【信息密度·单镜 ≤3 条】每个镜头只承载 ≤3 条核心信息（人物动作 / 台词 / 关键环境 各算 1 条）；"
+    "3) 【一镜一动作·信息密度】每个镜头只承载 **1 个核心动作/信息**（人物动作 / 台词 / 关键环境 三选一）；"
+    "一段需要连续完成 2 个以上动作时，**按动作先后拆成相邻两镜**，每镜只推进一个动作——"
+    "参考片 92 镜几乎每镜只有一个动作节拍，靠相邻镜切换推进，而不是靠一镜内堆叠多个动作；"
     "一条信息用一个画面能讲清的，绝不拆成两镜；**纯环境空镜**（无人、无动作、无信息推进）禁止生成；\n"
     "4) 【描述/对白比】剧情主要由人物台词与动作推进，画面描述只做必要补充："
     "全块所有镜头 description+visual_detail 的合计字数不得超过 dialogue 合计字数的 3 倍；"
@@ -386,10 +404,15 @@ REWRITE_RULES = (
     "只能写进 description / audio_cues（且仅保留推进剧情的部分），绝不进 dialogue；\n"
     "8) 自检：写完一块后回看梗概，确认每个关键情节都有对应镜头；"
     "纯背景补叙、纯环境描写若未推进剧情，应当已删去，**不要求「逐句覆盖原文」**。\n"
-    "9) 【镜头语言克制】运镜以固定为主（约 75%），推/拉/摇/手持/跟随仅在情绪递进或空间转换时用；"
-    "景别以中景/中近景/近景为主（约 80%），全景与特写做情绪锚点（各 ≤ 3%），"
-    "局部近景用于情感道具回环；每个镜头的 edit_reason 字段写一句剪辑动机（15 字以内，"
-    "如「用背影暂缓解释」「情绪停在等待而非眼泪」「道具回环推进信任弧线」），"
+    "9) 【镜头语言克制·对齐参考片 92 镜实测】运镜以固定为主（约 75%），"
+    "推/拉/摇/手持/跟随仅在情绪递进或空间转换时用，且用「轻推 / 轻摇 / 跟随 / 轻手持」这类克制写法"
+    "（参考片非固定运镜全部是这 4 种，从不使用推镜/拉镜/摇镜/移镜/升降/环绕/变焦/定格）；"
+    "景别三足鼎立：近景 / 中近景 / 局部 各约 25%（合计约 76%）——「局部」= 只拍手部/道具/身体局部、"
+    "不出现完整人脸的插入镜，参考片占比 25%，用于把叙事压到道具上并规避人脸崩坏；"
+    "中景 约 17%（空间与关系交代，是运镜主力）；全景与特写只做情绪锚点（各 ≤ 3%），大特写/远景/大远景不用；"
+    "越近越静——特写 100% 固定、局部与中近景基本固定，运镜多长在中景；"
+    "每个镜头的 edit_reason 字段写一句**具体**的剪辑动机（20~30 字，说明「为什么切到这一镜 / 承担什么叙事功能」，"
+    "如「切掉环境只留下他的反应」「用空间拉开取代告别对白」「物件回环把十年压缩到一张纸上」），"
     "不解释给观众，是给构图与取舍的依据。\n"
     "10) 【视觉锚点/道具回环】识别原文中反复出现的关键道具（如印章、信物、武器、食物、书信等），"
     "把它作为跨镜头视觉锚点：每次该道具出现时，在 description 的构图描述中明确写道具"
@@ -423,7 +446,18 @@ REWRITE_RULES = (
     "      并在 description/visual_detail 里**体现**这种幅度——大幅变化（场景切换/冲突爆发，"
     "      写足空间与动作的完整过程）、中幅变化（人物动作推进，写清动作起势与结果）、"
     "      小幅变化（表情微变/道具细节，只写变化点不重写全景），让相邻镜的画面递进**可追踪**，"
-    "      变化幅度与本镜叙事节拍（规则11）节奏一致：高潮镜允许大幅、过渡镜用小幅快切。"
+    "      变化幅度与本镜叙事节拍（规则11）节奏一致：高潮镜允许大幅、过渡镜用小幅快切。\n"
+    "13) 【台词长度·切镜节奏的总开关｜权重高于规则 9 的镜头语言】参考片单镜中位时长只有 2.08 秒，"
+    "它的快节奏**不是靠运镜、是靠「一句短台词说完就切」**。换算成台词：一镜台词以 8~14 字为宜"
+    "（按中文语速≈5 字/秒，对应 2~3 秒），**上限 20 字**。禁止一镜塞一句长台词（30 字以上）——"
+    "本系统旧剧本实测单镜台词中位要 8 秒才念完，镜头被迫拉长到 8~12 秒，成片观感就是"
+    "「一个分镜演半天不切换」。因此：\n"
+    "    · 长台词必须按**停顿/语义换气点**拆成相邻多镜，一句一镜（问句一镜、答句一镜、"
+    "      金句单独一镜、对方反应单独一镜）；同一句话也可在停顿处切开、后半镜把景别推近一档"
+    "      （参考片「同一句话换景别」切法）；\n"
+    "    · 拆出的镜头**各自都要有独立画面内容**（说话人换景别 / 对方的反应 / 手部动作），"
+    "      不允许把同一画面重复两遍充数；\n"
+    "    · 无台词的镜头靠动作与反应推进，同样保持短促（2~4 秒），不要写成静态长镜。\n"
 )
 
 
@@ -711,7 +745,7 @@ def extract_chunk_outline(client, chunk: dict, novel_title: str,
   "scenes": [{{"name": "场景名", "location": "地点类型", "appearance": "环境特征，30 字以内"}}],
   "key_beats": ["按原文顺序列出本段关键情节节点，每条 30 字以内，最多 12 条（分镜阶段会读取完整原文，这里只做索引，不要逐句复述、不要写成英文）"]
 }}
-【道具三问过滤】items 最多输出 3 条（宁缺勿滥）：只保留通过三问的重要道具（见上方 importance 判定），临时道具一律不进 items。"""
+【登记口径·不设数量上限】characters / items / scenes **不设数量上限**：原文登记了多少就报多少（characters 按戏份从大到小排）；items 仍按三问过滤（见上方 importance 判定），临时道具一律不进 items；无名群演（老人甲、村民若干、路人）不登记，只登记有名有戏的角色。"""
     label = f"outline#{chunk.get('index')}"
     hit = _cache_get(cache_dir, "outline", prompt, events, label)
     if hit is not None and hit.get("_chunk"):
@@ -779,7 +813,9 @@ def _ctx_asset_names_block(ctx) -> str:
                 nm = str(r.get("name") or "").strip()
                 if nm:
                     rows.append(nm)
-        return rows[:12]
+        # 2026-09-29 资产不设上限：不再 [:12] 截断 —— 锁定名单截掉的规范名，
+        # 模型在汇总阶段就会另造近名 → 下游重复生成参考图
+        return rows
 
     chars, items, scenes = _names("characters"), _names("items"), _names("scenes")
     if not (chars or items or scenes):
@@ -845,16 +881,19 @@ def build_bible(client, outlines: list, novel_title: str, style: str, episodes: 
     for o in outlines:
         if not isinstance(o, dict):
             continue
+        # 审计修正（2026-09-29，用户决策：资产不设数量上限）：digest 不再截断
+        # characters[:6] / items[:3] / scenes[:6] —— 这里截掉的条目 ②汇总阶段就
+        # 看不见，「上游丢的名字下游救不回来」。条目数量由模型侧登记口径约束。
         digest.append({
             "段": o.get("_chunk", {}).get("index"),
             "摘要": o.get("summary", ""),
             "人物": [{"name": c.get("name"), "role": c.get("role"), "gender": c.get("gender"), "appearance": c.get("appearance")}
-                     for c in (o.get("characters") or [])[:6] if isinstance(c, dict)],
+                     for c in (o.get("characters") or []) if isinstance(c, dict)],
             "物品": [{"name": i.get("name"), "category": i.get("category"), "appearance": i.get("appearance"),
                      "importance": i.get("importance", "")}
-                    for i in (o.get("items") or [])[:3] if isinstance(i, dict)],
+                    for i in (o.get("items") or []) if isinstance(i, dict)],
             "场景": [{"name": s.get("name"), "appearance": s.get("appearance")}
-                     for s in (o.get("scenes") or [])[:6] if isinstance(s, dict)],
+                     for s in (o.get("scenes") or []) if isinstance(s, dict)],
             "情节要点": (o.get("key_beats") or [])[:5],
         })
     prompt = f"""【任务】以下是长篇小说《{novel_title}》各段落的提炼结果（JSON）。请把它们整合成一份可直接用于漫剧生产的「全剧设定集」。
@@ -869,13 +908,13 @@ def build_bible(client, outlines: list, novel_title: str, style: str, episodes: 
   "theme": "一句话主题/卖点（30 字以内）",
   "style": "{style}",
   "characters": [{{"name": "姓名", "gender": "性别，只允许「男」或「女」两个值；必须按原文的人物称谓/代词/姓名线索推断后明确给出，禁止留空或写「未知」", "age": "年龄", "identity": "身份/阵营（15 字以内）", "appearance": "静态外貌定妆（含发色/瞳色/脸型/体格/标志特征等**不随剧情变化的特征**，**必须包含性别（如「女性」「男子」**，**不含会逐集变化的服饰/配饰——那些写进 outfit**），60 字以内；若上方设定库已锁定则该字段必须与锁定值逐字一致", "outfit": "本集服装状态（**动态特征：逐集可变的服饰/配饰，与静态 appearance 解耦**——appearance 是定妆照约束的静态外貌，outfit 是分镜画面约束的本集服装），20 字以内，与上集结尾一致；若本集确有换装必须体现原因", "personality": "性格（30 字以内）", "voice_style": "配音风格（15 字以内）", "reference_prompt_zh": "中文参考图提示词：角色三视图设定图，60 字以内，**必须写明角色性别（如开头写「女性角色，」「男性角色，」）**，只写画面可见的具体特征——发色发型、瞳色、脸型、服装款式与材质配色、标志配饰、三视图版式（**必须写明「正面、侧面、背面三张全身视图横排，从头到脚完整入画、同一角色身高比例一致」**，不要写成半身/胸像）；**严禁写任何风格词/画风词/质量词**（如「国漫」「3D渲染」「电影级」「高清」「精致」）", "reference_prompt_en": "English prompt for a character reference sheet with three full-body views (front, side, back laid out horizontally, head-to-toe, consistent body proportions), under 45 words, must explicitly state the character's gender (e.g. 'a woman,' / 'a man,'), comma-separated CONCRETE visual keywords (hair color and style, eye color, face shape, outfit material and colors, signature accessories, view layout). It MUST be an accurate translation of reference_prompt_zh. Never romanize Chinese concepts into invented pinyin (「国漫」 must become 'Chinese animated style', NOT 'xuanxuan'); never write style or quality words — the program appends them"}}],
-  "items": [{{"name": "物品名", "category": "武器/法宝/道具/服饰", "appearance": "外观（50 字以内）", "owner": "持有人", "importance": "重要/临时。判定三问（任一答案为「是」即判临时）：①删掉它剧情还成立吗？②它只是随手用的日常物品吗？③它只是场景陈设吗？", "reference_prompt_zh": "中文参考图提示词，50 字以内，只写形制、材质、颜色、纹样与磨损状态；**严禁写风格词/画风词/质量词**", "reference_prompt_en": "English prompt for an item prop sheet, under 40 words, comma-separated concrete visual keywords (shape, material, color, pattern, wear). Accurate translation of reference_prompt_zh; no invented pinyin, no style or quality words"}}],
+  "items": [{{"name": "物品名", "category": "武器/法宝/道具/服饰", "appearance": "外观（50 字以内）, reference_prompt_zh（只写物品本体：造型/材质/颜色/纹样/尺寸感）", "owner": "持有人", "importance": "重要/临时。判定三问（任一答案为「是」即判临时）：①删掉它剧情还成立吗？②它只是随手用的日常物品吗？③它只是场景陈设吗？", "reference_prompt_zh": "中文参考图提示词，50 字以内，只写形制、材质、颜色、纹样与磨损状态；**严禁写风格词/画风词/质量词**", "reference_prompt_en": "English prompt for an item prop sheet, under 40 words, comma-separated concrete visual keywords (shape, material, color, pattern, wear). Accurate translation of reference_prompt_zh; no invented pinyin, no style or quality words"}}],
   "scenes": [{{"name": "场景名", "location": "地点类型（**同一个场所的不同机位、朝向或景别一律视作同一个 location**，不要重复建场景；只有当边界、入口、功能区或固定结构真的不同时才算新地点）", "appearance": "环境与氛围（70 字以内）：把「压抑/肃杀/温暖」翻译成**已有依据的空间选择**——通道宽窄、光比强弱、材质反射、空气状态（雾/尘/雪/烟）、色温关系；不得为造气氛而新增剧情事故、封锁出口或搬动固定结构。并点明此空间能承载的戏：谁掌控入口、座位与视线高点，谁会被阻拦、围观或逼入死角，哪件道具可被交接、摔碎或藏匿（撑不起对抗、羞辱、救援、揭露与反转的空间，不要写成核心场景）", "scene_lighting": "该场景的**统一光影基调**（30 字以内）：整个场景所有镜头共享的主光源/时间/色温（如「黄昏暖调逆光」「冷蓝月光」「正午顶光」），用于消除同场景内逐镜光影漂移；无明确光源倾向时写「自然漫射光」。此字段只写光影，不写风格词/画风词/质量词，也不要出现人物", "reference_prompt_zh": "中文参考图提示词，90 字以内，**地理优先**：用「从哪个入口看向哪个方向、前中后景分别是什么、锚点在彼此哪一侧」的两两关系来写，不堆装饰清单。必写：①空间身份与功能；②观察方向与可见边界；③入口与通道如何连通；④1-3 个固定锚点及其左右前后相对关系；⑤前景/中景/背景层次与一处尺度参照；⑥墙地顶材质与主次色。最后写时间天气与光源方向。**严禁写风格词/画风词/质量词，且不要出现人物**（保持空场，才能作为地理参考被后续镜头反复复用）", "reference_prompt_en": "English prompt for an environment concept art sheet, under 60 words, comma-separated concrete visual keywords. Geography-first: state the viewpoint and what falls in foreground, midground and background, then entrance and circulation, then one to three fixed anchors as pairwise relations (what sits left or right of what), then materials and palette, then time, weather and light direction. Spatial layout, architecture, no decoration inventory, no people. Accurate translation of reference_prompt_zh; no invented pinyin, no style or quality words"}}],
   "production_notes": {{"style_guide": "画面与叙事风格说明（60 字以内）"}}
 }}
-【硬性约束】characters 最多 6 个（只保留主要角色，按戏份排序）；items 最多 3 个（**宁缺勿滥**，本集 0-3 个都可：只有通过三问过滤的重要道具才保留——①删掉它剧情还成立吗？②只是随手用的日常物品吗？③只是场景陈设吗？任一答案为「是」即剔除；临时道具不得进 items）；scenes 最多 6 个；不要输出示例里的占位文字。若上方提供了「项目级设定库」，则已登记角色的 name / gender / appearance / personality 必须与该库完全一致（禁止改名、禁止改性别、禁止改外观），只允许更新 outfit（当前服装状态）。
+【硬性约束】characters / items / scenes **不设数量上限**——原文有多少就登记多少，不得为省篇幅合并或丢弃条目；characters 按戏份从大到小排序，无名群演（老人甲、村民若干、路人）不登记；items 仍按三问过滤（①删掉它剧情还成立吗？②只是随手用的日常物品吗？③只是场景陈设吗？任一答案为「是」即剔除，临时道具不得进 items）；不要输出示例里的占位文字。若上方提供了「项目级设定库」，则已登记角色的 name / gender / appearance / personality 必须与该库完全一致（禁止改名、禁止改性别、禁止改外观），只允许更新 outfit（当前服装状态）。
 【风格红线·重要变更】风格词由**程序在生成前统一追加**（幂等，不会重复），不再由你写。因此 characters / items / scenes 三个数组里每一条 reference_prompt_zh 与 reference_prompt_en **都不得自行写风格词、画风词或质量词**——自己写了会导致风格在提示词里出现两遍（实测就是「中国古风玄幻漫剧风格。风格：中国古风玄幻漫剧，画面精致…」这种重复），属于不合格输出。你只需专注描述画面里看得见的具体特征，把风格判断交给程序。
-【格式红线】直接以 {{ 作为输出的第一个字符；严禁输出任何推理过程、思考草稿、英文说明、markdown 代码块标记或前后缀解释文字；整个 JSON 输出控制在 1200 字以内（字段描述能短则短）。"""
+【格式红线】直接以 {{ 作为输出的第一个字符；严禁输出任何推理过程、思考草稿、英文说明、markdown 代码块标记或前后缀解释文字；各条目字段描述尽量精炼，但**不得为控制篇幅而丢弃或合并角色/物品/场景条目**（数量上限已取消，超长由程序自动提高额度重试）。"""
     # 断点缓存：命中则跳过模型汇总（未命中时行为与加缓存前完全一致）。
     # 只缓存**模型成功产出**的结果；下面的确定性兜底不缓存，好让下次仍有机会走模型。
     hit = _cache_get(cache_dir, "bible", prompt, events, "bible")
@@ -926,17 +965,18 @@ def _fallback_bible(outlines: list, novel_title: str, style: str) -> dict:
     for o in outlines or []:
         if not isinstance(o, dict):
             continue
-        for c in (o.get("characters") or [])[:6]:
+        # 2026-09-29 资产不设上限：兜底聚合同样不再 [:6]/[:3] 截断
+        for c in (o.get("characters") or []):
             if isinstance(c, dict):
                 _pick(c, chars, ["identity", "gender", "appearance", "outfit", "personality", "voice_style"])
-        for i in (o.get("items") or [])[:3]:
+        for i in (o.get("items") or []):
             if isinstance(i, dict):
                 _pick(i, items, ["category", "appearance", "owner"])
-        for s in (o.get("scenes") or [])[:6]:
+        for s in (o.get("scenes") or []):
             if isinstance(s, dict):
                 _pick(s, scenes, ["location", "appearance"])
-    out_chars, out_items, out_scenes = (list(chars.values())[:6], list(items.values())[:3],
-                                        list(scenes.values())[:6])
+    out_chars, out_items, out_scenes = (list(chars.values()), list(items.values()),
+                                        list(scenes.values()))
     # 兜底路径同样要带风格：否则一旦 bible 汇总失败，资产提示词又回到「零风格词」老样子
     eff = style_kit.normalize_style(style)
     if eff:
@@ -1008,14 +1048,16 @@ def build_shots_for_chunk(client, bible: dict, outline: dict, chunk: dict, shots
                     shots_hard_cap=shots_hard_cap))
             return _out
 
+    # 2026-09-29 资产不设上限：可用资产清单不再 [:6]/[:3] 截断 —— 清单里没有的名字
+    # 分镜就不敢引用，_match_known_names 会在上游把未登记名静默滤掉（丢锚点不可逆）。
     char_brief = [
         {"name": c.get("name"), "gender": c.get("gender") or "", "appearance": (c.get("appearance") or "")[:40]}
-        for c in (bible.get("characters") or [])[:6] if isinstance(c, dict)
+        for c in (bible.get("characters") or []) if isinstance(c, dict)
     ]
     item_brief = [{"name": i.get("name"), "appearance": (i.get("appearance") or "")[:30]}
-                  for i in (bible.get("items") or [])[:3] if isinstance(i, dict)]
+                  for i in (bible.get("items") or []) if isinstance(i, dict)]
     scene_brief = [{"name": s.get("name"), "appearance": (s.get("appearance") or "")[:40]}
-                   for s in (bible.get("scenes") or [])[:6] if isinstance(s, dict)]
+                   for s in (bible.get("scenes") or []) if isinstance(s, dict)]
     _hard = int(shots_hard_cap or 0)
     shots_target = int(shots_target)
     if _hard > 0:
@@ -1029,7 +1071,7 @@ def build_shots_for_chunk(client, bible: dict, outline: dict, chunk: dict, shots
     prompt = f"""【任务】为漫剧《{bible.get('title') or ''}》的「{chunk.get('title')}」（第 {chunk['index']}/{chunk['total']} 段）编写分镜：至少 {shots_target} 个、上限 {shots_cap} 个。把下方原文**压缩提炼**成可拍摄的镜头，只保留推动剧情的关键情节（冲突/转折/关键动作/金句），纯背景铺陈直接删去、勿逐句照搬。
 {REWRITE_RULES}
 【全剧风格】{bible.get('style') or ''}　【画面风格指南】{_ctx_block(continuity_ctx, 'style_guide_text') or (bible.get('production_notes') or {}).get('style_guide') or ''}
-{_ctx_line(continuity_ctx, 'prev_block')}{_ctx_line(continuity_ctx, 'bible_block')}{_ctx_line(continuity_ctx, 'contract_block')}{_ctx_line(continuity_ctx, 'style_block')}{_ctx_line(continuity_ctx, 'camera_block')}{prev_tail}【可用角色】{json.dumps(char_brief, ensure_ascii=False)}
+{_ctx_line(continuity_ctx, 'prev_block')}{_ctx_line(continuity_ctx, 'bible_block')}{_ctx_line(continuity_ctx, 'contract_block')}{_ctx_line(continuity_ctx, 'style_block')}{_ctx_line(continuity_ctx, 'camera_block')}{_ctx_line(continuity_ctx, 'preflight_block')}{prev_tail}【可用角色】{json.dumps(char_brief, ensure_ascii=False)}
 【可用物品】{json.dumps(item_brief, ensure_ascii=False)}
 【可用场景】{json.dumps(scene_brief, ensure_ascii=False)}
 【本段原文（先压缩提炼：只保留冲突/转折/关键动作/金句，纯背景铺陈直接删去，勿逐句照搬）】
@@ -1037,8 +1079,16 @@ def build_shots_for_chunk(client, bible: dict, outline: dict, chunk: dict, shots
 【本段剧情摘要】{outline.get('summary', '')}
 【本段情节要点】{json.dumps(outline.get('key_beats') or [], ensure_ascii=False)}
 【输出要求】严格只输出一个 JSON 对象，不要 markdown 代码块、不要解释文字，结构如下：
-{{"shots": [{{"camera": "景别+运镜（必须取自上方运镜术语表，如 中景跟拍/特写推入，10 字以内）", "shot_type": "景别（只填以下 {len(SHOT_TYPES)} 值之一：{_SHOT_TYPE_ENUM_ZH}；局部=只拍手部/道具的插入镜；与 camera 里的景别词保持一致；本镜确实无法确定景别时写空字符串）", "camera_motion": "运镜（只填运镜词，如 固定/推入/拉远/摇镜/移镜/跟拍/升降/环绕/变焦/手持；无运镜的静止镜头填「固定」）", "location": "所属场景名（必须来自可用场景）", "description": "画面内容描述（80 字以内，只写人物动作过程与关键构图：谁做了什么、怎么做的、在画面什么位置；外貌衣着/环境光线只在推动剧情或首次出场时写，不逐句铺陈，禁止写背景陈述/世界观/来历评述）", "visual_detail": "画面补充细节（可选；当 description 之外还有更细的关键动作过程/环境细节时写在这里，80 字以内；没有多余细节时写空字符串）", "dialogue": [{{"speaker": "说话角色名（必须与可用角色完全一致）", "text": "该角色台词（≤30 字；原文对话尽量原样保留；角色的自语/心声写成该角色本人的台词）"}}], "emotion": "情绪（8 字以内）", "edit_reason": "剪辑动机（15字以内，为什么切到这一镜/承担什么叙事功能，如：用背影暂缓解释/情绪停在等待而非眼泪/道具回环推进信任弧线）", "beat": "叙事节拍（本镜所处节拍，只填「开场」「触发」「高潮」「收尾」四值之一；拿不准填「触发」）", "audio_cues": "音效/配乐提示（60 字以内，只写环境音/音效/配乐，不写人声）", "characters_in_shot": ["出场角色名"], "first_frame": "首帧画面（运动开始前那一刻的静态快照：画面主体与构图，40字以内；无明显运动变化写空字符串）", "last_frame": "末帧画面（运动结束后的终态，40字以内；与首帧相同或无运动时写空字符串）", "motion": "运动描述（严格区分【摄影机运动】推拉摇移跟升降 与【画面内运动】人物/物体自身动作；30字以内；静止镜头写空字符串）", "items_in_shot": ["出场物品名"]}}]}}
+{{"shots": [{{"camera": "景别+运镜（必须取自上方运镜术语表，如 中景跟随/近景轻推，10 字以内）", "shot_type": "景别（只填以下 {len(SHOT_TYPES)} 值之一：{_SHOT_TYPE_ENUM_ZH}；局部=只拍手部/道具的插入镜；与 camera 里的景别词保持一致；本镜确实无法确定景别时写空字符串）", "camera_motion": "运镜（只填运镜词，优先用上方【克制运镜·推荐】的 固定/轻推/轻摇/跟随/轻手持；无运镜的静止镜头填「固定」）", "location": "所属场景名（必须来自可用场景）", "description": "画面内容描述（80 字以内，只写人物动作过程与关键构图：谁做了什么、怎么做的、在画面什么位置；外貌衣着/环境光线只在推动剧情或首次出场时写，不逐句铺陈，禁止写背景陈述/世界观/来历评述）", "visual_detail": "画面补充细节（可选；当 description 之外还有更细的关键动作过程/环境细节时写在这里，80 字以内；没有多余细节时写空字符串）", "dialogue": [{{"speaker": "说话角色名（必须与可用角色完全一致）", "text": "该角色台词（≤30 字；原文对话尽量原样保留；角色的自语/心声写成该角色本人的台词）"}}], "emotion": "情绪（8 字以内）", "edit_reason": "剪辑动机（20~30字，具体说明这一镜为什么切/承担什么叙事功能，禁止写可套用的空话，如：切掉环境只留下他的反应/用空间拉开取代告别对白/物件回环把十年压缩到一张纸上）", "beat": "叙事节拍（本镜所处节拍，只填「开场」「触发」「高潮」「收尾」四值之一；拿不准填「触发」）", "audio_cues": "音效/配乐提示（60 字以内，只写环境音/音效/配乐，不写人声）", "characters_in_shot": ["出场角色名"], "first_frame": "首帧画面（运动开始前那一刻的静态快照：画面主体与构图，40字以内；无明显运动变化写空字符串）", "last_frame": "末帧画面（运动结束后的终态，40字以内；与首帧相同或无运动时写空字符串）", "motion": "运动描述（严格区分【摄影机运动】推拉摇移跟升降 与【画面内运动】人物/物体自身动作；30字以内；静止镜头写空字符串）", "items_in_shot": ["出场物品名"]}}]}}
 【禁止输出 prompt_h3 字段】视频提示词由程序在生成阶段按 H3 规范自动构建（它会结合当次实际传入的参考图，生成 subject_definitions / summary / retention_analysis / detailed_description / overall_soundscape / non_diegetic_music 六段）。你在剧本阶段并不知道最终配几张参考图，写出来的英文提示词缺少 <Picture N> 标签，反而会覆盖规范提示词导致出片偏离设定。因此**不要写 prompt_h3、不要写英文提示词**；把画面信息全部写进 description 即可。
+【站位与动作（3D 导演台依赖，逐镜必填）】每一镜都要写：\n
+  ① blocking：本镜出场角色的**站位**，每个出场角色一条，形如 
+{{"name": 角色名, "x": left/center/right, "depth": front/mid/back, "facing": camera/left/right/back}}。\n
+     · x = 画面左右（left=画面左）；depth = 离镜头远近（front=更靠近镜头）；facing = 朝向，留空表示朝内。\n
+     · **左右顺序与前后层次必须与本镜情节一致**（谁在左、谁更靠近镜头），
+禁止所有镜头套用同一套站位；角色互换攻守、走近/退开时，站位要跟着变。\n
+  ② action：本镜的**动作 beat**——谁做了什么、动作从哪到哪（例：「羡进抬头直视赵天霸，右手缓缓握拳」）。
+**不得留空**，纯对话镜也要写神态与小动作。\n
 【台词要求】dialogue 必须是数组，数组元素为 {{"speaker": 角色名, "text": 台词}}；speaker 必须精确等于「可用角色」中的名字，禁止写“旁白/众人”等未登记角色；无台词的镜头 dialogue 写 []（空数组），禁止写成字符串或 null。角色的心理活动改写成该角色**本人**的自语台词时，speaker 仍写角色名（不要写成「旁白」，本系统没有旁白角色）。dialogue **只承载**：原文对话、以及原文明确心理活动/独白改写的第一人称自语——第三人称叙述与背景补叙**禁止**写成任何角色开口的台词（改写规则 8）。
 【台词预算（防成片截断）】单个镜头的 dialogue **合计不超过 {speech_budget} 字**（≈6.7 秒配音）。台词过多时**先精简冗余语气词与重复表述**，仍超预算才拆成相邻镜头——配音是按镜头时间轴铺的，单镜台词超出镜头时长会被成片尾部静默截掉。
 【音轨说明（本系统不产出旁白）】成片没有画外音解说，配音链路**只读 dialogue**：audio_cues 里写「雨声」「风声」这类音效**不会产生人声**。因此：① 有对话或自语的镜头必须写 dialogue，禁止把台词塞进 description / visual_detail / audio_cues；② 纯画面/纯动作镜头允许没有台词（该镜成片留白，由音效与配乐铺底），但**必须**在 audio_cues 写明音效/配乐提示；③ **严禁**凭空编造原文里没有的台词来「凑人声」——宁可留白，也不要无中生有。
@@ -1188,14 +1238,9 @@ def _norm_list(items, limit, keys):
 
 # ===================== 剧本 Schema：镜头数 / 每集时长（自动判定） =====================
 # AI 转剧本阶段自动判定并写入，后续分镜 / 视频 / 配音链路直接引用，无需人工配置。
-SHOT_DURATION_MIN = 3.0          # 单镜头最短秒数
-SHOT_DURATION_MAX = 12.0         # 单镜头最长秒数
-SHOT_DURATION_SILENT = 3.0       # 无台词的纯画面镜头基准秒数
-CHARS_PER_SECOND = 4.5           # 中文配音语速基准（字/秒），用于按台词长度推算镜头时长
-#: 单镜台词合计字数建议上限（≈6.7 秒配音）。这是「剧本阶段」的软预算：写超了应当拆成更多镜头。
-#: 「生成期」另有一道硬兜底 —— required_shot_duration() 超 SHOT_DURATION_MAX 的镜头会被 _norm_shots 自动拆镜，
-#: 所以即使模型没遵守预算，也不会让配音溢出到下一镜（溢出的尾部会被成片 -shortest 静默截掉）。
-SHOT_SPEECH_BUDGET_CHARS = 30
+# ⚠️ 时长模型常量已提到 config.py 做**唯一权威**（生成期与质检期共用同一套口径），
+# 并由 config 顶部 import 引入本模块命名空间（下方 from config import 一行）。
+# 历史缺陷：本文件与 qc_client 各写一份、口径不同，约束互相打架。
 
 # 动作镜识别词：description 命中任意一个即给画面停留时间加成（动作戏观感不仓促）
 _ACTION_MARKERS = (
@@ -1209,12 +1254,7 @@ _ACTION_MARKERS = (
 #: 节拍四段白名单。模型输出越界/未识别值一律归一到「触发」（最通用的中性节拍）。
 _BEAT_WHITELIST = ("开场", "触发", "高潮", "收尾")
 _DEFAULT_BEAT = "触发"
-#: 「高潮」节拍镜的画面停留加成（秒）：爆点镜需要停留让观众看清动作与反应，
-#: 故在基准时长上额外加成、把时长向档位上限（SHOT_DURATION_MAX=12）顶住。
-#: ⚠️ 不加到全局 SHOT_DURATION_MAX（QC 侧 SHOT_DURATION_MAX_OK 共用同口径）——
-#: 加成只抬高 required/estimate，最终仍被 estimate_shot_duration 夹在 [MIN, MAX]，
-#: 所以是「更常贴着 12s 上限」而非突破上限，不会引入 QC「时长过长」误报。
-BEAT_CLIMAX_BONUS_SEC = 2.0
+#: 「高潮」节拍镜的画面停留加成见 config.BEAT_CLIMAX_BONUS_SEC（唯一权威）。
 
 
 def _norm_beat(raw) -> str:
@@ -1243,14 +1283,14 @@ def required_shot_duration(shot: dict) -> float:
         str(shot.get("description") or ""),
         str(shot.get("visual_detail") or ""),
     ) if x).strip()
-    desc_sec = min(2.0, len(desc) / 60.0)
+    desc_sec = min(SHOT_DURATION_DESC_SEC_MAX, len(desc) / SHOT_DURATION_DESC_CHARS_PER_SEC)
     # 动作复杂度加成：description 里动作过程词/动词越多，画面越需要停留时间。
     # 历史缺陷：动作镜与静景镜一律 3 秒基准，动作戏（打斗/追逐/施法）观感仓促。
     action_sec = 0.0
     if desc:
         action_hits = sum(1 for kw in _ACTION_MARKERS if kw in desc)
         if action_hits:
-            action_sec = min(1.5, 0.4 + action_hits * 0.15)
+            action_sec = min(SHOT_DURATION_ACTION_SEC_MAX, 0.15 + action_hits * 0.08)
     # 节拍加成（P1）：高潮/爆点镜额外停留，让节奏分层落地；不影响过渡镜的快切。
     beat_bonus = BEAT_CLIMAX_BONUS_SEC if str(shot.get("beat") or "").strip() == "高潮" else 0.0
     return SHOT_DURATION_SILENT + speak_sec + desc_sec + action_sec + beat_bonus
@@ -1424,6 +1464,55 @@ def _match_known_names(raw_names, known: list, field: str,
                 "、".join(x for x in (known or []) if x)[:120])
     return resolved
 
+#: 画面文本字段（补全 characters_in_shot 时的扫描面）——这些字段都会被写进
+#: 生成端提示词，模型看得见里面的人名，就有概率把那个人画出来。
+_CAST_SCAN_FIELDS = ("description", "visual_detail", "first_frame", "last_frame", "motion")
+
+
+def augment_cast_from_text(row: dict, chars: list, shot_id=None) -> list:
+    """从画面文本补全 characters_in_shot —— 文本点名了谁，就必须带谁的参考图。
+
+    ## 为什么必须补（2026-09-30，实测分镜 2 反复卡死）
+
+    characters_in_shot 的唯一来源是 LLM 自己写的字段，而 _match_known_names
+    只做「把不在 bible 里的名字过滤掉」——漏登记不会被发现。于是出现：
+
+      · description 写「赵天霸右手食指伸出指向右前方羡进胸口方向」
+      · characters_in_shot 只写 ["赵天霸"]
+
+    下游 _allocate_storyboard_refs（生成）与 _qc_ref_images（质检）都只认
+    characters_in_shot，两端都走 _match_shot_chars → 羡进全程没有参考图。
+    生成端提示词里却出现了「羡进」三个字，模型要么不画（动作落空），要么凭想象
+    画一张脸（身份完全不对）——两条路质检都必挂 → 重试循环 → 该镜永远出不了图。
+
+    ## 判据与边界
+
+    · 只增不减：已登记的角色原序保留，命中者按 bible 顺序追加；
+    · 名字长度 >= 2 才扫描（单字名会在任何句子里误命中）；
+    · 命中即补 + warning 日志，让「模型漏登记」这件事可见（不静默）；
+    · 不做任何网络/模型调用（纯字符串包含判定），零成本、可重放。
+
+    返回补全后的角色名列表。
+    """
+    declared = [str(n) for n in (row.get("characters_in_shot") or []) if n]
+    text = " ".join(str(row.get(_f) or "") for _f in _CAST_SCAN_FIELDS)
+    if not text:
+        return declared
+    added = []
+    for _n in (chars or []):
+        _nm = str(_n or "").strip()
+        if len(_nm) < 2 or _nm in declared:
+            continue
+        if _nm in text:
+            declared.append(_nm)
+            added.append(_nm)
+    if added:
+        logger.warning(
+            "镜头 %s 的画面文本点名了未登记角色 %s → 已自动补进 characters_in_shot"
+            "（否则生成端/质检端都拿不到其参考图，模型会凭想象画脸）。原文：%s",
+            shot_id if shot_id is not None else "?", "、".join(added), text[:120])
+    return declared
+
 
 # 实质台词文本判据（P0-2 补修 / task#9）：
 # 一条台词只有当它含「实质字符」（CJK / 字母 / 数字）才算"有台词内容"。
@@ -1596,6 +1685,377 @@ def _norm_camera_motion(value) -> str:
     return t
 
 
+#: 一镜一动作的**拆镜阈值**：动作节拍 ≥ 此值的镜头会被拆成相邻两镜。
+#:
+#: 为什么需要它（而不是只靠提示词）：同输入 A/B 实测（旧规则 vs 加了「一镜一动作」的新规则，
+#: 素材《剑冢》第一章、shots_target=8）——
+#:   旧规则：10 镜，节拍均值 1.60，≥3 节拍的镜 2/10 = **20%**，最多 3 个；
+#:   新规则： 8 镜，节拍均值 1.12，≥3 节拍的镜 0/8  = **0%**， 最多 2 个。
+#: 提示词把「一镜多动作」在样本内压到了 0，但它仍是**软约束**：换个素材/长度就可能故态复萌。
+#: 故这里补一刀**硬兜底** —— 拆镜是确定性的（不调模型、不引入新内容），只把动作按先后切开，
+#: 保证成片真的产生「切换」而不是一镜里演好几件事。
+SPLIT_ACTION_BEATS = 3
+
+
+# ===================== 参考片风格对齐（2026-09-30）=====================
+#
+# 目标：让成片观感对齐参考片 92 镜实测口径 —— 运镜只用「固定/轻推/轻摇/跟随/轻手持」，
+# 不用大特写/远景/大远景，且约 1/4 的镜头是「只拍手部/道具、不出现完整人脸」的局部插入镜。
+#
+# 为什么必须是**确定性后处理**而不是只写进提示词：实测提示词能把「一镜多动作」压到 0，
+# 但「局部」占比始终为 0 —— 模型嘴上答应、产出不照做（同一模型、同一素材，两轮都是 0/8）。
+# 用户要的是成片效果而不是提示词措辞，所以这里直接改镜头表。
+
+#: 参考片运镜白名单：非固定运镜 100% 落在这些词上。
+REF_MOTIONS = ("固定", "轻推", "轻摇", "跟随", "轻手持")
+#: 非白名单运镜 → 白名单的确定性映射（按关键字匹配，长词优先）
+_MOTION_MAP = (("手持", "轻手持"), ("轻推", "轻推"), ("缓推", "轻推"), ("推", "轻推"),
+               ("跟随", "跟随"), ("跟", "跟随"), ("轻摇", "轻摇"), ("缓摇", "轻摇"),
+               ("摇", "轻摇"), ("移", "固定"), ("升降", "固定"), ("环绕", "固定"),
+               ("变焦", "固定"), ("定格", "固定"), ("拉", "固定"))
+#: 参考片「越近越静」：特写 100% 固定 → 强制锁定机位（大特写已先收窄为特写）
+_FORCE_LOCKED_TYPES = ("特写",)
+#: 极端景别收窄：参考片大特写/远景/大远景 0 使用。只收窄到**同距离家族**，
+#: 避免「描述写环境为主体、景别却给近景」这种取景与描述互相矛盾的改法。
+_TYPE_NARROW = {"大特写": "特写", "远景": "全景", "大远景": "全景"}
+#: 「局部」插入镜目标占比（参考片 25%，取略低值留余量）
+REF_INSERT_RATIO = 0.22
+#: 插入镜最多把镜头数放大到原来的多少倍（防镜数与总时长失控）
+REF_INSERT_MAX_GROWTH = 1.35
+#: 单镜时长上限（参考片 92 镜实测 0.40~6.57s，中位 2.08s，没有一镜拖到 7s 以上）。
+#: 只砍长尾，不下压到台词所需时长以下。
+REF_SHOT_DURATION_MAX = 6.5
+
+
+def _shot_type_of(row: dict) -> str:
+    """本镜景别：优先 shot_type 字段，其次从 camera 复合串取，**长词优先**。"""
+    st = str(row.get("shot_type") or "").strip()
+    if st in SHOT_TYPES:
+        return st
+    cam = str(row.get("camera") or "")
+    for name in ("大特写", "特写", "中近景", "近景", "局部", "中景", "全景", "大远景", "远景"):
+        if name in cam:
+            return name
+    return st
+
+
+def _ref_motion(motion: str) -> str:
+    """把任意运镜写法归一到参考片白名单里的词。"""
+    m = str(motion or "").strip()
+    if not m:
+        return "固定"
+    if m in REF_MOTIONS:
+        return m
+    for k, v in _MOTION_MAP:
+        if k in m:
+            return v
+    return "固定"
+
+
+def _derive_insert_shot(src: dict, prop: str) -> dict:
+    """由含道具的源镜头派生一个「局部」插入镜（不调模型、不新增剧情）。
+
+    动作依据取源镜头 description 里**含该道具的短句**；没有就取该镜头里任意动作短句，
+    再没有才退化为道具名本身 —— 保证画面内容来自原文，不是凭空编造。
+    """
+    segs = [x.strip() for x in ACTION_CLAUSE_RE.split(str(src.get("description") or "")) if x.strip()]
+    clause = next((x for x in segs if prop in x), "")
+    if not clause:
+        clause = next((x for x in segs if any(w in x for w in ACTION_WORDS)), "")
+    body = clause or prop
+    row = dict(src)
+    row["shot_type"] = "局部"
+    row["camera_motion"] = "固定"
+    row["camera"] = "局部固定"
+    row["description"] = (body + "；画面只拍手部与" + prop + "，不出现完整人脸")[:200]
+    row["visual_detail"] = ""
+    row["dialogue"] = []
+    row["dialogue_text"] = ""
+    row["first_frame"] = ""
+    row["last_frame"] = ""
+    row["motion"] = ""
+    row["items_in_shot"] = [prop]
+    row["edit_reason"] = "局部插入镜：把叙事压到道具上，规避人脸崩坏"
+    # insert_of 先挂源镜头本身，等 align 重排完 shot_id 再回填 —— 直接写死当前 shot_id
+    # 的话，插入镜导致的重排会让这个编号指到别的镜头上（实测踩过）。
+    row["_insert_src"] = src
+    row.pop("source_unit_ids", None)          # 不重复计入原文覆盖率
+    row.pop("duration_overflow_sec", None)
+    row["duration"] = estimate_shot_duration(row)
+    return row
+
+
+#: 拆台词后每段的最小字数（低于此值不值得单独成镜，切了也是碎句）
+REF_DIALOGUE_MIN_PART = 4
+#: 台词拆镜时后半镜「景别推近一档」的映射：同一句话换景别，是参考片最常见的切法之一。
+_CLOSER_TYPE = {"全景": "中景", "中景": "中近景", "中近景": "近景", "近景": "特写", "局部": "局部"}
+
+
+def _split_long_dialogue_shot(row: dict) -> list:
+    """把「台词太长、把镜头顶到 REF_SHOT_DURATION_MAX 以上」的镜头按停顿拆成相邻两镜。
+
+    参考片单镜中位 2.08s —— 它的快节奏来自「一句短台词说完就切」，而不是靠运镜。
+    本系统旧剧本单镜台词中位需要 8.0s 才念完（实测），镜头被迫拉到 8~12s，
+    成片观感就是「一个分镜演半天不切换」。
+
+    拆法：台词在停顿处（，。；！？）一分为二，前半留原镜、后半另起一镜并把景别推近一档 ——
+    台词一字不丢、总时长不变，但成片多出一次真实切换。
+    """
+    if required_shot_duration(row) <= REF_SHOT_DURATION_MAX:
+        return [row]
+    lines = _dlg_lines(row.get("dialogue"))
+    if not lines:
+        return [row]
+    idx = max(range(len(lines)), key=lambda i: len(str(lines[i].get("text") or "")))
+    text = str(lines[idx].get("text") or "")
+    # 在标点后切开（保留标点），再找最均衡的切点
+    parts = [p for p in re.split(r"(?<=[，。；！？!?])", text) if p.strip()]
+    if len(parts) < 2:
+        return [row]
+    best, best_score = None, None
+    for k in range(1, len(parts)):
+        pa = "".join(parts[:k]).strip()
+        pb = "".join(parts[k:]).strip()
+        if len(pa) < REF_DIALOGUE_MIN_PART or len(pb) < REF_DIALOGUE_MIN_PART:
+            continue
+        score = abs(len(pa) - len(pb))
+        if best_score is None or score < best_score:
+            best, best_score = (pa, pb), score
+    if best is None:
+        return [row]
+    pa, pb = best
+    a, b = dict(row), dict(row)
+    la = [dict(x) for x in lines]
+    lb = [dict(x) for x in lines]
+    la[idx]["text"] = pa
+    lb[idx]["text"] = pb
+    a["dialogue"] = la
+    b["dialogue"] = lb
+    a["dialogue_text"] = _dlg_text(la)
+    b["dialogue_text"] = _dlg_text(lb)
+    # 后半：景别推近一档，形成真正的「切换」而不是同画面重播
+    st = _shot_type_of(b)
+    closer = _CLOSER_TYPE.get(st, st)
+    b["shot_type"] = closer
+    b["camera_motion"] = "固定"
+    b["camera"] = closer + "固定"
+    b["dialogue_split_from"] = int(row.get("shot_id") or 0)
+    b.pop("source_unit_ids", None)          # 不重复计入原文覆盖率
+    for r in (a, b):
+        r["duration"] = estimate_shot_duration(r)
+        _need = required_shot_duration(r)
+        if _need > SHOT_DURATION_MAX:
+            r["duration_overflow_sec"] = round(_need - SHOT_DURATION_MAX, 2)
+        else:
+            r.pop("duration_overflow_sec", None)
+    return [a, b]
+
+def align_shots_to_reference(shots: list, start_id: int = 1) -> list:
+    """把镜头表对齐到参考片口径：运镜归一 / 极端景别收窄 / 补足局部插入镜。
+
+    ⚠️ 幂等：已对齐过的镜头表再跑一次不会继续变形（局部占比达标即不再补）。
+    ⚠️ 会重排 shot_id（补插入镜后必须连续），故放在集数分配之前调用。
+    """
+    if not shots:
+        return shots
+    # ---- 1) 逐镜归一：景别收窄 → 运镜归一 → 特写强制固定 ----
+    for s in shots:
+        st = _TYPE_NARROW.get(_shot_type_of(s)) or _shot_type_of(s)
+        if st:
+            s["shot_type"] = st
+        mo = _ref_motion(s.get("camera_motion") or s.get("camera") or "")
+        if st in _FORCE_LOCKED_TYPES:
+            mo = "固定"
+        s["camera_motion"] = mo
+        s["camera"] = (st + mo) if st else mo
+    # ---- 2) 补足「局部」插入镜 ----
+    n = len(shots)
+    cur = sum(1 for s in shots if _shot_type_of(s) == "局部")
+    if n and cur / float(n) < REF_INSERT_RATIO:
+        want = int(round((REF_INSERT_RATIO * n - cur) / (1 - REF_INSERT_RATIO)))
+        want = max(0, min(want, int(n * REF_INSERT_MAX_GROWTH) - n))
+        pri = {"中景": 0, "中近景": 1, "近景": 2, "全景": 3, "特写": 4}
+        # ⚠️ 排除 `insert_of`：否则插入镜自己（它也有 items_in_shot）会再次成为来源，
+        # 级联插出同道具的重复镜（实测：筑基丹被连插 2 次、画面几乎一样）。
+        cands = [s for s in shots
+                 if (s.get("items_in_shot") or [])
+                 and _shot_type_of(s) != "局部"
+                 and s.get("split_part") != 2
+                 and not s.get("insert_of")
+                 and s.get("description")]
+        cands.sort(key=lambda s: pri.get(_shot_type_of(s), 5))
+        cand_ids = {id(s) for s in cands}
+        # 同一道具最多插 2 次：参考片里局部插入镜本来就是同一道具在不同时刻复现，
+        # 但连续两次几乎同画面的插入（实测产物）观感是重复，故设上限。
+        prop_used = {}
+        out, added = [], 0
+        for s in shots:
+            out.append(s)
+            if added < want and id(s) in cand_ids:
+                prop = str((s.get("items_in_shot") or [""])[0])
+                if prop and prop_used.get(prop, 0) < 2:
+                    prop_used[prop] = prop_used.get(prop, 0) + 1
+                    out.append(_derive_insert_shot(s, prop))
+                    added += 1
+        shots = out
+        if added:
+            logger.info("参考片风格对齐：补足 %d 个「局部」插入镜（%d → %d 镜）",
+                        added, n, len(shots))
+    # ---- 2b) 特写/全景 数量上限 ----
+    # 参考片 92 镜里特写只 2 个、全景只 3 个（各 2~3%），是「情绪锚点」而非主奏景别。
+    # 短集按比例算会归零，故下限取 max(1, ...) —— 每集至少留 1 个锚点镜。
+    # 只做「同距离家族」内收窄：特写→近景（取景变化最轻），不够再全景→中景。
+    limit = max(1, int(round(0.10 * len(shots))))
+    anchors = [s for s in shots if _shot_type_of(s) in ("特写", "全景")]
+    if len(anchors) > limit:
+        anchors.sort(key=lambda s: 0 if _shot_type_of(s) == "特写" else 1)
+        for s in anchors[:len(anchors) - limit]:
+            old_t = _shot_type_of(s)
+            new_t = "近景" if old_t == "特写" else "中景"
+            s["shot_type"] = new_t
+            s["camera"] = new_t + str(s.get("camera_motion") or "固定")
+            logger.info("参考片风格对齐：锚点景别超限，%s → %s（镜%s）", old_t, new_t, s.get("shot_id"))
+    # ---- 2b2) 补情绪锚点特写 ----
+    # 参考片 92 镜里 2 个特写（2.2%）=「把观众钉在表情上」的情绪锚点。实测模型常一个特写都
+    # 不写（新生成 0/14），全片平铺直叙没有「钉住」的一刻。若整片仍无特写/全景锚点，把
+    # 节拍=高潮 的那一镜转成特写（爆点镜画面本就聚焦表情/关键动作，取景收窄不矛盾；
+    # 特写 100% 固定在第 1 步已锁死，不会带出运镜）。
+    anchors_now = sum(1 for s in shots if _shot_type_of(s) in ("特写", "全景"))
+    if not anchors_now:
+        climax = next((s for s in shots if str(s.get("beat") or "").strip() == "高潮"), None)
+        if climax is not None and _shot_type_of(climax) != "局部":
+            old_t = _shot_type_of(climax)
+            climax["shot_type"] = "特写"
+            climax["camera_motion"] = "固定"
+            climax["camera"] = "特写固定"
+            logger.info("参考片风格对齐：补情绪锚点特写（原镜%s %s → 特写）", climax.get("shot_id"), old_t)
+    # ---- 2c) 主力景别配平 ----
+    # 参考片里近景(~26%)与中近景(25%)数量几乎相等，是叙事双主力。模型常把两者写得很偏
+    # （实测 40% vs 20%），这里把多的一方挪一部分到少的一方（同属腰部以上取景，变化最轻）。
+    nj = sum(1 for s in shots if _shot_type_of(s) == "近景")
+    nz = sum(1 for s in shots if _shot_type_of(s) == "中近景")
+    if abs(nj - nz) > 1:
+        big, small = ("近景", "中近景") if nj > nz else ("中近景", "近景")
+        move = (max(nj, nz) - min(nj, nz)) // 2
+        for s in [x for x in shots if _shot_type_of(x) == big][-move:]:
+            s["shot_type"] = small
+            s["camera"] = small + str(s.get("camera_motion") or "固定")
+        logger.info("参考片风格对齐：主力景别配平 %s → %s 共 %d 镜", big, small, move)
+    # ---- 2c3) 补运镜纹理 ----
+    # 参考片 25% 的镜头有运镜（轻推 11% / 跟随 4% / 轻摇 3% / 手持 4%），且全部长在中景。
+    # 实测模型会把全片写成 100% 固定（克制过头、画面发死）——把 ~15% 的镜头（只挑中景）
+    # 均匀散布标成轻推，补回纹理；近景/局部/中近景/特写不动（参考片「越近越静」）。
+    n_mv = len(shots)
+    want_moving = int(round(0.15 * n_mv))
+    moving = sum(1 for s in shots if str(s.get("camera_motion") or "固定") != "固定")
+    if n_mv and moving < want_moving:
+        need = want_moving - moving
+        med = [i for i, s in enumerate(shots)
+               if _shot_type_of(s) == "中景" and str(s.get("camera_motion") or "固定") == "固定"]
+        if med:
+            for k in range(min(need, len(med))):
+                i = med[k * len(med) // max(1, need)]
+                shots[i]["camera_motion"] = "轻推"
+                shots[i]["camera"] = "中景轻推"
+            logger.info("参考片风格对齐：中景补轻推 %d 处（运镜占比 → 约 15%%）", min(need, len(med)))
+    # ---- 2c2) 长台词拆镜（对齐参考片切镜节奏）----
+    # 参考片单镜中位 2.08s：节奏来自「一句短台词说完就切」。本系统旧剧本单镜台词中位需要
+    # 8.0s 才念完（实测），镜头被迫拉到 8~12s —— 这才是「看不出切换」的真正根因。
+    # 拆完再走下面的时长收窄，两半才都能落到参考片区间。
+    _out, _splits = [], 0
+    for s in shots:
+        _parts = _split_long_dialogue_shot(s)
+        _out.extend(_parts)
+        _splits += len(_parts) - 1
+    if _splits:
+        logger.info("参考片风格对齐：长台词拆镜 %d 处（%d → %d 镜）", _splits, len(shots), len(_out))
+    shots = _out
+    # ---- 2d) 时长长尾收窄（对齐参考片节奏）----
+    # 这才是「看不出切换」的真正来源：参考片中位镜长 2.08s，而本系统旧剧本单镜能拖到 11~12s，
+    # 一镜 10 秒不切，观感就是一镜演完好几件事。这里把上限收到参考片最长镜（6.5s）。
+    # ⚠️ 只砍长尾，绝不压到台词所需时长以下 —— 压下去配音会溢出（duration_overflow_sec 同理重算）。
+    for s in shots:
+        need = required_shot_duration(s)
+        d = float(s.get("duration") or SHOT_DURATION_MIN)
+        target = max(min(d, REF_SHOT_DURATION_MAX), min(need, SHOT_DURATION_MAX))
+        s["duration"] = round(max(SHOT_DURATION_MIN, target), 2)
+        if need > SHOT_DURATION_MAX:
+            s["duration_overflow_sec"] = round(need - SHOT_DURATION_MAX, 2)
+        else:
+            s.pop("duration_overflow_sec", None)
+    # ---- 3) 重排 shot_id（补插入镜后必然错号），并回填插入镜的真实来源镜号 ----
+    for i, s in enumerate(shots, start_id):
+        s["shot_id"] = i
+    for s in shots:
+        _src = s.pop("_insert_src", None)
+        if _src is not None:
+            s["insert_of"] = int(_src.get("shot_id") or 0)
+    return shots
+
+def _split_multi_action_row(row: dict) -> list:
+    """把一个「一镜多动作」的镜头确定性拆成相邻两镜（不调模型）。
+
+    做法：把 description 按动作短句边界切成两半，让每半只承载一半动作，从而在成片里
+    真正产生「切换」。元数据全部保留；切点在「左右两侧动作短句数最接近」处，
+    且要求两侧各至少 1 个动作短句、各自文本 ≥4 字，否则原样返回（不硬拆）。
+
+    台词只留在前半：拆镜后两半是同一段表演的先后两个动作，同句台词若复制到后半会被
+    配音播两遍。后半的时长由 estimate_shot_duration 重算，不会因为少了台词而失真。
+
+    source_unit_ids 只留在前半：覆盖率校验按它统计原文承载量，两半都带会**重复计数**。
+
+    返回 [row]（未拆）或 [row_a, row_b]（已拆）。
+    """
+    desc = str(row.get("description") or "").strip()
+    if count_action_beats(desc) < SPLIT_ACTION_BEATS:
+        return [row]
+    segs = [x.strip() for x in ACTION_CLAUSE_RE.split(desc) if x.strip()]
+    if len(segs) < 2:
+        return [row]
+    has_action = [any(w in x for w in ACTION_WORDS) for x in segs]
+    total = sum(1 for h in has_action if h)
+    best, best_score = None, None
+    for k in range(1, len(segs)):
+        left = sum(1 for h in has_action[:k] if h)
+        right = total - left
+        if left < 1 or right < 1:
+            continue
+        score = abs(left - right)
+        if best_score is None or score < best_score:
+            best, best_score = k, score
+    if best is None:
+        return [row]
+    a_txt = "，".join(segs[:best])
+    b_txt = "，".join(segs[best:])
+    # 守卫：两侧都要有实际画面内容。阈值取 4 字而非 6 字 —— 「老人抬起手」（5 字）已是
+    # 完整的动作短句，卡在 6 字会让「1 个动作 + 2 个动作」这种最常见的三节拍切法永远拆不开
+    # （实测踩过：3 个节拍的镜头一个都没拆掉）。
+    if len(a_txt) < 4 or len(b_txt) < 4:
+        return [row]
+
+    a, b = dict(row), dict(row)
+    a["description"] = a_txt[:200]
+    b["description"] = b_txt[:200]
+    b["dialogue"] = []
+    b["dialogue_text"] = ""
+    a["last_frame"] = ""
+    b["first_frame"] = ""
+    b.pop("source_unit_ids", None)     # 覆盖率只算一次（留在前半）
+    a["split_from"] = int(row.get("shot_id") or 0)
+    b["split_from"] = int(row.get("shot_id") or 0)
+    a["split_part"] = 1
+    b["split_part"] = 2
+    for r in (a, b):
+        r["duration"] = estimate_shot_duration(r)
+        need = required_shot_duration(r)
+        if need > SHOT_DURATION_MAX:
+            r["duration_overflow_sec"] = round(need - SHOT_DURATION_MAX, 2)
+        else:
+            r.pop("duration_overflow_sec", None)
+    logger.info("一镜多动作已拆镜：镜%s → 「%s」/「%s」",
+                row.get("shot_id"), a["description"][:30], b["description"][:30])
+    return [a, b]
+
 def _norm_shots(raw_shots: list, bible: dict, episodes: int, start_id: int = 1) -> list:
     scenes = [s.get("name") for s in (bible.get("scenes") or []) if isinstance(s, dict)]
     chars = [c.get("name") for c in (bible.get("characters") or []) if isinstance(c, dict)]
@@ -1734,6 +2194,11 @@ def _norm_shots(raw_shots: list, bible: dict, episodes: int, start_id: int = 1) 
             "last_frame": str(s.get("last_frame") or "").strip()[:40],
             "motion": str(s.get("motion") or "").strip()[:30],
         }
+        # ---- 角色补全（2026-09-30）：画面文本点名了谁，就必须带谁的参考图 ----
+        # 模型偶尔漏登记 characters_in_shot（实测分镜 2：description 写「指向右前方羡进
+        # 胸口方向」却只登记了赵天霸）→ 生成端/质检端都拿不到羡进的设定图，模型只能凭
+        # 想象画脸 → 质检必挂 → 重试循环。这里按画面文本自动补全（只增不减 + 告警）。
+        row["characters_in_shot"] = augment_cast_from_text(row, chars, row.get("shot_id"))
         # 覆盖率补生成镜头：保留其承载的原文单元编号，便于覆盖率校验与前端回溯
         src_ids = s.get("source_unit_ids")
         if isinstance(src_ids, (list, tuple)) and src_ids:
@@ -1793,8 +2258,14 @@ def _norm_shots(raw_shots: list, bible: dict, episodes: int, start_id: int = 1) 
         need = required_shot_duration(row)
         if need > SHOT_DURATION_MAX:
             row["duration_overflow_sec"] = round(need - SHOT_DURATION_MAX, 2)
-        shots.append(row)
-        sid += 1
+        # 一镜一动作硬兜底（2026-09-30）：动作节拍 ≥ SPLIT_ACTION_BEATS 的镜头拆成相邻两镜。
+        # 提示词在样本内已能把多动作镜压到 0，但它是软约束（换素材/长度就可能反弹），
+        # 这里补上确定性的一刀，保证成片真的产生「切换」。
+        # 拆出的两半 shot_id 连续占号（前半=原号，后半=下一个），不跳号。
+        for _part in _split_multi_action_row(row):
+            _part["shot_id"] = sid
+            shots.append(_part)
+            sid += 1
     if dropped_empty:
         logger.warning("已丢弃 %d 条空壳镜头（无画面描述/细节/台词，出不了图且会卡死整集）：%s",
                        len(dropped_empty), dropped_empty[:12])
@@ -1804,6 +2275,9 @@ def _norm_shots(raw_shots: list, bible: dict, episodes: int, start_id: int = 1) 
             "旁白通道已关闭，剧本阶段不再产出 narration；如有叙述性内容，请改写为角色自语台词"
             "（dialogue）或画面描述（description）。",
             "、".join(sorted(set(dropped_deprecated))), len(dropped_deprecated))
+    # 参考片风格对齐（2026-09-30）：运镜归一 / 极端景别收窄 / 补足「局部」插入镜。
+    # 必须放在集数分配之前 —— 对齐会改变镜数与 shot_id，集数分配要看到最终镜头表。
+    shots = align_shots_to_reference(shots, start_id)
     # 分配集数
     n = len(shots)
     if n:
@@ -1930,13 +2404,15 @@ def convert_novel_to_script(client, novel_meta: dict, novel_text: str, style: st
     bible = _as_dict(build_bible(client, outlines, novel_title, style, episodes, target_shots,
                                  events=cache_events, cache_dir=cache_dir))
 
-    characters = _norm_list(bible.get("characters"), 8,
+    # 2026-09-29 资产不设数量上限（用户决策）：limit=None = 全量保留（_norm_list 的
+    # [:None] 切片语义），数量约束前移到提示词登记口径（无名群演不登记 / 道具三问）。
+    characters = _norm_list(bible.get("characters"), None,
                             ["name", "age", "gender", "appearance", "personality", "voice_style",
                              "reference_prompt_zh", "reference_prompt_en"])
-    items = _norm_list(bible.get("items"), 3,
+    items = _norm_list(bible.get("items"), None,
                        ["name", "category", "appearance", "owner", "importance",
                         "reference_prompt_zh", "reference_prompt_en"])
-    scenes = _norm_list(bible.get("scenes"), 8,
+    scenes = _norm_list(bible.get("scenes"), None,
                         ["name", "location", "appearance", "scene_lighting", "reference_prompt_zh", "reference_prompt_en"])
     if not characters:
         raise LLMError("模型未返回有效角色设定，转换中止")

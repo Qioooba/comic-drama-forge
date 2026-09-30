@@ -756,6 +756,46 @@ export const episodesApi = {
     ),
 };
 
+/** 前置解析结果（人物档案 + 故事梗概 + 关键事件 + 人物情绪） */
+export interface ChapterPreflightResult {
+  version: string;
+  chapter_index: number;
+  chapter_title: string;
+  analyzed_at: string;
+  characters: {
+    name: string;
+    gender: string;
+    age: string;
+    identity: string;
+    appearance: string;
+    personality: string;
+    voice_style: string;
+    emotions: { beat: string; emotion: string; intensity: number }[];
+  }[];
+  story_summary: string;
+  key_events: string[];
+  character_mood_arc: string;
+}
+
+export const preflightApi = {
+  /** 运行前置解析（LLM 调用，耗时较长） */
+  analyze: (novelId: string, chapterIndex: number, force?: boolean) =>
+    request<{ success: boolean; result: ChapterPreflightResult; bible_added: string[]; bible_updated: string[] }>(
+      `/novels/${encodeURIComponent(novelId)}/chapters/${chapterIndex}/preflight`,
+      { method: 'POST', body: JSON.stringify({ force }) }
+    ),
+  /** 读取已有前置解析结果 */
+  get: (novelId: string, chapterIndex: number) =>
+    request<{ exists: boolean; result?: ChapterPreflightResult }>(
+      `/novels/${encodeURIComponent(novelId)}/chapters/${chapterIndex}/preflight`
+    ),
+  /** 列出该项目所有已完成前置解析的章节 */
+  list: (novelId: string) =>
+    request<{ success: boolean; chapter_indices: number[]; count: number }>(
+      `/novels/${encodeURIComponent(novelId)}/preflight/list`
+    ),
+};
+
 /** P2-2 分集断点提议（与生产口径同源；不传 opts 即默认参数，提议 ≡ 实际生成） */
 export const novelsSplitPlanApi = {
   get: (
@@ -987,10 +1027,11 @@ export const aiConfigApi = {
    * （如 GLM-5.3-Flash）有意义：留空 = 不注入该参数，由服务端取默认档。
    * 用 undefined 表示「不改动」，用空串表示「清空」——两者语义不同，别合并。
    */
-  save: (module: string, base_url: string, model: string, api_key?: string, reasoning_effort?: string) =>
+  save: (module: string, base_url: string, model: string, api_key?: string, reasoning_effort?: string,
+        fallbacks?: { base_url: string; model: string; api_key?: string; label?: string; reasoning_effort?: string }[]) =>
     request<{ success: boolean; module_config: any; config: AIConfigResponse['config']; message: string }>(
       '/ai/config',
-      { method: 'POST', body: JSON.stringify({ module, base_url, model, api_key, reasoning_effort }) }
+      { method: 'POST', body: JSON.stringify({ module, base_url, model, api_key, reasoning_effort, fallbacks }) }
     ),
   clear: (module?: string) =>
     request<{ success: boolean; config: AIConfigResponse['config']; message: string }>(
@@ -1002,6 +1043,16 @@ export const aiConfigApi = {
     request<AITestResult>(
       '/ai/test',
       { method: 'POST', body: JSON.stringify({ module, base_url, model, api_key, probe, timeout, reasoning_effort }) }
+    ),
+  /**
+   * 测试「已保存的备用模型」连通性。
+   * 前端视图里备用的 api_key 恒为脱敏值（拿不到明文），所以这里只传索引，
+   * 由后端按 fallback_index 取那条备用已保存的 base_url / model / 解密后的 key 再探。
+   */
+  testFallback: (module: string, index: number, probe?: string, timeout?: number) =>
+    request<AITestResult>(
+      '/ai/test',
+      { method: 'POST', body: JSON.stringify({ module, fallback_index: index, probe, timeout }) }
     ),
 };
 
@@ -1028,6 +1079,22 @@ export const watermarkApi = {
     ),
   update: (patch: Record<string, unknown>) =>
     request<{ success?: boolean; config: Record<string, unknown> }>('/watermark/config', {
+      method: 'POST',
+      body: JSON.stringify(patch),
+    }),
+};
+
+/**
+ * 提示词增强总开关（2026-09-30）：出图/出片前用「文本分析模型」把画面描述改写得更具体，
+ * 再用「质检模型」对提示词做语义复审。任何一层失败都 fail-open（按原文继续），绝不阻断生成。
+ * 保存后立即生效、无需重启（后端每次生成都重读开关文件）。
+ */
+export const promptEnhanceApi = {
+  get: () =>
+    request<{ success?: boolean; effective?: { enhance_enabled?: boolean; review_enabled?: boolean };
+      file_config?: Record<string, unknown>; env_overridden?: { enhance?: boolean; review?: boolean } }>('/prompt_enhance/config'),
+  update: (patch: { enhance_enabled?: boolean; review_enabled?: boolean }) =>
+    request<{ success?: boolean; effective?: { enhance_enabled?: boolean; review_enabled?: boolean } }>('/prompt_enhance/config', {
       method: 'POST',
       body: JSON.stringify(patch),
     }),
@@ -1082,3 +1149,108 @@ export const upscaleApi = {
   /** 全部超分任务（按创建时间倒序） */
   tasks: () => request<{ success: boolean; items: UpscaleTask[] }>('/upscale/tasks'),
 };
+// --- 审片（四层质量状态 · 并排复核；2026-09-29） -------------------------------
+
+export interface QualityStageInfo {
+  status: string;
+  name: string;
+  label: string;
+  at: string;
+  note: string;
+  has_binding: boolean;
+}
+
+export interface QualityReleaseInfo {
+  ready: boolean;
+  blockers: string[];
+}
+
+export interface QualityEpisodeRow {
+  episode_no: number;
+  title: string;
+  shots_total: number;
+  duration_sec: number;
+  state: Record<string, QualityStageInfo>;
+  release: QualityReleaseInfo;
+  stale: Record<string, string>;
+  artifact: { exists: boolean; name: string; url: string };
+  review: { status?: string; stale?: boolean; exists?: boolean };
+  preview: { exists: boolean; name?: string; url?: string };
+}
+
+export interface QualityEpisodesResponse {
+  success: boolean;
+  project: string;
+  episodes: QualityEpisodeRow[];
+  count: number;
+  summary: { total: number; ready: number; awaiting_review: number };
+}
+
+export interface ReviewShotRef { kind: string; name: string; url: string }
+
+export interface ReviewShotQcLatest {
+  attempt?: number;
+  ok?: boolean;
+  passed?: boolean;
+  score?: number;
+  reason?: string;
+  issues?: string[];
+  critical_issues?: string[];
+  style_mismatch?: boolean;
+  duration?: number;
+  time?: string;
+  frames?: string[];
+}
+
+export interface ReviewShot {
+  seq: number;
+  shot_id: number | string;
+  duration?: number;
+  camera: string;
+  location: string;
+  description: string;
+  dialogue_text: string;
+  first_frame: string;
+  last_frame: string;
+  motion: string;
+  emotion: string;
+  beat: string;
+  video: { exists: boolean; url: string };
+  storyboard: { exists: boolean; url: string };
+  refs: ReviewShotRef[];
+  qc: { found: boolean; attempts: number; last_passed?: boolean | null; latest: ReviewShotQcLatest };
+}
+
+export interface QualityReviewResponse {
+  success: boolean;
+  project: string;
+  episode: number;
+  contract: { title: string; style: string; shots_total: number; duration_sec: number };
+  shots: ReviewShot[];
+  artifact: { exists: boolean; name: string; url: string };
+  state: Record<string, QualityStageInfo>;
+  release: QualityReleaseInfo;
+  stale: Record<string, string>;
+  preview: { exists: boolean; name?: string; url?: string };
+}
+
+export const qualityApi = {
+  /** 集列表 + 每集四层状态（审片左栏） */
+  episodes: (project: string) =>
+    request<QualityEpisodesResponse>('/quality/episodes?project=' + encodeURIComponent(project)),
+
+  /** 单集完整审片载荷（契约/分镜/参考/视频/质检） */
+  review: (project: string, episode: number) =>
+    request<QualityReviewResponse>(
+      '/quality/review?project=' + encodeURIComponent(project) + '&episode=' + episode),
+
+  /** 人工层状态写入（C 编辑复核 / D 发布批准） */
+  setStage: (data: { project: string; episode: number; stage: string; status: string; note?: string }) =>
+    request<{ success: boolean; state: Record<string, QualityStageInfo>; release: QualityReleaseInfo; stale: Record<string, string> }>(
+      '/quality/stage', { method: 'POST', body: JSON.stringify(data) }),
+
+  /** 批准预演产物 → 安排正式生产（两级生产第二阶段） */
+  approvePreview: (data: { project: string; episode_no: number; note?: string }) =>
+    request<{ success: boolean }>('/videos/preview/approve', { method: 'POST', body: JSON.stringify(data) }),
+};
+

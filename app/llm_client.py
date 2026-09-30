@@ -1065,5 +1065,239 @@ class LLMClient:
             return dict(base_out, success=False, error=str(e), verdict="failed")
 
 
+# ===================== 备用模型故障转移（2026-09-30） =====================
+class FailoverLLMClient:
+    """主 + 备用 LLMClient 链的故障转移包装器。
+
+    设计目标（用户要求）：主模型连续 3 次 API 报错 → 自动切到下一个备用模型，
+    任务继续跑、不中断成片生产。主模型恢复后自动回切（每次调用前探活主模型）。
+
+    对外接口 = LLMClient 常用子集：chat / chat_ex / chat_tools / chat_json /
+    chat_json_robust / test_connection / 属性（model、base_url、configured、
+    last_json_meta、last_error、reasoning_effort、disable_thinking、chat_url）。
+    上层调用方（novel_to_script / continuity / script_generator / qc_client）
+    无需任何改动 —— 同一个鸭子接口。
+
+    切换语义：
+    - 只对「API 级错误」计数（LLMError 族，含 LLMGatewayUnavailable）：
+      模型输出质量问题（JSON 解析失败 / 截断 / 只吐思考）由调用方各自的
+      retry 逻辑处理，不触发切换。
+    - 当前 active 连续 3 次 API 报错 → 切到下一个 client（计数清零）；
+      备用也挂就按序试下一个；全链耗尽才抛最后一次的错。
+    - 切到备用后，每次调用前先对主模型做一次轻量探活（45s 超时）；
+      主模型活了就回切，任务零感知。
+    """
+
+    _FAILOVER_THRESHOLD = 3          # 连续 N 次 API 报错 → 切备用
+    _PROBE_TIMEOUT = 45             # 回切前主模型探活超时（秒）
+
+    def __init__(self, clients: list, labels: list = None, module: str = ""):
+        if not clients:
+            raise LLMError("FailoverLLMClient 至少需要一个客户端")
+        self.clients = list(clients)
+        self.labels = list(labels) if labels and len(labels) == len(clients) \
+            else [f"模型{i + 1}" for i in range(len(clients))]
+        self.module = module
+        self._active_idx = 0
+        self._consec_fail = 0        # 当前 active 的连续 API 报错数
+        self._switch_log = []        # [{from, to, reason, at}] 供诊断回显
+
+    # ---- 鸭子接口：转发当前 active client 的属性 ----
+    @property
+    def active(self) -> LLMClient:
+        return self.clients[self._active_idx]
+
+    @property
+    def configured(self) -> bool:
+        return any(c.configured for c in self.clients)
+
+    @property
+    def model(self) -> str:
+        return self.active.model
+
+    @property
+    def base_url(self) -> str:
+        return self.active.base_url
+
+    @property
+    def chat_url(self) -> str:
+        return self.active.chat_url
+
+    @property
+    def last_error(self) -> str:
+        return getattr(self.active, "last_error", "")
+
+    @last_error.setter
+    def last_error(self, value):
+        try:
+            self.active.last_error = value
+        except Exception:  # noqa: BLE001
+            pass
+
+    @property
+    def last_json_meta(self) -> dict:
+        return getattr(self.active, "last_json_meta", {}) or {}
+
+    @last_json_meta.setter
+    def last_json_meta(self, value):
+        try:
+            self.active.last_json_meta = value
+        except Exception:  # noqa: BLE001
+            pass
+
+    @property
+    def reasoning_effort(self) -> str:
+        return getattr(self.active, "reasoning_effort", "")
+
+    @reasoning_effort.setter
+    def reasoning_effort(self, value):
+        try:
+            self.active.reasoning_effort = value
+        except Exception:  # noqa: BLE001
+            pass
+
+    @property
+    def disable_thinking(self):
+        return getattr(self.active, "disable_thinking", False)
+
+    @disable_thinking.setter
+    def disable_thinking(self, value):
+        try:
+            self.active.disable_thinking = value
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ---- 故障转移核心 ----
+    def _note_api_error(self, exc) -> None:
+        """记一次 API 级报错；达到阈值时切到下一个 client。"""
+        self._consec_fail += 1
+        if self._consec_fail < self._FAILOVER_THRESHOLD:
+            logger.warning(
+                "LLM API 报错（%s 连续 %d/%d 次）：%s",
+                self.module or "llm", self._consec_fail,
+                self._FAILOVER_THRESHOLD, str(exc)[:200])
+            return
+        cur = self._active_idx
+        if cur + 1 >= len(self.clients):
+            logger.error("LLM 已是故障转移链尾（%s），无备用可切", self.labels[cur])
+            self._consec_fail = 0
+            return
+        nxt = cur + 1
+        self._switch_log.append({"from": self.labels[cur], "to": self.labels[nxt],
+                                 "reason": str(exc)[:150],
+                                 "at": datetime.now().isoformat(timespec="seconds")})
+        logger.warning(
+            "LLM 故障转移：%s → %s（连续 %d 次 API 报错）：%s",
+            self.labels[cur], self.labels[nxt], self._consec_fail, str(exc)[:200])
+        self._active_idx = nxt
+        self._consec_fail = 0
+
+    def _try_return_to_primary(self) -> None:
+        """若当前不在主模型，探活主模型；活了就回切（任务零感知）。"""
+        if self._active_idx == 0:
+            return
+        primary = self.clients[0]
+        try:
+            _payload = primary._build_payload(
+                [{"role": "user", "content": "ping"}], 0, 16)
+            primary._post(_payload, timeout=self._PROBE_TIMEOUT)
+            self._switch_log.append(
+                {"from": self.labels[self._active_idx], "to": self.labels[0],
+                 "reason": "主模型探活成功，回切",
+                 "at": datetime.now().isoformat(timespec="seconds")})
+            logger.info("LLM 主模型已恢复，切回主模型（原：%s）",
+                       self.labels[self._active_idx])
+            self._active_idx = 0
+            self._consec_fail = 0
+        except LLMError:
+            pass  # 主模型还挂着，继续用备用
+        except Exception:  # noqa: BLE001  探活本身异常不阻断任务
+            pass
+
+    def _call_with_failover(self, method: str, *args, **kwargs):
+        """调 active client 的 method；API 级报错计数 + 自动切换 + 全链兜底。
+
+        语义：当前 active 累计 _FAILOVER_THRESHOLD 次 API 报错后，自动切到下一个
+        client 并清空计数（_note_api_error 内部处理）。整条链（主 + 各备用）依次
+        给足各自阈值次数；全链耗尽才抛最后一次的错。
+        """
+        self._try_return_to_primary()
+        last_exc = None
+        for _round in range(len(self.clients)):
+            client = self.active
+            _budget = self._FAILOVER_THRESHOLD - self._consec_fail
+            _attempted = 0
+            while _attempted < _budget and self.active is client:
+                try:
+                    result = getattr(client, method)(*args, **kwargs)
+                    self._consec_fail = 0
+                    return result
+                except LLMError as e:
+                    last_exc = e
+                    self._note_api_error(e)
+                    _attempted += 1
+                except Exception as e:  # noqa: BLE001  网络层非 LLMError 异常也计入
+                    last_exc = e
+                    self._note_api_error(e)
+                    _attempted += 1
+        if last_exc is None:
+            raise LLMError("LLM 调用失败（故障转移链耗尽）")
+        raise last_exc
+    # ---- 对外接口（LLMClient 子集，上层无感知） ----
+    def chat(self, messages: list, temperature: float = 0.7, max_tokens: int = 4096,
+             timeout: int = None) -> str:
+        return self._call_with_failover("chat", messages, temperature=temperature,
+                                        max_tokens=max_tokens, timeout=timeout)
+
+    def chat_ex(self, messages: list, temperature: float = 0.7, max_tokens: int = 4096,
+                timeout: int = None) -> dict:
+        return self._call_with_failover("chat_ex", messages, temperature=temperature,
+                                        max_tokens=max_tokens, timeout=timeout)
+
+    def chat_tools(self, messages: list, tools: list, temperature: float = 0.3,
+                   max_tokens: int = 4096, timeout: int = None) -> dict:
+        return self._call_with_failover("chat_tools", messages, tools,
+                                        temperature=temperature,
+                                        max_tokens=max_tokens, timeout=timeout)
+
+    def chat_json(self, prompt: str, system: str = None, temperature: float = 0.4,
+                  max_tokens: int = 4096, retries: int = 1) -> dict:
+        return self._call_with_failover("chat_json", prompt, system=system,
+                                        temperature=temperature,
+                                        max_tokens=max_tokens, retries=retries)
+
+    def chat_json_robust(self, prompt: str, system: str = None, temperature: float = 0.4,
+                         max_tokens: int = 4096, max_attempts: int = 3,
+                         token_ladder=None, on_event=None) -> dict:
+        return self._call_with_failover("chat_json_robust", prompt, system=system,
+                                        temperature=temperature,
+                                        max_tokens=max_tokens,
+                                        max_attempts=max_attempts,
+                                        token_ladder=token_ladder, on_event=on_event)
+
+    def test_connection(self) -> dict:
+        """当前 active 的连通测试结果 + 故障转移链状态。"""
+        out = dict(self.active.test_connection())
+        out["failover"] = {
+            "active": self.labels[self._active_idx],
+            "active_index": self._active_idx,
+            "chain": self.labels,
+            "switches": self._switch_log[-5:],
+        }
+        return out
+
+    @staticmethod
+    def gateway_circuit_state(base_url: str) -> dict:
+        return LLMClient.gateway_circuit_state(base_url)
+
+    @staticmethod
+    def reset_gateway_circuits() -> None:
+        LLMClient.reset_gateway_circuits()
+
+    def require_configured(self):
+        if not self.configured:
+            raise LLMError("尚未配置任何可用的 LLM 客户端（主 + 备用均未配置）")
+
+
 def client_from_config(config_path: str, timeout: int = DEFAULT_TIMEOUT) -> LLMClient:
     return LLMClient(config_path=config_path, timeout=timeout)

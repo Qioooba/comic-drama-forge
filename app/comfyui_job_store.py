@@ -134,11 +134,22 @@ def _prune(jobs: dict, now: float) -> dict:
 # --------------------------------------------------------------------- 公开 API
 
 def find(job_key: str) -> Optional[dict]:
-    """查任务记录；不存在返回 None。"""
+    """查任务记录；不存在返回 None。
+
+    ⚠️ 台账是**两级结构** {"jobs": {...}, "seed": {...}}，任务键在 jobs 下面 ——
+    直接对顶层取值会永远查不到（本模块首版就踩了这个坑，被
+    verify_comfyui_resume.py 的 B/C 段当场抓住）。这里同时兼容「扁平写入」的
+    历史/手改台账，避免一次性损坏。
+    """
     if not job_key:
         return None
     with _lock:
-        rec = _load().get(job_key)
+        data = _load()
+        jobs = data.get("jobs")
+        if isinstance(jobs, dict) and job_key in jobs:
+            rec = jobs.get(job_key)
+        else:
+            rec = data.get(job_key)          # 兼容扁平结构
     return rec if isinstance(rec, dict) else None
 
 

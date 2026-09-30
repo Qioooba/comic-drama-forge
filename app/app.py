@@ -18,7 +18,7 @@ from flask import Flask, render_template, request, jsonify, send_file, abort, re
 from werkzeug.exceptions import BadRequest, HTTPException
 
 from config import (
-    COMFYUI_URL, PROJECT_ROOT_DIR, PROJECT_OUTPUT_DIR, SCRIPT_DIR,
+    COMFYUI_URL, PROJECT_ROOT_DIR, PROJECT_DATA_DIR, PROJECT_OUTPUT_DIR, SCRIPT_DIR,
     CHARACTERS_DIR, ITEMS_DIR, SCENES_DIR, STORYBOARDS_DIR, KEYFRAMES_DIR, VIDEOS_DIR, FINAL_DIR,
     PROJECT_TRASH_DIR,
     NOVELS_DIR, LLM_CONFIG_PATH, NOVEL_CHUNK_CHARS, NOVEL_MAX_CHUNKS,
@@ -40,11 +40,14 @@ from config import (
     SCENE_ANGLE_TO_VIEW, SCENE_VIEWS_ENABLED, SCENE_VIEW_MAX_RETRIES,
     H3_COMMON_REFS, H3_COMMON_REFS_MAX,
     PROJECT_DEFAULT_CONFIG,
+    PROMPT_ENHANCE_CONFIG_PATH, save_prompt_enhance_config, _prompt_enhance_file_flags,
 )
 from script_generator import ScriptGenerator
 from comfyui_client import (ComfyUIClient, camera_spec as _camera_spec,
                             camera_key as _camera_key, camera_angle as _camera_angle)
 import comfyui_job_store  # 崩溃免重渲检查点（2026-09-29）：种子沿用判据 + 台账查询
+import preview_gate  # 两级生产（2026-09-29）：预演不可交付 + 预演批准
+import quality_stage  # 四层质量状态（2026-09-29：预演也记 A/B 层）
 # ⚠️ 注意：本文件里 `comfyui_client` 这个名字是**实例**（见下方 `comfyui_client = ComfyUIClient()`），
 # 不是模块。因此**模块级函数**（camera_spec / camera_key / get_call_stats 等）必须像上面这样
 # 直接 import 后用别名调用 —— 写成 `comfyui_client.camera_spec(...)` 会在运行时抛
@@ -56,7 +59,8 @@ from novel_parser import (
     get_novel, preview_novel, read_novel_text, split_chapters
 )
 from llm_client import (
-    LLMClient, LLMError, LLMGatewayUnavailable, load_config as load_llm_config,
+    LLMClient, LLMError, LLMGatewayUnavailable, LLMTruncatedError, LLMReasoningOnlyError,
+    FailoverLLMClient, load_config as load_llm_config,
     save_config as save_llm_config, clear_config as clear_llm_config,
     public_view as llm_public_view
 )
@@ -68,6 +72,7 @@ import analytics
 import autopilot
 import consistency
 import continuity
+import chapter_preflight
 import coverage
 import script_consistency
 import keyframe
@@ -1348,7 +1353,30 @@ def api_project_asset_detail(pid):
 
 
 # ===== 页面（Vite SPA）=====
-_STATIC_DIR = os.path.join(os.path.dirname(__file__), 'static')
+def _resolve_static_dir():
+    """定位前端静态目录（app/static），兼容源码运行与 PyInstaller 单文件打包。
+
+    2026-09-30 修复「桌面版页面出不来（GET / 返回 404）」：
+    打包后模块以**裸名 app** 从 PYZ 导入（serve.py 的 app.app 回退路径），
+    `__file__` = <_MEIPASS>/app.pyc → 旧写法得到 <_MEIPASS>/static，
+    而 spec 的 datas 实际把前端放在 <_MEIPASS>/app/static → 找不到 index.html。
+    现按「打包布局优先、源码布局兜底」依次探测。
+    """
+    import sys as _sys
+    _cands = []
+    if getattr(_sys, "frozen", False):
+        _mp = getattr(_sys, "_MEIPASS", "") or ""
+        if _mp:
+            _cands.append(os.path.join(_mp, "app", "static"))
+            _cands.append(os.path.join(_mp, "static"))
+    _cands.append(os.path.join(os.path.dirname(__file__), "static"))
+    for _c in _cands:
+        if os.path.isdir(_c):
+            return _c
+    return _cands[-1]
+
+
+_STATIC_DIR = _resolve_static_dir()
 
 @app.route('/')
 def index():
@@ -3331,7 +3359,20 @@ def _generate_asset_task(task_id: str, assets: list, asset_type: str, project_na
                         base_ok = True
                         break
                     _set_phase(f"{name} 基础图质检中（第 {attempt + 1} 次）", "checking")
-                    verdict = qc_client.check_image(scratch_base, qc_desc, qc_cfg, style=gen_style)
+                    # 物品参考图多给一条判据：只认本体，出现承托物/容器即缺陷。
+                    # 实测漏判：筑基丹提示词自带「置于黑色玉盒中」，图照着画 → 图与提示词
+                    # 完全一致 → 质检判通过。质检口径必须比「像不像提示词」更高一层。
+                    _qc_desc_base = qc_desc
+                    if str(asset_type) == "item":
+                        _qc_desc_base = (str(qc_desc) +
+                                         "\n\n【物品图专项判据】物品参考图只应呈现**物品本体**。"
+                                         "若画面主体是容器/托盘/盒子/底座/支架/展示台/碗碟/绸布等承托物，"
+                                         "或物品被遮挡、被放进/放在别的物体内或上面、出现手或人物，"
+                                         "判为关键缺陷（extra_prop / 承托物），kinds 记「物品变形」。"
+                                         "纯白背景上出现明显投影或桌面/地面也计一条缺陷。"
+                                         "注意：本判据优先于「是否与提示词一致」——"
+                                         "提示词本身写了容器时，仍判缺陷。")
+                    verdict = qc_client.check_image(scratch_base, _qc_desc_base, qc_cfg, style=gen_style)
                     app.logger.info(f"[资产质检] base {asset_type}/{name} 第{attempt + 1}次 → "
                                     f"{verdict.get('call_url')} model={verdict.get('model')} "
                                     f"ok={verdict.get('ok')} passed={verdict.get('passed')} "
@@ -3644,6 +3685,241 @@ def _generate_asset_task(task_id: str, assets: list, asset_type: str, project_na
             })
     _maybe_reclaim_comfyui_output()   # D-11a：任务收尾滚动回收 ComfyUI 重试残留（节流+全容错）
     _maybe_clear_comfyui_history("资产批量生成收尾")
+
+
+# ===================== 清空重做一集（总控 AI 工具 reset_episode 的后端） =====================
+# 2026-09-30：总控 AI 需要独立的「清空重做」能力。安全性三原则：
+#   ① 只**移入回收站**（output/projects/_trash/reset/<时间戳>_<项目>/），绝不真删——可恢复；
+#   ② 只动**该集**的产物（第 1 集平铺、第 2 集起 epNN/ 子目录，口径与 _ep_dir 一致）；
+#   ③ 逐项 try/except：单项被占用（生产仍在写）→ 跳过并如实上报，绝不中途抛异常。
+# ⚠️ 调用方（总控 AI）应先用 stop_production 停止该项目生产，否则正在写入的文件会
+#    清理失败（skipped 里会如实列出）。
+@app.route('/api/autopilot/reset-episode', methods=['POST'])
+def api_autopilot_reset_episode():
+    data = _body()
+    project_name, err = _project_or_400((data.get('project_name') or '').strip())
+    if err is not None:
+        return err
+    try:
+        episode_no = max(1, int(data.get('episode_no') or 1))
+    except (TypeError, ValueError):
+        episode_no = 1
+    include_script = bool(data.get('include_script'))
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    trash_root = os.path.join(PROJECT_OUTPUT_DIR, "projects", "_trash", "reset",
+                              f"{stamp}_{project_name}")
+    cleared, skipped, notes = [], [], []
+
+    def _trash_move(src, category):
+        """把单个文件/目录移入回收站；不存在=无事发生，被占用=记入 skipped"""
+        if not src or not os.path.exists(src):
+            return
+        try:
+            dst = os.path.join(trash_root, category,
+                               os.path.basename(src.rstrip('\\/')) or category)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.move(src, dst)
+            cleared.append({"category": category, "path": src})
+        except Exception as e:  # noqa: BLE001  单项失败不阻断其余清理
+            skipped.append({"path": src, "error": str(e)})
+
+    # ---- 目录级产物：分镜图 / 尾帧 / 视频 / 成片 ----
+    # 第 1 集平铺（只移文件，其它集的 epNN/ 子目录原地保留）；第 2 集起整块移 epNN/ 子目录
+    for category, base_dir in (("storyboards", STORYBOARDS_DIR), ("keyframes", KEYFRAMES_DIR),
+                               ("videos", VIDEOS_DIR), ("final", FINAL_DIR)):
+        proj_dir = os.path.join(base_dir, project_name)
+        if not os.path.isdir(proj_dir):
+            continue
+        if episode_no > 1:
+            _trash_move(os.path.join(proj_dir, f"ep{episode_no:02d}"), category)
+        else:
+            for _name in os.listdir(proj_dir):
+                _p = os.path.join(proj_dir, _name)
+                if os.path.isfile(_p):
+                    _trash_move(_p, category)
+
+    # ---- 文件级产物：配音 / 混音 / 质检（文件名带 epNN_ 前缀的归该集）----
+    for category, base_dir in (("dub", DUB_DIR), ("dub_mix", DUB_MIX_DIR), ("qc", QC_DIR)):
+        proj_dir = os.path.join(base_dir, project_name)
+        if not os.path.isdir(proj_dir):
+            continue
+        _prefix = f"ep{episode_no:02d}_"
+        _hit = False
+        for _root, _dirs, _files in os.walk(proj_dir):
+            for _name in list(_files):
+                if _name.startswith(_prefix):
+                    _hit = True
+                    _trash_move(os.path.join(_root, _name), category)
+        if not _hit and episode_no == 1 and category == "qc":
+            # 兜底：qc 里不带 ep 前缀的记录（如 storyboard_scratch、prompt_*.json）属第 1 集
+            # 平铺口径 —— 整目录移入回收站（qc 是派生数据，可恢复）。
+            _trash_move(proj_dir, category)
+
+    # ---- 剧本（可选）：include_script=true 时连剧本一并移入回收站 ----
+    if include_script:
+        try:
+            _script_path = novel_to_script.episode_script_path(SCRIPT_DIR, project_name, episode_no)
+            _trash_move(_script_path, "scripts")
+        except Exception as e:  # noqa: BLE001
+            notes.append(f"剧本定位失败（忽略）：{e}")
+
+    # ---- 交付记录：把该集条目从 deliverables.json 摘除（被摘条目进回收站，可恢复）----
+    _dl_file = os.path.join(PROJECT_OUTPUT_DIR, "autopilot", project_name, "deliverables.json")
+    if os.path.isfile(_dl_file):
+        try:
+            with open(_dl_file, "r", encoding="utf-8") as f:
+                _dl = json.load(f)
+            _items = _dl if isinstance(_dl, list) else (_dl.get("items") if isinstance(_dl, dict) else None) or []
+            _removed = [_it for _it in _items
+                        if isinstance(_it, dict) and int(_it.get("episode_no") or 0) == episode_no]
+            if _removed:
+                _keep = [_it for _it in _items if _it not in _removed]
+                os.makedirs(os.path.join(trash_root, "autopilot"), exist_ok=True)
+                with open(os.path.join(trash_root, "autopilot", "deliverables_removed.json"),
+                          "w", encoding="utf-8") as f:
+                    json.dump(_removed, f, ensure_ascii=False, indent=2)
+                if isinstance(_dl, list):
+                    atomic_write_json(_dl_file, _keep)
+                else:
+                    _dl["items"] = _keep
+                    atomic_write_json(_dl_file, _dl)
+                notes.append(f"交付记录已摘除 {len(_removed)} 条（被摘条目在回收站，可恢复）")
+        except Exception as e:  # noqa: BLE001
+            notes.append(f"交付记录清理失败（忽略）：{e}")
+
+    if not cleared and not skipped:
+        notes.append("该集没有可清理的产物（本来就是空的）")
+    app.logger.info("[reset-episode] 项目=%s 集=%s 清理 %d 项、跳过 %d 项，回收站=%s",
+                    project_name, episode_no, len(cleared), len(skipped), trash_root)
+    return jsonify({
+        "success": True, "project": project_name, "episode_no": episode_no,
+        "include_script": include_script, "cleared": cleared, "skipped": skipped,
+        "notes": notes, "trash": trash_root,
+        "hint": "产物已移入回收站（可恢复）；接着用 produce_episode 从头重产该集",
+    })
+
+
+# ===================== 清空重做单个镜头 / 单个资产（总控 AI 工具后端） =====================
+# 与 reset-episode 同一套安全原则：移入回收站（可恢复）、逐项容错、按镜号/资产名精确圈定。
+
+def _trash_move(src, category, trash_root, cleared, skipped):
+    """把单个文件/目录移入回收站；不存在=无事发生，被占用=记入 skipped。
+
+    模块级版本（reset-shot / reset-asset 共用）；reset-episode 端点内另有闭包版本，语义一致。
+    """
+    if not src or not os.path.exists(src):
+        return
+    try:
+        dst = os.path.join(trash_root, category,
+                           os.path.basename(src.rstrip('\\/')) or category)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.move(src, dst)
+        cleared.append({"category": category, "path": src})
+    except Exception as e:  # noqa: BLE001  单项失败不阻断其余清理
+        skipped.append({"path": src, "error": str(e)})
+
+
+def _collect_matching(base_dir, prefixes):
+    """收集 base_dir 下（递归）名字以任一前缀开头的文件/目录路径（浅层优先）。
+
+    浅层优先的原因：目录整移会连带其内容，深层残余路径在 move 时已不存在 → 静默跳过。
+    """
+    hits = []
+    if base_dir and os.path.isdir(base_dir):
+        for _root, _dirs, _files in os.walk(base_dir):
+            for _name in _dirs + _files:
+                if any(_name.startswith(pfx) for pfx in prefixes):
+                    hits.append(os.path.join(_root, _name))
+    hits.sort(key=lambda p: p.count(os.sep))
+    return hits
+
+
+@app.route('/api/autopilot/reset-shot', methods=['POST'])
+def api_autopilot_reset_shot():
+    """清空重做单个镜头：分镜图 / 尾帧 / 视频 / 配音 / 质检记录 → 回收站（可恢复）。
+
+    清完之后用 produce_episode 重产该集，断点续跑只会重做缺失的这一镜（其余镜不重烧）。
+    """
+    data = _body()
+    project_name, err = _project_or_400((data.get('project_name') or '').strip())
+    if err is not None:
+        return err
+    try:
+        episode_no = max(1, int(data.get('episode_no') or 1))
+    except (TypeError, ValueError):
+        episode_no = 1
+    shot_id = (data.get('shot_id') or '').strip()
+    seq = _shot_seq(shot_id, 0)
+    if seq <= 0:
+        return jsonify({"success": False,
+                        "error": f"无法解析镜号：{shot_id}（形如 shot_3，可从 get_shots 拿到）"})
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    trash_root = os.path.join(PROJECT_OUTPUT_DIR, "projects", "_trash", "reset",
+                              f"{stamp}_{project_name}")
+    ep_tag = "" if episode_no <= 1 else f"ep{episode_no:02d}"
+    ep_prefix = f"ep{episode_no:02d}_shot{seq:02d}"
+    shot_prefix = f"shot_{seq:02d}"
+    cleared, skipped = [], []
+    # （目录, 名字前缀列表, 类别）——前缀按各目录的实际命名口径
+    for base_dir, prefixes, category in (
+            (os.path.join(STORYBOARDS_DIR, project_name, ep_tag), [shot_prefix], "storyboards"),
+            (os.path.join(KEYFRAMES_DIR, project_name, ep_tag), [shot_prefix], "keyframes"),
+            (os.path.join(VIDEOS_DIR, project_name, ep_tag), [shot_prefix], "videos"),
+            (os.path.join(DUB_DIR, project_name), [ep_prefix], "dub"),
+            (os.path.join(DUB_MIX_DIR, project_name), [ep_prefix], "dub_mix"),
+            (os.path.join(QC_DIR, project_name), [ep_prefix, shot_prefix,
+                                                  f"prompt_shot_{seq:02d}"], "qc"),
+    ):
+        for _p in _collect_matching(base_dir, prefixes):
+            _trash_move(_p, category, trash_root, cleared, skipped)
+    if not cleared and not skipped:
+        return jsonify({"success": True, "project": project_name, "episode_no": episode_no,
+                        "shot_id": shot_id, "cleared": [], "skipped": [],
+                        "notes": ["该镜没有已生成的产物（本来就是空的）"], "trash": trash_root})
+    app.logger.info("[reset-shot] 项目=%s 集=%s 镜=%s(seq %02d) 清理 %d 项、跳过 %d 项",
+                    project_name, episode_no, shot_id, seq, len(cleared), len(skipped))
+    return jsonify({"success": True, "project": project_name, "episode_no": episode_no,
+                    "shot_id": shot_id, "cleared": cleared, "skipped": skipped,
+                    "trash": trash_root,
+                    "hint": "该镜产物已移入回收站；用 produce_episode 重产该集时只会重做这一镜"})
+
+
+@app.route('/api/autopilot/reset-asset', methods=['POST'])
+def api_autopilot_reset_asset():
+    """清空重做单个资产（角色/物品/场景）：基础图 + 多视图 + 质检记录 → 回收站（可恢复）。
+
+    资产卡描述保留（只清图）；下一轮生产的资产步骤会因「base 图缺失」自动补做该资产。
+    ⚠️ 若命中跨项目资产库的形象指纹，重做可能直接复用既有图；要换形象请先改描述再重做。
+    """
+    data = _body()
+    project_name, err = _project_or_400((data.get('project_name') or '').strip())
+    if err is not None:
+        return err
+    kind = (data.get('kind') or '').strip().lower()
+    name = (data.get('name') or '').strip()
+    _kind_dirs = {"character": CHARACTERS_DIR, "item": ITEMS_DIR, "scene": SCENES_DIR}
+    base_dir = _kind_dirs.get(kind)
+    if not base_dir:
+        return jsonify({"success": False,
+                        "error": "kind 必须是 character / item / scene 之一"})
+    if not name or '/' in name or '\\' in name or name in ('.', '..'):
+        return jsonify({"success": False, "error": "name 不能为空且不得含路径分隔符"})
+    asset_dir = os.path.join(base_dir, project_name, name)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    trash_root = os.path.join(PROJECT_OUTPUT_DIR, "projects", "_trash", "reset",
+                              f"{stamp}_{project_name}")
+    cleared, skipped, notes = [], [], []
+    if not os.path.isdir(asset_dir):
+        notes.append("该资产没有已生成的图（本来就是空的），无需清理")
+    else:
+        _trash_move(asset_dir, f"assets/{kind}", trash_root, cleared, skipped)
+    app.logger.info("[reset-asset] 项目=%s kind=%s 资产=%s 清理 %d 项、跳过 %d 项",
+                    project_name, kind, name, len(cleared), len(skipped))
+    return jsonify({"success": True, "project": project_name, "kind": kind, "name": name,
+                    "cleared": cleared, "skipped": skipped, "notes": notes,
+                    "trash": trash_root,
+                    "hint": "资产图已移入回收站（角色卡描述保留）；下一轮生产会自动补做该资产。"
+                            "若命中跨项目资产库指纹可能直接复用旧图，要换形象请先改描述"})
 
 
 @app.route('/api/assets/generate', methods=['POST'])
@@ -4747,7 +5023,35 @@ def _storyboard_worker(task_id: str, project_name: str, shots: list,
                         item["error"] = "该镜头无可用参考图（请先完成步骤2/3/4的资产生成）"
                 else:
                     labels = [r[1] for r in refs]
-                    prompt = comfyui_client.build_storyboard_prompt(shot, labels)
+                    # ---- TE 3D 导演台：渲染 3D 站位/机位构图基准图（2026-09-30）----
+                    # 每镜先渲一张无面人偶站位图 → 作 <image1> 构图基准 → 提示词追加
+                    # COMPOSITION BASELINE 段。渲染失败静默降级为纯文字站位锚点（fail-open）。
+                    from config import ENABLE_3D_BLOCKING_IMAGE
+                    _blocking_ref_path = ""
+                    if ENABLE_3D_BLOCKING_IMAGE:
+                        try:
+                            import te_3d_render
+                            if te_3d_render.available():
+                                _blk_out_dir = os.path.join(QC_DIR, project_name, "te3d_blocking")
+                                _blocking_ref_path = te_3d_render.render_blocking(
+                                    shot, _blk_out_dir,
+                                    aspect=":".join(map(str, _sb_style_res.get("ratio") or ("16", "9"))),
+                                    width=_sb_size[0],
+                                ) or ""
+                                if _blocking_ref_path:
+                                    app.logger.info("[3D导演台] shot=%s 站位基准图已渲染：%s",
+                                                     shot_id, os.path.basename(_blocking_ref_path))
+                                    item["_blocking_ref"] = _blocking_ref_path
+                                    # 插入为第一张参考图（<image1>），后续参考图序号后移
+                                    refs.insert(0, (_blocking_ref_path, "3D构图基准", _blocking_ref_path))
+                                    labels = [r[1] for r in refs]
+                        except Exception as _3d_e:  # noqa: BLE001
+                            app.logger.warning("[3D导演台] shot=%s 渲染失败（降级为纯文字站位）：%s",
+                                               shot_id, _3d_e)
+                            _blocking_ref_path = ""
+                    prompt = comfyui_client.build_storyboard_prompt(
+                        shot, labels,
+                        has_blocking_image=bool(_blocking_ref_path))
                     item["prompt"] = prompt
                     orig_prompt = prompt      # 教训库的稳定键：改写后的提示词不参与指纹
                     item["refs"] = {r[0]: os.path.basename(os.path.dirname(r[2])) for r in refs}
@@ -4780,6 +5084,11 @@ def _storyboard_worker(task_id: str, project_name: str, shots: list,
                     #   旧 bug：重试召回教训库以 orig_prompt（自愈前）为键，导致重试
                     #   回落到未自愈提示词，自愈修复被静默丢弃。
                     self_healed_prompt = prompt
+                    # G10b（2026-09-30）：第 1 次尝试的提示词也实时暴露（live.attempt=0）
+                    with lock:
+                        generation_state[task_id]["live"] = {
+                            "shot": shot_id, "attempt": 0, "prompt": prompt,
+                            "phase": "generating", "done": False}
 
                     # ---------- 图片 AI 质检（不达标自动重生成） ----------
                     # G13：qc_cfg/qc_on/qc_declared/max_retries 已在 worker 级读一次（见上方），
@@ -4846,6 +5155,11 @@ def _storyboard_worker(task_id: str, project_name: str, shots: list,
                                 generation_state[task_id]["phase"] = \
                                     f"质检不达标，修改提示词后重新生成（第 {attempt}/{max_retries} 次）"
                                 generation_state[task_id]["qc_phase"] = "regenerating"
+                                # G10b（2026-09-30）：改写后的提示词**实时**暴露给前端轮询。
+                                # 前端每 3s 拉 /api/generation/status/<task_id> 的 live 字段
+                                generation_state[task_id]["live"] = {
+                                    "shot": shot_id, "attempt": attempt + 1,
+                                    "prompt": prompt, "phase": "regenerating", "done": False}
                         result = comfyui_client.generate_storyboard(
                             prompt_zh=prompt,
                             ref_images=[r[2] for r in refs],
@@ -4891,11 +5205,30 @@ def _storyboard_worker(task_id: str, project_name: str, shots: list,
                         with lock:
                             generation_state[task_id]["phase"] = f"图片质检中（镜头 {shot_id} · 第 {attempt + 1} 次）"
                             generation_state[task_id]["qc_phase"] = "checking"
+                            # G10b：质检阶段同步暴露当前提示词（与生成阶段同一份）
+                            generation_state[task_id]["live"] = {
+                                "shot": shot_id, "attempt": attempt + 1,
+                                "prompt": prompt, "phase": "checking", "done": False}
+                        # ---- 景别后处理（C 方案，2026-09-30）：送检前若主体占比超出目标景别，自动裁剪 ----
+                        _shot_type = (shot.get("shot_type") or shot.get("camera") or "").strip()
+                        if _shot_type and os.path.isfile(scratch_png):
+                            try:
+                                _crop_res = qc_client.auto_crop_framing(scratch_png, _shot_type)
+                                if _crop_res.get("cropped") and os.path.isfile(_crop_res["out_path"]):
+                                    app.logger.info("[分镜质检] 景别自动裁剪 shot=%s: %s", shot_id, _crop_res["reason"])
+                                    scratch_png = _crop_res["out_path"]
+                            except Exception as _crop_e:  # noqa: BLE001
+                                app.logger.warning("[分镜质检] 景别自动裁剪失败（不阻断）shot=%s: %s", shot_id, _crop_e)
                         verdict = qc_client.check_image(
                             scratch_png, _qc_shot_desc(shot), qc_cfg,
                             style=(shot.get("style") or _sb_style),
                             ref_images=_qc_ref_images(
                                 shot, char_idx, item_idx, scene_idx, refs),
+                            blocking_ref=(item.get("_blocking_ref") or ""),
+                        # 预演图不再送检（见 qc_client.check_image 的说明），改送确定性文字规格；
+                        # 只有本镜确实该出基准图时才带（否则空串，等同于不加这段口径）。
+                        blocking_spec=(_blocking_spec_text(shot)
+                                        if (item.get("_blocking_ref") or "") else ""),
                             # ---- 跨镜连续性（P1，2026-09-25）----
                             # 只在**同场景**时给上一镜信息：跨场景切换本就该换背景换光，
                             # 拿上一镜去比会判出一堆假缺陷（与 keyframe.same_scene 同判据）。
@@ -5011,13 +5344,18 @@ def _storyboard_worker(task_id: str, project_name: str, shots: list,
                         item["qc"] = {"enabled": False, "status": "disabled",
                                       "label": "质检未开启", "attempts": 0, "regenerated": 0}
             except Exception as shot_err:
-                app.logger.error(f"镜头 {shot_id} 分镜图生成失败: {shot_err}")
+                import traceback as _tb
+                app.logger.error(f"镜头 {shot_id} 分镜图生成失败: {shot_err}\n{_tb.format_exc()}")
                 item["error"] = str(shot_err)
 
             manifest_shots.append(item)
             with lock:
                 generation_state[task_id]["results"].append(item)
                 generation_state[task_id]["progress"] = int((i + 1) / max(len(shots), 1) * 100)
+                # G10b（2026-09-30）：该镜收尾 → 标记 live 完成（前端据此区分「进行中/已定稿」）
+                _live = generation_state[task_id].get("live")
+                if isinstance(_live, dict) and _live.get("shot") == shot_id:
+                    _live["done"] = True
 
         ok = sum(1 for r in manifest_shots if r.get("success"))
         blocked = sum(1 for r in manifest_shots if r.get("qc_blocked"))
@@ -5363,6 +5701,21 @@ def api_storyboard_file(filename):
 
 # ===== 步骤6：视频生成 =====
 
+def _blocking_spec_text(shot: dict) -> str:
+    """本镜的**确定性构图规格**文字（3D 导演台），用于替代「无面人偶预演图」送质检。
+
+    背景：把预演图与成品图一起送视觉质检会严重污染判定（同一张合格图 88 → 35），
+    污染来自图像本身而非措辞，所以改送这段文字规格（人数/左右顺序/景别/机位）。
+    任何异常都返回空串 —— 构图规格绝不能影响质检主流程。
+    """
+    try:
+        import te_3d_director  # noqa: PLC0415
+        return te_3d_director.blocking_spec_text(shot)
+    except Exception as e:  # noqa: BLE001
+        app.logger.warning("[质检] 构图规格生成失败（不影响判定）：%s", e)
+        return ""
+
+
 def _collect_reference_images(character_refs: list, scene_refs: list) -> list:
     """把前端传来的参考图（可能是 /api/assets/... 的 HTTP 资源路径）解析为本地绝对路径
 
@@ -5636,6 +5989,27 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
 
         ref_imgs = _collect_reference_images(character_refs, scene_refs)
         main_char_img = _collect_reference_images(character_refs[:1], [])
+        # 参考图兜底（2026-10-01 实测补）：前端未传、或传了结构不完整的对象
+        # （例如直接传剧本 characters，只有 reference_prompt_zh 而无 front/base 键）时，
+        # 从磁盘资产目录自动收集 —— 与单镜重跑路径 (_video_retry_shot_impl) 同一口径。
+        # ⚠️ 主链路此前漏了这一步，后果是整集视频**一个角色锚点都拿不到**：
+        # 日志里那句「角色参考图不可用: 羡进 / 赵天霸」就是它，人物完全靠模型自由发挥，
+        # 正是「全片人物 OOC / 服装款式对不上设定图」的根因。这类静默降级不报错，
+        # 只能靠跑一遍全流程看日志才能发现。
+        if not main_char_img or not ref_imgs:
+            _auto_chars, _auto_scenes = _collect_asset_refs(project_name)
+            if not main_char_img:
+                character_refs = character_refs or _auto_chars
+                main_char_img = _collect_reference_images(character_refs[:1], [])
+            if not ref_imgs:
+                scene_refs = scene_refs or _auto_scenes
+                ref_imgs = _collect_reference_images(character_refs, scene_refs)
+            if main_char_img or ref_imgs:
+                app.logger.info("[视频] 参考图已由磁盘资产补齐：角色 %d / 合计 %d",
+                                len(main_char_img), len(ref_imgs))
+            else:
+                app.logger.warning("[视频] 磁盘资产目录里也没有可用参考图 —— 本集将无角色锚点生成，"
+                                   "人物一致性无法保证（检查 output/assets/characters/%s）", project_name)
         app.logger.info(f"视频参考图解析结果: {ref_imgs}；主角锚点: {main_char_img}")
 
         # B-18 P1-7：构建角色索引，供 _shot_segment 逐镜匹配参考图（与分镜链路口径对齐）
@@ -6060,6 +6434,87 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
                     "phase": f"整集 {len(segs)} 段一次生成（H3 原生衔接，整片 QC 门控）",
                     "segment_count": len(segs),
                 })
+            # ---------------- 两级生产（2026-09-29）：预演 → 批准 → 正式 ----------------
+            # 开关默认**关** → 整段跳过，行为与改造前一致。
+            # 打开后：本集还没有「被批准过的预演」时，只出一版低成本预演就返回，等人工
+            # 批准；批准后再跑一次才是正式生产。坏片在廉价档就被拦下，不必等几十分钟。
+            if preview_gate.enabled():
+                _pv_prefix = preview_gate.preview_prefix(
+                    f"comic_drama/{project_name}_{episode_tag or 'episode'}")
+                _pv_need, _pv_why = preview_gate.needs_preview(project_name, episode_tag)
+                if _pv_need:
+                    app.logger.info("[预演] 第%s集先出低成本预演（原因：%s）", episode_tag, _pv_why)
+                    with lock:
+                        generation_state[task_id].update({
+                            "phase": f"整集预演生成中（{len(segs)} 段 · 低分辨率 + 短时长）",
+                            "preview": True, "progress": 5})
+                    _pv_size = preview_gate.preview_size(_size)
+                    _pv_segs = preview_gate.preview_segments(segs)
+                    app.logger.info("[预演] 画幅 %s → %s；段数 %d（不变，每镜都看得到）",
+                                    _size, _pv_size, len(_pv_segs))
+                    _pv_res = None
+                    try:
+                        _pv_res = comfyui_client.generate_h3_sequence_sequential(
+                            segments=_pv_segs,
+                            filename_prefix=_pv_prefix,
+                            seed=comfyui_job_store.get_or_create_seed(
+                                f"preview|{project_name}|{episode_tag or 'episode'}",
+                                lambda: random.randint(1, 2 ** 31 - 1),
+                                live_key=f"h3|{_pv_prefix}"),
+                            timeout_per_segment=timeout_per_segment,
+                            size=_pv_size,
+                            qc_fn=_seg_qc_fn if qc_on else None,
+                            qc_cfg=qc_cfg,
+                            qc_style=eff_style,
+                            max_retries=0,      # 预演不重试：要改就重出一版预演
+                            common_refs=[c["path"] for c in _common if c.get("path")],
+                        )
+                    except Exception as _pv_err:                       # noqa: BLE001
+                        app.logger.error("[预演] 生成失败：%s", _pv_err, exc_info=True)
+                    _pv_files = (_pv_res or {}).get("files") or []
+                    if not _pv_files:
+                        with lock:
+                            generation_state[task_id].update({
+                                "status": "failed", "success_count": 0,
+                                "error": "预演生成失败（未产出可用文件）",
+                                "results": [{"success": False, "mode": "episode",
+                                             "preview": True, "segment_count": 0,
+                                             "error": "预演生成失败"}]})
+                        return
+                    os.makedirs(videos_dir, exist_ok=True)
+                    _pv_dst = os.path.join(
+                        videos_dir,
+                        f"{episode_tag or 'episode'}{preview_gate.PREVIEW_MARK}1.mp4")
+                    try:
+                        shutil.move(_pv_files[0], _pv_dst)
+                    except Exception as _pv_mv:                        # noqa: BLE001
+                        app.logger.warning("[预演] 产物迁移失败（沿用原路径）：%s", _pv_mv)
+                        _pv_dst = _pv_files[0]
+                    # 预演也记四层状态：A 层判技术完成，B 层取本次质检结论（若送检）
+                    try:
+                        quality_stage.record_stage(
+                            project_name, episode_tag, "A",
+                            quality_stage.evaluate_technical(_pv_dst).get("status") or "pending",
+                            evidence={"preview": True, "path": _pv_dst})
+                        _pv_qc = (_pv_res or {}).get("qc_results") or []
+                        if _pv_qc:
+                            quality_stage.record_stage(
+                                project_name, episode_tag, "B",
+                                quality_stage.evaluate_content(_pv_qc[-1]).get("status")
+                                or "pending", evidence={"preview": True})
+                    except Exception as _pv_qs:                        # noqa: BLE001
+                        app.logger.warning("[预演] 质量状态记录失败（忽略）：%s", _pv_qs)
+                    with lock:
+                        generation_state[task_id].update({
+                            "status": "awaiting_preview_approval", "progress": 100,
+                            "phase": "预演已生成，等待人工批准后再生产正式成片",
+                            "results": [{"success": True, "mode": "episode",
+                                         "preview": True, "deliverable": False,
+                                         "file": _pv_dst, "segment_count": len(_pv_segs),
+                                         "approve_hint": "批准预演后重新生成本集，即产出正式成片"}]})
+                    app.logger.info("[预演] 已产出预演（不可交付）：%s", _pv_dst)
+                    return
+
             app.logger.info(f"[episode] 整集生成开始：{len(segs)} 段，qc_on={qc_on}，max_retries={max_retries}")
 
             result = comfyui_client.generate_h3_sequence_sequential(
@@ -6645,6 +7100,41 @@ def api_watermark_config_save():
                                else "视频水印已关闭（成片不会带水印）"})
 
 
+@app.route('/api/prompt_enhance/config', methods=['GET', 'POST'])
+def api_prompt_enhance_config():
+    """提示词增强总开关（前端「AI 配置」页的开关）。
+
+    - GET  返回当前生效值 + 各来源（env 覆盖 / 文件开关 / 代码默认），让页面如实标注状态；
+    - POST body {enhance_enabled?, review_enabled?} 写文件级开关，**立即生效、无需重启**：
+      prompt_enhance.enhance_enabled()/review_enabled() 每次调用都重读该文件。
+      优先级：env（MJSCXT_PROMPT_ENHANCE / MJSCXT_PROMPT_MODEL_REVIEW，运维最高）> 文件 > 代码默认。
+    """
+    import prompt_enhance
+    if request.method == "POST":
+        data = request.json or {}
+        if not any(k in data for k in ("enhance_enabled", "review_enabled")):
+            return jsonify({"success": False, "error": "缺少 enhance_enabled / review_enabled"}), 400
+        cfg = save_prompt_enhance_config(data)
+    else:
+        cfg = _prompt_enhance_file_flags()
+    flags = _prompt_enhance_file_flags()
+    return jsonify({
+        "success": True,
+        "config": cfg,
+        "file_config": flags,
+        "effective": {
+            "enhance_enabled": prompt_enhance.enhance_enabled(),
+            "review_enabled": prompt_enhance.review_enabled(),
+        },
+        "env_overridden": {
+            "enhance": os.environ.get("MJSCXT_PROMPT_ENHANCE", "").strip() != "",
+            "review": os.environ.get("MJSCXT_PROMPT_MODEL_REVIEW", "").strip() != "",
+        },
+        "config_path": os.path.abspath(PROMPT_ENHANCE_CONFIG_PATH),
+        "message": "提示词增强开关已保存，立即对后续生成生效（无需重启）",
+    })
+
+
 @app.route('/api/watermark/apply', methods=['POST'])
 def api_watermark_apply():
     """对指定视频烧写水印（手动单段验证用）。body: video_path / project_name / config(临时覆盖)"""
@@ -7179,7 +7669,8 @@ AI_MODULE_LABEL = {m: ai_config.MODULE_META[m]["label"] for m in AI_MODULES}
 
 def _ai_client_for_module(module: str, base_url: str = None, api_key: str = None,
                           model: str = None, timeout: int = None,
-                          reasoning_effort: str = None) -> LLMClient:
+                          reasoning_effort: str = None,
+                          with_fallbacks: bool = True) -> LLMClient:
     """构造某个 AI 模块的客户端；传参可用于「测试连接」（不落盘）
 
     ⚠️ reasoning_effort 必须一起透传：它决定请求体注入哪个思考档位。
@@ -7200,7 +7691,34 @@ def _ai_client_for_module(module: str, base_url: str = None, api_key: str = None
     if not (ep["base_url"] and ep["api_key"] and ep["model"]):
         raise LLMError(f"「{AI_MODULE_LABEL.get(module, module)}」尚未配置"
                        "（base_url / api_key / model 均为必填）")
-    return LLMClient(AI_CONFIG_PATH, config=ep, timeout=timeout or LLM_REQUEST_TIMEOUT)
+    primary = LLMClient(AI_CONFIG_PATH, config=ep, timeout=timeout or LLM_REQUEST_TIMEOUT)
+    # 备用模型故障转移链（顺序即优先级）：主模型连续 3 次 API 报错自动切备用，
+    # 任务继续跑不中断；备用全挂才抛错。缺密钥的备用跳过。
+    _fb_clients = []
+    _fb_labels = []
+    # ⚠️ 2026-09-30 修复：这里原本读的是 `ep.get("fallbacks")`，而 `ep` 是上面刚拼出来的
+    # 四字段字典（base_url/api_key/model/reasoning_effort），**从来不含 fallbacks** ——
+    # 于是这个循环永远拿不到备用模型，故障转移链从来就没被构造过，
+    # 「备用模型」在配置页配了也完全不生效（实测：配好后 _ai_client_for_module 仍返回裸 LLMClient）。
+    # 正确来源是 saved（ai_config.get_module 返回的完整模块视图，含已解密的备用密钥）。
+    for _fb in (saved.get("fallbacks") or []):
+        if not (_fb.get("base_url") and _fb.get("model") and _fb.get("api_key")):
+            continue
+        _fb_clients.append(LLMClient(AI_CONFIG_PATH, config={
+            "base_url": _fb["base_url"], "api_key": _fb["api_key"],
+            "model": _fb["model"],
+            "reasoning_effort": _fb.get("reasoning_effort") or "",
+        }, timeout=timeout or LLM_REQUEST_TIMEOUT))
+        _fb_labels.append(_fb.get("label") or _fb.get("model") or "备用")
+    # with_fallbacks=False 用于「测试连接」：探针只应该测**这一个端点**。
+    # ⚠️ 2026-10-01 实测：修好 fallbacks 取值来源之后，探针也把故障转移链带上了 ——
+    # 于是点一次「测试连接」会先连挂主模型 3 次、再切备用连挂 3 次（各带退避），
+    # 在限速网关上要几分钟才返回；用户侧表现为「点了测试没反应、什么信息都不显示」。
+    # 按索引测某条备用时更荒谬：primary 与备用是同一个端点，等于把同一个地址连测 6 次。
+    if _fb_clients and with_fallbacks:
+        return FailoverLLMClient([primary] + _fb_clients,
+                                 labels=["主模型"] + _fb_labels, module=module)
+    return primary
 
 
 def _ai_gate_or_400(action: str, probe: bool = True):
@@ -7453,9 +7971,13 @@ def _save_ai_module(data: dict):
     if keep and not old.get("api_key"):
         return jsonify({"success": False, "error": "该模块首次配置必须填写 api_key"}), 400
 
+    # 备用模型（故障转移链）：字段缺失 = 不改动；传 list = 整体覆盖
+    has_fallbacks = "fallbacks" in data
+    _fb = data.get("fallbacks") if has_fallbacks else None
     cfg = ai_config.save_module(AI_CONFIG_PATH, module, base_url=base_url, model=model,
                                 api_key=None if keep else key, legacy_path=LLM_CONFIG_PATH,
-                                reasoning_effort=(reasoning_effort if has_reasoning_effort else None))
+                                reasoning_effort=(reasoning_effort if has_reasoning_effort else None),
+                                fallbacks=_fb)
     # ⭐ 凭证单一事实源由 `ai_config.save_module` **内部**镜像闭合（json + 加密库 + tasks.db
     # 一次写完，见其 `_mirror_credentials_db` 长注释）—— 这里不再重复写库，只**读回核对**，
     # 避免同一份值有两个写点（将来谁改一处就会漂移）。核对能抓到「接口返回成功但写没落地」
@@ -7598,15 +8120,34 @@ def api_ai_test():
 
     cfg = ai_config.load_config(AI_CONFIG_PATH, LLM_CONFIG_PATH)
     saved = ai_config.get_module(cfg, module)
-    base_url = (data.get("base_url") or saved["base_url"] or "").strip()
-    model = (data.get("model") or saved["model"] or "").strip()
+    # 备用模型「测试连接」：前端拿不到已保存备用的明文密钥（对外视图恒脱敏），
+    # 所以按 fallback_index 在**服务端**取那条备用的完整配置（含解密后的 key）再探。
+    # 显式传了 base_url/model/api_key 时以显式值为准（用于「还没保存」的草稿条目）。
+    _fb = None
+    _fb_idx_raw = data.get("fallback_index")
+    if _fb_idx_raw is not None and str(_fb_idx_raw).strip() != "":
+        try:
+            _fbs_saved = saved.get("fallbacks") or []
+            _fb_i = int(_fb_idx_raw)
+            if 0 <= _fb_i < len(_fbs_saved):
+                _fb = _fbs_saved[_fb_i]
+        except (TypeError, ValueError):
+            _fb = None
+        if _fb is None:
+            return jsonify({"success": False, "module": module,
+                            "error": f"备用模型 #{_fb_idx_raw} 不存在（可能已被删除），请刷新页面后重试"}), 400
+    _fb_base = str((_fb or {}).get("base_url") or "").strip()
+    _fb_model = str((_fb or {}).get("model") or "").strip()
+    _fb_key = str((_fb or {}).get("api_key") or "").strip()
+    base_url = (data.get("base_url") or _fb_base or saved["base_url"] or "").strip()
+    model = (data.get("model") or _fb_model or saved["model"] or "").strip()
     api_key = data.get("api_key")
     if not api_key or not str(api_key).strip() or "*" in str(api_key):
-        api_key = saved["api_key"] or ""
-    # 思考档位：页面暂存值优先，否则沿用已保存值（必须带上，见 _ai_client_for_module 的说明）
+        api_key = _fb_key or saved["api_key"] or ""
+    # 思考档位：页面暂存值优先，否则沿用该备用 / 主模型的已保存值
     _re = data.get("reasoning_effort")
     if _re is None:
-        _re = saved.get("reasoning_effort") or ""
+        _re = (_fb or {}).get("reasoning_effort") or saved.get("reasoning_effort") or ""
     ep = {"base_url": base_url, "api_key": str(api_key).strip(), "model": model,
           "reasoning_effort": str(_re).strip()}
     if not (ep["base_url"] and ep["api_key"] and ep["model"]):
@@ -7628,9 +8169,12 @@ def api_ai_test():
         # 此前这里自建 LLMClient(AI_CONFIG_PATH, config=ep)，运行态走 _ai_client_for_module，
         # 两边各写一份「参数取谁 / reasoning_effort 怎么注入 / 默认超时多少」的推导 ——
         # 一旦分叉就是「测试连接通过、运行时行为不一致」的经典温床。现在只此一条路径。
+        # with_fallbacks=False：测试连接必须**只测这一个端点**（详见 _ai_client_for_module 的说明）。
+        # 运行态照旧带备用链，两者在「参数推导」上仍然同源，只是探针不参与故障转移。
         client = _ai_client_for_module(
             module, base_url=ep["base_url"], api_key=ep["api_key"], model=ep["model"],
-            timeout=int(data.get("timeout") or 60), reasoning_effort=ep["reasoning_effort"])
+            timeout=int(data.get("timeout") or 60), reasoning_effort=ep["reasoning_effort"],
+            with_fallbacks=False)
         result = dict(client.test_connection() or {})
     except LLMError as e:
         # 与运行态同一个报错：未配置时的提示语完全一致，不再出现"测试说没问题、跑起来报未配置"
@@ -8444,6 +8988,22 @@ def _optimize_prompt_from_qc(kind: str, prompt: str, rec: dict, style: str = "")
             "4. 不要新增与问题无关的内容，不要改变原有画面主体；\n"
             "5. 修正要具体可执行（例如「去掉文字」就写「画面中不得出现任何文字/字幕/水印」）。"
         )
+        # ⚠️ 2026-10-01 实测：参考图重试的优化器会写出与资产图**不变量**冲突的要求 ——
+        # 实测输出「特写镜头，画面核心为黑色玉盒及其内部丹药，严禁全白纯色背景」，
+        # 而守卫函数随后又追加「，纯白背景，…」→ 同一份提示词里出现矛盾指令，模型必然摇摆
+        # （那一轮同时被「承托物」和「桌面/阴影」两条判据拦下就是因此）。
+        # 这里把不变量写进系统提示，并要求它**不得写入与之冲突的措辞**。
+        if kind == "asset":
+            system += (
+                "\n\n【不可违背的参考图不变量（优先级高于上面全部要求）】\n"
+                "1. 纯白背景：画面里不得出现场景、地面、桌面、墙面、投影、背景纹理或任何环境元素；"
+                "严禁写入「不要纯白背景 / 严禁全白纯色背景 / 加上场景或桌面」这类**与不变量冲突**的要求。\n"
+                "2. 物品参考图只呈现**物品本体**：不得出现容器、托盘、盒子、底座、支架、展示台、"
+                "碗碟、绸布等任何承托物，不得把物品放进或放在别的物体内部/上方，不得出现手或人物；"
+                "严禁把「某个容器」（例如黑色玉盒）写成画面核心或主体。\n"
+                "3. 角色参考图保持多视图横排、完整入画，不改变五官与服装。\n"
+                "4. 只修补质检列出的问题，**不得引入任何新物体、新容器、新场景元素**。"
+            )
         user = (
             f"原提示词：\n{prompt.strip()}\n\n"
             f"质检判定不达标的问题：\n{issues_text}"
@@ -9162,7 +9722,9 @@ def api_qc_audio():
     source = str(data.get('source') or '').strip().lower()
     target, why = '', ''
     if raw_path:
-        cand = os.path.abspath(os.path.join(PROJECT_ROOT_DIR, raw_path)) \
+        # 相对路径挂到**数据根**（output/ 就在它下面）：frozen 时 PROJECT_ROOT_DIR 是
+        # _MEIPASS（只读资源区），拿它当基址会让下面 output/ 的包含性校验恒不通过。
+        cand = os.path.abspath(os.path.join(PROJECT_DATA_DIR, raw_path)) \
             if not os.path.isabs(raw_path) else os.path.abspath(raw_path)
         root = os.path.abspath(PROJECT_OUTPUT_DIR)
         # 只允许检查 output/ 内的产物：这是「回显用户自己的成品」，不是任意文件读取接口
@@ -10432,6 +10994,98 @@ def _episode_progress(project_name: str, episode_no: int, shot_count: int = 0) -
     }
 
 
+# ===================== 前置解析（chapter pre-flight）=====================
+
+@app.route('/api/novels/<novel_id>/chapters/<int:chapter_index>/preflight', methods=['POST'])
+def api_novel_chapter_preflight(novel_id, chapter_index):
+    """单章前置解析：输出人物档案 + 故事梗概 + 关键事件 + 人物情绪。
+
+    结果落盘到 output/continuity/<项目键>/preflight/第N章.json，
+    并将人物档案并入 bible.json（锁定角色，防止全片 OOC）。
+
+    body: { force?: bool }  force=true 覆盖已有结果
+    返回: { success, chapter_index, result, path, bible_added, bible_updated }
+    """
+    try:
+        meta = get_novel(NOVELS_DIR, novel_id)
+    except NovelParseError as e:
+        return jsonify({"success": False, "error": str(e)}), 404
+
+    client = _current_llm_client()
+    if not client.configured:
+        return _ai_guide_response("尚未配置自定义 AI 接口，无法执行前置解析")
+
+    all_chapters = meta.get("chapters") or []
+    target = next((c for c in all_chapters if int(c.get("index") or 0) == int(chapter_index)), None)
+    if not target:
+        return jsonify({"success": False,
+                        "error": f"章节 {chapter_index} 不存在（共 {len(all_chapters)} 章）"}), 404
+
+    data = request.json or {}
+    proj = _resolve_novel_project(data, meta)
+    key = _novel_key(meta, proj["dir_key"])
+    _full_text = read_novel_text(NOVELS_DIR, meta["novel_id"])
+    ch_text = _full_text[int(target.get("start") or 0):int(target.get("end") or 0)]
+
+    try:
+        result = chapter_preflight.preflight_analyze(
+            client,
+            meta.get("title") or meta.get("name") or "",
+            int(chapter_index),
+            target.get("title") or f"第{chapter_index}章",
+            ch_text,
+        )
+    except LLMError as e:
+        return jsonify({"success": False, "error": f"LLM 解析失败：{e}"}), 500
+    except Exception as e:  # noqa: BLE001
+        app.logger.exception("前置解析异常（章节 %s）", chapter_index)
+        return jsonify({"success": False, "error": f"解析异常：{e}"}), 500
+
+    path = chapter_preflight.save_preflight(CONTINUITY_DIR, key, result)
+    bible_merge = chapter_preflight.merge_to_bible(CONTINUITY_DIR, key, result)
+
+    return jsonify({
+        "success": True,
+        "chapter_index": int(chapter_index),
+        "chapter_title": result.get("chapter_title"),
+        "result": result,
+        "path": path,
+        "project_key": key,
+        "bible_added": bible_merge.get("added") or [],
+        "bible_updated": bible_merge.get("updated") or [],
+        "characters": len(result.get("characters") or []),
+        "key_events": len(result.get("key_events") or []),
+    })
+
+
+@app.route('/api/novels/<novel_id>/chapters/<int:chapter_index>/preflight', methods=['GET'])
+def api_novel_chapter_preflight_get(novel_id, chapter_index):
+    """读取某章已有前置解析结果；不存在返回 {exists: false}"""
+    try:
+        meta = get_novel(NOVELS_DIR, novel_id)
+    except NovelParseError as e:
+        return jsonify({"success": False, "error": str(e)}), 404
+    proj = _resolve_novel_project({}, meta)
+    key = _novel_key(meta, proj["dir_key"])
+    result = chapter_preflight.load_preflight(CONTINUITY_DIR, key, int(chapter_index))
+    if not result:
+        return jsonify({"exists": False, "chapter_index": int(chapter_index)})
+    return jsonify({"exists": True, "chapter_index": int(chapter_index), "result": result})
+
+
+@app.route('/api/novels/<novel_id>/preflight/list', methods=['GET'])
+def api_novel_preflight_list(novel_id):
+    """列出该小说（项目）所有已完成前置解析的章节号"""
+    try:
+        meta = get_novel(NOVELS_DIR, novel_id)
+    except NovelParseError as e:
+        return jsonify({"success": False, "error": str(e)}), 404
+    proj = _resolve_novel_project({}, meta)
+    key = _novel_key(meta, proj["dir_key"])
+    indices = chapter_preflight.list_preflight(CONTINUITY_DIR, key)
+    return jsonify({"success": True, "chapter_indices": indices, "count": len(indices)})
+
+
 @app.route('/api/episodes/<novel_id>', methods=['GET'])
 def api_list_episodes(novel_id):
     """某小说已生成的剧集清单（含从磁盘产物推导的真实状态与进度）"""
@@ -10472,6 +11126,61 @@ def api_list_episodes(novel_id):
         "episode_dir": os.path.abspath(os.path.join(SCRIPT_DIR, key)),
         "episodes": episodes,
     })
+
+
+@app.route('/api/episodes/<novel_id>/<int:episode_no>', methods=['PUT'])
+def api_update_episode(novel_id, episode_no):
+    """修改单集剧本（shot.description / motion / emotion / camera 等字段）。
+
+    payload: {"shots": [{"shot_id": 2, "description": "...", "motion": "...", ...}, ...]}
+    按 shot_id 匹配后合并字段（只更新 payload 里出现的 key，不整镜替换）。
+    落盘前备份原始剧本到 .bak；任何失败 fail-closed（不写盘）。
+    """
+    try:
+        meta = get_novel(NOVELS_DIR, novel_id)
+    except NovelParseError as e:
+        return jsonify({"success": False, "error": str(e)}), 404
+    pref = (request.args.get('project_id') or request.args.get('project_name') or '').strip()
+    proj = project_store.get_project(pref) if pref else project_store.find_by_novel(novel_id)
+    key = _novel_key(meta, proj["dir_key"] if proj else None)
+    script_path = novel_to_script.episode_script_path(SCRIPT_DIR, key, episode_no)
+    if not os.path.isfile(script_path):
+        return jsonify({"success": False, "error": f"剧本文件不存在：{script_path}"}), 404
+    try:
+        with open(script_path, "r", encoding="utf-8") as f:
+            script = json.load(f)
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"success": False, "error": f"剧本读取失败：{e}"}), 500
+    data = request.json or {}
+    updates = data.get("shots") or []
+    if not updates:
+        return jsonify({"success": False, "error": "没有要修改的镜头"}), 400
+    _ALLOWED = ("description", "visual_detail", "motion", "emotion", "edit_reason",
+                "beat", "camera", "camera_motion", "shot_type", "duration", "audio_cues")
+    shots = script.get("shots") or []
+    by_id = {str(s.get("shot_id")): s for s in shots}
+    changed = 0
+    for up in updates:
+        sid = str((up or {}).get("shot_id", ""))
+        target = by_id.get(sid)
+        if target is None:
+            continue
+        for fld in _ALLOWED:
+            if fld in up and up[fld] is not None:
+                target[fld] = up[fld]
+                changed += 1
+    if changed == 0:
+        return jsonify({"success": False, "error": "没有匹配到任何镜头（shot_id 对不上）"}), 400
+    bak = script_path + ".bak"
+    if not os.path.isfile(bak):
+        import shutil as _shutil
+        _shutil.copy2(script_path, bak)
+    with open(script_path, "w", encoding="utf-8") as f:
+        json.dump(script, f, ensure_ascii=False, indent=2)
+    app.logger.info("[剧本编辑] novel=%s ep=%s 更新了 %d 个字段（shot_ids=%s）",
+                   novel_id, episode_no, changed,
+                   [str((u or {}).get("shot_id")) for u in updates])
+    return jsonify({"success": True, "changed": changed, "script_path": script_path})
 
 
 @app.route('/api/episodes/<novel_id>/<int:episode_no>', methods=['GET'])
@@ -11968,6 +12677,14 @@ def register_final_deliverable(project_name: str, episode_no, video_path: str,
 
     返回 {"registered": bool, "reason": str, "stats": {...}, "item": {...}}
     """
+    # 铁律（2026-09-29）：预演产物**永不可交付**。这里给一个**友好拒绝**（不抛异常），
+    # 让调用方能直接把原因显示给用户；同一不变量在 pipeline.record_deliverable 上还有
+    # 一道硬闸门（防绕过）。
+    _ok, _why = preview_gate.deliverable_ok(video_path)
+    if not _ok:
+        app.logger.error("[预演拦截] 拒绝把非正式产物登记为成片（%s）：%s",
+                         os.path.basename(str(video_path or "")), _why)
+        return {"registered": False, "reason": _why, "stats": {}, "preview_blocked": True}
     if not video_path or not os.path.exists(video_path):
         return {"registered": False, "reason": "成片文件不存在", "stats": {}}
     try:
@@ -12422,9 +13139,13 @@ def _handle_bad_request(e):
 @app.route('/api/autopilot/status', methods=['GET'])
 @_autopilot_guard
 def api_autopilot_status():
-    """托管总览：开关状态、当前在做什么、待验收数、异常数、24h 生产曲线"""
+    """托管总览：开关状态、当前在做什么、待验收数、异常数、24h 生产曲线
+
+    brief=1：只回状态判断必要的短字段（AI 总控用；见 autopilot.status 的 brief 说明）。
+    """
     project = request.args.get("project", "").strip()
-    return jsonify({"success": True, **autopilot.status(project)})
+    brief = str(request.args.get("brief") or "").strip().lower() in ("1", "true", "yes", "on")
+    return jsonify({"success": True, **autopilot.status(project, brief=brief)})
 
 
 @app.route('/api/autopilot/ready', methods=['GET'])
@@ -12611,6 +13332,380 @@ def api_autopilot_review():
         return jsonify({"success": False, "error": f"未找到 {project} 第{ep}集的成片记录"}), 404
     return jsonify({"success": True, "item": item})
 
+@app.route('/api/videos/preview/approve', methods=['POST'])
+def api_video_preview_approve():
+    """批准某集预演 → 之后重新生成本集即走**正式**生产（两级生产第二阶段）。
+
+    批准会绑定该预演产物的哈希（见 preview_gate.approve）：预演被重出一版，
+    旧批准自动失效，避免「批的是上一版预演」。
+    """
+    data = request.json or {}
+    project, err = _project_or_400(
+        data.get('project') or data.get('project_name') or '', field_name="project")
+    if err is not None:
+        return err
+    ep = data.get('episode_no') or 1
+    path = str(data.get('path') or '')
+    if not path:
+        # 没传路径 → 在该集视频目录里找预演产物（文件名带 PREVIEW_MARK）
+        try:
+            _d = _ep_dir(os.path.join(VIDEOS_DIR, project), ep)
+            _cand = [os.path.join(_d, f) for f in sorted(os.listdir(_d))
+                     if preview_gate.is_preview_path(f)] if os.path.isdir(_d) else []
+            path = _cand[-1] if _cand else ''
+        except Exception as e:                                       # noqa: BLE001
+            app.logger.warning("查找预演产物失败：%s", e)
+    if not path or not os.path.isfile(path):
+        return jsonify({"success": False,
+                        "error": "未找到该集的预演产物（请先生成预演）"}), 404
+    state = preview_gate.approve(project, ep, path, note=str(data.get('note') or ''))
+    app.logger.info("[预演] 已批准：%s 第%s集 → %s", project, ep, os.path.basename(path))
+    return jsonify({"success": True, "preview": state, "path": path})
+
+
+# =====================================================================
+# 四层质量状态 · 审片接口（2026-09-29，C/D 层的人工并排复核）
+# =====================================================================
+# 数据口径与生成链路完全一致（零新管道）：
+#   逐镜视频   /api/videos/<项目>/epNN/shot_XX.mp4          （VIDEOS_DIR）
+#   分镜图     /api/storyboards/file/<项目>/shot_XX.png      （合同侧的「预期画面」）
+#   抽帧       /api/qc/frames/...                            （送检时已抽好）
+#   逐镜质检   qc_client.read_history(QC_DIR, 项目, "video", 镜号)
+#   镜头契约   _load_script_for（shot_id/duration/description/...）
+#   参考资产   /api/assets/<characters|items|scenes>/<项目>/<名称>/<图>
+#
+# C/D 的「通过」必须绑定当刻产物 + 合同（哈希）：重渲一集或改剧本后批准自动失效，
+# 由 GET 接口的 stale 字段带回界面 —— 否则界面会显示「已批准」，实际批的是上一版。
+
+def _quality_video_url(local_path: str) -> str:
+    """本地视频路径 → /api/videos URL；出了 VIDEOS_DIR 就不给 URL（防穿越）。"""
+    if not local_path:
+        return ""
+    try:
+        rel = os.path.relpath(local_path, VIDEOS_DIR)
+    except (ValueError, TypeError):
+        return ""
+    if rel.startswith(".."):
+        return ""
+    return "/api/videos/" + rel.replace(os.sep, "/")
+
+
+def _quality_asset_url(kind: str, project: str, name: str) -> str:
+    """资产名 → 第一张可用图的 URL（front/base 优先，与生成链路取图同口径）。"""
+    d = os.path.join(PROJECT_OUTPUT_DIR, "assets", kind, project, str(name))
+    if not os.path.isdir(d):
+        return ""
+    try:
+        files = sorted(f for f in os.listdir(d)
+                       if f.lower().endswith((".png", ".jpg", ".jpeg", ".webp")))
+    except OSError:
+        return ""
+    if not files:
+        return ""
+    pick = files[0]
+    for prio in ("front", "base"):
+        hit = next((x for x in files if x.lower().startswith(prio)), "")
+        if hit:
+            pick = hit
+            break
+    return "/api/assets/%s/%s/%s/%s" % (kind, project, name, pick)
+
+
+def _quality_storyboard_url(project: str, seq: int) -> str:
+    """分镜图 URL（并排审片「合同侧」的预期画面）；无图给空串。"""
+    fn = "shot_%02d.png" % seq
+    if os.path.isfile(os.path.join(STORYBOARDS_DIR, project, fn)):
+        return "/api/storyboards/file/%s/%s" % (project, fn)
+    return ""
+
+
+def _quality_refs_for_shot(project: str, shot: dict) -> list:
+    """本镜参考资产（角色/物品/场景）→ 可显示的图列表。"""
+    refs = []
+
+    def _add(kind, names):
+        for n in (names or []):
+            if not n:
+                continue
+            u = _quality_asset_url(kind, project, n)
+            if u:
+                refs.append({"kind": kind, "name": str(n), "url": u})
+
+    _add("characters", shot.get("characters_in_shot"))
+    _add("items", shot.get("items_in_shot"))
+    loc = shot.get("location") or shot.get("scene")
+    if loc:
+        u = _quality_asset_url("scenes", project, loc)
+        if u:
+            refs.append({"kind": "scenes", "name": str(loc), "url": u})
+    return refs
+
+
+def _quality_ep_numbers(project: str) -> list:
+    """项目集号 = 剧本集 ∪ 视频产物集（任一侧有就列出，旧项目缺剧本也能审）。"""
+    nums = set()
+    try:
+        key = project_store.safe_key(project)
+        for ep in (novel_to_script.list_episodes(SCRIPT_DIR, key) or []):
+            try:
+                nums.add(int(ep.get("episode_no")))
+            except (TypeError, ValueError):
+                pass
+    except Exception as e:                                   # noqa: BLE001
+        app.logger.debug("剧本集列表读取失败：%s", e)
+    vroot = os.path.join(VIDEOS_DIR, project)
+    try:
+        entries = os.listdir(vroot) if os.path.isdir(vroot) else []
+    except OSError:
+        entries = []
+    if any(f.lower().endswith((".mp4", ".mov", ".mkv")) for f in entries):
+        nums.add(1)
+    for d in entries:
+        m = re.match(r"^ep(\\d+)$", d)
+        if m and os.path.isdir(os.path.join(vroot, d)):
+            nums.add(int(m.group(1)))
+    return sorted(nums)
+
+
+def _quality_find_full(project: str, ep) -> str:
+    """该集整集成片（播放与批准绑定都认它）；无则空串。"""
+    d = _ep_read_dir(VIDEOS_DIR, project, ep)
+    if not os.path.isdir(d):
+        return ""
+    try:
+        fps = sorted(f for f in os.listdir(d)
+                     if f.lower().endswith(".mp4") and "_full" in f.lower())
+    except OSError:
+        return ""
+    if not fps:
+        return ""
+    try:
+        tag = "ep%02d" % int(ep)
+    except (TypeError, ValueError):
+        tag = ""
+    for f in fps:
+        if tag and f.lower().startswith(tag):
+            return os.path.join(d, f)
+    return os.path.join(d, fps[0])
+
+
+def _quality_find_preview(project: str, ep) -> dict:
+    """该集预演产物（两级生产第一阶段的输出，不可交付）。"""
+    d = _ep_read_dir(VIDEOS_DIR, project, ep)
+    try:
+        if os.path.isdir(d):
+            for fn in sorted(os.listdir(d)):
+                if preview_gate.is_preview_path(fn):
+                    p = os.path.join(d, fn)
+                    return {"exists": True, "name": fn, "url": _quality_video_url(p)}
+    except OSError as e:                                     # noqa: BLE001
+        app.logger.warning("扫描预演产物失败：%s", e)
+    return {"exists": False, "name": "", "url": ""}
+
+
+def _quality_contract_summary(project: str, ep) -> dict:
+    """合同的稳定摘要（批准时进哈希；镜头数/时长被改 → 批准失效）。"""
+    scr = _load_script_for(project, ep) or {}
+    shots = [s for s in (scr.get("shots") or []) if isinstance(s, dict)]
+    return {"shots_total": int(scr.get("shot_count") or len(shots)),
+            "duration_sec": float(scr.get("episode_duration_sec") or 0),
+            "shots": [[shot_key.shot_seq(s.get("shot_id"), i + 1), s.get("duration")]
+                      for i, s in enumerate(shots)]}
+
+
+def _quality_state_view(project: str, ep) -> dict:
+    """四层状态 + 发布就绪判定 + 批准是否已被重渲作废（界面的唯一口径）。"""
+    state = quality_stage.load_state(project, ep)
+    full = _quality_find_full(project, ep)
+    stages, stale, blockers_extra = {}, {}, []
+    for s in quality_stage.STAGES:
+        e = (state.get("stages") or {}).get(s) or {}
+        stages[s] = {"status": e.get("status") or "pending",
+                     "name": e.get("name") or quality_stage.STAGE_NAMES[s],
+                     "label": e.get("label") or quality_stage.STAGE_LABELS[s],
+                     "at": e.get("at") or "", "note": e.get("note") or "",
+                     "has_binding": bool(e.get("binding"))}
+        # 批准已过期检测：C/D 通过过、但产物已不是批准时那一份
+        if s in ("C", "D") and stages[s]["status"] == "passed" and e.get("binding"):
+            bstatus, breason = quality_stage.check_stage_binding(state, s, full)
+            if bstatus == "invalid":
+                stale[s] = breason
+                blockers_extra.append("%s(%s) 批准已失效：%s"
+                                      % (s, quality_stage.STAGE_NAMES[s], breason))
+    _ready, blockers = quality_stage.release_ready(state)
+    blockers = list(blockers) + blockers_extra
+    ready = not [r for r in blockers if not r.startswith("提示：")]
+    return {"stages": stages, "release": {"ready": ready, "blockers": blockers},
+            "stale": stale, "updated_at": state.get("updated_at") or ""}
+
+
+def _quality_episode_row(project: str, ep) -> dict:
+    """单集摘要行（审片左栏）。"""
+    scr = _load_script_for(project, ep) or {}
+    full = _quality_find_full(project, ep)
+    sv = _quality_state_view(project, ep)
+    review = {}
+    try:
+        for d in pipeline.list_deliverables(project):
+            try:
+                if int(d.get("episode_no") or 0) == int(ep):
+                    review = {"status": d.get("review") or "pending",
+                              "stale": bool(d.get("approval_stale")),
+                              "exists": bool(d.get("exists"))}
+                    break
+            except (TypeError, ValueError):
+                continue
+    except Exception as e:                                   # noqa: BLE001
+        app.logger.debug("交付物状态读取失败：%s", e)
+    return {"episode_no": int(ep),
+            "title": scr.get("episode_title") or scr.get("title") or "",
+            "shots_total": int(scr.get("shot_count") or len(scr.get("shots") or [])),
+            "duration_sec": float(scr.get("episode_duration_sec") or 0),
+            "state": sv["stages"], "release": sv["release"], "stale": sv["stale"],
+            "artifact": {"exists": bool(full),
+                         "name": os.path.basename(full) if full else "",
+                         "url": _quality_video_url(full)},
+            "review": review, "preview": _quality_find_preview(project, ep)}
+
+
+@app.route('/api/quality/episodes', methods=['GET'])
+def api_quality_episodes():
+    """集列表 + 每集四层状态（审片界面左栏）。"""
+    raw = (request.args.get('project') or '').strip()
+    if not raw:
+        return jsonify({"success": False, "error": "缺少 project 参数"}), 400
+    project = _safe_project(raw)
+    rows = [_quality_episode_row(project, e) for e in _quality_ep_numbers(project)]
+    return jsonify({"success": True, "project": project, "episodes": rows,
+                    "count": len(rows),
+                    "summary": {"total": len(rows),
+                                "ready": sum(1 for r in rows if r["release"]["ready"]),
+                                "awaiting_review": sum(
+                                    1 for r in rows
+                                    if r["state"]["C"]["status"] == "pending"
+                                    and r["artifact"]["exists"])}})
+
+
+@app.route('/api/quality/review', methods=['GET'])
+def api_quality_review():
+    """单集完整审片载荷：契约 + 逐镜（分镜/参考/视频/质检）+ 四层状态。"""
+    raw = (request.args.get('project') or '').strip()
+    if not raw:
+        return jsonify({"success": False, "error": "缺少 project 参数"}), 400
+    project = _safe_project(raw)
+    try:
+        ep = int(request.args.get('episode') or 1)
+    except (TypeError, ValueError):
+        ep = 1
+
+    scr = _load_script_for(project, ep) or {}
+    shots = [s for s in (scr.get("shots") or []) if isinstance(s, dict)]
+    ep_dir = _ep_read_dir(VIDEOS_DIR, project, ep)
+
+    out_shots = []
+    for i, s in enumerate(shots):
+        seq = shot_key.shot_seq(s.get("shot_id"), i + 1) or (i + 1)
+        vpath = os.path.join(ep_dir, "shot_%02d.mp4" % seq)
+        vexists = os.path.isfile(vpath)
+        sb_url = _quality_storyboard_url(project, seq)
+        qc = {"found": False, "attempts": 0, "last_passed": None, "latest": {}}
+        try:
+            hist = qc_client.read_history(QC_DIR, project, "video",
+                                          s.get("shot_id", seq)) or {}
+            recs = hist.get("records") or []
+            if recs:
+                last = recs[-1] if isinstance(recs[-1], dict) else {}
+                qc = {"found": True, "attempts": len(recs),
+                      "last_passed": hist.get("last_passed"),
+                      "latest": {"attempt": last.get("attempt"),
+                                 "ok": last.get("ok"), "passed": last.get("passed"),
+                                 "score": last.get("score"),
+                                 "reason": last.get("reason") or "",
+                                 "issues": last.get("issues") or [],
+                                 "critical_issues": last.get("critical_issues") or [],
+                                 "style_mismatch": bool(last.get("style_mismatch")),
+                                 "duration": last.get("duration"),
+                                 "time": last.get("time") or "",
+                                 "frames": last.get("frames") or []}}
+        except Exception as e:                               # noqa: BLE001
+            app.logger.warning("读逐镜质检历史失败（shot %s）：%s", seq, e)
+        out_shots.append({
+            "seq": seq, "shot_id": s.get("shot_id", seq),
+            "duration": s.get("duration"), "camera": s.get("camera") or "",
+            "location": s.get("location") or "",
+            "description": s.get("description") or "",
+            "dialogue_text": s.get("dialogue_text") or "",
+            "first_frame": s.get("first_frame") or "",
+            "last_frame": s.get("last_frame") or "",
+            "motion": s.get("motion") or "", "emotion": s.get("emotion") or "",
+            "beat": s.get("beat") or "",
+            "video": {"exists": vexists, "url": _quality_video_url(vpath) if vexists else ""},
+            "storyboard": {"exists": bool(sb_url), "url": sb_url},
+            "refs": _quality_refs_for_shot(project, s), "qc": qc})
+
+    full = _quality_find_full(project, ep)
+    sv = _quality_state_view(project, ep)
+    return jsonify({"success": True, "project": project, "episode": ep,
+                    "contract": {"title": scr.get("episode_title") or scr.get("title") or "",
+                                 "style": scr.get("style") or "",
+                                 "shots_total": int(scr.get("shot_count") or len(shots)),
+                                 "duration_sec": float(scr.get("episode_duration_sec") or 0)},
+                    "shots": out_shots,
+                    "artifact": {"exists": bool(full),
+                                 "name": os.path.basename(full) if full else "",
+                                 "url": _quality_video_url(full)},
+                    "state": sv["stages"], "release": sv["release"],
+                    "stale": sv["stale"], "preview": _quality_find_preview(project, ep)})
+
+
+@app.route('/api/quality/stage', methods=['POST'])
+def api_quality_stage():
+    """人工层（C 编辑复核 / D 发布批准）状态写入。
+
+    「passed」必须绑定当刻产物 + 合同哈希：重渲或改剧本后批准自动失效。
+    A/B 由系统判定，本接口不接受 —— 防止人工结论覆盖机器证据。
+    """
+    data = _body()
+    project, err = _project_or_400(
+        (data.get('project') or data.get('project_name') or '').strip())
+    if err is not None:
+        return err
+    try:
+        ep = int(data.get('episode') or data.get('episode_no') or 1)
+    except (TypeError, ValueError):
+        return jsonify({"success": False, "error": "episode 必须是整数"}), 400
+    stage = str(data.get('stage') or '').strip().upper()
+    status = str(data.get('status') or '').strip().lower()
+    note = str(data.get('note') or '')
+    if stage not in ('C', 'D'):
+        return jsonify({"success": False,
+                        "error": "stage 仅允许 C(编辑复核)/D(发布批准)，A/B 由系统判定"}), 400
+    if status not in quality_stage.STATUSES:
+        return jsonify({"success": False,
+                        "error": "status 非法（允许 %s）" % (quality_stage.STATUSES,)}), 400
+
+    full = _quality_find_full(project, ep)
+    binding = None
+    if status == 'passed':
+        if not full:
+            return jsonify({"success": False,
+                            "error": "该集尚无整集成片，无法复核/批准（请先完成整集生成）"}), 400
+        binding = quality_stage.make_binding(
+            full, contract=_quality_contract_summary(project, ep))
+
+    state = quality_stage.record_stage(
+        project, ep, stage, status, note=note,
+        evidence={"by": "review_ui",
+                  "artifact": os.path.basename(full) if full else ""},
+        binding=binding)
+    app.logger.info("[审片] %s 第%s集 %s → %s%s", project, ep,
+                    quality_stage.STAGE_LABELS[stage], status,
+                    ("（%s）" % note) if note else "")
+    sv = _quality_state_view(project, ep)
+    return jsonify({"success": True, "stage": stage, "status": status,
+                    "state": sv["stages"], "release": sv["release"],
+                    "stale": sv["stale"]})
+
 
 @app.route('/api/autopilot/deliverable/file/<project_name>/<path:filename>')
 @_autopilot_guard
@@ -12702,6 +13797,14 @@ def api_autopilot_run_once():
                         "error": f"该小说没有第{ep}集（共 {len(chapters)} 章 / {_n_units} 集）"}), 400
     cfg = pipeline.normalize_config({**plan, 'novel_id': meta.get('novel_id')},
                                     default_project_key=project)
+    # 2026-09-30：已被判定「需人工介入」的集，在**入口**就挡住并把原因回给调用方。
+    # 旧行为是放它进后台、由 run_episode 立刻返回 needs_human，总控只拿到 200 started，
+    # 用户这边什么都看不到（第1集 401 那次就是这样静默掉的）。现在总控能当场拿到 409+原因。
+    _dead = pipeline._is_dead_letter(cfg, project, ep)
+    if _dead:
+        return jsonify({"success": False, "episode_no": ep,
+                        "error": f"第{ep}集此前已判定需人工介入：{_dead.get('reason') or '未知原因'}",
+                        "hint": "请先在「异常 / 需人工介入」里处理或标记忽略，然后重跑本集"}), 409
     # P1-5：run-once 的 progress_cb 把进度实时写进 autopilot 的 current 状态，
     # `/api/autopilot/status` 轮询即可拿到实时进度（当前在哪一步 / 百分之几 / 卡在重试）。
     _seen: list = []
@@ -12730,7 +13833,18 @@ def api_autopilot_run_once():
                         "error": "该集正在生产中",
                         "retry_after_sec": 30}), 409
 
+    # 总控「停止 → 再生产」流程修复（2026-09-30 实测）：stop_production 置的全局
+    # 暂停**持久化到磁盘**（重启也恢复），而本集视频 worker 的中止判定器
+    # （_video_should_stop）对托管任务「is_paused → 停」——于是总控停止后再
+    # 「生产一集」，每次 ComfyUI 提交都被秒级掐断，3 次重试瞬间烧完、整集失败。
+    # 显式 run-once = 用户要求「现在就生产」，先解除暂停再开跑。
+    try:
+        autopilot.resume()
+    except Exception as e:  # noqa: BLE001  解除暂停失败不得阻断本次生产
+        app.logger.warning("run-once 前解除托管暂停失败（忽略）：%s", e)
+
     def _run_once_worker():
+        result = {}
         try:
             result = pipeline.run_episode(cfg, project, ep, meta, chapter, progress_cb=_cb)
             if result.get('status') == 'busy':
@@ -12745,7 +13859,33 @@ def api_autopilot_run_once():
         except Exception as e:  # noqa: BLE001  后台任务异常不得带崩进程/线程静默死亡
             app.logger.error("run-once 后台生产失败（%s 第%s集）：%s",
                              project, ep, e, exc_info=True)
+            result = {"ok": False, "status": "failed", "episode_no": ep,
+                      "project": project, "error": f"{type(e).__name__}: {e}",
+                      "elapsed_sec": 0, "deliverable": "", "steps": {}}
         finally:
+            # 2026-09-30 修复「失败了总控不知道」：run-once 此前只 logger.error 再清 current，
+            # 既不落死信也不写 last_run ⇒ /api/autopilot/status 回报 current=null /
+            # exceptions=0 / last_error=""，总控 get_status 看到的是「空闲且零异常」，
+            # 于是第1集的 401 失败永远汇报不出来。现在成功与失败都登记 last_run
+            # （带项目归属、落盘）；硬失败同时落死信，让「异常」列表和总控都看得见。
+            try:
+                _st = str(result.get('status') or '')
+                _ok = bool(result.get('ok'))
+                if _st != 'busy':
+                    autopilot.record_run_result(
+                        project, ep, _ok, status=_st or ('done' if _ok else 'failed'),
+                        error=str(result.get('error') or ''),
+                        deliverable=str(result.get('deliverable') or ''),
+                        elapsed_sec=result.get('elapsed_sec') or 0,
+                        title=chapter.get('title') or '', source='run-once')
+                    if not _ok and _st != 'cancelled':
+                        # 取消＝用户/托管主动停，不算「需人工介入」，不落死信
+                        autopilot._mark_dead(project, ep,
+                                             str(result.get('error') or '未知错误'),
+                                             {"source": "run-once",
+                                              "status": _st or "failed"})
+            except Exception as e:  # noqa: BLE001  登记失败不得影响 current 清理
+                app.logger.warning("run-once 结果登记失败：%s", e)
             try:
                 autopilot._clear_current()
             except Exception as e:  # noqa: BLE001

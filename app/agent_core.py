@@ -111,10 +111,12 @@ TOOLS = [
     # ---------- 只读探针 ----------
     {
         "name": "get_status",
-        "description": "查询项目托管状态：自动生产开关、当前在做的事、待验收数、异常数。参数可选，不传则用当前项目上下文。",
+        "description": "查询项目托管状态：自动生产开关、当前在做的事、**上一次生产的结果**（last_run：上一集是成功还是失败、失败原因、耗时）、待验收数、异常数。参数可选，不传则用当前项目上下文。",
         "parameters": _schema({"project": _proj_prop()}),
         "risk": "safe", "expensive": False,
-        "call": lambda a, c: ("GET", f"/api/autopilot/status?project={_qp(a.get('project') or c.get('project'))}", {}),
+        # brief=1：只取状态判断必要的短字段 —— 工具结果只喂回前 1600 字符，
+        # 完整 payload 里的 curve/totals 会把 last_run（上一集结果）挤出窗口。
+        "call": lambda a, c: ("GET", f"/api/autopilot/status?brief=1&project={_qp(a.get('project') or c.get('project'))}", {}),
     },
     {
         "name": "get_progress",
@@ -296,6 +298,60 @@ TOOLS = [
                                "episode_no": int(a.get("episode_no") or c.get("episode_no") or 0),
                                "review": a.get("review") or "pending",
                                "note": a.get("note") or ""}),
+    },
+    {
+        # 2026-09-30：清空重做能力（用户需求）。安全边界：产物**移入回收站**（可恢复）
+        # 而非真删；只动该集的产物；剧本默认保留，include_script=true 才一起清。
+        "name": "reset_episode",
+        "description": "清空重做指定一集：把该集已生成的产物（分镜图/尾帧/视频/成片/配音/质检记录/"
+                       "交付记录）整体**移入回收站**（可恢复，不是永久删除），之后用 produce_episode "
+                       "从头重产该集。⚠️ 调用前必须先 stop_production 停止该项目的生产，否则正在写入"
+                       "的文件会清不掉（结果里 skipped 会如实列出）。include_script=true 时连剧本也"
+                       "一并移入回收站（下一轮会重新生成剧本）——只有用户明确要求「连剧本一起重做」才传 true。",
+        "parameters": _schema({"project": _proj_prop(), "episode": _INT,
+                               "include_script": _BOOL}),
+        "risk": "write", "expensive": False,
+        "call": lambda a, c: ("POST", "/api/autopilot/reset-episode",
+                              {"project_name": a.get("project") or c.get("project"),
+                               "episode_no": int(a.get("episode") or c.get("episode") or 1),
+                               "include_script": bool(a.get("include_script"))}),
+    },
+    {
+        # 单镜清空重做：清完之后 produce_episode 的断点续跑只会重做缺失的这一镜。
+        "name": "reset_shot",
+        "description": "清空重做单个镜头：把该镜的分镜图/尾帧/视频/配音/质检记录移入回收站"
+                       "（可恢复，不是永久删除），之后用 produce_episode 重产该集时只会重做"
+                       "缺失的这一镜（其余镜不重烧）。shot_id 形如 shot_3（从 get_shots 拿）。"
+                       "⚠️ 调用前先 stop_production 停止该项目的生产。",
+        "parameters": _schema({"project": _proj_prop(), "episode": _INT,
+                               "shot_id": {"type": "string",
+                                           "description": "镜号，形如 shot_3"}},
+                              ["shot_id"]),
+        "risk": "write", "expensive": False,
+        "call": lambda a, c: ("POST", "/api/autopilot/reset-shot",
+                              {"project_name": a.get("project") or c.get("project"),
+                               "episode_no": int(a.get("episode") or c.get("episode") or 1),
+                               "shot_id": _p(a.get("shot_id"))}),
+    },
+    {
+        # 单资产清空重做：资产卡描述保留，只清已生成的图；下一轮生产自动补做。
+        "name": "reset_asset",
+        "description": "清空重做单个资产（角色/物品/场景）：把该资产的已生成图（基础图+多视图）"
+                       "移入回收站（可恢复，不是永久删除），资产卡描述保留；之后用 produce_episode "
+                       "重产时会因「基础图缺失」自动补做该资产。⚠️ 若命中跨项目资产库的形象指纹"
+                       "可能直接复用旧图——要换形象请先用 update_character 改描述再重做。"
+                       "调用前先 stop_production。",
+        "parameters": _schema({"project": _proj_prop(),
+                               "kind": {"type": "string",
+                                        "description": "character / item / scene"},
+                               "name": {"type": "string",
+                                        "description": "资产名（从 list_characters 或剧本里拿）"}},
+                              ["kind", "name"]),
+        "risk": "write", "expensive": False,
+        "call": lambda a, c: ("POST", "/api/autopilot/reset-asset",
+                              {"project_name": a.get("project") or c.get("project"),
+                               "kind": _p(a.get("kind")),
+                               "name": _p(a.get("name"))}),
     },
 
     # ---------- 生产调度 ----------
@@ -498,6 +554,14 @@ SYSTEM_PROMPT = """你是这部漫剧的**总控导演 AI**，有权直接操作
    本集已完成：剧本 → 资产；当前环节已跑 M 分钟。」
 - `current` 为空（null）＝**当前没有在生产**。此时如实说「当前没有在跑生产」，
   并顺带说明托管开关状态（`enabled_count`）与下一集是什么，**不要**把上一次的进度说成正在跑。
+- ⚠️ **`current` 为空时必须接着看 `last_run`（上一集生产结果）** —— 它是唯一能说明
+  「上一集到底成没成」的字段，`current` 被清空后不会留下任何其它痕迹：
+  - `last_run.ok == false` → **主动汇报**「第 N 集生产失败，原因：<last_run.error>」，
+    并给出下一步建议（改配置 / 换 key / 处理「需人工介入」后重跑）。
+    **绝对不许**只回一句「当前没有在跑生产」就把一次失败带过去 —— 用户会觉得你根本没在管。
+  - `last_run.ok == true` → 简短说明上一集已完成、交付物在哪，再问是否需要继续下一集。
+  - `last_run` 为空对象 → 说明这个项目**从未跑完过任何一集**，如实这么讲。
+  - 生产的**失败原因**还可能出现在 `exceptions`（需人工介入的集）里，一并读出来告诉用户。
 - `current.stall_warning` 非空时，说明该环节长时间没推进（多为模型重试 / ComfyUI 排队）：
   如实告知用户「卡在 XX 环节，已 N 分钟没推进」，**不要**说成失败，也**不要**说成正常。
 - `other_project_running: true` 时（见下方项目纪律），只说别的项目在跑，**绝不**把它当本项目的进度。

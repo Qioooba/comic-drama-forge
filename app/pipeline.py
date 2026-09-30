@@ -47,6 +47,10 @@ import traceback
 
 import cancellation
 import gpu_task_gate
+import quality_stage  # 四层质量状态 + 哈希绑定人审（2026-09-29）
+import task_lease  # 文件租约 + 心跳（2026-09-29：跨进程互斥 + 崩溃可回收）
+import failure_codes  # 结构化失败码（2026-09-29：从既有文案归类，原文一字不改）
+import preview_gate  # 两级生产（2026-09-29：预演产物永不可交付）
 
 from fs_atomic import atomic_write_json, read_json_strict
 
@@ -59,23 +63,68 @@ logger = logging.getLogger(__name__)
 # 不可用全局锁（会让不同项目/不同集互相阻塞）。
 _EP_LOCKS: dict = {}
 _EP_LOCKS_GUARD = threading.Lock()
+#: 集级**文件租约**（跨进程）：key -> task_lease.Lease
+_EP_LEASES: dict = {}
+
+
+def _episode_scope(project_name: str, episode_no: int) -> str:
+    return f"episode:{project_name}#{int(episode_no)}"
 
 
 def _acquire_episode_lock(project_name: str, episode_no: int) -> bool:
-    """尝试获取集级锁；拿不到（另一执行体正在跑）返回 False，不阻塞。"""
+    """尝试获取集级锁；拿不到（另一执行体正在跑）返回 False，不阻塞。
+
+    2026-09-29 增强（阶段三）：在原**进程内** threading.Lock 之外再加一层
+    **文件租约**（task_lease）。原因：
+
+    * 跨进程无效 —— 原实现是一张进程内字典。托管守护线程与「手动 run-once」若不在
+      同一进程（或多个实例并行），两边各持一份字典，互斥形同虚设，同一集会并发写
+      同一批路径；
+    * 崩溃无痕 —— 进程没了字典也没了，没人能回答「这集是不是正被别人跑着」。
+
+    两层都拿到才算成功；任一层失败就回滚另一层，绝不半持有。租约子系统故障
+    （目录不可写等）会降级为「仅进程内锁」并 warning —— 不让产线因它停摆。
+    """
     key = f"{project_name}#{int(episode_no)}"
     with _EP_LOCKS_GUARD:
         lk = _EP_LOCKS.get(key)
         if lk is None:
             lk = threading.Lock()
             _EP_LOCKS[key] = lk
-    return lk.acquire(blocking=False)
+    if not lk.acquire(blocking=False):
+        return False
+    lease = None
+    try:
+        lease = task_lease.acquire(_episode_scope(project_name, episode_no),
+                                   owner="pipeline",
+                                   ttl_sec=task_lease.DEFAULT_TTL_SEC)
+    except Exception as e:                                   # noqa: BLE001
+        logger.warning("集级租约获取异常（降级为仅进程内锁）：%s", e)
+        lease = None
+    if lease is None:
+        try:
+            lk.release()
+        except RuntimeError:
+            pass
+        logger.warning("第%s集正被其他执行体运行（文件租约被占用），本次跳过：%s",
+                       episode_no, project_name)
+        return False
+    lease.start_heartbeat()      # 长任务必备：心跳停了租约会被判过期并回收
+    with _EP_LOCKS_GUARD:
+        _EP_LEASES[key] = lease
+    return True
 
 
 def _release_episode_lock(project_name: str, episode_no: int) -> None:
     key = f"{project_name}#{int(episode_no)}"
     with _EP_LOCKS_GUARD:
         lk = _EP_LOCKS.get(key)
+        lease = _EP_LEASES.pop(key, None)
+    if lease is not None:
+        try:
+            lease.release()      # 内部停掉心跳线程；只有 token 仍是自己的才删
+        except Exception as e:                               # noqa: BLE001
+            logger.debug("释放集级租约失败（忽略）：%s", e)
     if lk is not None:
         try:
             lk.release()
@@ -84,11 +133,22 @@ def _release_episode_lock(project_name: str, episode_no: int) -> None:
 
 
 def is_episode_running(project_name: str, episode_no: int) -> bool:
-    """该集当前是否有执行体（供前端/诊断查询）"""
+    """该集当前是否有执行体（供前端/诊断查询）
+
+    2026-09-29：除进程内锁外也认**文件租约** —— 别的进程（或崩溃前留下的）正在跑，
+    这里必须如实回答 True，不能因为本进程没有锁就报「没人跑」。
+    """
     key = f"{project_name}#{int(episode_no)}"
     with _EP_LOCKS_GUARD:
         lk = _EP_LOCKS.get(key)
-    return bool(lk and lk.locked())
+    if lk is not None and lk.locked():
+        return True
+    try:
+        st = task_lease.status(_episode_scope(project_name, episode_no))
+        return bool(st.get("held"))
+    except Exception as e:                                   # noqa: BLE001
+        logger.debug("查询集级租约状态失败（按未运行处理）：%s", e)
+        return False
 
 # ===================== 步骤定义 =====================
 
@@ -1524,6 +1584,10 @@ def run_episode(config: dict, project_name: str, episode_no: int, novel_meta: di
     # 把「是否该停」注册进当前执行上下文（contextvars）：本集内部所有 LLM 调用与
     # 重试退避都能感知到它，从而实现「暂停秒级生效」。作用域仅限本调用链 ——
     # 用户手动触发的生产（should_stop=None）不受任何影响。
+    # ⚠️ push 前必须 clear()：线程池复用线程时 contextvars 随副本继承，先前请求
+    #    泄漏的判定器（实测：总控「停止生产」的全局暂停）会让新生产每次提交都被
+    #    秒级取消（3 次重试瞬间烧完）。先清场再注册自己的判定器，见 cancellation.clear()。
+    cancellation.clear()
     _cancel_token = cancellation.push(should_stop)
     try:
         # P0-6：进入步骤循环前先做「模式 × 产物期望」一致性断言（配置矛盾时在这里
@@ -1765,6 +1829,10 @@ def mark_dead_letter(project_name: str, episode_no: int, reason: str,
     eps = data.setdefault("episodes", {})
     eps[str(int(episode_no))] = {
         "episode_no": int(episode_no), "reason": reason,
+        # 结构化失败码（2026-09-29）：从**已有文案**归类，原文一字不改，
+        # 只为让死信队列与看板能按原因分组统计（failure_codes.summarize）。
+        "code": failure_codes.classify(reason),
+        "code_label": failure_codes.explain(reason),
         "detail": detail or {}, "marked_at": _now(), "resolved": False,
     }
     _dead_letter_snapshot_bak(p)  # P1-11（A-13）：发布前快照最后一份好版本
@@ -1810,6 +1878,14 @@ def list_dead_letters(project_name: str) -> list:
 def record_deliverable(project_name: str, episode_no: int, path: str,
                        meta: dict = None) -> dict:
     """把该集成片登记进「待验收」队列（用户只需看这里）"""
+    # 铁律（2026-09-29）：预演产物**永不可交付**。闸门放在**最深的这个漏斗**上，
+    # 这样任何调用方（register_final_deliverable / 托管轮转 / 手动登记）都绕不过去。
+    # 预演长得像成片，一旦进索引，用户就可能拿一版低分辨率糊图去发布。
+    _ok, _why = preview_gate.deliverable_ok(path)
+    if not _ok:
+        logger.error("[预演拦截] 拒绝把非正式产物登记为成片（%s）：%s",
+                     os.path.basename(str(path or "")), _why)
+        raise PipelineError(f"不可交付的产物：{_why}")
     A = _A()
     idx_path = os.path.join(A.PROJECT_OUTPUT_DIR, "autopilot", project_name, "deliverables.json")
     os.makedirs(os.path.dirname(idx_path), exist_ok=True)
@@ -1820,6 +1896,20 @@ def record_deliverable(project_name: str, episode_no: int, path: str,
     items = data.setdefault("items", {})
     key = str(int(episode_no))
     prev = items.get(key) or {}
+    # 哈希绑定（2026-09-29）：老实现只看**路径**是否变化，但重做一集时产物是
+    # **原地覆盖**（同名 ep01_full.mp4），路径没变 → 旧的「已验收」会静默延续到
+    # 新内容上，用户以为批的是当前这版、其实是上一版。这里补一层内容指纹。
+    sig = quality_stage.file_signature(path, with_hash=True) if _nonempty(path) else {}
+    prev_sig = prev.get("artifact") or {}
+    same_path = prev.get("path") == path
+    if sig.get("sha256"):
+        same_content = (bool(prev_sig.get("sha256"))
+                        and prev_sig.get("sha256") == sig["sha256"])
+    else:
+        # 哈希算不出（文件被占用 / IO 异常）→ 退回旧的纯路径判据，
+        # 不制造无谓的「验收反复失效」抖动（宁可保守沿用原行为）。
+        same_content = same_path
+    review_keep = bool(same_path and same_content)
     items[key] = {
         "episode_no": int(episode_no),
         "project": project_name,
@@ -1827,11 +1917,22 @@ def record_deliverable(project_name: str, episode_no: int, path: str,
         "filename": os.path.basename(path),
         "size": os.path.getsize(path) if _nonempty(path) else 0,
         "meta": meta or {},
+        "artifact": sig,
         "created_at": prev.get("created_at") or _now(),
         "updated_at": _now(),
         # 重新生产会重置验收状态（内容已变，旧结论失效）
-        "review": "pending" if prev.get("path") != path else (prev.get("review") or "pending"),
+        "review": (prev.get("review") or "pending") if review_keep else "pending",
     }
+    if review_keep:
+        if prev.get("approval"):
+            items[key]["approval"] = prev["approval"]
+    else:
+        # 内容变了 → 明确留痕，别让用户对着「已验收」察觉不到换了片
+        if same_path and prev_sig and not same_content:
+            items[key]["review_note"] = ("产物内容已变（同路径覆盖），"
+                                        "原验收结论已自动失效")
+            logger.warning("交付物内容变化但路径未变，验收结论已复位：项目 %s 第 %s 集",
+                           project_name, episode_no)
     atomic_write_json(idx_path, data)
     return items[key]
 
@@ -1856,14 +1957,31 @@ def list_deliverables(project_name: str = "") -> list:
                 v = dict(v)
                 v["exists"] = _nonempty(v.get("path") or "")
                 v["url"] = f"/api/autopilot/deliverable/file/{pj}/{v.get('filename')}"
+                # 验收有效性快检（**只比 size/mtime，不做 sha256**）：成片动辄几百 MB，
+                # 列表接口逐个哈希会把界面拖死。真哈希交给 validate_deliverable_review。
+                _ap, _sig = v.get("approval") or {}, v.get("artifact") or {}
+                if _ap and _sig.get("size") is not None:
+                    try:
+                        _st = os.stat(v.get("path") or "")
+                        if (int(_sig["size"]) != _st.st_size
+                                or abs(float(_sig.get("mtime") or 0)
+                                       - _st.st_mtime) > 0.001):
+                            v["approval_stale"] = True
+                    except OSError:
+                        v["approval_stale"] = True
                 out.append(v)
     out.sort(key=lambda x: (x.get("project") or "", int(x.get("episode_no") or 0)))
     return out
 
 
 def set_deliverable_review(project_name: str, episode_no: int, review: str,
-                           note: str = "") -> dict:
-    """验收 / 打回（打回会在下次托管轮转时重跑该集）"""
+                           note: str = "", qa_report: dict = None) -> dict:
+    """验收 / 打回（打回会在下次托管轮转时重跑该集）
+
+    review == "accepted" 时把「产物哈希 + 合同哈希 + 质检报告哈希」三者绑定到该集
+    （见 quality_stage.make_binding）。之后任一变化，批准即自动失效 ——
+    这是防「批完又重渲、结论静默延续」的关键。
+    """
     A = _A()
     idx_path = os.path.join(A.PROJECT_OUTPUT_DIR, "autopilot", project_name, "deliverables.json")
     # A-4：统一走严格读；「文件不存在→{}」的既有契约不变，损坏时先试 .bak，
@@ -1874,12 +1992,68 @@ def set_deliverable_review(project_name: str, episode_no: int, review: str,
     if not item:
         return {}
     item.update({"review": review, "review_note": note, "reviewed_at": _now()})
+    if review == "accepted":
+        binding = quality_stage.make_binding(
+            item.get("path") or "",
+            contract=(item.get("meta") or {}),
+            qa_report=qa_report)
+        item["approval"] = binding
+        # 同步刷新 artifact 指纹：artifact 的语义是「**当前 review 所针对的那份内容**」。
+        # 不刷新的话它会停在上一版，后续 record_deliverable 拿**过期基线**比对，
+        # 把刚给出的合法验收误判成「内容已变」而复位
+        # （verify_quality_stage.py 的 F7 抓住的正是这个 bug）。
+        item["artifact"] = {"size": binding.get("artifact_size"),
+                            "mtime": binding.get("artifact_mtime"),
+                            "sha256": binding.get("artifact_sha256") or ""}
+        logger.info("交付物验收已绑定哈希：项目 %s 第 %s 集 artifact=%s",
+                    project_name, episode_no,
+                    str(binding.get("artifact_sha256") or "")[:12])
+    else:
+        item.pop("approval", None)
     atomic_write_json(idx_path, data)
     if review == "rejected":
         # 打回 = 该集需要重做：清掉死信状态让流水线重新尝试
         resolve_dead_letter(project_name, episode_no, note="成片被打回，重新生产")
     return item
 
+
+def validate_deliverable_review(project_name: str, episode_no: int,
+                                *, persist: bool = True) -> dict:
+    """校验该集的「已验收」是否仍然成立；失效则复位 pending 并留因。
+
+    为什么必须有它：重做一集时产物路径不变（原地覆盖），只看路径的话「已验收」
+    会静默延续到新内容上。这里用 quality_stage.check_binding 做**内容级**校验，
+    快路径先比 size/mtime（避免为几百 MB 的成片反复算哈希）。
+
+    返回 {"status": valid|invalid|unbound|none, "reason": ..., "item": {...}}。
+    一切异常 fail-open：校验不出结果时**不误伤**，保持原 review 不动。
+    """
+    A = _A()
+    idx_path = os.path.join(A.PROJECT_OUTPUT_DIR, "autopilot", project_name,
+                            "deliverables.json")
+    try:
+        data = read_json_strict(idx_path, {}) or {}
+    except (ValueError, OSError) as e:
+        logger.error("交付物索引损坏，无法校验验收有效性（项目 %s）：%s", project_name, e)
+        return {"status": "none", "reason": "索引不可读", "item": {}}
+    item = (data.get("items") or {}).get(str(int(episode_no)))
+    if not isinstance(item, dict):
+        return {"status": "none", "reason": "无该集交付物", "item": {}}
+    if item.get("review") != "accepted":
+        return {"status": "unbound", "reason": "该集尚未验收", "item": item}
+    status, reason = quality_stage.check_binding(
+        item.get("approval"), item.get("path") or "",
+        contract=(item.get("meta") or {}))
+    if status == "invalid" and persist:
+        logger.warning("交付物验收已失效（项目 %s 第 %s 集）：%s",
+                       project_name, episode_no, reason)
+        item.update({"review": "pending",
+                     "review_note": "原验收结论已失效：%s，请重新验收" % reason,
+                     "approval_invalidated_at": _now(),
+                     "approval_invalid_reason": reason})
+        item.pop("approval", None)
+        atomic_write_json(idx_path, data)
+    return {"status": status, "reason": reason, "item": item}
 
 def mark_deliverable_stale(project_name: str, episode_no: int, reason: str,
                            detail: dict = None) -> dict:

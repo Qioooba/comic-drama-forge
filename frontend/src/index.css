@@ -433,3 +433,25 @@ body::before {
        已改为共享 ui 组件，定义随之删除
    如需复用其中某个效果，请先确认它是否真的被引用，避免再次堆死代码。
    ========================================================================== */
+
+/* ------------------------------------------------------------------------ */
+/* Electron 桌面壳：隐藏系统标题栏后，Navbar 兼作窗口拖拽条                    */
+/* 对应 electron-app/main.js 的 titleBarStyle:'hidden' + titleBarOverlay。     */
+/* 只在 Electron 里挂 .electron-titlebar（见 Navbar.tsx），浏览器/exe 版不受影响。*/
+/* ------------------------------------------------------------------------ */
+.electron-titlebar {
+  -webkit-app-region: drag;
+  /* 右上角让出原生「最小化 / 最大化 / 关闭」覆盖层（≈138×44），否则按钮被压住 */
+  padding-right: 150px !important;
+  min-height: 44px;
+}
+
+/* 可交互元素必须显式退出拖拽区，否则点不动 */
+.electron-titlebar button,
+.electron-titlebar a,
+.electron-titlebar input,
+.electron-titlebar select,
+.electron-titlebar [role="button"],
+.electron-titlebar [role="menuitem"] {
+  -webkit-app-region: no-drag;
+}

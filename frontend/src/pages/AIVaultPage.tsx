@@ -1,10 +1,10 @@
 import React, { useState, useEffect } from 'react';
 import { useApp } from '@/context/AppContext';
-import { aiConfigApi, watermarkApi } from '@/api/client';
+import { aiConfigApi, watermarkApi, promptEnhanceApi } from '@/api/client';
 import { Badge, Button, Card, ConfirmDialog, Input, Select, Skeleton } from '@/components/ui';
-import { AlertTriangle, Brain, CheckCircle2, Eye, EyeOff, Network, Search, X } from '@/components/ui/icons';
+import { AlertTriangle, Brain, CheckCircle2, Eye, EyeOff, Network, Pencil, RefreshCw, Search, X } from '@/components/ui/icons';
 import type { IconProps } from '@/components/ui/icons';
-import type { AIConfigModule, AIConfigResponse, AITestResult } from '@/types';
+import type { AIConfigModule, AIConfigResponse, AITestResult, AIFallbackModel } from '@/types';
 
 type ModuleKey = 'text' | 'qc' | 'chat';
 
@@ -95,6 +95,24 @@ export function AIVaultPage() {
   const [testResult, setTestResult] = useState<Record<ModuleKey, AITestResult | null>>({
     text: null, qc: null, chat: null,
   });
+  // 备用模型（故障转移链）：按模块维护，主模型挂 3 次自动切下一个，任务不中断
+  const [fallbacks, setFallbacks] = useState<Record<ModuleKey, AIFallbackModel[]>>({ text: [], qc: [], chat: [] });
+  const [showAddFb, setShowAddFb] = useState<ModuleKey | null>(null);
+  const [fbDraft, setFbDraft] = useState<AIFallbackModel>({ base_url: '', model: '', api_key: '', label: '' });
+  /** 正在编辑哪一条备用（null = 新增）；编辑时密钥回填脱敏值，提交即「不改动原密钥」 */
+  const [editingFb, setEditingFb] = useState<{ module: ModuleKey; index: number } | null>(null);
+  /** 每条备用各自的连通性测试结果，key = `${module}#${index}` */
+  const [fbResults, setFbResults] = useState<Record<string, AITestResult | null>>({});
+  const [fbTesting, setFbTesting] = useState<string | null>(null);
+  /**
+   * 备用列表「已改但未保存」标记。
+   * ⚠️ 实测踩坑（用户报「我配了 2 个备用，怎么只剩 1 个」）：备用卡片里的「添加」
+   * 只改组件 state，必须再点卡片**下方**的主「保存配置」才会落盘。用户加完就刷新，
+   * 未保存的条目自然消失。所以这里显式提示，别再让人白配一遍。
+   */
+  const [fbDirty, setFbDirty] = useState<Record<ModuleKey, boolean>>({ text: false, qc: false, chat: false });
+  /** 备用列表正在落盘（添加/编辑/删除后自动提交，不需要用户再点一次「保存配置」） */
+  const [fbSaving, setFbSaving] = useState<ModuleKey | null>(null);
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const [clearTarget, setClearTarget] = useState<ModuleKey | null>(null);
   const [clearing, setClearing] = useState(false);
@@ -110,6 +128,11 @@ export function AIVaultPage() {
     watermark_text: '',
   });
   const [sysSaving, setSysSaving] = useState(false);
+
+  // 提示词增强开关（2026-09-30）：出图/出片前 LLM 增强 + 质检模型复审。
+  // 保存后立即生效（后端每次生成都重读开关文件），无需重启。
+  const [pe, setPe] = useState<{ enhance: boolean; review: boolean; envOverridden: boolean }>({ enhance: true, review: true, envOverridden: false });
+  const [peSaving, setPeSaving] = useState(false);
 
   useEffect(() => {
     Promise.all([
@@ -128,6 +151,13 @@ export function AIVaultPage() {
           if (Array.isArray(raw.reasoning_effort_options) && raw.reasoning_effort_options.length) {
             setReOptions(raw.reasoning_effort_options.map((x: unknown) => String(x)));
           }
+          // 回填备用模型（故障转移链）
+          setFallbacks({
+            text: Array.isArray(c.text?.fallbacks) ? c.text!.fallbacks!.map(f => ({ ...f })) : [],
+            qc: Array.isArray(c.qc?.fallbacks) ? c.qc!.fallbacks!.map(f => ({ ...f })) : [],
+            chat: Array.isArray(c.chat?.fallbacks) ? c.chat!.fallbacks!.map(f => ({ ...f })) : [],
+          });
+          setFbDirty({ text: false, qc: false, chat: false });
           setConfig({
             text: {
               base_url: c.text?.base_url || '',
@@ -166,12 +196,82 @@ export function AIVaultPage() {
           }));
         })
         .catch(() => {}),
+      // 加载提示词增强开关
+      promptEnhanceApi.get()
+        .then(d => {
+          const eff = d.effective || {};
+          setPe({
+            enhance: eff.enhance_enabled !== false,
+            review: eff.review_enabled !== false,
+            envOverridden: Boolean((d.env_overridden || {}).enhance || (d.env_overridden || {}).review),
+          });
+        })
+        .catch(() => {}),
     ]).finally(() => setLoading(false));
   }, []);
 
   const showMessage = (type: 'success' | 'error', text: string) => {
     setMessage({ type, text });
     setTimeout(() => setMessage(null), 4000);
+  };
+
+  /** 保存后回读：把服务端归一化后的 index / has_api_key / api_key_masked 拉回来 */
+  const refreshFallbacks = async (module: ModuleKey) => {
+    try {
+      const d = await aiConfigApi.get();
+      const raw2 = (d.config || {}) as any;
+      const c2 = (raw2.modules || raw2) as Record<ModuleKey, AIConfigModule>;
+      setFallbacks(prev => ({
+        ...prev,
+        [module]: Array.isArray(c2[module]?.fallbacks) ? c2[module]!.fallbacks!.map(f => ({ ...f })) : [],
+      }));
+    } catch { /* 回读失败不影响已保存的结果 */ }
+  };
+
+  /**
+   * 把备用列表**立刻落盘**。
+   *
+   * 为什么需要它（用户实测提问：「为什么点了保存修改还要点下方的保存配置」）：
+   * 备用列表原先只在点主「保存配置」时随 module 配置一起提交，于是加/改/删之后
+   * 必须再点一次下面那个按钮才生效 —— 少点一次就静默丢失（用户配了 2 条只剩 1 条）。
+   * 现在添加/保存修改/删除都会走这里自动提交，两段式变成一步。
+   */
+  const persistFallbacks = async (module: ModuleKey, list: AIFallbackModel[], okText?: string) => {
+    const state = config[module];
+    if (!state.base_url.trim() || !state.model.trim()) {
+      setFbDirty(prev => ({ ...prev, [module]: true }));
+      showMessage('error', t('vault.fallbackNeedMainFirst'));
+      return;
+    }
+    // 只提交填了 base_url + model 的条目；密钥留空 = 不改动原密钥（后端按签名续上）
+    const _fbs = list.map(f => ({
+      base_url: f.base_url?.trim(),
+      model: f.model?.trim(),
+      api_key: f.api_key?.trim() || undefined,
+      label: f.label?.trim() || undefined,
+      reasoning_effort: f.reasoning_effort,
+    })).filter(f => f.base_url && f.model);
+    setFbSaving(module);
+    try {
+      // 注意：这里**总是**把数组传下去（哪怕是空的）——
+      // 传 undefined 等于「不改动」，删光备用就永远删不掉。
+      const result = await aiConfigApi.save(
+        module, state.base_url.trim(), state.model.trim(),
+        state.api_key.trim() || undefined, state.reasoning_effort, _fbs);
+      if (result.success) {
+        setFbDirty(prev => ({ ...prev, [module]: false }));
+        await refreshFallbacks(module);
+        showMessage('success', okText || t('vault.fallbackSaved'));
+      } else {
+        setFbDirty(prev => ({ ...prev, [module]: true }));
+        showMessage('error', t('settings.saveFailed'));
+      }
+    } catch (err) {
+      setFbDirty(prev => ({ ...prev, [module]: true }));
+      showMessage('error', t('vault.saveFailedDetail', { err: err instanceof Error ? err.message : t('error.unknown') }));
+    } finally {
+      setFbSaving(null);
+    }
   };
 
   // ========== AI 模块操作 ==========
@@ -188,14 +288,26 @@ export function AIVaultPage() {
 
     setSaving(module);
     try {
+      // 备用模型：只提交填了 base_url + model 的条目（缺密钥的也允许提交，由后端标记 has_api_key）
+      const _fbs = (fallbacks[module] || []).map(f => ({
+        base_url: f.base_url?.trim(),
+        model: f.model?.trim(),
+        api_key: f.api_key?.trim() || undefined,
+        label: f.label?.trim() || undefined,
+        reasoning_effort: f.reasoning_effort,
+      })).filter(f => f.base_url && f.model);
       const result = await aiConfigApi.save(
         module,
         state.base_url.trim(),
         state.model.trim(),
         state.api_key.trim() || undefined,
-        state.reasoning_effort
+        state.reasoning_effort,
+        // 总是提交数组（含空数组）：传 undefined = 不改动，会让「删光备用」静默失效
+        _fbs
       );
       if (result.success) {
+        setFbDirty(prev => ({ ...prev, [module]: false }));
+        await refreshFallbacks(module);
         showMessage('success', result.message || t('vault.msg.saved', { module: t(MODULE_CONFIG[module].titleKey) }));
         setConfig(prev => ({
           ...prev,
@@ -261,6 +373,67 @@ export function AIVaultPage() {
       showMessage('error', t('vault.testFailedDetail', { err: err instanceof Error ? err.message : t('error.unknown') }));
     } finally {
       setTesting(null);
+    }
+  };
+
+  /** 打开某条备用的编辑表单（密钥回填脱敏值 → 不改动即保留原密钥） */
+  const openFbEditor = (module: ModuleKey, index: number) => {
+    const fb = (fallbacks[module] || [])[index];
+    if (!fb) return;
+    setFbDraft({
+      base_url: fb.base_url || '',
+      model: fb.model || '',
+      api_key: fb.api_key_masked || fb.api_key || '',
+      label: fb.label || '',
+      reasoning_effort: fb.reasoning_effort || '',
+    });
+    setEditingFb({ module, index });
+    setShowAddFb(module);
+  };
+
+  /** 关闭新增/编辑表单 */
+  const closeFbForm = () => {
+    setShowAddFb(null);
+    setEditingFb(null);
+    setFbDraft({ base_url: '', model: '', api_key: '', label: '', reasoning_effort: '' });
+  };
+
+  /**
+   * 测试某条备用。两条路径：
+   * - 已保存且用户没改密钥（无明文）→ 只传索引，由后端取解密后的 key（密钥不下发前端）；
+   * - 草稿 / 用户刚填了明文 → 用显式 base_url/model/api_key 直接探，
+   *   否则会拿「旧的第 i 条」当被测对象，结论张冠李戴。
+   */
+  const handleTestFallback = async (module: ModuleKey, index: number) => {
+    const key = `${module}#${index}`;
+    const fb = (fallbacks[module] || [])[index];
+    const label = fb?.label || `备用${index + 1}`;
+    const typedKey = (fb?.api_key || '').trim();
+    const canTestByIndex = !typedKey && typeof fb?.index === 'number';
+    setFbTesting(key);
+    setFbResults(prev => ({ ...prev, [key]: null }));
+    try {
+      const result = canTestByIndex
+        ? await aiConfigApi.testFallback(module, fb!.index!, MODULE_CONFIG[module].probe || 'text', 30)
+        : await aiConfigApi.test(module, fb?.base_url || '', fb?.model || '',
+            typedKey || undefined, MODULE_CONFIG[module].probe || 'text', 30, fb?.reasoning_effort);
+      setFbResults(prev => ({ ...prev, [key]: result }));
+      const partial = result.success && result.verdict !== 'ok';
+      showMessage(
+        result.success && !partial ? 'success' : 'error',
+        result.success
+          ? (partial ? t('vault.fallbackTestPartial') : t('vault.fallbackTestOk', { label }))
+          : `${t('vault.fallbackTestFail')}：${result.error || result.guide || ''}`.slice(0, 200)
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : t('error.unknown');
+      setFbResults(prev => ({
+        ...prev,
+        [key]: { success: false, module, probe: 'text', error: msg } as AITestResult,
+      }));
+      showMessage('error', `${t('vault.fallbackTestFail')}：${msg}`);
+    } finally {
+      setFbTesting(null);
     }
   };
 
@@ -331,6 +504,28 @@ export function AIVaultPage() {
       showMessage('error', t('vault.saveFailedDetail', { err: err instanceof Error ? err.message : t('error.unknown') }));
     } finally {
       setSysSaving(false);
+    }
+  };
+
+  // ========== 提示词增强开关（保存后立即生效，无需重启） ==========
+  const handlePeSave = async () => {
+    setPeSaving(true);
+    try {
+      const d = await promptEnhanceApi.update({
+        enhance_enabled: pe.enhance,
+        review_enabled: pe.review,
+      });
+      const eff = d.effective || {};
+      setPe(prev => ({
+        ...prev,
+        enhance: eff.enhance_enabled !== false,
+        review: eff.review_enabled !== false,
+      }));
+      showMessage('success', t('vault.promptEnhanceSaved'));
+    } catch (err) {
+      showMessage('error', t('vault.saveFailedDetail', { err: err instanceof Error ? err.message : t('error.unknown') }));
+    } finally {
+      setPeSaving(false);
     }
   };
 
@@ -427,14 +622,54 @@ export function AIVaultPage() {
           )}
         </div>
 
+        {/* 提示词增强（2026-09-30）：出图/出片前 LLM 增强 + 质检模型复审，保存后立即生效 */}
+        <div className="border-t border-line pt-4 mt-4">
+          <div className="mb-2">
+            <span className="text-ink-1 font-medium">{t('vault.promptEnhanceTitle')}</span>
+            <p className="text-xs text-ink-3 mt-1">{t('vault.promptEnhanceDesc')}</p>
+          </div>
+          <div className="space-y-2">
+            <div className="flex items-center gap-3">
+              <input
+                type="checkbox"
+                checked={pe.enhance}
+                onChange={e => setPe(p => ({ ...p, enhance: e.target.checked }))}
+                className="w-5 h-5 rounded border-line-strong text-brand focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 focus-visible:ring-offset-2"
+              />
+              <span className="text-ink-2 font-medium">{t('vault.promptEnhanceOn')}</span>
+            </div>
+            <div className="flex items-center gap-3">
+              <input
+                type="checkbox"
+                checked={pe.review}
+                onChange={e => setPe(p => ({ ...p, review: e.target.checked }))}
+                className="w-5 h-5 rounded border-line-strong text-brand focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 focus-visible:ring-offset-2"
+              />
+              <span className="text-ink-2 font-medium">{t('vault.promptReviewOn')}</span>
+            </div>
+            {pe.envOverridden && (
+              <p className="text-xs text-warning-strong">{t('vault.promptEnhanceEnvNote')}</p>
+            )}
+          </div>
+        </div>
+
         <div className="flex justify-end pt-2">
-          <Button
-            variant="brand"
-            onClick={handleSysSave}
-            loading={sysSaving}
-          >
-            {t('vault.saveWatermark')}
-          </Button>
+          <div className="flex items-center gap-3">
+            <Button
+              variant="secondary"
+              onClick={handlePeSave}
+              loading={peSaving}
+            >
+              {t('vault.savePromptEnhance')}
+            </Button>
+            <Button
+              variant="brand"
+              onClick={handleSysSave}
+              loading={sysSaving}
+            >
+              {t('vault.saveWatermark')}
+            </Button>
+          </div>
         </div>
       </Card>
 
@@ -543,6 +778,161 @@ export function AIVaultPage() {
                     {t('vault.reasoningHintTail')}
                   </p>
                 </div>
+              </div>
+
+              {/* ===== 备用模型（故障转移链）===== */}
+              <div className="border-t border-line pt-4 mt-2">
+                <div className="flex items-center justify-between mb-2">
+                  <div>
+                    <span className="text-sm font-medium text-ink-1">{t('vault.fallbackTitle')}</span>
+                    <p className="text-xs text-ink-3 mt-0.5">{t('vault.fallbackDesc')}</p>
+                  </div>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => {
+                      setEditingFb(null);
+                      setFbDraft({ base_url: '', model: '', api_key: '', label: '', reasoning_effort: '' });
+                      setShowAddFb(moduleKey);
+                    }}
+                  >
+                    + {t('vault.fallbackAdd')}
+                  </Button>
+                </div>
+                {fallbacks[moduleKey]?.length > 0 && (
+                  <ul className="space-y-2">
+                    {fallbacks[moduleKey].map((fb, i) => (
+                      <li key={i} className="p-2 rounded-lg bg-surface-2 text-sm">
+                        <div className="flex items-center gap-2">
+                          <div className="flex-1 min-w-0">
+                            <div className="font-mono text-xs text-ink-1 truncate">
+                              {fb.label || `备用${i + 1}`}
+                              <span className="ml-2 text-ink-3">{fb.model}</span>
+                            </div>
+                            <div className="font-mono text-[11px] text-ink-3 truncate">{fb.base_url}</div>
+                          </div>
+                          {/*
+                           * 「未填密钥」只在**确实没有任何密钥**时显示。
+                           * ⚠️ 实测踩坑：原先只看 `has_api_key`，而刚在表单里新填的条目是本地
+                           * draft（没有 has_api_key 字段，密钥在 `api_key` 里），于是用户明明
+                           * 填了 key，行上却挂着红字「未填密钥」—— 他截图来问「我不是填了密钥吗」。
+                           * 现在三种来源任一存在即视为已填：已保存标记 / 已保存脱敏值 / 草稿明文。
+                           */}
+                          {!(fb.has_api_key || fb.api_key_masked || (fb.api_key && fb.api_key.trim())) && (
+                            <span className="text-[11px] text-warning-strong shrink-0">{t('vault.fallbackNoKey')}</span>
+                          )}
+                          {/* 测试连接：与主模型同款能力。密钥不回前端，只传索引由后端取。 */}
+                          <button
+                            type="button"
+                            onClick={() => handleTestFallback(moduleKey, i)}
+                            disabled={fbTesting === `${moduleKey}#${i}`}
+                            className="shrink-0 flex items-center gap-1 px-2 py-1 rounded border border-line text-[11px] text-ink-2 hover:text-brand hover:border-brand transition-colors disabled:opacity-40"
+                            title={t('vault.fallbackTest')}
+                          >
+                            <RefreshCw className={`h-3 w-3 ${fbTesting === `${moduleKey}#${i}` ? 'animate-spin' : ''}`} />
+                            {t('vault.fallbackTest')}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => openFbEditor(moduleKey, i)}
+                            className="shrink-0 flex items-center gap-1 px-2 py-1 rounded border border-line text-[11px] text-ink-2 hover:text-brand hover:border-brand transition-colors"
+                            title={t('vault.fallbackEdit')}
+                          >
+                            <Pencil className="h-3 w-3" />
+                            {t('vault.fallbackEdit')}
+                          </button>
+                          <button
+                            type="button"
+                            disabled={fbSaving === moduleKey}
+                            onClick={() => {
+                              const next = (fallbacks[moduleKey] || []).filter((_, idx) => idx !== i);
+                              setFallbacks(prev => ({ ...prev, [moduleKey]: next }));
+                              setFbResults(prev => {
+                                const n = { ...prev };
+                                Object.keys(n).forEach(k => { if (k.startsWith(`${moduleKey}#`)) delete n[k]; });
+                                return n;
+                              });
+                              // 删完立刻落盘，不用再点下面的「保存配置」
+                              persistFallbacks(moduleKey, next, t('vault.fallbackDeleted'));
+                            }}
+                            className="shrink-0 flex items-center gap-1 px-2 py-1 rounded border border-line text-[11px] text-ink-2 hover:text-danger hover:border-danger transition-colors"
+                            title={t('vault.fallbackRemove')}
+                          >
+                            <X className="h-3 w-3" />
+                            {t('vault.fallbackRemove')}
+                          </button>
+                        </div>
+                        {fbTesting === `${moduleKey}#${i}` && (
+                          <div className="mt-1 text-[11px] text-ink-3">
+                            {t('vault.fallbackTesting')}
+                          </div>
+                        )}
+                        {fbResults[`${moduleKey}#${i}`] && (() => {
+                          const r = fbResults[`${moduleKey}#${i}`]!;
+                          const partial = r.success && r.verdict !== 'ok';
+                          return (
+                            <div className={`mt-1 text-[11px] ${r.success ? (partial ? 'text-warning-strong' : 'text-success-strong') : 'text-danger-strong'}`}>
+                              {r.success
+                                ? (partial ? t('vault.fallbackTestPartial') : t('vault.fallbackTestOk', { label: fb.label || `备用${i + 1}` }))
+                                : `${t('vault.fallbackTestFail')}：${String(r.error || '').slice(0, 180)}`}
+                            </div>
+                          );
+                        })()}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                {fbDirty[moduleKey] && (
+                  <div className="mt-2 flex items-start gap-1.5 text-[11px] text-warning-strong">
+                    <AlertTriangle className="h-3.5 w-3.5 shrink-0 mt-[1px]" />
+                    <span>{t('vault.fallbackSaveFailed')}</span>
+                  </div>
+                )}
+                {showAddFb === moduleKey && (
+                  <div className="mt-2 p-3 rounded-lg border border-line space-y-2">
+                    {editingFb && editingFb.module === moduleKey && (
+                      <div className="text-xs text-ink-2">{t('vault.fallbackEditTitle')}</div>
+                    )}
+                    <Input label="Label" placeholder={t('vault.fallbackLabelPh')} value={fbDraft.label || ''}
+                      onChange={v => setFbDraft(d => ({ ...d, label: v }))} className="text-sm" />
+                    <Input label="Base URL" placeholder={t('vault.fallbackUrlPh')} value={fbDraft.base_url || ''}
+                      onChange={v => setFbDraft(d => ({ ...d, base_url: v }))} className="font-mono text-sm" />
+                    <div className="grid grid-cols-2 gap-2">
+                      <Input label="Model" placeholder={t('vault.fallbackModelPh')} value={fbDraft.model || ''}
+                        onChange={v => setFbDraft(d => ({ ...d, model: v }))} className="font-mono text-sm" />
+                      <Input label="API Key" type="password" placeholder={t('vault.fallbackKeyPh')}
+                        value={fbDraft.api_key || ''}
+                        onChange={v => setFbDraft(d => ({ ...d, api_key: v }))} className="font-mono text-sm" />
+                    </div>
+                    <div className="flex justify-end gap-2">
+                      <Button variant="ghost" size="sm" onClick={closeFbForm}>
+                        {t('vault.cancel')}
+                      </Button>
+                      <Button variant="brand" size="sm"
+                        disabled={!fbDraft.base_url?.trim() || !fbDraft.model?.trim()}
+                        onClick={() => {
+                          const isEdit = Boolean(editingFb && editingFb.module === moduleKey);
+                          const list = [...(fallbacks[moduleKey] || [])];
+                          if (isEdit && editingFb) list[editingFb.index] = { ...fbDraft };
+                          else list.push({ ...fbDraft });
+                          setFallbacks(prev => ({ ...prev, [moduleKey]: list }));
+                          // 列表变了 → 旧的测试结论作废，避免张冠李戴
+                          setFbResults(prev => {
+                            const next = { ...prev };
+                            Object.keys(next).forEach(k => { if (k.startsWith(`${moduleKey}#`)) delete next[k]; });
+                            return next;
+                          });
+                          closeFbForm();
+                          // 加/改完立刻落盘 —— 不再要求用户再点一次下面的「保存配置」
+                          persistFallbacks(moduleKey, list,
+                            isEdit ? t('vault.fallbackUpdated') : t('vault.fallbackAdded'));
+                        }}
+                      >
+                        {editingFb && editingFb.module === moduleKey ? t('vault.fallbackUpdate') : t('vault.fallbackSave')}
+                      </Button>
+                    </div>
+                  </div>
+                )}
               </div>
 
               {/* Action Buttons */}

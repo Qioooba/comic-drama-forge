@@ -360,6 +360,77 @@ def build_camera(cam_key: str, cam_angle: str, center_x: float = 0.0, center_z: 
     return position, target, float(fov)
 
 
+# --------------------------------------------------------------------------- #
+# 显式站位（shot["blocking"]）—— 解决「8 个镜头只有 2 种舞台」
+# --------------------------------------------------------------------------- #
+# 背景（2026-10-01 实测）：剧本给每镜的只有 camera="中景固定" + characters_in_shot，
+# 没有任何站位信息 → 同角色同景别的镜头只能推出同一张舞台 → 8 镜折叠成 2 种基准图。
+# 这里让 shot 可以**显式声明**站位；缺失/不匹配时逐字回退旧的「按出场序排开」，零行为变更。
+#
+# shot["blocking"] 形如：
+#   [{"name":"羡进","x":"left","depth":"front","facing":"right"},
+#    {"name":"赵天霸","x":"right","depth":"front","facing":"left"}]
+#   x ∈ left/center/right（画面左/中/右）｜depth ∈ front/mid/back（离镜头近/中/远）
+#   facing ∈ camera/left/right/back（面朝镜头/画面左/画面右/背对镜头），留空 = 向内稍转
+_X_SLOT = {"left": -1.0, "左": -1.0, "center": 0.0, "centre": 0.0, "middle": 0.0, "中": 0.0,
+           "right": 1.0, "右": 1.0}
+_DEPTH_Z = {"front": 0.45, "前": 0.45, "mid": 0.0, "middle": 0.0, "中": 0.0,
+            "back": -0.7, "后": -0.7}
+_FACING_Y = {"camera": 0.0, "镜头": 0.0, "front": 0.0,
+             "left": -0.55, "左": -0.55, "right": 0.55, "右": 0.55,
+             "back": math.pi, "背": math.pi, "away": math.pi}
+
+
+def _blocking_lookup(shot: dict, chars: List[str]) -> Dict[str, dict]:
+    """读出 shot["blocking"] 中**与出场角色同名**的条目；没有则返回空 dict（回退按序排）。"""
+    raw = (shot or {}).get("blocking")
+    if not isinstance(raw, list) or not raw:
+        return {}
+    want = {str(c).strip() for c in chars}
+    out: Dict[str, dict] = {}
+    for it in raw:
+        if not isinstance(it, dict):
+            continue
+        nm = str(it.get("name") or "").strip()
+        if nm and nm in want:
+            out[nm] = {"x": str(it.get("x") or it.get("side") or "").strip().lower(),
+                       "depth": str(it.get("depth") or "").strip().lower(),
+                       "facing": str(it.get("facing") or "").strip().lower()}
+    return out
+
+
+def _blocking_pose(spec: dict, spread: float, idx: int, total: int):
+    """由站位条目推 (position, rotation)；字段缺失的维度沿用旧的按序推导。"""
+    base_pos = _position_for_index(idx, total, spread)
+    base_rot = _rotation_for_index(idx, total)
+    xk = _X_SLOT.get(spec.get("x") or "")
+    px = round(xk * max(0.15, float(spread)), 3) if xk is not None else base_pos[0]
+    pz = base_pos[2]
+    dk = _DEPTH_Z.get(spec.get("depth") or "")
+    if dk is not None:
+        pz = dk
+    yk = _FACING_Y.get(spec.get("facing") or "")
+    ry = yk if yk is not None else base_rot[1]
+    return (px, 0.0, pz), (0.0, ry, 0.0)
+
+
+def _scene_center(scene: dict) -> Tuple[float, float]:
+    """主体中心取**场景实体**的均值（显式站位生效后，机位瞄准必须跟着走）。"""
+    xs, zs = [], []
+    for e in ((scene or {}).get("entities") or []):
+        if not isinstance(e, dict) or e.get("type") != "character":
+            continue
+        try:
+            p = (e.get("transform") or {}).get("position") or [0, 0, 0]
+            xs.append(float(p[0]))
+            zs.append(float(p[2]))
+        except (TypeError, ValueError, IndexError):
+            continue
+    if not xs:
+        return (0.0, 0.0)
+    return (round(sum(xs) / len(xs), 3), round(sum(zs) / len(zs), 3))
+
+
 def build_scene_json(
     shot: dict,
     aspect: str = "9:16",
@@ -395,9 +466,14 @@ def build_scene_json(
 
     # ---- 角色 entity（站位核心）----
     total = len(chars)
+    # 显式站位优先（缺失/不匹配 → 逐字回退旧行为，老剧本零影响）
+    _blk = _blocking_lookup(shot, chars)
     for idx, name in enumerate(chars, start=1):
-        pos = _position_for_index(idx - 1, total, spread)
-        rot = _rotation_for_index(idx - 1, total)
+        if name in _blk:
+            pos, rot = _blocking_pose(_blk[name], spread, idx - 1, total)
+        else:
+            pos = _position_for_index(idx - 1, total, spread)
+            rot = _rotation_for_index(idx - 1, total)
         entities.append({
             "id": _entity_id("char", idx),
             "type": "character",
@@ -574,7 +650,8 @@ def build_render_plan(shot: dict, aspect: str = "9:16", width: int = 768,
     # ⚠️ 主体中心必须用**与 build_scene_json 相同的 spread** 计算（同画幅 + 同景别 + 同人数），
     #    否则机位会偏离主体。
     spread = _lateral_spread(aspect, cam_key, len(chars))
-    cx, cz = _subject_center(chars, spread)
+    # 瞄准点取**场景实体**均值：显式站位生效后位置会变，用旧的按序均值会瞄偏
+    cx, cz = _scene_center(scene)
     position, target, fov = build_camera(cam_key, cam_angle, cx, cz)
     w, h = plan_pixel_size(aspect, width)
     capacity = framing_capacity(aspect, cam_key)
@@ -592,6 +669,48 @@ def build_render_plan(shot: dict, aspect: str = "9:16", width: int = 768,
         "capacity": capacity,
         "cam_key": cam_key,
     }
+
+
+def blocking_spec_text(shot: dict, aspect: str = "9:16") -> str:
+    """把本镜的**确定性构图规格**压成一段文字，供质检核对构图。
+
+    为什么用它替代「无面人偶预演图」（2026-10-01）：
+      把 3D 基准图（灰/蓝无面人偶）与成品图一起送视觉质检会**严重污染**判定 ——
+      实测同一张合格图：不送基准图 score=88 通过；送了 score=35 拒绝。
+      反复加强提示词口径也压不住（build_blocking_note 已写明「人偶外观不得作为判定依据」），
+      因为污染来自**图像本身**，不是措辞问题。
+    而 3D 导演台本来就是**零模型、确定性**的：人数 / 左右顺序 / 景别 / 机位都能精确转文字。
+    于是改成送「文字规格」：保住「有没有照构图出图」的核对能力，同时零视觉污染。
+
+    返回空串表示本镜不该出基准图（``fits`` 为假），调用方据此不加这段口径。
+    """
+    try:
+        plan = build_render_plan(shot, aspect=aspect)
+    except Exception:  # noqa: BLE001 - 规格生成失败绝不影响质检主流程
+        return ""
+    if not plan.get("fits"):
+        return ""
+    ents = [e for e in ((plan.get("scene") or {}).get("entities") or [])
+            if isinstance(e, dict) and e.get("type") == "character" and e.get("visible", True)]
+
+    def _x(e):
+        try:
+            return float((e.get("transform") or {}).get("position", [0])[0])
+        except (TypeError, ValueError, IndexError):
+            return 0.0
+
+    names = [str(e.get("name") or "?") for e in sorted(ents, key=_x)]
+    cam_key = str(plan.get("cam_key") or "未指定")
+    order = " → ".join(names) if names else "（无）"
+    return (
+        "\n【本镜构图规格（由 3D 导演台**确定性**生成，请按此核对成品图的构图）】\n"
+        f"  · 景别：{cam_key}｜人物数：{len(names)}\n"
+        f"  · 站位（画面从左到右）：{order}\n"
+        "  · 核对口径：只比**人物数量 / 左右顺序 / 前后层次 / 景别 / 机位角度**；\n"
+        "    人物的姿态、表情、动作过程、光影、道具细节、外观与配色允许不同，**不得**据此判缺陷；\n"
+        "  · 仅当出现**明显**构图偏差（人数不符、左右颠倒、前后层次错乱、景别差两档以上、机位方向相反）时，\n"
+        "    才在 issues 里写明「构图不符：<具体项>」并扣分。\n"
+    )
 
 
 def block_annotation(shot: dict, characters: Optional[List[str]] = None) -> str:
