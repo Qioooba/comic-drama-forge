@@ -183,12 +183,13 @@ const ASPECT_PRESETS: { value: string; labelKey: string }[] = [
   { value: '21:9 \u8d85\u5bbd', labelKey: 'project.aspect21x9' },
 ];
 
-// 视频生成方式（写入 config.video_mode；取值与后端 config.VIDEO_MODES 一致）。
-// 新建项目时选一次，之后「生成视频」与托管生产都按它执行，不再各处写死默认值。
+// 视频生成方式（写入 config.video_mode）。
+// ⚠️ 2026-10-02 修复：后端 `config.norm_video_mode` 已**只保留「整集一次生成」**
+//   （per_shot / keyframe 废弃，一律归一成 episode，见 config.py:384）。
+//   这里原先仍列 3 项且注释自称「与后端 config.VIDEO_MODES 一致」——与事实不符，
+//   用户选了会被后端静默归一。现与后端同源收敛为单值。
 const VIDEO_MODE_OPTIONS: { value: string; labelKey: string; descKey: string }[] = [
   { value: 'episode', labelKey: 'project.videoModeEpisode', descKey: 'project.videoModeEpisodeDesc' },
-  { value: 'per_shot', labelKey: 'project.videoModePerShot', descKey: 'project.videoModePerShotDesc' },
-  { value: 'keyframe', labelKey: 'project.videoModeKeyframe', descKey: 'project.videoModeKeyframeDesc' },
 ];
 
 const ACCEPT_EXTS = '.txt,.docx,.pdf,.epub,.md';

@@ -1,12 +1,12 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useApp } from '@/context/AppContext';
 import { t } from '@/i18n';
-import { projectsApi, keyframesApi, storyboardApi, videoApi, ttsApi, mixApi, qcApi, exportApi, autopilotApi, upscaleApi, chatApi, agentApi, episodesApi, novelsSplitPlanApi, preflightApi, type VideoMode, type ChapterPreflightResult } from '@/api/client';
-import { Button, Input, EmptyState, ErrorState, Skeleton, Modal, Select } from '@/components/ui';
+import { projectsApi, keyframesApi, storyboardApi, videoApi, ttsApi, mixApi, qcApi, exportApi, autopilotApi, upscaleApi, chatApi, agentApi, episodesApi, novelsSplitPlanApi, preflightApi, characterOutfits, characterSheetUpload, assetPrecipitation, generationApi, type VideoMode, type ChapterPreflightResult, type AssetPrecipitationResponse, type PrecipitationStatus } from '@/api/client';
+import { Button, ConfirmDialog, Input, EmptyState, ErrorState, Loading, Skeleton, Modal, Select } from '@/components/ui';
 // tab 图标統一走线性 SVG（方案 P2-10）：此前是 emoji，字号受系统字体影响且观感与全站割裂
 import {
   AlertTriangle, BarChart3, Box, Check, CheckCircle2, Clapperboard, ClipboardCheck, ClipboardList, FileText,
-  FolderOpen, ImageIcon, MessageSquare, Mountain, Music, Network, Share2, Target, User, X, ZoomIn,
+  FolderOpen, ImageIcon, MessageSquare, Mountain, Music, Network, Share2, Target, Upload, User, X, ZoomIn,
 } from '@/components/ui/icons';
 import { useToast } from '@/components/ui/toast';
 import { useComfyProgress } from '@/hooks/useComfyProgress';
@@ -15,7 +15,7 @@ import { GridPage } from '@/pages/GridPage';
 import { RelationGraphTab } from '@/components/RelationGraphTab';
 import { OutputReviewTab } from '@/components/OutputReviewTab';
 import { AudioTab } from '@/components/AudioTab';
-import type { Project, Deliverable, UpscaleEnv, UpscaleSource, UpscaleTask, UpscaleArtifact, AgentStep, AutopilotCurrent } from '@/types';
+import type { Project, Deliverable, UpscaleEnv, UpscaleSource, UpscaleTask, UpscaleArtifact, AgentStep, AutopilotCurrent, CharacterOutfit, ShotGridStatusResponse, ShotGridTaskState } from '@/types';
 
 // 焦点环：与 components/ui/index.tsx 里的 FOCUS_RING 逐字一致。
 // index.css 有全局 :focus-visible outline 兜底，这里显式加 focus:outline-none 把它压掉，
@@ -427,6 +427,14 @@ function OverviewTab({
   const { t } = useApp();
   const toast = useToast();
   const [preview, setPreview] = useState<{ item: AssetItem; type: 'character' | 'item' | 'scene' } | null>(null);
+  // 上传形象图 → 三视图（零 GPU 本地切分）
+  const [uploadOpen, setUploadOpen] = useState(false);
+  // 可上传的角色名：优先取已有角色资产（用户大概率是给已抽出的角色换图），
+  // 没有资产时也给个空列表让用户手填 —— 支持「先上传形象图再跑剧本」的用法。
+  const uploadCharacters = React.useMemo(
+    () => (assets?.gallery?.characters || []).map((c) => c.name).filter(Boolean),
+    [assets]
+  );
 
   // 剧本相关状态
   const [episodes, setEpisodes] = useState<any[]>([]);
@@ -732,6 +740,13 @@ function OverviewTab({
       <ProductionProgress projectKey={projectKey} />
 
       {/* 资产展示 */}
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="text-lg font-semibold text-ink-1">{t('wb.assetsTitle')}</h3>
+        <Button variant="secondary" onClick={() => setUploadOpen(true)}>
+          <Upload className="h-4 w-4 mr-1.5" />
+          {t('uploadSheet.entry')}
+        </Button>
+      </div>
       {total > 0 && (
         <>
           {groups.map((g) => {
@@ -763,6 +778,14 @@ function OverviewTab({
           />
         </>
       )}
+      {/* 上传形象图模态挂在 total>0 之外：空项目也能先上传角色形象图再跑剧本 */}
+      <UploadSheetModal
+        isOpen={uploadOpen}
+        onClose={() => setUploadOpen(false)}
+        projectKey={projectKey}
+        characters={uploadCharacters}
+        onUploaded={onRefreshAssets}
+      />
 
       {/* 剧本概览 */}
       <div className="border-t border-line pt-8">
@@ -1155,6 +1178,189 @@ function AssetCard({
   );
 }
 
+// ========== Upload Character Sheet Modal（上传形象图 → 三视图） ==========
+// 设计要点：上传的图**直接落 base.png** 再本地切分（零 GPU、零质检），所以
+//   · 界面必须先把「期望版式」画清楚 —— 用户按版式出图才切得开；
+//   · 切分失败不能报模糊错误，要把后端给的 layout_hint 原样透出来；
+//   · 角色名给下拉（从项目剧本/已有资产取），避免手打错字落错目录。
+function UploadSheetModal({
+  isOpen,
+  onClose,
+  projectKey,
+  characters,
+  onUploaded,
+}: {
+  isOpen: boolean;
+  onClose: () => void;
+  projectKey: string;
+  characters: string[];
+  onUploaded?: () => void;
+}) {
+  const { t } = useApp();
+  const toast = useToast();
+  const [character, setCharacter] = useState('');
+  const [customName, setCustomName] = useState('');
+  const [file, setFile] = useState<File | null>(null);
+  const [preview, setPreview] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [overwrite, setOverwrite] = useState(false);
+  const fileRef = useRef<HTMLInputElement | null>(null);
+
+  // 每次打开重置：上一次的文件/错误绝不能带进下一次（会误传给另一个角色）
+  useEffect(() => {
+    if (!isOpen) return;
+    setFile(null);
+    setPreview('');
+    setBusy(false);
+    setOverwrite(false);
+    setCustomName('');
+    setCharacter((prev) => (prev && characters.includes(prev) ? prev : characters[0] || ''));
+  }, [isOpen, characters]);
+
+  useEffect(() => {
+    if (!file) {
+      setPreview('');
+      return;
+    }
+    const url = URL.createObjectURL(file);
+    setPreview(url);
+    return () => URL.revokeObjectURL(url);
+  }, [file]);
+
+  const finalName = (character === '__custom__' ? customName : character).trim();
+
+  const submit = async () => {
+    if (!finalName) {
+      toast.error(t('uploadSheet.needCharacter'));
+      return;
+    }
+    if (!file) {
+      toast.error(t('uploadSheet.needFile'));
+      return;
+    }
+    setBusy(true);
+    try {
+      const r = await characterSheetUpload.upload({
+        project_name: projectKey,
+        character: finalName,
+        file,
+        overwrite,
+      });
+      if (r.skipped) {
+        toast.info(r.message || t('uploadSheet.skipped'));
+      } else {
+        toast.success(t('uploadSheet.ok', { n: Object.keys(r.views || {}).length }));
+      }
+      onUploaded?.();
+      onClose();
+    } catch (e) {
+      // 后端把「版式不符」的可读原因 + layout_hint 都放在 error 里，直接展示
+      toast.error(e instanceof Error ? e.message : t('uploadSheet.failed'));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal isOpen={isOpen} onClose={onClose} title={t('uploadSheet.title')}>
+      <div className="space-y-4">
+        {/* 版式示意：这是本功能唯一的使用门槛，必须一眼看懂 */}
+        <div className="rounded-lg border border-line bg-surface-2 p-3">
+          <p className="text-xs font-medium text-ink-1 mb-2">{t('uploadSheet.layoutTitle')}</p>
+          <div className="flex items-center gap-2">
+            <div className="flex flex-col gap-1">
+              <div className="flex gap-1">
+                {['front', 'left', 'back'].map((k) => (
+                  <div
+                    key={k}
+                    className="w-12 h-16 rounded border border-dashed border-ink-3 bg-surface flex items-center justify-center text-[10px] text-ink-3"
+                  >
+                    {t(`uploadSheet.view.${k}`)}
+                  </div>
+                ))}
+              </div>
+              <div className="w-12 h-16 rounded border border-dashed border-ink-3 bg-surface flex items-center justify-center text-[10px] text-ink-3">
+                {t('uploadSheet.view.half')}
+              </div>
+            </div>
+            <p className="text-xs text-ink-2 flex-1">{t('uploadSheet.layoutHint')}</p>
+          </div>
+        </div>
+
+        {/* 角色选择 */}
+        <div>
+          <label className="block text-sm font-medium text-ink-1 mb-1">
+            {t('uploadSheet.character')}
+          </label>
+          <Select
+            value={character === '__custom__' || !characters.includes(character) ? '__custom__' : character}
+            onChange={(v) => setCharacter(v)}
+            options={[
+              ...characters.map((c) => ({ value: c, label: c })),
+              { value: '__custom__', label: t('uploadSheet.customName') },
+            ]}
+            className="w-full"
+          />
+          {(character === '__custom__' || characters.length === 0) && (
+            <Input
+              className="mt-2 w-full"
+              value={customName}
+              placeholder={t('uploadSheet.characterPlaceholder')}
+              onChange={(v) => setCustomName(v)}
+            />
+          )}
+        </div>
+
+        {/* 文件选择 */}
+        <div>
+          <label className="block text-sm font-medium text-ink-1 mb-1">
+            {t('uploadSheet.file')}
+          </label>
+          <input
+            ref={fileRef}
+            type="file"
+            accept=".png,.jpg,.jpeg,.webp"
+            className="hidden"
+            onChange={(e) => setFile(e.target.files?.[0] || null)}
+          />
+          <div className="flex items-center gap-3">
+            <Button variant="secondary" onClick={() => fileRef.current?.click()} disabled={busy}>
+              {file ? t('uploadSheet.reselect') : t('uploadSheet.choose')}
+            </Button>
+            <span className="text-xs text-ink-2 truncate">
+              {file ? `${file.name}（${(file.size / 1024).toFixed(0)} KB）` : t('uploadSheet.noFile')}
+            </span>
+          </div>
+          {preview && (
+            <div className="mt-2 rounded-lg border border-line overflow-hidden bg-surface-2">
+              <img src={preview} alt="preview" className="w-full max-h-56 object-contain" />
+            </div>
+          )}
+        </div>
+
+        <label className="flex items-center gap-2 text-sm text-ink-2">
+          <input
+            type="checkbox"
+            checked={overwrite}
+            onChange={(e) => setOverwrite(e.target.checked)}
+            className="rounded border-line"
+          />
+          {t('uploadSheet.overwrite')}
+        </label>
+
+        <div className="flex justify-end gap-2 pt-2">
+          <Button variant="ghost" onClick={onClose} disabled={busy}>
+            {t('common.cancel')}
+          </Button>
+          <Button onClick={submit} disabled={busy || !file || !finalName}>
+            {busy ? t('uploadSheet.uploading') : t('uploadSheet.submit')}
+          </Button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
 // ========== Asset Preview Modal ==========
 // 薄封装：遮罩、头部、动画、ESC / 遮罩关闭、滚动锁定、焦点陷阱、层级全部由共享 Modal
 // 负责（方案 P1-7）。此前这里是一份独立的自建弹层（bg-black/60 + p-4 头部 + z-modal），
@@ -1360,8 +1566,369 @@ function AssetPreviewModal({
               </>
             )}
           </div>
+
+          {/* 资产沉淀过程（时间线）：抽取 → 提示词 → 出图 → 质检 → 教训 → 切分 → 入库 */}
+          {item?.name && (
+            <AssetPrecipitationSection
+              projectKey={projectKey}
+              kind={preview?.type || 'character'}
+              name={item.name}
+            />
+          )}
+
+          {/* 服装变体（衣柜）：仅角色资产显示 —— 列表 + 新增入口 */}
+          {preview?.type === 'character' && item?.name && (
+            <CharacterOutfitsSection projectKey={projectKey} character={item.name} />
+          )}
         </div>
     </Modal>
+  );
+}
+
+// ========== 资产沉淀过程（时间线，2026-10-06） ==========
+// 需求：资产不是「一下就有的」，用户在界面上只能看到「最后那张图」，看不到
+// 「它被改了几次、为什么改、学到了什么」。后端 /api/projects/<pid>/asset-precipitation
+// 把散落在质检历史（QC_DIR）、产物旁路元数据（*.meta.json）、教训库
+// （output/lessons/lessons.jsonl）三处的痕迹按资产聚合成 7 步时间线。
+//
+// 与 CharacterOutfitsSection 同款 fail-open：默认折叠、点开才拉取；接口异常降级成
+// 「无法读取」一行字，绝不打断预览主体（后端零回归约束对齐）。
+function AssetPrecipitationSection({
+  projectKey,
+  kind,
+  name,
+}: {
+  projectKey: string;
+  kind: string;
+  name: string;
+}) {
+  const { t } = useApp();
+  const [open, setOpen] = useState(false);
+  const [data, setData] = useState<AssetPrecipitationResponse | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(false);
+
+  useEffect(() => {
+    setData(null);
+    setError(false);
+    if (!open || !projectKey || !name) return;
+    let alive = true;
+    setLoading(true);
+    assetPrecipitation
+      .get(projectKey, kind, name)
+      .then((d) => { if (alive) setData(d); })
+      .catch(() => { if (alive) setError(true); })
+      .finally(() => { if (alive) setLoading(false); });
+    return () => { alive = false; };
+  }, [open, projectKey, kind, name]);
+
+  // 状态 → 圆点样式 + 文案。skipped/pending 视觉上明显弱于 done/failed，
+  // 因为它们是「本来就没有这一步」而非「出错了」，不该让用户误以为有问题。
+  const dotOf = (status: PrecipitationStatus) => {
+    switch (status) {
+      case 'done':    return 'bg-success-strong border-success-strong';
+      case 'failed':  return 'bg-danger-strong border-danger-strong';
+      case 'pending': return 'bg-surface border-line-strong';
+      default:        return 'bg-surface-2 border-line';
+    }
+  };
+  const badgeOf = (status: PrecipitationStatus) => {
+    switch (status) {
+      case 'done':    return 'bg-success-subtle text-success-strong';
+      case 'failed':  return 'bg-danger-subtle text-danger-strong';
+      default:        return 'bg-surface-2 text-ink-3';
+    }
+  };
+  const statusText = (status: PrecipitationStatus) =>
+    t(`precip.status.${status}`);
+
+  const summary = data?.summary;
+
+  return (
+    <div className="border border-line rounded-lg p-3 space-y-2">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        className={`flex w-full items-center justify-between rounded text-sm font-semibold text-ink-1 hover:text-brand transition-colors ${FOCUS_RING}`}
+      >
+        <span className="flex items-center gap-2">
+          <span>{t('precip.title')}</span>
+          {summary && (
+            <span className="rounded-full bg-surface-2 px-2 py-0.5 text-[11px] font-normal text-ink-3">
+              {t('precip.summary.done', { done: summary.done, total: summary.total_steps })}
+            </span>
+          )}
+        </span>
+        <span className="text-xs text-ink-3">{open ? '−' : '+'}</span>
+      </button>
+
+      {open && (
+        <div className="space-y-3">
+          {loading ? (
+            <div className="text-xs text-ink-3">{t('common.loading')}</div>
+          ) : error || !data ? (
+            <div className="text-xs text-ink-3">{t('precip.loadFailed')}</div>
+          ) : (
+            <>
+              {/* 概览：质检次数 / 命中教训 / 视角数 / 是否用户上传 */}
+              <div className="flex flex-wrap gap-1.5">
+                {summary?.is_user_upload && (
+                  <span className="rounded-full bg-brand-subtle px-2 py-0.5 text-[11px] font-medium text-brand-strong">
+                    {t('precip.badge.userUpload')}
+                  </span>
+                )}
+                <span className="rounded-full bg-surface-2 px-2 py-0.5 text-[11px] text-ink-2">
+                  {t('precip.stat.qc', { n: summary?.qc_attempts ?? 0 })}
+                </span>
+                <span className="rounded-full bg-surface-2 px-2 py-0.5 text-[11px] text-ink-2">
+                  {t('precip.stat.lessons', { n: summary?.lessons ?? 0 })}
+                </span>
+                {!!summary?.views?.length && (
+                  <span className="rounded-full bg-surface-2 px-2 py-0.5 text-[11px] text-ink-2">
+                    {t('precip.stat.views', { n: summary.views.length })}
+                  </span>
+                )}
+              </div>
+
+              {/* 步骤时间线 */}
+              <ol className="space-y-0">
+                {data.steps.map((s, i) => (
+                  <li key={s.id} className="flex gap-2.5">
+                    {/* 竖线 + 圆点 */}
+                    <span className="flex flex-col items-center pt-1.5">
+                      <span className={`h-2.5 w-2.5 shrink-0 rounded-full border-2 ${dotOf(s.status)}`} />
+                      {i < data.steps.length - 1 && <span className="w-px flex-1 bg-line" />}
+                    </span>
+                    <div className="min-w-0 flex-1 pb-3">
+                      <div className="flex items-center gap-2">
+                        <span className="text-sm text-ink-1">{s.label}</span>
+                        <span
+                          className={`shrink-0 rounded-full px-1.5 py-0.5 text-[10px] font-medium ${badgeOf(s.status)}`}
+                        >
+                          {statusText(s.status)}
+                        </span>
+                      </div>
+                      {s.detail && (
+                        <p className="mt-0.5 text-xs text-ink-3 break-words">{s.detail}</p>
+                      )}
+
+                      {/* 质检逐次尝试：哪一次、多少分、因为什么被打回 */}
+                      {s.id === 'qc' && s.items.length > 0 && (
+                        <ul className="mt-1.5 space-y-1">
+                          {s.items.map((it, j) => (
+                            <li
+                              key={j}
+                              className="rounded-md border border-line bg-surface-2 px-2 py-1.5 text-[11px]"
+                            >
+                              <div className="flex items-center gap-2">
+                                <span className="text-ink-2">
+                                  {t('precip.qc.attempt', { n: it.attempt ?? j + 1 })}
+                                </span>
+                                {it.score != null && (
+                                  <span className="text-ink-3">
+                                    {t('precip.qc.score', { score: it.score })}
+                                  </span>
+                                )}
+                                <span className={it.passed ? 'text-success-strong' : 'text-danger-strong'}>
+                                  {it.passed ? t('precip.qc.passed') : t('precip.qc.failed')}
+                                </span>
+                                {it.seed != null && (
+                                  <span className="ml-auto text-ink-3">seed {it.seed}</span>
+                                )}
+                              </div>
+                              {it.reason && (
+                                <p className="mt-0.5 text-ink-3 break-words">{it.reason}</p>
+                              )}
+                              {!!it.issues?.length && (
+                                <ul className="mt-0.5 list-disc pl-4 text-ink-3">
+                                  {it.issues.map((x, k) => (
+                                    <li key={k} className="break-words">{x}</li>
+                                  ))}
+                                </ul>
+                              )}
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+
+                      {/* 教训：下次重画时会被召回用于改写提示词 */}
+                      {s.id === 'lesson' && s.items.length > 0 && (
+                        <ul className="mt-1.5 space-y-1">
+                          {s.items.map((it, j) => (
+                            <li
+                              key={j}
+                              className="rounded-md border border-line bg-surface-2 px-2 py-1.5 text-[11px]"
+                            >
+                              <div className="flex items-start gap-2">
+                                <span className="min-w-0 flex-1 text-ink-2 break-words">{it.issue}</span>
+                                {it.category && (
+                                  <span className="shrink-0 rounded-full bg-surface px-1.5 py-0.5 text-[10px] text-ink-3">
+                                    {it.category}
+                                  </span>
+                                )}
+                                {it.priority && (
+                                  <span className="shrink-0 rounded-full bg-surface px-1.5 py-0.5 text-[10px] text-ink-3">
+                                    {it.priority}
+                                  </span>
+                                )}
+                              </div>
+                              {it.project && (
+                                <p className="mt-0.5 text-ink-3">
+                                  {t('precip.lesson.from', { project: it.project })}
+                                </p>
+                              )}
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+
+                      {/* 通用键值条目（抽取字段 / 提示词 / seed / 视角清单 / 目录） */}
+                      {s.id !== 'qc' && s.id !== 'lesson' && s.items.filter((x) => x.key).length > 0 && (
+                        <dl className="mt-1 space-y-0.5">
+                          {s.items.filter((x) => x.key).map((it, j) => (
+                            <div key={j} className="flex gap-2 text-[11px]">
+                              <dt className="shrink-0 text-ink-3">{it.key}</dt>
+                              <dd className="min-w-0 flex-1 text-ink-2 break-words whitespace-pre-wrap">
+                                {it.value}
+                              </dd>
+                            </div>
+                          ))}
+                        </dl>
+                      )}
+                    </div>
+                  </li>
+                ))}
+              </ol>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ========== 服装变体（衣柜，2026-10-02） ==========
+// 角色资产预览弹层里的小入口：展开显示已生成的服装变体列表
+// （GET /api/assets/character/outfits），并提供「+ 新增服装变体」表单
+// （服装名 + 服装描述 → POST /api/assets/character/outfit，后端复用资产生成
+// 全链路，异步进度可看任务列表）。仅角色类型显示；任何接口异常都降级为空列表 /
+// toast 提示，绝不打断预览主体（fail-open，与后端零回归约束对齐）。
+function CharacterOutfitsSection({ projectKey, character }: { projectKey: string; character: string }) {
+  const { t } = useApp();
+  const toast = useToast();
+  const [open, setOpen] = useState(false);
+  const [outfits, setOutfits] = useState<CharacterOutfit[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [outfitKey, setOutfitKey] = useState('');
+  const [outfitDesc, setOutfitDesc] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+
+  const load = React.useCallback(async () => {
+    setLoading(true);
+    try {
+      const d = await characterOutfits.list(projectKey, character);
+      setOutfits(Array.isArray(d?.outfits) ? d.outfits : []);
+    } catch {
+      setOutfits([]);   // 目录不存在 / 读取失败 → 空列表，不打断预览
+    } finally {
+      setLoading(false);
+    }
+  }, [projectKey, character]);
+
+  useEffect(() => {
+    if (open) void load();
+  }, [open, load]);
+
+  const submit = async () => {
+    if (submitting) return;
+    if (!outfitKey.trim() || !outfitDesc.trim()) {
+      toast.warning(t('assets.outfit.required'));
+      return;
+    }
+    setSubmitting(true);
+    try {
+      const d = await characterOutfits.generate({
+        project_name: projectKey,
+        character,
+        outfit_key: outfitKey.trim(),
+        outfit_desc: outfitDesc.trim(),
+      });
+      if (d?.skipped) {
+        toast.info(d.message || t('assets.outfit.skipped'));
+      } else {
+        toast.success(t('assets.outfit.started'));
+      }
+      setOutfitKey('');
+      setOutfitDesc('');
+      setOpen(true);
+      void load();
+    } catch (err: any) {
+      toast.error(err?.message || t('assets.outfit.failed'));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="border border-line rounded-lg p-3 space-y-2">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        className={`flex w-full items-center justify-between rounded text-sm font-semibold text-ink-1 hover:text-brand transition-colors ${FOCUS_RING}`}
+      >
+        <span>{t('assets.outfit.title')}</span>
+        <span className="text-xs text-ink-3">{open ? '−' : '+'}</span>
+      </button>
+      {open && (
+        <div className="space-y-2">
+          {loading ? (
+            <div className="text-xs text-ink-3">{t('common.loading')}</div>
+          ) : outfits.length === 0 ? (
+            <div className="text-xs text-ink-3">{t('assets.outfit.empty')}</div>
+          ) : (
+            <ul className="space-y-1.5">
+              {outfits.map((o) => (
+                <li key={o.outfit_key}
+                    className="flex items-center justify-between gap-2 rounded-md border border-line bg-surface-2 px-2.5 py-1.5">
+                  <span className="min-w-0">
+                    <span className="block truncate text-sm text-ink-1">{o.outfit_key}</span>
+                    {o.desc && (
+                      <span className="block truncate text-xs text-ink-3">{o.desc}</span>
+                    )}
+                  </span>
+                  <span
+                    className={`shrink-0 rounded-full px-2 py-0.5 text-[11px] font-medium ${
+                      o.ready ? 'bg-success-subtle text-success-strong' : 'bg-surface-2 text-ink-3'
+                    }`}
+                  >
+                    {o.ready ? t('assets.outfit.ready') : t('assets.outfit.generating')}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+          {/* 新增服装变体：服装名 + 服装描述（⚠️ ui.Input 的 onChange 直接传 string 值） */}
+          <div className="space-y-1.5 pt-1">
+            <Input
+              value={outfitKey}
+              onChange={(v) => setOutfitKey(v)}
+              placeholder={t('assets.outfit.keyPlaceholder')}
+            />
+            <Input
+              value={outfitDesc}
+              onChange={(v) => setOutfitDesc(v)}
+              placeholder={t('assets.outfit.descPlaceholder')}
+            />
+            <Button size="sm" variant="secondary" onClick={submit} loading={submitting}>
+              {t('assets.outfit.add')}
+            </Button>
+          </div>
+          <p className="text-[11px] text-ink-3">{t('assets.outfit.hint')}</p>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -2336,13 +2903,19 @@ function KeyframesTab({ projectKey, episodeNo }: { projectKey: string; episodeNo
 // 单镜重做闭环：后端 /api/storyboard/retry-shot（分镜图）与 /api/video/retry-shot（视频）
 // 早已实现，但前端此前**零入口** —— 用户对某一镜不满意只能整集重跑。
 // 这里把两个入口放到每张分镜卡上，并在视频重做成功后提示「同集成片已过期」。
-// 项目级视频生成方式（写入 config.video_mode；取值与后端 config.VIDEO_MODES 一致）。
-// 与每镜的 reference/keyframe 重做模式无关：那个只管「这一镜怎么重做」。
+// 项目级视频生成方式（写入 config.video_mode）。
+// ⚠️ 2026-10-02 修复：后端 `config.norm_video_mode` 已**只保留「整集一次生成」**
+//   （per_shot / keyframe 两种模式废弃，任何入口一律归一成 episode，见 config.py:384）。
+//   这里原先仍列 3 项并注释「取值与后端 config.VIDEO_MODES 一致」——**注释与事实不符**
+//   （自我背书的错误注释），用户选 per_shot/keyframe 会被后端**静默归一**，
+//   界面却仍显示所选值，属静默降级。现与后端同源收敛为单值。
+//   注意与「每镜重做模式」（reference / keyframe，只管这一镜怎么重做）是两件事。
 const PROJECT_VIDEO_MODE_OPTIONS: { value: VideoMode; labelKey: string }[] = [
   { value: 'episode', labelKey: 'project.videoModeEpisode' },
-  { value: 'per_shot', labelKey: 'project.videoModePerShot' },
-  { value: 'keyframe', labelKey: 'project.videoModeKeyframe' },
 ];
+
+// 批量重生成单次上限：与后端 /api/video/retry-shots-batch 的硬上限（≤12）一致
+const BATCH_RETRY_LIMIT = 12;
 
 function StoryboardTab({ projectKey, episodeNo }: { projectKey: string; episodeNo?: number | null }) {
   const { t } = useApp();
@@ -2365,6 +2938,36 @@ function StoryboardTab({ projectKey, episodeNo }: { projectKey: string; episodeN
   /** 项目级视频生成方式（新建项目时选的 video_mode）：本页「生成视频」按它执行。
    *  ⚠️ 不要与上面每镜的 videoMode（reference/keyframe 单镜重做）混用，两者不是一个东西。 */
   const [projectVideoMode, setProjectVideoMode] = useState<VideoMode>('episode');
+
+  // ---- 批量重生成（POST /api/video/retry-shots-batch，单次 ≤12 个）----
+  /** 已勾选待批量重生成的镜头 id（String(card.shot_id)） */
+  const [selectedShots, setSelectedShots] = useState<string[]>([]);
+  /** 批量请求进行中：同步端点可能耗时数分钟，期间防重复提交 */
+  const [batchRunning, setBatchRunning] = useState(false);
+  /** 批量重生成确认弹窗 */
+  const [batchConfirmOpen, setBatchConfirmOpen] = useState(false);
+  /** 最近一次批量结果（成功 N/共 M + 失败明细），展示在工具栏下方 */
+  const [batchResult, setBatchResult] = useState<{
+    total: number;
+    ok: number;
+    failures: { shot_id: string; error: string }[];
+  } | null>(null);
+
+  // ---- 分镜九宫格候选构图（P2-1：grid-candidates 生成 3x3 候选 → 点选某格 → grid-apply 裁切入库）----
+  /** 正在操作九宫格的镜头（sid + 展示用序号）；null = 弹窗关闭 */
+  const [gridTarget, setGridTarget] = useState<{ sid: string; seq: number } | null>(null);
+  /** 弹窗内阶段：generating=候选图生成中 / ready=可点选（或已失败可重试）/ applying=裁切入库中 */
+  const [gridPhase, setGridPhase] = useState<'generating' | 'ready' | 'applying'>('generating');
+  /** 后端生成的 3x3 候选网格图地址（generation 任务完成态的 grid_url） */
+  const [gridImgUrl, setGridImgUrl] = useState('');
+  /** 用户点选的格号（1-9，行优先：1=左上 … 9=右下，与后端 crop_grid_cell 的等分切分一致） */
+  const [gridCell, setGridCell] = useState<number | null>(null);
+  /** 候选生成失败原因（弹窗内展示，可原地重试） */
+  const [gridError, setGridError] = useState('');
+  /** 九宫格轮询句柄（弹窗关闭 / 换镜 / 卸载时必须清掉，否则会一直打后端） */
+  const gridPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  /** 进行中的候选生成任务（sid → task_id）：弹窗被提前关掉后重开可续接轮询，不重复烧卡 */
+  const gridTaskRef = useRef<{ sid: string; taskId: string } | null>(null);
 
   const fetchCanvas = async () => {
     if (!projectKey) return;
@@ -2492,6 +3095,138 @@ function StoryboardTab({ projectKey, episodeNo }: { projectKey: string; episodeN
     }
   };
 
+  // ---- 批量重生成 ----
+  // 刷新/切集后清掉已不在当前列表里的勾选（防止带着旧集的镜头去批量重做）
+  useEffect(() => {
+    const ids = new Set(cards.map((c: any) => String(c.shot_id)));
+    setSelectedShots((prev) => prev.filter((id) => ids.has(id)));
+  }, [cards]);
+
+  const toggleShotSelected = (sid: string) => {
+    setSelectedShots((prev) =>
+      prev.includes(sid) ? prev.filter((s) => s !== sid) : [...prev, sid]
+    );
+  };
+
+  // 确认弹窗里点「确认」后执行。与单镜重跑一样是同步等待（逐镜等 ComfyUI 出片，
+  // 可能耗时数分钟）：ConfirmDialog loading 期间不可关闭，按钮 loading 防重复提交。
+  const runBatchRetry = async () => {
+    if (batchRunning || selectedShots.length === 0) return;
+    setBatchRunning(true);
+    setShotError('');
+    setNotice('');
+    try {
+      const r = await videoApi.retryShotsBatch(projectKey, episodeNo ?? undefined, selectedShots);
+      const results = Array.isArray(r.results) ? r.results : [];
+      const ok = typeof r.ok_count === 'number'
+        ? r.ok_count
+        : results.filter((x) => x.success).length;
+      const failures = results
+        .filter((x) => !x.success)
+        .map((x) => ({ shot_id: String(x.shot_id), error: x.error || t('video.batchRetry.unknownError') }));
+      const total = results.length || selectedShots.length;
+      setBatchResult({ total, ok, failures });
+      if (failures.length === 0) {
+        toast.success(t('video.batchRetry.done', { ok, total }));
+      } else {
+        toast.warning(t('video.batchRetry.partial', { ok, total }));
+      }
+      setSelectedShots([]);
+      await fetchCanvas();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : t('video.batchRetry.submitFailed');
+      setShotError(msg);
+      toast.error(msg);
+    } finally {
+      setBatchRunning(false);
+      setBatchConfirmOpen(false);
+    }
+  };
+
+  // ---- 分镜九宫格候选构图（P2-1 前端入口） ----
+  const stopGridPoll = () => {
+    if (gridPollRef.current) { clearInterval(gridPollRef.current); gridPollRef.current = null; }
+  };
+  // 组件卸载时停掉轮询
+  useEffect(() => () => stopGridPoll(), []);
+
+  /** 关闭弹窗：停轮询并复位弹窗内状态（服务端任务继续跑；同镜重开时续接轮询，不重复发起） */
+  const closeGridModal = () => {
+    stopGridPoll();
+    setGridTarget(null);
+    setGridPhase('generating');
+    setGridImgUrl('');
+    setGridCell(null);
+    setGridError('');
+  };
+
+  /** 轮询九宫格生成任务（3s）：完成取 grid_url 展示；失败/取消把原因留在弹窗内可重试。
+   *  ⚠️ /api/generation/status 历史上存在 {success, task:{…}} 信封与顶层平铺两种返回形态，
+   *     这里按 `task ?? 顶层` 兼容读取，不依赖其中一种。 */
+  const pollGridTask = (taskId: string) => {
+    stopGridPoll();
+    const tick = async () => {
+      try {
+        const d = await generationApi.status(taskId) as unknown as ShotGridStatusResponse;
+        const st: ShotGridTaskState = ((d as any)?.task ?? (d as any)) || {};
+        if (st.status === 'completed') {
+          stopGridPoll();
+          gridTaskRef.current = null;
+          setGridImgUrl(st.grid_url || '');
+          if (!st.grid_url) setGridError(t('sb.grid.generateFailed'));
+          setGridPhase('ready');
+        } else if (st.status === 'failed' || st.status === 'cancelled') {
+          stopGridPoll();
+          gridTaskRef.current = null;
+          setGridError(st.error || t('sb.grid.generateFailed'));
+          setGridPhase('ready');
+        }
+      } catch { /* 网络抖动：等下一轮 */ }
+    };
+    tick();
+    gridPollRef.current = setInterval(tick, 3000);
+  };
+
+  /** 发起九宫格候选生成（打开弹窗与弹窗内「重新生成」共用）：异步任务 + 轮询，防重复提交 */
+  const runGridCandidates = async (target: { sid: string; seq: number }) => {
+    setGridTarget(target);
+    setGridPhase('generating');
+    setGridImgUrl('');
+    setGridCell(null);
+    setGridError('');
+    stopGridPoll();
+    // 同一镜头已有候选任务在跑（上次弹窗被提前关掉）：直接续接轮询，不重复烧一次 GPU
+    const running = gridTaskRef.current;
+    if (running && running.sid === target.sid) {
+      pollGridTask(running.taskId);
+      return;
+    }
+    try {
+      const r = await storyboardApi.gridCandidates(projectKey, episodeNo ?? 1, target.sid);
+      gridTaskRef.current = { sid: target.sid, taskId: r.task_id };
+      pollGridTask(r.task_id);
+    } catch (e) {
+      // 发起失败（镜号不存在 / 无可用参考图等 4xx）：留在弹窗内展示原因，可关闭或重试
+      setGridError(e instanceof Error ? e.message : t('sb.grid.generateFailed'));
+      setGridPhase('ready');
+    }
+  };
+
+  /** 应用所选格：后端把该格从九宫格图裁切为该镜正式分镜图（人工定稿），成功后刷新画布 */
+  const handleGridApply = async () => {
+    if (!gridTarget || gridCell == null || gridPhase === 'applying') return;
+    setGridPhase('applying');
+    try {
+      const r = await storyboardApi.gridApply(projectKey, episodeNo ?? 1, gridTarget.sid, gridCell);
+      toast.success(t('sb.grid.applied', { seq: gridTarget.seq, cell: r.cell ?? gridCell }));
+      closeGridModal();
+      await fetchCanvas();
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : t('sb.grid.applyFailed'));
+      setGridPhase('ready');
+    }
+  };
+
   return (
     <div className="space-y-6">
       <div className="flex justify-between items-center">
@@ -2512,6 +3247,21 @@ function StoryboardTab({ projectKey, episodeNo }: { projectKey: string; episodeN
             className="bg-brand hover:bg-brand-strong"
           >
             {episodeGenerating ? t('common.generating') : t('sb.generateVideo')}
+          </Button>
+          {/* 批量重生成：无选中禁用；超上限在复选框层已挡，这里再兜底 */}
+          {selectedShots.length > 0 && (
+            <span className="text-xs text-ink-2 whitespace-nowrap">
+              {t('video.batchRetry.selectedCount', { n: selectedShots.length, max: BATCH_RETRY_LIMIT })}
+            </span>
+          )}
+          <Button
+            size="sm"
+            variant="secondary"
+            onClick={() => { setBatchResult(null); setBatchConfirmOpen(true); }}
+            disabled={loading || batchRunning || selectedShots.length === 0 || selectedShots.length > BATCH_RETRY_LIMIT}
+            title={t('video.batchRetry.buttonHint')}
+          >
+            {batchRunning ? t('video.batchRetry.running') : t('video.batchRetry.button')}
           </Button>
           <Button size="sm" onClick={fetchCanvas} disabled={loading}>{t('common.refresh')}</Button>
         </div>
@@ -2552,6 +3302,40 @@ function StoryboardTab({ projectKey, episodeNo }: { projectKey: string; episodeN
         </div>
       )}
 
+      {/* 批量重生成结果：成功 N/共 M + 失败明细（错误可能整段话，行内展示比 toast 从容） */}
+      {batchResult && (
+        <div className={`p-3 rounded-lg border text-sm ${
+          batchResult.failures.length === 0
+            ? 'bg-success-subtle border-success/30 text-success-strong'
+            : 'bg-warning-subtle border-warning/30 text-warning-strong'
+        }`}>
+          <div className="flex items-center justify-between gap-2">
+            <span className="font-medium">
+              {batchResult.failures.length === 0
+                ? t('video.batchRetry.done', { ok: batchResult.ok, total: batchResult.total })
+                : t('video.batchRetry.partial', { ok: batchResult.ok, total: batchResult.total })}
+            </span>
+            <button
+              type="button"
+              onClick={() => setBatchResult(null)}
+              aria-label={t('common.close')}
+              className={`shrink-0 opacity-60 hover:opacity-100 ${FOCUS_RING}`}
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+          {batchResult.failures.length > 0 && (
+            <ul className="mt-2 space-y-1 text-xs">
+              {batchResult.failures.map((f) => (
+                <li key={f.shot_id} className="text-danger-strong break-all">
+                  {t('video.batchRetry.failedItem', { shot_id: f.shot_id, error: f.error })}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+
       {error === 'no-data' && (
         <EmptyState
           icon={<Clapperboard className="h-10 w-10" />}
@@ -2579,10 +3363,22 @@ function StoryboardTab({ projectKey, episodeNo }: { projectKey: string; episodeN
           const imgBusy = busy === `${card.shot_id}:image`;
           const vidBusy = busy === `${card.shot_id}:video`;
           const mode = videoMode[sid] || 'reference';
+          const isSelected = selectedShots.includes(sid);
           return (
             <div key={card.seq} className="bg-surface rounded-lg border border-line p-4 flex flex-col">
               <div className="flex items-center justify-between mb-2">
-                <span className="font-mono text-sm text-ink-2">#{card.seq}</span>
+                <label className="flex items-center gap-1.5 cursor-pointer">
+                  {/* 批量重生成勾选：已达上限时未勾选的复选框禁用（原生 checkbox，与 QcTab 一致） */}
+                  <input
+                    type="checkbox"
+                    checked={isSelected}
+                    disabled={batchRunning || (!isSelected && selectedShots.length >= BATCH_RETRY_LIMIT)}
+                    onChange={() => toggleShotSelected(sid)}
+                    aria-label={t('video.batchRetry.pickShot', { seq: card.seq })}
+                    className={`rounded ${FOCUS_RING}`}
+                  />
+                  <span className="font-mono text-sm text-ink-2">#{card.seq}</span>
+                </label>
                 <span className="text-xs text-ink-2">{card.camera}</span>
               </div>
 
@@ -2661,11 +3457,125 @@ function StoryboardTab({ projectKey, episodeNo }: { projectKey: string; episodeN
                 >
                   {vidBusy ? t('sb.redoing') : t('sb.redoVideo')}
                 </Button>
+                {/* 九宫格候选构图：一次生成 3x3 候选，弹窗内点选某格裁切为该镜分镜图。
+                    生成中全站九宫格按钮禁用（防重复提交），弹窗内有进度提示 */}
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onClick={() => runGridCandidates({ sid, seq: card.seq })}
+                  loading={gridTarget?.sid === sid && gridPhase === 'generating'}
+                  disabled={!!busy || gridPhase === 'generating' || gridPhase === 'applying'}
+                  title={t('sb.grid.buttonHint')}
+                >
+                  {t('sb.grid.button')}
+                </Button>
               </div>
             </div>
           );
         })}
       </div>
+
+      {/* 批量重生成确认：与 QcTab 清空配置同款模式 —— loading 期间不可关闭，防重复提交 */}
+      <ConfirmDialog
+        isOpen={batchConfirmOpen}
+        onClose={() => setBatchConfirmOpen(false)}
+        onConfirm={runBatchRetry}
+        title={t('video.batchRetry.confirmTitle')}
+        message={
+          <>
+            <p>{t('video.batchRetry.confirmBody', { n: selectedShots.length, shots: selectedShots.join(', ') })}</p>
+            <p className="mt-2 text-xs text-ink-3">{t('video.batchRetry.confirmHint')}</p>
+          </>
+        }
+        confirmText={batchRunning ? t('video.batchRetry.running') : t('video.batchRetry.button')}
+        loading={batchRunning}
+      />
+
+      {/* 九宫格候选构图弹窗：生成中显示进度提示；完成后在候选图上按 3x3 等分覆盖 9 个
+          透明选格按钮（行优先 1-9，与后端 crop_grid_cell 的整图等分切分逐格对齐），
+          点格 → 「应用所选格」即裁切为该镜正式分镜图并刷新画布 */}
+      <Modal
+        isOpen={gridTarget !== null}
+        onClose={closeGridModal}
+        preventClose={gridPhase === 'applying'}
+        title={t('sb.grid.modalTitle', { seq: gridTarget?.seq ?? '' })}
+        description={t('sb.grid.pickHint')}
+        size="lg"
+        footer={
+          <>
+            <span className="mr-auto text-xs text-ink-2">
+              {gridCell != null ? t('sb.grid.pickedCell', { n: gridCell }) : ''}
+            </span>
+            <Button variant="secondary" onClick={closeGridModal} disabled={gridPhase === 'applying'}>
+              {t('common.close')}
+            </Button>
+            <Button
+              onClick={handleGridApply}
+              disabled={gridPhase !== 'ready' || gridCell == null || !!gridError || !gridImgUrl}
+              loading={gridPhase === 'applying'}
+            >
+              {gridPhase === 'applying' ? t('sb.grid.applying') : t('sb.grid.apply')}
+            </Button>
+          </>
+        }
+      >
+        {/* 生成中：ComfyUI 出图可能耗时一两分钟，给明确进度文案，防用户以为卡死 */}
+        {gridPhase === 'generating' && (
+          <Loading size="md" label={t('sb.grid.generating')} />
+        )}
+
+        {/* 生成失败 / 取消：原因留在弹窗内，可原地重试（异常不打断页面） */}
+        {gridPhase !== 'generating' && gridError && (
+          <div className="space-y-3">
+            <div className="p-3 bg-danger-subtle border border-danger/30 rounded-lg text-danger-strong text-sm break-all">
+              {gridError}
+            </div>
+            <Button
+              variant="secondary"
+              onClick={() => gridTarget && runGridCandidates(gridTarget)}
+              disabled={gridPhase === 'applying'}
+            >
+              {t('sb.grid.regenerate')}
+            </Button>
+          </div>
+        )}
+
+        {/* 候选图 + 3x3 选格覆盖层：划分与后端裁切同口径（整图等分三行三列，行优先） */}
+        {gridPhase !== 'generating' && !gridError && gridImgUrl && (
+          <div className="relative select-none">
+            <img
+              src={gridImgUrl}
+              alt={t('sb.grid.imageAlt', { seq: gridTarget?.seq ?? '' })}
+              className="block w-full rounded-md border border-line bg-surface-2"
+            />
+            <div className="absolute inset-0 grid grid-cols-3 grid-rows-3">
+              {Array.from({ length: 9 }, (_, i) => i + 1).map((n) => (
+                <button
+                  key={n}
+                  type="button"
+                  aria-label={t('sb.grid.cellN', { n })}
+                  aria-pressed={gridCell === n}
+                  title={t('sb.grid.cellN', { n })}
+                  onClick={() => setGridCell(n)}
+                  className={`relative cursor-pointer transition-colors ${FOCUS_RING} ${
+                    gridCell === n
+                      ? 'border-2 border-brand bg-brand/25'
+                      : 'border border-transparent hover:border-brand/70 hover:bg-brand/10'
+                  }`}
+                >
+                  <span
+                    className={`absolute left-1 top-1 rounded px-1.5 py-0.5 text-[10px] font-medium ${
+                      gridCell === n ? 'bg-brand text-white' : 'bg-slate-900/70 text-white'
+                    }`}
+                  >
+                    {n}
+                  </span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+      </Modal>
     </div>
   );
 }
