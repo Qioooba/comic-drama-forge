@@ -37,11 +37,12 @@ from typing import Dict, List, Optional, Any, Tuple, Sequence
 # NameError: name 'Sequence' is not defined（实测）。别删这个导入。
 
 from config import (
-    COMFYUI_URL, COMFYUI_OUTPUT_DIR,
+    COMFYUI_URL, COMFYUI_OUTPUT_DIR, COMFYUI_TEMP_DIR,
     resolve_workflow_path,
     PROJECT_OUTPUT_DIR, WORKFLOW_TEMPLATE, MULTIVIEW_CONFIG,
     SCENE_VIEW_ANGLE_ZH, SCENE_VIEW_KEYS, SCENE_VIEW_LABELS,
     H3_EMIT_AUDIO,
+    H3_DISABLE_DLSS,
     CONFLICT_NEGATIVE_TOKENS,
     ENABLE_BLOCKING_ANNOTATION,
     H3_ENABLE_REFINE,
@@ -592,6 +593,198 @@ INPUT_LOAD_CLASSES = {"LoadImage", "LoadAudio", "LoadVideo", "LoadImageMask",
 # 文件名型（媒体）输入键：转换时需按节点类型规范化目录标注
 MEDIA_INPUT_KEYS = {"image", "images", "audio", "video", "file", "filename", "path",
                     "image_path", "audio_path", "video_path"}
+
+
+# ===================== P2-2 RefMod PoC：节点探测 + UI→API 兼容自检 =====================
+# 背景：RefMod（ComfyUI-MiniMaxH3Mod）把角色参考图打包成 .safetensors，像 LoRA 一样
+# 直接喂 H3。社区节点多为 UI 模式工作流，「能否过本模块的 UI→API 转换 + validate_api_prompt
+# 自检」是唯一集成风险 —— 下面两个函数把这件事变成可探测、可报告的自动化自检，
+# 供 /api/comfyui/refmod-status 消费。口径与 get_status / get_object_info 一致：**fail-open**，
+# ComfyUI 不可达 / 节点不存在 / 任何异常都返回结构化结果，绝不抛错、绝不影响生成链路。
+
+#: RefMod / MiniMaxH3Mod 节点类名匹配（大小写不敏感；``.?`` 兼容 MiniMax-H3 等连字符变体）
+_REFMOD_NODE_RE = re.compile(r"(refmod|minimax.?h3)", re.IGNORECASE)
+
+
+def _compact_refmod_spec(raw) -> dict:
+    """把 object_info 的一组输入声明压成 PoC 需要的紧凑形态（输入名 → [类型, options]）。
+
+    combo 候选只留前 8 个（PoC 只用第一个当默认值，也避免数百个模型文件名把
+    状态端点响应撑爆）；options 只留 default / forceInput（后者决定该输入是
+    「控件」还是「连线槽位」）。
+    """
+    out: dict = {}
+    for name, spec in (raw or {}).items():
+        if not isinstance(spec, (list, tuple)) or not spec:
+            out[str(name)] = [spec] if spec is not None else []
+            continue
+        t = spec[0]
+        opts = spec[1] if len(spec) > 1 and isinstance(spec[1], dict) else {}
+        kept: dict = {}
+        if "default" in opts:
+            kept["default"] = opts.get("default")
+        if opts.get("forceInput"):
+            kept["forceInput"] = True
+        out[str(name)] = [list(t)[:8] if isinstance(t, (list, tuple)) else t, kept]
+    return out
+
+
+def probe_refmod_nodes(timeout: int = 5) -> dict:
+    """GET {COMFYUI_URL}/object_info 探测 RefMod / MiniMaxH3Mod 自定义节点（P2-2）。
+
+    返回 ``{"reachable": bool, "nodes": [{"class": str, "input": {...}}], "error": str?}``：
+    - 遍历 object_info 的节点类名，筛出命中 ``(?i)(refmod|minimax.?h3)`` 的类，
+      每个类记录其 required / optional 输入声明（紧凑形态见 :func:`_compact_refmod_spec`）；
+    - 请求异常 / 非法响应 → ``reachable=False + error``（fail-open，绝不抛错）。
+    """
+    result: dict = {"reachable": False, "nodes": []}
+    try:
+        # 跟随 get_status 的 (connect, read) 元组超时：主机不可达时快速失败，不干等满程超时
+        resp = requests.get(f"{COMFYUI_URL}/object_info", timeout=(min(3, timeout), timeout))
+        resp.raise_for_status()
+        info = resp.json()
+    except Exception as e:  # noqa: BLE001
+        result["error"] = f"{type(e).__name__}: {e}"
+        return result
+    try:
+        if not isinstance(info, dict):
+            result["error"] = f"object_info 返回类型异常：{type(info).__name__}"
+            return result
+        for cls_name, obj in info.items():
+            if not _REFMOD_NODE_RE.search(str(cls_name or "")):
+                continue
+            spec = ((obj or {}).get("input") or {}) if isinstance(obj, dict) else {}
+            result["nodes"].append({
+                "class": cls_name,
+                "input": {"required": _compact_refmod_spec(spec.get("required")),
+                          "optional": _compact_refmod_spec(spec.get("optional"))},
+            })
+        result["reachable"] = True
+    except Exception as e:  # noqa: BLE001
+        result["error"] = f"解析 object_info 失败: {type(e).__name__}: {e}"
+    return result
+
+
+def _refmod_widget_default(spec) -> Tuple[str, dict, bool, Any]:
+    """按 object_info 单条输入声明判定「控件 or 连线槽位」并给合成默认值。
+
+    返回 ``(类型名, options, 是否widget, 默认值)``：
+    - combo（spec[0] 是候选列表）→ widget，默认取第一个候选；
+    - INT / FLOAT / STRING / BOOLEAN → widget，默认取 options.default（缺省给安全值）；
+    - options.forceInput=True 或其它类型名（MODEL / CLIP / IMAGE …）→ 连线槽位（无默认值）。
+    """
+    if not isinstance(spec, (list, tuple)) or not spec:
+        return "", {}, False, None
+    t = spec[0]
+    opts = spec[1] if len(spec) > 1 and isinstance(spec[1], dict) else {}
+    if opts.get("forceInput"):
+        return str(t), opts, False, None
+    if isinstance(t, (list, tuple)):
+        choices = [c for c in t if c not in (None, "")]
+        return "COMBO", opts, True, (choices[0] if choices else "")
+    if t == "INT":
+        try:
+            return t, opts, True, int(opts.get("default", 1))
+        except (TypeError, ValueError):
+            return t, opts, True, 1
+    if t == "FLOAT":
+        try:
+            return t, opts, True, float(opts.get("default", 1.0))
+        except (TypeError, ValueError):
+            return t, opts, True, 1.0
+    if t == "STRING":
+        return t, opts, True, str(opts.get("default") or "")
+    if t == "BOOLEAN":
+        return t, opts, True, bool(opts.get("default", False))
+    return str(t), opts, False, None
+
+
+def refmod_ui_to_api_poc(node_class: str, input_spec: dict, timeout: int = 5) -> dict:
+    """合成一张最小 UI 格式图，喂给本模块 UI→API 转换 + validate_api_prompt 自检（P2-2 PoC）。
+
+    做法：按 ``input_spec``（:func:`probe_refmod_nodes` 记录的紧凑声明）合成一个只含
+    该节点的 UI 图 —— ``widgets_values`` 按声明顺序填默认值、连接型输入留空连线
+    （与 UI 里新建一个未连线的节点同构），然后走与生产**完全相同**的入口
+    :meth:`ComfyUIClient.to_api` → :meth:`ComfyUIClient.validate_api_prompt`，
+    把「社区 UI 模式节点能否过本项目转换」变成结构化报告。
+
+    返回 ``{"node_class", "ui_to_api_ok": bool, "api_nodes": int, "missing_inputs": [...],
+    "error": str?}``（另附 ``validate`` 明细与 ``unresolved_inputs`` 便于排查）：
+
+    - ``ui_to_api_ok``：转换零异常 + 节点类完整进入 API 结果 + object_info 认识该类；
+    - ``missing_inputs``：required 输入在转换结果里缺失 —— 连接型输入在无连线合成图里
+      **必然缺失，属预期**，如实上报、不算崩溃；
+    - 任何异常 → ``ui_to_api_ok=False + error``（fail-open）。
+    """
+    out: dict = {"node_class": node_class, "ui_to_api_ok": False, "api_nodes": 0,
+                 "missing_inputs": []}
+    if not str(node_class or "").strip():
+        out["error"] = "node_class 为空，跳过 PoC"
+        return out
+    try:
+        widget_names: List[str] = []
+        widget_values: List[Any] = []
+        conn_inputs: List[dict] = []
+        for group in ("required", "optional"):
+            for name, spec in ((input_spec or {}).get(group) or {}).items():
+                _t, _o, is_widget, default = _refmod_widget_default(spec)
+                if is_widget:
+                    widget_names.append(str(name))
+                    widget_values.append(default)
+                else:
+                    conn_inputs.append({"name": str(name), "type": str(_t), "link": None})
+        # 最小 UI 格式图：nodes / links / version 是 UI 格式必备键（_is_api_format 靠
+        # 「含 nodes 键」判为 UI 格式）；widget 项带 "widget" 键、连接项带 "link"，
+        # 转换器据此做「位置兜底控件名 vs 连线槽位」的区分（见 fallback_widgets）。
+        ui_node = {
+            "id": 1, "type": node_class, "mode": 0,
+            "inputs": [{"name": n, "widget": {"name": n}} for n in widget_names] + conn_inputs,
+            "outputs": [], "properties": {},
+            "widgets_values": widget_values,
+        }
+        ui_workflow = {"nodes": [ui_node], "links": [], "version": 0.4,
+                       "extra": {}, "groups": []}
+        client = ComfyUIClient()
+        # 预取 object_info 并种进该 client 的缓存：让 validate_api_prompt 遵守调用方的
+        # timeout（其内部 _get 固定 60s），且 PoC 内不重复下载整份 object_info。
+        try:
+            resp = requests.get(f"{COMFYUI_URL}/object_info",
+                                timeout=(min(3, timeout), timeout))
+            resp.raise_for_status()
+            oi = resp.json()
+        except Exception as e:  # noqa: BLE001
+            out["error"] = f"object_info 获取失败（无法自检）: {type(e).__name__}: {e}"
+            return out
+        if not isinstance(oi, dict) or not oi:
+            out["error"] = "object_info 为空，无法自检"
+            return out
+        client._object_info = oi
+        client._object_info_ts = time.time()
+        api, meta = client.to_api(ui_workflow, return_meta=True)
+        out["api_nodes"] = len(api or {})
+        entry = (api or {}).get("1")
+        ok = bool(entry) and entry.get("class_type") == node_class and len(api) == 1
+        report = client.validate_api_prompt(api)
+        out["validate"] = {k: report.get(k) for k in
+                           ("node_count", "unknown_types", "missing_required",
+                            "dangling_links", "unexpected_inputs")}
+        out["unresolved_inputs"] = list((meta or {}).get("unresolved_inputs") or [])
+        # 「1(类名).输入名」→ 输入名（nid/类名不含点，切第一段即剥前缀）
+        out["missing_inputs"] = [str(m).split(".", 1)[1] if "." in str(m) else str(m)
+                                 for m in (report.get("missing_required") or [])]
+        if report.get("unknown_types"):
+            out["error"] = (f"object_info 不认识节点类 {node_class}"
+                            "（插件未生效？请重启 ComfyUI 后重试）")
+        else:
+            out["ui_to_api_ok"] = ok
+            if not ok:
+                out["error"] = (f"转换结果异常：期望 1 个 API 节点({node_class})，"
+                                f"实际 {out['api_nodes']} 个"
+                                + (f"，class_type={entry.get('class_type')}" if entry else ""))
+    except Exception as e:  # noqa: BLE001
+        out["ui_to_api_ok"] = False
+        out["error"] = f"{type(e).__name__}: {e}"
+    return out
 
 
 class ComfyUIClient:
@@ -1157,6 +1350,15 @@ class ComfyUIClient:
         """
         start = time.time()
         while time.time() - start < timeout:
+            # ⓪ temp 看门狗（2026-10-01）：DLSS 补帧节点在 ComfyUI temp 下建工作目录，
+            # 若整个 temp 被外部清理（TE 启动器/磁盘清理），mkdtemp 报 WinError 3 →
+            # 收尾文件不存在 → 整集成片丢失（实测连续 18 次提交全死于此）。
+            # 每次轮询顺手确保 temp 存在（exist_ok 幂等、零开销），把「被删」窗口
+            # 压到一个轮询间隔（3s）内。
+            try:
+                os.makedirs(COMFYUI_TEMP_DIR, exist_ok=True)
+            except OSError:
+                pass
             # ① 中止信号：点「暂停」后立刻打断远端并抛出，让上层转 cancelled 而非干等
             if cancellation.should_stop():
                 logger.warning(f"等待期间收到中止信号，打断远端任务 {prompt_id}")
@@ -2149,6 +2351,73 @@ class ComfyUIClient:
         return ""
 
     @staticmethod
+    def build_shot_grid_candidates_prompt(shot: dict, ref_labels: List[str] = None,
+                                          has_blocking_image: bool = False,
+                                          candidates: int = 9) -> str:
+        """分镜「九宫格候选构图」提示词（2026-10-01，对标 BigBanana 的 Shot Workbench）。
+
+        在常规分镜提示词的基础上做两处改写：
+        1. TASK 从「单帧」改为「3x3 联系表（contact sheet），九个备选构图」；
+        2. 末尾追加 GRID LAYOUT 段：严格 3 行 3 列、逐格列出机位/景别变体清单，
+           同场景同角色同风格，**只有取景与角度在格间变化**。
+        生成后由调用方/QC 选出最佳格，裁切为该镜正式分镜图（一图九候选，比
+        best-of-N 的九次独立生成省时省卡）。
+        """
+        prompt = ComfyUIClient.build_storyboard_prompt(
+            shot, ref_labels, has_blocking_image=has_blocking_image)
+        prompt = prompt.replace(
+            "TASK: Generate a single storyboard frame.",
+            f"TASK: Generate ONE image laid out as a 3x3 contact sheet showing "
+            f"{candidates} alternative compositions of the exact same moment, "
+            "changing ONLY the camera framing and angle between cells.", 1)
+        rows = (candidates + 2) // 3
+        variants = ("(1) wide establishing shot, (2) medium shot from the front, "
+                    "(3) close-up on the main subject's face, (4) low angle looking up, "
+                    "(5) high angle looking down, (6) over-the-shoulder depth shot, "
+                    "(7) side profile view, (8) extreme close-up on a key prop or detail, "
+                    "(9) dutch-tilted dramatic angle")
+        prompt += (f"\n\nGRID LAYOUT: exactly {rows} rows by 3 columns, reading order "
+                   f"left-to-right top-to-bottom, {candidates} cells in total. Every cell "
+                   "shows the SAME scene with the SAME characters (identical identity, "
+                   "costume and style); cells vary ONLY in camera framing and angle as "
+                   f"follows: {variants}. Do not add text, numbers, borders or labels "
+                   "between cells.")
+        return prompt
+
+    def generate_shot_grid_candidates(self, shot: dict, ref_labels: List[str],
+                                      ref_images: List[str], project: str,
+                                      shot_key: str, style: str = "",
+                                      has_blocking_image: bool = False,
+                                      seed: int = None, size=None,
+                                      timeout: int = None) -> Dict[str, Any]:
+        """生成一镜的九宫格候选构图，返回与 generate_storyboard 同构的结果 dict。"""
+        grid_prompt = self.build_shot_grid_candidates_prompt(
+            shot, ref_labels, has_blocking_image=has_blocking_image)
+        return self.generate_storyboard(
+            prompt_zh=grid_prompt,
+            ref_images=ref_images,
+            filename_prefix=f"comic_drama_shotgrid/{project}_{shot_key}",
+            seed=seed,
+            size=size,
+            timeout=timeout,
+        )
+
+    @staticmethod
+    def crop_grid_cell(grid_path: str, cell_index: int, out_path: str,
+                       cols: int = 3, rows: int = 3) -> str:
+        """从九宫格图里裁出第 cell_index（0 起，行优先）格，保存并返回路径。"""
+        from PIL import Image
+        img = Image.open(grid_path).convert("RGB")
+        w, h = img.size
+        cw, ch = w / cols, h / rows
+        r, c = divmod(cell_index, cols)
+        box = (int(c * cw), int(r * ch), int((c + 1) * cw), int((r + 1) * ch))
+        cell = img.crop(box)
+        os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+        cell.save(out_path, "PNG")
+        return out_path
+
+    @staticmethod
     def build_storyboard_prompt(shot: dict, ref_labels: List[str] = None,
                                 has_blocking_image: bool = False) -> str:
         """按镜头剧情描述构建分镜图（Qwen-Image-2.1 多参考图编辑）提示词。
@@ -2311,6 +2580,15 @@ class ComfyUIClient:
             content_lines.append(f"Location: {location}.")
         if desc:
             content_lines.append(f"Action and content: {desc}{SHOT_ACTION_SUFFIX}")
+        # ---------- 2026-09-30：消费剧本的 action 字段（一镜一动作的权威产物） ----------
+        # script_generator 的 schema 已让模型输出「本镜动作beat」，此前下游零消费。
+        # 分镜图是单帧，把动作 beat 显式交给模型，让它抓拍这一拍最有表现力的瞬间，
+        # 而不是从长描述里自己猜该画哪一刻。
+        _act = str(shot.get("action") or "").strip()
+        if _act and _act != desc:
+            content_lines.append(
+                "KEY ACTION BEAT (the single action this frame must capture — "
+                f"depict its most telling moment): {_act}.")
         # ---------- P0-1：首帧/末帧/运动 三段结构（借鉴 ViMax / CineGen）----------
         # 给模型「运动起点 → 终点 → 运动类型」的显式锚点，减少动作画崩。
         # 字段缺失（旧剧本/模型未输出）时整段不出现，回落单段 description，零变化。
@@ -2438,6 +2716,52 @@ class ComfyUIClient:
                     old = inputs[key]
                     inputs[key] = None
                     changed.append(f"{nid}({ctype}).{key}=None(原={old})")
+        return changed
+
+    # ===================== DLSS 补帧旁路（2026-10-01） =====================
+
+    @classmethod
+    def bypass_dlss_node(cls, api_prompt: dict) -> List[str]:
+        """把工作流里的 DLSS 补帧节点设为 bypass（mode=4）并重连输出直连。
+
+        NvidiaDLSSFrameInterpolation 在 ComfyUI temp 下建工作目录，该目录被外部
+        （TE 启动器/磁盘清理）周期性删除 → mkdtemp 报 WinError 3 → 收尾文件不存在
+        → 整集成片丢失（实测连续 18 次提交全死于此）。本系统的 FlashVSR 超分已
+        独立承担画质提升，DLSS 补帧属可选增强，旁路后少一个单点故障。
+
+        做法：找到 DLSS 节点 → 记录它的 video 来源 → 把下游 SaveVideo 的 video
+        输入改为直连 DLSS 的上游（CreateVideo），DLSS 节点设 mode=4。
+        """
+        changed: List[str] = []
+        dlss_id = None
+        for nid, node in (api_prompt or {}).items():
+            if not isinstance(node, dict):
+                continue
+            ctype = str(node.get("class_type") or "")
+            if "dlss" in ctype.lower() or "DLSS" in ctype:
+                dlss_id = nid
+                break
+        if dlss_id is None:
+            return changed
+        # 找 DLSS 的 video 来源（上游 CreateVideo 的输出）
+        dlss_inputs = api_prompt[dlss_id].get("inputs") or {}
+        video_src = dlss_inputs.get("video")
+        if not video_src:
+            return changed
+        # 把下游 SaveVideo 的 video 输入改直连上游
+        for nid, node in api_prompt.items():
+            if not isinstance(node, dict):
+                continue
+            if node.get("class_type") not in ("SaveVideo", "SaveImage", "VHS_VideoCombine"):
+                continue
+            inputs = node.get("inputs") or {}
+            vid = inputs.get("video")
+            if vid and isinstance(vid, list) and str(vid[0]) == str(dlss_id):
+                inputs["video"] = video_src
+                changed.append(f"{nid}(SaveVideo).video: {dlss_id} → {video_src[0]}")
+        # DLSS 节点标记 bypass
+        api_prompt[dlss_id]["mode"] = 4
+        changed.append(f"{dlss_id} mode=bypass")
         return changed
 
     # ===================== 随机种子注入（质检重试时用于产出不同结果） =====================
@@ -2929,6 +3253,14 @@ class ComfyUIClient:
         report = self.validate_api_prompt(api_prompt)
         if report["unknown_types"] or report["missing_required"] or report["dangling_links"]:
             logger.warning(f"H3 提交前自检异常: {json.dumps(report, ensure_ascii=False)[:400]}")
+
+        # DLSS 补帧旁路（2026-10-01）：NvidiaDLSSFrameInterpolation 的 temp 工作目录
+        # 被外部周期性删除 → mkdtemp WinError 3 → 收尾文件不存在 → 整集成片丢失。
+        # 本系统 FlashVSR 超分已独立承担画质，DLSS 插帧属可选增强，跳过不失衡。
+        if H3_DISABLE_DLSS:
+            dlss_bypassed = self.bypass_dlss_node(api_prompt)
+            if dlss_bypassed:
+                logger.info(f"H3 DLSS 补帧已旁路（temp 不稳定）: {dlss_bypassed}")
 
         timeout = timeout or int(1200 + timeout_per_segment * n)
         logger.info(f"H3 提交：{n} 段，总超时 {timeout}s（单段预估 {timeout_per_segment}s）")
@@ -3462,6 +3794,13 @@ class ComfyUIClient:
         logger.info(f"H3(Director) 提交：{n} 段，总超时 {timeout}s（单段预估 {timeout_per_segment}s），"
                     f"段间引导 {'开' if layout.get('continuity') else '关'}"
                     f"（{layout.get('continuity_overlap_frames')} 帧）")
+        # DLSS 补帧旁路（2026-10-01）：NvidiaDLSSFrameInterpolation 的 temp 工作目录
+        # 被外部周期性删除 → mkdtemp WinError 3 → 收尾文件不存在 → 整集成片丢失。
+        # 本系统 FlashVSR 超分已独立承担画质，DLSS 插帧属可选增强，跳过不失衡。
+        if H3_DISABLE_DLSS:
+            dlss_bypassed = self.bypass_dlss_node(api_prompt)
+            if dlss_bypassed:
+                logger.info(f"H3(Director) DLSS 补帧已旁路: {dlss_bypassed}")
         # 崩溃免重渲（2026-09-29）：整集一次提交要跑几十分钟，崩溃/重启后先查台账与
         # 远端 history —— 能复用就复用、还在跑就重连，绝不重复提交白烧 GPU。
         history, prompt_id, resumed = self.submit_resumable(

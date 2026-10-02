@@ -249,10 +249,10 @@ def normalize_config(raw: dict, default_project_key: str = "") -> dict:
               "enable_upscale", "require_consistency",
               "auto_repair", "overwrite_script"):
         cfg[k] = bool(cfg.get(k))
-    if cfg.get("video_mode") not in ("per_shot", "episode", "keyframe"):
-        cfg["video_mode"] = "per_shot"
-    if cfg["video_mode"] == "keyframe":
-        cfg["enable_keyframe"] = True      # 关键帧模式必须先生成尾帧
+    # 2026-10-01：只保留整集一次生成（per_shot / keyframe 废弃）
+    cfg["video_mode"] = "episode"
+    if cfg.get("video_mode") == "keyframe":
+        cfg["enable_keyframe"] = True      # 历史关键帧模式分支，现恒不触发
     try:
         import keyframe as _kf
         cfg["keyframe_chain_mode"] = _kf.norm_chain_mode(cfg.get("keyframe_chain_mode"))
@@ -1409,7 +1409,9 @@ def step_enabled(step: str, ctx) -> bool:
     if step == "storyboard":
         return True                      # 分镜图是视频的必要输入，恒开
     if step == "keyframe":
-        return bool(cfg.get("enable_keyframe"))
+        # 2026-10-01：视频只保留整集一次生成（用户决策）——尾帧仅 keyframe 视频模式
+        # 消费，整集模式不读尾帧，此步恒关（enable_keyframe 配置不再生效）。
+        return False
     if step == "video":
         return bool(cfg.get("enable_video"))
     if step == "final":
@@ -1622,6 +1624,30 @@ def run_episode(config: dict, project_name: str, episode_no: int, novel_meta: di
                 "finished_at": _now(),
             }
             ctx["steps"][step] = out
+            # 角色资产自动补做（2026-10-01）：assets 步骤完成后验证角色图是否真实落盘，
+            # 缺失时自动重跑一次（修复「角色参考图不可用」→ 视频无锚点的反复故障）
+            if step == "assets" and out.get("ok"):
+                try:
+                    from config import CHARACTERS_DIR as _CD
+                    _cb = os.path.join(_CD, ctx["project_name"])
+                    _has = any(
+                        os.path.isfile(os.path.join(_cb, d, "base.png"))
+                        for d in (os.listdir(_cb) if os.path.isdir(_cb) else [])
+                        if os.path.isdir(os.path.join(_cb, d))
+                    )
+                    if not _has:
+                        logger.warning("角色资产图缺失（base.png 均不存在），自动重跑资产生成")
+                        out, attempts = _run_step_with_retry("assets", ctx)
+                        result["steps"][step] = {
+                            "status": "done" if out.get("ok") else "failed",
+                            "attempts": attempts,
+                            "error": out.get("error") or "",
+                            "artifact": out.get("artifact") or "",
+                            "detail": out.get("detail") or {},
+                        }
+                        ctx["steps"][step] = out
+                except Exception as _ace:
+                    logger.warning("角色资产自动补做检查失败（忽略）：%s", _ace)
             if not out.get("ok"):
                 result["steps_status"] = "blocked"
                 raise PipelineError(f"{STEP_LABELS[step]}未通过：{out.get('error')}"

@@ -65,6 +65,18 @@ _DERIVED = _derive_comfyui_paths(COMFYUI_ROOT)
 COMFYUI_WORKFLOWS_DIR = _norm_path(_env("COMFYUI_WORKFLOWS_DIR", _DERIVED["workflows"]))
 COMFYUI_INPUT_DIR = _norm_path(_env("COMFYUI_INPUT_DIR", _DERIVED["input"]))
 COMFYUI_OUTPUT_DIR = _norm_path(_env("COMFYUI_OUTPUT_DIR", _DERIVED["output"]))
+# ComfyUI temp 目录（DLSS 补帧等节点在此建工作目录；被外部清理会导致收尾
+# FileNotFoundError → 整集成片丢失，见 comfyui_client.wait_for_completion 的看门狗）
+COMFYUI_TEMP_DIR = _norm_path(_env(
+    "COMFYUI_TEMP_DIR",
+    os.path.join(os.path.dirname(_DERIVED["output"]), "temp")))
+
+# DLSS 补帧节点旁路（2026-10-01）：NvidiaDLSSFrameInterpolation 在 ComfyUI temp
+# 下建工作目录，该目录被外部（TE 启动器/磁盘清理）周期性删除 → mkdtemp 报
+# WinError 3 → 收尾文件不存在 → 整集成片丢失（实测连续 18 次提交全死于此）。
+# 设为 True 后工作流跳过补帧节点（CreateVideo 直接进 SaveVideo），
+# 24fps 原速出片（无 50fps 插帧），FlashVSR 超分不受影响。
+H3_DISABLE_DLSS = _env("H3_DISABLE_DLSS", "1").strip().lower() not in ("0", "false", "off", "no")
 
 # ===================== 工作流模板目录（项目自包含） =====================
 # ⚠️ 为什么要有这一段：工作流 JSON 以前只存在于本机 ComfyUI 的
@@ -350,16 +362,9 @@ SHOT_SPEECH_BUDGET_CHARS = 16
 
 #: 视频生成方式（**项目级设定**，新建项目时由用户选择；全链路唯一口径）。
 #:
-#:   episode  = 整集一次提交，H3 原生段间衔接产出「一条连续整集视频」（默认，观感最连贯）
-#:   per_shot = 逐镜独立生成，便于「某一镜不满意单独返工」
-#:   keyframe = 首尾帧驱动（先生成尾帧图，H3 在首尾帧之间插值）
-#:
-#: ⚠️ 为什么放在**项目配置**而不是托管计划（2026-09-29）：过去它只是 pipeline /
-#: PLAN_DEFAULTS 里的一个内部默认值，用户在「新建项目」时无从选择；前端「整集生成
-#: 视频」按钮又固定发 mode=episode，后端缺省 per_shot —— 同一件事三处口径，
-#: 用户的选择没有任何入口。现在以项目配置为单一事实来源，托管计划里的该字段
-#: 由 autopilot.get_plan 派生、set_plan 写回（见 app/autopilot.py）。
-VIDEO_MODES = ("episode", "per_shot", "keyframe")
+#: ⚠️ 2026-10-01：**只保留「整集一次生成」**（用户决策）。per_shot / keyframe 两种
+#: 模式废弃（norm_video_mode 一律归一 episode）；保留 tuple 仅为兼容既有 import。
+VIDEO_MODES = ("episode",)
 
 #: 视频生成方式的中文标签（后端日志 / 提示文案口径，避免与前端 i18n 两处文字漂移）
 VIDEO_MODE_LABELS = {
@@ -377,17 +382,13 @@ _VIDEO_MODE_ALIASES = {
 
 
 def norm_video_mode(value, default: str = "episode") -> str:
-    """视频生成方式归一：非法/缺失一律回落 default（绝不把脏值透传给段数计算）
+    """视频生成方式归一。
 
-    历史坑：mode 参数直接进 segment_shot / 工作流段数计算，脏值会导致段数算错
-    或整段静默不生成 —— 必须在**入口**收敛，而不是在深处兜底。
+    ⚠️ 2026-10-01 需求：**只保留「整集一次生成」**，逐镜（per_shot）/ 关键帧（keyframe）
+    两种模式废弃。所有入口（新建项目、托管 plan、接口直传、历史残留）一律归一成 episode，
+    避免再走早已弃用的分支、或让用户「选了整集却出单镜」。
     """
-    v = str(value or "").strip().lower()
-    if v in VIDEO_MODES:
-        return v
-    if v in _VIDEO_MODE_ALIASES:
-        return _VIDEO_MODE_ALIASES[v]
-    return default if default in VIDEO_MODES else "episode"
+    return "episode"
 
 
 # 新项目默认配置（每项目一份，落在 output/projects/<项目ID>/config.json）
