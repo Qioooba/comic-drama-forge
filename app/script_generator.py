@@ -335,15 +335,23 @@ class ScriptGenerator:
       "shot_id": 1,
       "episode": 1,
       "duration": 5,
-      "camera": "近景/中景/全景/特写",
+      "camera": "景别+运镜复合词（如「中景轻推」「特写固定」；景别只允许：大特写/特写/近景/中近景/局部/中景/全景/远景/大远景）",
+      "shot_type": "景别（与 camera 中的景别部分一致，单列一字段便于下游精确读取）",
+      "camera_motion": "运镜（只允许克制词表：固定/轻推/轻摇/跟随/轻手持）",
       "location": "场景名（对应scenes中的name）",
       "description": "画面描述（详细，50字以内）",
+      "visual_detail": "扩展画面细节（时间/天气/光源方向/动作过程补全；没有则空串）",
       "dialogue": "角色台词",
       "emotion": "情绪",
+      "beat": "叙事节拍（触发/铺垫/对峙/爆发/收尾 等）",
+      "edit_reason": "这一镜为什么切（剪辑动机，20~30字）",
+      "scene_lighting": "本镜光影（光源方向/色温/氛围）",
       "audio_cues": "音效/音乐提示",
       "prompt_h3": "H3视频生成提示词（英文，包含角色动作、镜头运动、环境描述）",
       "characters_in_shot": ["角色名列表"],
-      "items_in_shot": ["物品名列表"]
+      "items_in_shot": ["物品名列表"],
+      "blocking": [{{"name": "角色名", "x": "left/center/right", "depth": "front/mid/back", "facing": "camera/left/right/back"}}],
+      "action": "本镜动作beat（谁做了什么、动作从哪到哪；纯对话镜也写神态小动作，不得留空）"
     }}
   ],
   "production_notes": {{
@@ -358,7 +366,10 @@ class ScriptGenerator:
 2. items：提取剧情中出现的重要物品（武器、法宝、关键道具），通常2-5个
 3. scenes：提取剧情涉及的主要场景，通常3-6个
 4. shots：至少10-15个分镜，每个分镜5-8秒，标注出场角色和物品
-5. 输出必须是合法的JSON格式，不要包含任何注释"""
+5. 一镜一动作：每镜只承载一个动作节拍（action 字段），连续动作拆成相邻两镜；
+   景别分布以 近景/中近景/局部 为主（各约25%），特写+全景合计不超过10%，
+   大特写/远景/大远景不用；运镜只用固定/轻推/轻摇/跟随/轻手持，特写与局部一律固定
+6. 输出必须是合法的JSON格式，不要包含任何注释"""
 
         if lessons_hint:
             prompt += f"\n\n【历史质检教训，务必规避（不要照抄进正文）】\n{lessons_hint}"

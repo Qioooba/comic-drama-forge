@@ -530,7 +530,105 @@ def build_scene_json(
         },
         "entities": entities,
     }
+    return validate_scene_json(scene)
+
+
+# ===================== 数值 schema 校验（Toonflow 吸收点 #3，2026-10-02） =====================
+# 对齐 Toonflow director3dNode 的 zod schema 思路：站位/机位的每个数值字段都有
+# [min, max] 物理合法域，出界/NaN/inf 一律**夹回边界**（fail-open，不抛错、不拒产）。
+# 为什么只在这里做：scene_json 是导演台回读与无头渲染的唯一数据源，基准图又是分镜的
+# 主要画布 —— 一个异常值混进去就是黑图/相机飞出舞台；在唯一出口 clamp 一次即可覆盖
+# 全部消费方（build_scene_json / build_render_plan 的返回都会过校验）。
+import logging as _t3d_logging
+
+_t3d_logger = _t3d_logging.getLogger(__name__)
+
+#: 字段 → (min, max)。注意区分：entity.position.y 是「离地高度」（≥0），
+#: 视线落点 target.y 允许为负（远景取景下沿到 -3.2m，见 _FRAMING_SPAN）。
+_T3D_NUM_RANGE = {
+    "pos_xz": (-50.0, 50.0),     # 舞台水平范围（全景半径 60 的内圈）
+    "pos_y": (0.0, 10.0),        # 人偶离地高度（米）
+    "look_y": (-6.0, 8.0),       # 视线落点高度（米，允许取景到地面以下）
+    "rot": (-2.0 * math.pi, 2.0 * math.pi),
+    "scale": (0.05, 12.0),
+    "height": (0.3, 3.0),        # 人偶身高（米；heightScale=1.0 → 1.7m 标准）
+    "girth": (0.2, 3.0),         # 体型（胖瘦）
+    "fov_deg": (10.0, 120.0),    # 垂直 FOV（度）
+}
+
+
+def _t3d_clamp(value, rng, default=0.0):
+    """数值 clamp：非法（NaN/inf/非数）回落 default，越界夹回 [min, max]。"""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return default
+    if math.isnan(v) or math.isinf(v):
+        return default
+    lo, hi = rng
+    return min(hi, max(lo, v))
+
+
+def _t3d_clamp_vec3(vec, key_xz: str, key_y: str, default=0.0) -> list:
+    """[x, y, z] 向量 clamp：x/z 走水平域，y 走指定高度域；缺位补 default。"""
+    out = list(vec) if isinstance(vec, (list, tuple)) else []
+    out = [v for v in out][:3] + [default] * (3 - min(3, len(out)))
+    return [
+        _t3d_clamp(out[0], _T3D_NUM_RANGE[key_xz], default),
+        _t3d_clamp(out[1], _T3D_NUM_RANGE[key_y], default),
+        _t3d_clamp(out[2], _T3D_NUM_RANGE[key_xz], default),
+    ]
+
+
+def validate_scene_json(scene: dict) -> dict:
+    """站位/机位数值 schema 校验（clamp 式，Toonflow #3）。
+
+    对 entities 里每个 transform（position / rotation / scale）与体型字段做
+    越界夹取、非法值回落安全默认；原 dict 就地修正并返回（调用方零感知）。
+    """
+    if not isinstance(scene, dict):
+        return scene
+    clamped = 0
+    for ent in (scene.get("entities") or []):
+        if not isinstance(ent, dict):
+            continue
+        tf = ent.get("transform")
+        if isinstance(tf, dict):
+            _old = (tf.get("position"), tf.get("rotation"), tf.get("scale"))
+            new_pos = _t3d_clamp_vec3(tf.get("position"), "pos_xz", "pos_y")
+            _raw_rot = (list(tf.get("rotation")) if isinstance(tf.get("rotation"), (list, tuple))
+                        else [])
+            _raw_rot = _raw_rot[:3] + [0.0] * (3 - min(3, len(_raw_rot)))
+            new_rot = [_t3d_clamp(v, _T3D_NUM_RANGE["rot"]) for v in _raw_rot]
+            new_scale = _t3d_clamp_vec3(tf.get("scale"), "scale", "scale", default=1.0)
+            if (new_pos, new_rot, new_scale) != _old:
+                clamped += 1
+            tf["position"], tf["rotation"], tf["scale"] = new_pos, new_rot, new_scale
+        for _k in ("uniformScale", "heightScale"):
+            if _k in ent:
+                ent[_k] = _t3d_clamp(ent.get(_k), _T3D_NUM_RANGE["scale"], default=1.0)
+        if "height" in ent:
+            ent["height"] = _t3d_clamp(ent.get("height"), _T3D_NUM_RANGE["height"],
+                                       default=TARGET_CHARACTER_HEIGHT)
+        if "girth" in ent:
+            ent["girth"] = _t3d_clamp(ent.get("girth"), _T3D_NUM_RANGE["girth"], default=1.0)
+        if ent.get("type") == "camera" and isinstance(ent.get("target"), (list, tuple)):
+            ent["target"] = _t3d_clamp_vec3(ent.get("target"), "pos_xz", "look_y")
+    if clamped:
+        _t3d_logger.warning("[3D导演台] scene_json 数值越界已夹回合法域：%d 个实体", clamped)
     return scene
+
+
+def validate_render_plan(plan: dict) -> dict:
+    """渲染计划的数值校验：FOV / 机位坐标 / 视线落点 clamp（Toonflow #3）。"""
+    if not isinstance(plan, dict):
+        return plan
+    plan["fov"] = _t3d_clamp(plan.get("fov"), _T3D_NUM_RANGE["fov_deg"], default=36.0)
+    cam = plan.get("camera")
+    if isinstance(cam, dict):
+        cam["position"] = _t3d_clamp_vec3(cam.get("position"), "pos_xz", "pos_y")
+        cam["target"] = _t3d_clamp_vec3(cam.get("target"), "pos_xz", "look_y")
+    return plan
 
 
 def _camera_position(cam_key: str, cam_angle: str) -> Tuple[float, float, float]:
@@ -655,7 +753,7 @@ def build_render_plan(shot: dict, aspect: str = "9:16", width: int = 768,
     position, target, fov = build_camera(cam_key, cam_angle, cx, cz)
     w, h = plan_pixel_size(aspect, width)
     capacity = framing_capacity(aspect, cam_key)
-    return {
+    _plan = {
         "width": w,
         "height": h,
         "aspect": aspect,
@@ -669,6 +767,7 @@ def build_render_plan(shot: dict, aspect: str = "9:16", width: int = 768,
         "capacity": capacity,
         "cam_key": cam_key,
     }
+    return validate_render_plan(_plan)
 
 
 def blocking_spec_text(shot: dict, aspect: str = "9:16") -> str:

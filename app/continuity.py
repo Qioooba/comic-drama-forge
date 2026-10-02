@@ -1301,6 +1301,37 @@ def _render_camera_block(camera_terms: dict) -> str:
             "按动作先后拆成相邻两镜，不要在一镜内堆叠多个动作")
 
 
+def _render_appearance_anchor_block(bible: dict) -> str:
+    """外观锚点块（优化#5 跨集角色一致性传递，2026-10-01）。
+
+    bible 的角色外观在第 N 集首次出现时即锁定（merge_bible_from_episode「仅补充不覆盖」），
+    但生成端此前只拿到设定库原文，缺一条「逐字钉死、禁止改写」的强约束 —— LLM 写长剧本时
+    改写发色/瞳色/服装款式造成跨集漂移。本块把锁定外观 + 当前服装以最高优先级显式重申，
+    拼在 bible_block 尾部随行注入（novel_to_script 无需改动即生效）。
+    """
+    chars = [c for c in ((bible or {}).get("characters") or [])
+             if isinstance(c, dict) and str(c.get("name") or "").strip()]
+    lines = []
+    for c in chars[:12]:
+        name = str(c.get("name") or "").strip()
+        app_txt = str(c.get("appearance") or "").strip()
+        outfit = str(c.get("current_outfit") or "").strip()
+        if not (app_txt or outfit):
+            continue
+        seg = f"  · {name}："
+        if app_txt:
+            seg += f"外观（逐字锁定，禁止任何改写/换色/换发型）＝{app_txt}"
+        if outfit:
+            seg += f"；本阶段服装＝{outfit}"
+        lines.append(seg)
+    if not lines:
+        return ""
+    return ("\n【角色外观锚点·最高优先级】以下为设定库锁定值，本集所有镜头必须逐字一致，"
+            "禁止在画面描述/外观字段中改写（含发色、瞳色、发型、体格、服装款式与配色）；"
+            "如剧情要求换装，只允许改 outfit/服装字段，不得改写外观锚点本身：\n"
+            + "\n".join(lines) + "\n")
+
+
 def build_continuity_context(continuity_dir: str, project_key: str, episode_no: int,
                              style: str, quotes: list = None) -> dict:
     """组装注入生成流程的上下文（②上集摘要卡 + ①设定库 + ③衔接契约 + ⑥⑦⑧风格/金句/口吻/运镜）"""
@@ -1319,7 +1350,9 @@ def build_continuity_context(continuity_dir: str, project_key: str, episode_no: 
         "project_key": project_key,
         "episode_no": int(episode_no),
         "prev_episode_no": int(episode_no) - 1 if prev_card or prev_state else None,
-        "bible_block": _render_bible_block(bible),
+        # 优化#5：外观锚点块拼在 bible_block 尾部（随行注入，生成端无需单独接线）
+        "bible_block": _render_bible_block(bible) + _render_appearance_anchor_block(bible),
+        "appearance_anchor_block": _render_appearance_anchor_block(bible),
         "prev_block": _render_prev_block(prev_card, prev_state),
         # 首集（无上集 state/摘要卡）用「开篇契约」：禁止 LLM 编造不存在的上集前情；
         # 后续集才用「衔接契约」（承接上集结尾）。

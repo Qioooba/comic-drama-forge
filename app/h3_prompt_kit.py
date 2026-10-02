@@ -1434,6 +1434,70 @@ def style_of(shot: dict, fallback: str = "") -> str:
     return str(shot.get("style") or fallback or _DEFAULT_STYLE).strip()
 
 
+def transition_clause(prev_shot: dict, shot: dict,
+                      prev_episode_state: dict = None) -> str:
+    """段间衔接提示词（优化#4 细化版，2026-10-02）。
+
+    生成一条「上一镜末态 → 本镜开场」的中文衔接约束，与 H3 Director 插件原生
+    段间引导（上一段末帧回喂）互补 —— 末帧只给画面，文字才说得清**承接方式**：
+
+      · 同场（location 相同）：强调人物位置/朝向/持物/机位关系连续，禁止跳切瞬移；
+      · 换场（location 变化）：明确允许换景，只要求开场先交代新环境，**不再**要求
+        位置连续 —— 硬要求反而诱导模型在两个场景间硬拗连续性（实测教训）；
+      · 机位：两镜机位不同时写明「机位已切换」，避免上一镜的运镜惯性带进本镜；
+      · 跨集首镜：prev_episode_state 给出上集 state_out（结尾地点/承接建议）时，
+        写「承接上集结尾」，让集与集之间也有文字级衔接（跨集一致性巩固）。
+
+    :return: 衔接句（可直接拼在段提示词末尾）；无衔接信息时返回 ""。
+    """
+    shot = shot or {}
+    cur_loc = str(shot.get("location") or "").strip()
+    cur_cam = str(shot.get("camera") or "").strip()
+    cur_action = str(shot.get("action") or shot.get("motion") or "").strip()
+
+    prev_state_out = {}
+    if isinstance(prev_episode_state, dict):
+        prev_state_out = prev_episode_state.get("state_out") or {}
+    prev_loc = str((prev_shot or {}).get("location") or "").strip()
+    prev_cam = str((prev_shot or {}).get("camera") or "").strip()
+    prev_tail = str((prev_shot or {}).get("action")
+                    or (prev_shot or {}).get("motion")
+                    or (prev_shot or {}).get("description") or "").strip()
+
+    lines: list = []
+    same_episode = bool(prev_shot)
+    if same_episode and prev_tail:
+        # 同场 or 换场的分野：location 都有值且不同 → 换场；其余按同场处理
+        is_scene_change = bool(cur_loc and prev_loc and cur_loc != prev_loc)
+        if is_scene_change:
+            lines.append(f"上一镜结束于：{prev_tail[:50]}。本镜为**换场**（{prev_loc or '原场景'}"
+                         f"→{cur_loc}）：开场先交代新环境与人物入场，位置连续性不作要求")
+        else:
+            lines.append(f"上一镜结束于：{prev_tail[:50]}。本镜开场必须从该状态自然承接："
+                         "人物位置/朝向/持物保持连续，不得凭空跳切、瞬移或无故换装")
+    elif prev_state_out:
+        # 跨集首镜：用上集 state_out 承接（跨集一致性巩固）
+        _ep_loc = str(prev_state_out.get("location") or "").strip()
+        _ep_tr = str(prev_state_out.get("transition") or "").strip()
+        if _ep_loc or _ep_tr:
+            seg = "【跨集衔接】承接上集结尾"
+            if _ep_loc:
+                seg += f"（上集结束于：{_ep_loc[:40]}"
+                if _ep_tr:
+                    seg += f"；建议承接：{_ep_tr[:50]}"
+                seg += "）"
+            lines.append(seg + "：本集开场须与前情自然衔接，人物外观/服装延续上集结尾状态")
+
+    if same_episode and prev_cam and cur_cam and prev_cam != cur_cam:
+        lines.append(f"机位已切换（{prev_cam[:20]} → {cur_cam[:20]}）："
+                     "按新机位重新起幅，不要延续上一镜的运镜惯性")
+
+    if not lines:
+        return ""
+    head = f"【段间衔接】" if same_episode else ""
+    return head + "；".join(lines) + "。"
+
+
 __all__ = [
     "REF_SECTIONS", "BASE_SECTIONS",
     "MAX_PROMPT_CHARS", "MAX_DETAIL_CHARS", "clamp_prompt", "clamp_h3_prompt",
@@ -1442,5 +1506,5 @@ __all__ = [
     "fmt_ts", "lang_tag", "dialogue_lines", "speaker_slots",
     "build_soundscape", "build_music", "build_summary",
     "build_detailed_description", "build_ref2va", "build_base",
-    "validate", "merge_detail", "resolve", "style_of",
+    "validate", "merge_detail", "resolve", "style_of", "transition_clause",
 ]
