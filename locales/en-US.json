@@ -587,7 +587,82 @@
     "off": "Off",
     "confirmClose": "The task keeps running in the background; closing this panel will not stop it."
   },
+  "assets": {
+    "outfit": {
+      "title": "Outfit Variants",
+      "empty": "No outfit variants yet",
+      "ready": "Ready",
+      "generating": "Generating",
+      "add": "+ New outfit variant",
+      "submitting": "Submitting…",
+      "keyPlaceholder": "Outfit name (e.g. Armor / Casual), ≤40 chars",
+      "descPlaceholder": "Outfit description (e.g. dark-iron armor with beast pauldrons and a crimson cape)",
+      "required": "Outfit name and description are required",
+      "started": "Outfit variant generation submitted; once ready it is matched by name in storyboard references",
+      "skipped": "This outfit variant already exists (pass overwrite on the generation side to redo it)",
+      "failed": "Failed to submit outfit variant",
+      "hint": "Generation runs the same QC pipeline as character sheets; storyboard / single-shot reruns prefer the variant image when the shot's outfit hint matches this name, and fall back to the main sheet otherwise."
+    }
+  },
+  "uploadSheet": {
+    "entry": "Upload sheet → views",
+    "title": "Upload character sheet",
+    "layoutTitle": "Image must follow this layout",
+    "layoutHint": "Top row: front / left / back full-body; bottom row: front half-body (bust). The image becomes the character sheet and is split directly — no redraw, so the look is preserved 100%.",
+    "view": {
+      "front": "Front",
+      "left": "Left",
+      "back": "Back",
+      "half": "Half"
+    },
+    "character": "Character",
+    "customName": "Type a character name…",
+    "characterPlaceholder": "Character name (no / \\)",
+    "file": "Sheet file",
+    "choose": "Choose image",
+    "reselect": "Choose another",
+    "noFile": "PNG / JPG / WEBP supported",
+    "overwrite": "Overwrite existing sheet (otherwise skipped if present)",
+    "needCharacter": "Select or type a character name first",
+    "needFile": "Choose a sheet image first",
+    "uploading": "Uploading and splitting…",
+    "submit": "Upload and split",
+    "ok": "Uploaded and split into {n} view images (zero GPU)",
+    "skipped": "This character already has a sheet; enable \"Overwrite existing sheet\" to replace it",
+    "failed": "Upload failed"
+  },
+  "precip": {
+    "title": "Asset buildup process",
+    "loadFailed": "Could not read the buildup process (image viewing is unaffected)",
+    "badge": {
+      "userUpload": "User upload"
+    },
+    "summary": {
+      "done": "{done}/{total} steps"
+    },
+    "stat": {
+      "qc": "{n} QC runs",
+      "lessons": "{n} lessons",
+      "views": "{n} views"
+    },
+    "status": {
+      "done": "Done",
+      "failed": "Not passed",
+      "pending": "Pending",
+      "skipped": "N/A"
+    },
+    "qc": {
+      "attempt": "Attempt {n}",
+      "score": "score {score}",
+      "passed": "passed",
+      "failed": "rejected"
+    },
+    "lesson": {
+      "from": "From project: {project}"
+    }
+  },
   "wb": {
+    "assetsTitle": "Assets",
     "overview": "Overview",
     "autopilot": "Auto Production",
     "keyframes": "Keyframes",
@@ -1209,7 +1284,24 @@
     "workflowTitle": "Workflow",
     "workflowStep1": "Generate TTS dubbing first (synthesize audio for every episode's lines)",
     "workflowStep2": "Then mix audio with video (combine the dubbing with the video clips)",
-    "workflowStep3": "Finally run audio QC to confirm the audio meets the bar"
+    "workflowStep3": "Finally run audio QC to confirm the audio meets the bar",
+    "voiceTitle": "Character voice (reference-audio cloning)",
+    "voiceHint": "Upload a clean 3–15s single-speaker sample; this character will then be dubbed with the cloned voice, keeping the timbre consistent across the series.",
+    "voiceCloneUnavailable": "ComfyUI does not expose the voice-clone nodes (FB_Qwen3TTSVoiceClone / LoadAudio); cloning is unavailable.",
+    "voiceNoCharacters": "No characters in the script yet — generate the script first, or upload and name a character manually.",
+    "voiceBoundTag": "Bound · {sec}s",
+    "voiceRefText": "Reference text: ",
+    "voiceUpload": "Upload audio",
+    "voiceReplace": "Replace",
+    "voicePreview": "Preview",
+    "voiceUnbind": "Unbind",
+    "voicePreviewLabel": "Clone preview",
+    "voiceBound": "Reference audio bound",
+    "voiceUnbound": "Reference audio unbound",
+    "voiceUploadFailed": "Failed to upload reference audio",
+    "voicePreviewFailed": "Preview failed",
+    "voiceDeleteFailed": "Failed to unbind",
+    "voicePreviewReady": "Preview generated — play to confirm"
   },
   "brand": {
     "mark": "M",
@@ -1380,7 +1472,40 @@
     "episodeGenerateFailed": "Failed to start episode video generation",
     "generateVideo": "Generate video",
     "videoModeSaved": "Video generation mode saved",
-    "videoModeSaveFailed": "Failed to save video generation mode"
+    "videoModeSaveFailed": "Failed to save video generation mode",
+    "grid": {
+      "button": "Grid candidates",
+      "buttonHint": "Generate 9 camera/framing candidates at once, then pick one as this shot's storyboard image",
+      "modalTitle": "Shot #{seq} · Grid candidates",
+      "pickHint": "Click to pick a cell (1-9, row-major); applying crops it into this shot's storyboard image",
+      "generating": "Generating the 3x3 candidate grid… (ComfyUI rendering may take a minute or two — keep this page open)",
+      "regenerate": "Regenerate",
+      "cellN": "Cell {n}",
+      "pickedCell": "Cell {n} selected",
+      "apply": "Apply selected cell",
+      "applying": "Applying…",
+      "applied": "Shot #{seq}: cell {cell} applied as the new storyboard image",
+      "applyFailed": "Failed to apply the selected cell",
+      "generateFailed": "Failed to generate grid candidates",
+      "imageAlt": "3x3 candidate composition grid for shot {seq}"
+    }
+  },
+  "video": {
+    "batchRetry": {
+      "button": "Batch regenerate",
+      "buttonHint": "Select shots to regenerate their videos in batch (up to 12 per run)",
+      "pickShot": "Select shot #{seq} for batch regeneration",
+      "selectedCount": "{n}/{max} selected",
+      "confirmTitle": "Batch regenerate videos",
+      "confirmBody": "Regenerate the {n} selected shot videos: {shots}.",
+      "confirmHint": "Each shot goes through the video model and the batch can take several minutes — keep this page open. Afterwards the episode cut is marked as \"needs re-render\".",
+      "running": "Batch regenerating…",
+      "done": "Batch regeneration finished: {ok}/{total} succeeded",
+      "partial": "Batch regeneration finished: {ok}/{total} succeeded, the rest failed",
+      "failedItem": "Shot {shot_id}: {error}",
+      "unknownError": "Unknown reason",
+      "submitFailed": "Batch regeneration request failed"
+    }
   },
   "toolLabel": {
     "apply_creative_settings": "Apply creative settings",

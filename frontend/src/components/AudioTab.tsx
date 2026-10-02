@@ -4,6 +4,7 @@ import { ttsApi, mixApi, qcApi } from '@/api/client';
 import { Button, Loading, Skeleton } from '@/components/ui';
 import { CheckCircle2, Lightbulb, Mic, Volume2, X } from '@/components/ui/icons';
 import { useToast } from '@/components/ui/toast';
+import type { VoiceBankItem } from '@/types';
 
 interface AudioTabProps {
   projectKey: string;
@@ -324,10 +325,16 @@ export function AudioTab({ projectKey }: AudioTabProps) {
               </div>
             )}
 
+            {/* 角色声线（参考音频克隆）——放在「配音计划」之前：先定声线再合成，
+                用户才来得及在按下「生成配音」前把音色调对 */}
+            <VoiceBankPanel
+              projectKey={projectKey}
+              characters={(ttsPlan?.characters || []).map((c: any) => c.name).filter(Boolean)}
+            />
+
             {ttsPlan && (
               <div className="mb-4">
-                <h4 className="font-medium text-ink-1 mb-3">{t('tts.planPreview')}</h4>
-                <div className="grid grid-cols-3 gap-4 mb-4">
+                <h4 className="font-medium text-ink-1 mb-3">{t('tts.planPreview')}</h4>                <div className="grid grid-cols-3 gap-4 mb-4">
                   <div className="bg-surface-2 rounded p-3 text-center">
                     <div className="text-2xl font-bold text-brand">
                       {ttsPlan.line_count ?? (ttsPlan.lines?.length ?? 0)}
@@ -802,6 +809,183 @@ export function AudioTab({ projectKey }: AudioTabProps) {
           <li>{t('audio.workflowStep3')}</li>
         </ol>
       </div>
+    </div>
+  );
+}
+
+// ========== 角色声线（参考音频克隆） ==========
+// 一个角色一段参考音频：上传 → 试听克隆效果 → 已绑定则显示，可解绑/重传。
+// 后端在 build_dub_plan 里见到 voice_bank 有该角色的音频就自动切 clone 模式
+// （除非 voice_map 里显式指定过其它模式），所以这里的操作**即时生效于下次配音**。
+function VoiceBankPanel({
+  projectKey,
+  characters,
+}: {
+  projectKey: string;
+  characters: string[];
+}) {
+  const { t } = useApp();
+  const toast = useToast();
+  const [items, setItems] = React.useState<VoiceBankItem[]>([]);
+  const [cloneOk, setCloneOk] = React.useState(true);
+  const [loading, setLoading] = React.useState(true);
+  const [busyChar, setBusyChar] = React.useState('');
+  const [previewUrl, setPreviewUrl] = React.useState('');
+
+  const load = React.useCallback(async () => {
+    try {
+      const d = await ttsApi.voiceBank(projectKey);
+      setItems(d.items || []);
+      setCloneOk(!!d.clone_available);
+    } catch {
+      /* 列表失败不打断配音主流程 */
+      setItems([]);
+    } finally {
+      setLoading(false);
+    }
+  }, [projectKey]);
+
+  React.useEffect(() => { load(); }, [load]);
+
+  const boundOf = (name: string) => items.find((x) => x.character === name);
+
+  // 候选角色 = 剧本角色 ∪ 已绑定的角色（剧本还没生成时也要能看到/管理已有绑定）
+  const names = React.useMemo(() => {
+    const s = new Set<string>(characters);
+    items.forEach((x) => s.add(x.character));
+    return Array.from(s).filter(Boolean);
+  }, [characters, items]);
+
+  const pickFile = (name: string) => {
+    const el = document.createElement('input');
+    el.type = 'file';
+    el.accept = '.wav,.mp3,.flac,.m4a,.ogg,.aac';
+    el.onchange = async () => {
+      const f = el.files?.[0];
+      if (!f) return;
+      setBusyChar(name);
+      try {
+        const r = await ttsApi.voiceBankUpload({
+          project_name: projectKey,
+          character: name,
+          file: f,
+        });
+        toast.success(r.message || t('audio.voiceBound'));
+        await load();
+      } catch (e) {
+        toast.error(e instanceof Error ? e.message : t('audio.voiceUploadFailed'));
+      } finally {
+        setBusyChar('');
+      }
+    };
+    el.click();
+  };
+
+  const doPreview = async (name: string) => {
+    setBusyChar(name);
+    try {
+      const r = await ttsApi.voiceBankPreview({ project_name: projectKey, character: name });
+      setPreviewUrl(r.url);
+      toast.success(t('audio.voicePreviewReady'));
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : t('audio.voicePreviewFailed'));
+    } finally {
+      setBusyChar('');
+    }
+  };
+
+  const doDelete = async (name: string) => {
+    setBusyChar(name);
+    try {
+      const r = await ttsApi.voiceBankDelete(projectKey, name);
+      toast.success(r.message || t('audio.voiceUnbound'));
+      setPreviewUrl('');
+      await load();
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : t('audio.voiceDeleteFailed'));
+    } finally {
+      setBusyChar('');
+    }
+  };
+
+  if (loading) {
+    return <Skeleton className="h-24 rounded-lg mb-4" />;
+  }
+
+  return (
+    <div className="mb-4 rounded-lg border border-line bg-surface-2 p-4">
+      <h4 className="font-medium text-ink-1 mb-1 flex items-center gap-1.5">
+        <Mic className="h-4 w-4" />
+        {t('audio.voiceTitle')}
+      </h4>
+      <p className="text-xs text-ink-2 mb-3">{t('audio.voiceHint')}</p>
+
+      {!cloneOk && (
+        <div className="mb-3 p-2 rounded bg-warning-subtle border border-warning/30 text-warning-strong text-xs">
+          {t('audio.voiceCloneUnavailable')}
+        </div>
+      )}
+
+      {names.length === 0 ? (
+        <div className="text-sm text-ink-3">{t('audio.voiceNoCharacters')}</div>
+      ) : (
+        <div className="space-y-2">
+          {names.map((name) => {
+            const b = boundOf(name);
+            const busy = busyChar === name;
+            return (
+              <div
+                key={name}
+                className="flex items-center justify-between gap-2 rounded border border-line bg-surface px-3 py-2"
+              >
+                <div className="min-w-0 flex-1">
+                  <div className="text-sm font-medium text-ink-1 truncate">
+                    {name}
+                    {b && (
+                      <span className="ml-2 text-xs font-normal text-success-strong">
+                        {t('audio.voiceBoundTag', {
+                          sec: b.duration_sec ? b.duration_sec.toFixed(1) : '?',
+                        })}
+                      </span>
+                    )}
+                  </div>
+                  {b?.ref_text && (
+                    <div className="text-xs text-ink-3 truncate">
+                      {t('audio.voiceRefText')}{b.ref_text}
+                    </div>
+                  )}
+                </div>
+                <div className="flex items-center gap-1.5 shrink-0">
+                  {b && (
+                    <>
+                      <Button
+                        variant="ghost"
+                        onClick={() => doPreview(name)}
+                        disabled={busy || !cloneOk}
+                      >
+                        {t('audio.voicePreview')}
+                      </Button>
+                      <Button variant="ghost" onClick={() => doDelete(name)} disabled={busy}>
+                        {t('audio.voiceUnbind')}
+                      </Button>
+                    </>
+                  )}
+                  <Button variant="secondary" onClick={() => pickFile(name)} disabled={busy}>
+                    {busy ? t('common.loading') : b ? t('audio.voiceReplace') : t('audio.voiceUpload')}
+                  </Button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {previewUrl && (
+        <div className="mt-3">
+          <div className="text-xs text-ink-2 mb-1">{t('audio.voicePreviewLabel')}</div>
+          <audio controls src={previewUrl} className="w-full h-9" />
+        </div>
+      )}
     </div>
   );
 }

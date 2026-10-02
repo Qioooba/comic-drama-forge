@@ -101,6 +101,38 @@ def _http_bytes(url: str, timeout: int = 300) -> bytes:
         return resp.read()
 
 
+def _http_multipart_upload(url: str, field: str, filename: str, content: bytes,
+                           content_type: str = "application/octet-stream",
+                           extra_fields: Optional[Dict[str, str]] = None,
+                           timeout: int = 120) -> Dict:
+    """用 urllib 手搓一个 multipart/form-data POST（不引入 requests 依赖）。
+
+    用途：把参考音频上传到 ComfyUI 的 ``/upload/image``（通用 input 文件上传端点）。
+    返回解析后的 JSON dict；HTTP 非 2xx 抛异常（调用方负责回落）。
+    """
+    boundary = "----mjscxt" + os.urandom(12).hex()
+    parts: List[bytes] = []
+    for k, v in (extra_fields or {}).items():
+        parts.append(
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n"
+            .encode("utf-8"))
+    parts.append(
+        (f"--{boundary}\r\n"
+         f"Content-Disposition: form-data; name=\"{field}\"; filename=\"{filename}\"\r\n"
+         f"Content-Type: {content_type}\r\n\r\n").encode("utf-8"))
+    parts.append(content)
+    parts.append(f"\r\n--{boundary}--\r\n".encode("utf-8"))
+    body = b"".join(parts)
+    req = urllib.request.Request(
+        url, data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}",
+                 "Content-Length": str(len(body))},
+        method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read().decode("utf-8", "replace")
+    return json.loads(raw or "{}")
+
+
 def probe_audio(path: str) -> Dict:
     """ffprobe 读取音频信息（时长/编码/采样率/声道/大小）"""
     info = {"path": os.path.abspath(path), "ok": False}
@@ -239,8 +271,21 @@ def list_voices() -> Dict:
         "modes": [
             {"key": "preset", "label": "预置音色（9 个内置音色，稳定）"},
             {"key": "design", "label": "音色设计（按中文描述生成音色，可自定义）"},
+            {"key": "clone", "label": "参考音频克隆（上传一段该角色的音频，复刻其音色）"},
         ],
+        "clone_supported": True,
+        "clone_hint": "参考音频 3–15 秒、单人、无背景音乐最佳；"
+                      "若填了「参考音频原文」，克隆相似度会明显更高。",
     }
+
+
+def clone_available(comfyui_url: str = COMFYUI_URL) -> bool:
+    """ComfyUI 侧是否具备参考音频克隆节点（FB_Qwen3TTSVoiceClone + LoadAudio）。"""
+    try:
+        info = _http_json(f"{comfyui_url.rstrip('/')}/object_info", timeout=20)
+    except Exception:
+        return False
+    return "FB_Qwen3TTSVoiceClone" in info and "LoadAudio" in info
 
 
 # ===================== 配音计划（角色 → 音色） =====================
@@ -370,7 +415,10 @@ def default_voice_map(characters: List[dict], project: str = "", episode: int = 
             speaker = pool_speakers.get(name, SPEAKER_KEYS[0])
         voice_style = str(ch.get("voice_style") or "").strip()
         chars[name] = {
-            "mode": "preset",
+            # mode="auto"：**未显式选择**（默认派生）。build_dub_plan 见到 auto 才会
+            # 允许被 voice_bank 的参考音频改写为 clone；用户显式存过的模式不受影响。
+            # normalize_voice 会把 auto 归一为 preset（下游拿到的永远是具体模式）。
+            "mode": "auto",
             "speaker": speaker,
             "instruct": voice_style,          # 仅 design 模式生效；preset 下作为参考描述保存
             "seed": stable_seed(f"{project}|{name}"),
@@ -387,11 +435,23 @@ def default_voice_map(characters: List[dict], project: str = "", episode: int = 
 
 
 def normalize_voice(raw: Optional[dict], fallback: Optional[dict] = None) -> Dict:
-    """校验并归一化单个音色配置（非法 speaker 直接报错，不静默回退）"""
+    """校验并归一化单个音色配置（非法 speaker 直接报错，不静默回退）
+
+    三种模式：
+      · ``preset`` —— 9 个预置 speaker（稳定，默认）；
+      · ``design`` —— 中文音色描述驱动 VoiceDesign；
+      · ``clone``  —— 参考音频克隆（``ref_audio`` 为参考音频路径，``ref_text`` 可选
+        且**强烈建议**填——它是参考音频里实际说出的那句话，填了克隆相似度显著更高）。
+    """
     base = dict(fallback or {})
     raw = raw or {}
+    _mode = raw.get("mode") or base.get("mode") or "preset"
+    # "auto" 是「默认派生、未显式选择」的内部标记（见 default_voice_map）。
+    # 归一为 preset —— 合成端拿到的永远是具体模式，不必认识 auto。
+    if _mode == "auto":
+        _mode = "preset"
     voice = {
-        "mode": raw.get("mode") or base.get("mode") or "preset",
+        "mode": _mode,
         "speaker": raw.get("speaker") or base.get("speaker") or SPEAKER_KEYS[0],
         "instruct": raw.get("instruct", base.get("instruct", "")) or "",
         "seed": int(raw.get("seed") if raw.get("seed") is not None else (base.get("seed") or 0)),
@@ -399,12 +459,25 @@ def normalize_voice(raw: Optional[dict], fallback: Optional[dict] = None) -> Dic
         "language": raw.get("language") or base.get("language") or TTS_DEFAULT_PARAMS["language"],
         "temperature": float(raw.get("temperature") or base.get("temperature") or TTS_DEFAULT_PARAMS["temperature"]),
     }
-    if voice["mode"] not in ("preset", "design"):
+    # clone 两个字段：即使当前不是 clone 模式也原样带着（切模式时不丢配置）
+    _ref_audio = raw.get("ref_audio", base.get("ref_audio", "")) or ""
+    _ref_text = raw.get("ref_text", base.get("ref_text", "")) or ""
+    if _ref_audio:
+        voice["ref_audio"] = str(_ref_audio)
+    if _ref_text:
+        voice["ref_text"] = str(_ref_text)
+    if voice["mode"] not in ("preset", "design", "clone"):
         raise TTSError(f"不支持的音色模式：{voice['mode']}")
     if voice["mode"] == "preset" and voice["speaker"] not in SPEAKER_KEYS:
         raise TTSError(f"不支持的预置音色：{voice['speaker']}（可选：{'、'.join(SPEAKER_KEYS)}）")
     if voice["mode"] == "design" and not str(voice["instruct"]).strip():
         raise TTSError("音色设计模式需要提供音色描述（instruct）")
+    if voice["mode"] == "clone":
+        # ⚠️ 这里**不因 ref_audio 缺失而报错** —— 存量 voice_map 里可能存的是
+        # 一个已被删除的参考音频，报错会让整张 voice_map 存不回去。由合成端
+        # 回落 preset 并记账（见 synthesize_batch 的 clone_fallback）。
+        if not str(voice.get("ref_audio") or "").strip():
+            logger.warning("音色为 clone 模式但未提供 ref_audio，合成时将回落预置音色")
     if voice["model_choice"] not in ("1.7B", "0.6B"):
         raise TTSError(f"不支持的模型规格：{voice['model_choice']}")
     return voice
@@ -494,6 +567,30 @@ def build_dub_plan(script: Dict, voice_map: Optional[Dict] = None,
     vmap.setdefault("characters", {})
     vmap.setdefault("lines", {})
 
+    # ---- 参考音频克隆（2026-10-06）----
+    # 某角色在 voice_bank 里登记过参考音频 → 其音色自动切 clone 模式（除非 voice_map
+    # 里**显式**指定了其它模式，显式优先）。dub_dir 由 out_dir_wav 反推（parent），
+    # 这样不用改 build_dub_plan 的签名（4 处调用方零改动）。
+    _dub_dir = os.path.dirname(os.path.abspath(out_dir_wav)) if out_dir_wav else ""
+    _bank_used: Dict[str, str] = {}
+    if _dub_dir:
+        for _name, _v in list(vmap["characters"].items()):
+            if not isinstance(_v, dict):
+                continue
+            # mode=="auto" = 默认映射（无用户显式选择）→ 允许被 voice_bank 改写为 clone。
+            # 用户显式存过 preset/design/clone 的一律尊重，不覆盖。
+            if _v.get("mode") and _v.get("mode") != "auto":
+                continue
+            _ref, _rt = find_voice_bank_ref(_dub_dir, _name)
+            if _ref:
+                _v["mode"] = "clone"
+                _v["ref_audio"] = _ref
+                if _rt and not _v.get("ref_text"):
+                    _v["ref_text"] = _rt
+                _bank_used[_name] = _ref
+            else:
+                _v["mode"] = "preset"
+    
     # 角色音色底稿：情绪化配音时固定这部分，只让「情绪」变，避免每句音色漂移
     _char_desc = {}
     for _ch in characters:
@@ -624,6 +721,109 @@ def load_voice_map(path: str) -> Optional[Dict]:
     except Exception as e:
         logger.warning(f"音色映射读取失败 {path}: {e}")
         return None
+
+
+# ===================== 参考音频音色库（voice_bank，2026-10-06） =====================
+# 每个角色可以挂一段参考音频（+ 该音频里说的话）作为克隆源。落盘结构：
+#   <dub_dir>/voice_bank/<角色安全名>/ref.<ext>   ← 参考音频本体（用户上传的）
+#   <dub_dir>/voice_bank/<角色安全名>/ref.json    ← {ref_text, original_filename, ...}
+# 参考音频**复制**进 bank（不引用临时上传目录）—— 用户下次跑配音时临时文件早已清掉。
+
+#: 参考音频允许的扩展名 / 时长建议区间（秒）
+VOICE_BANK_EXTS = (".wav", ".mp3", ".flac", ".m4a", ".ogg", ".aac")
+VOICE_BANK_MIN_SEC = 1.0
+VOICE_BANK_MAX_SEC = 60.0
+
+
+def voice_bank_dir(dub_dir: str, character: str) -> str:
+    """某角色的参考音频存放目录"""
+    return os.path.join(dub_dir, "voice_bank", safe_name(character, 40) or "unknown")
+
+
+def find_voice_bank_ref(dub_dir: str, character: str) -> Tuple[str, str]:
+    """查找某角色已登记的参考音频，返回 ``(音频绝对路径, ref_text)``。
+
+    找不到返回 ``("", "")``。只认第一个命中的音频文件（扩展名白名单内），
+    配套 ref.json 读 ref_text（缺失或损坏都只当空串，不影响音频本身可用）。
+    """
+    d = voice_bank_dir(dub_dir, character)
+    if not os.path.isdir(d):
+        return "", ""
+    ref_text = ""
+    meta_path = os.path.join(d, "ref.json")
+    if os.path.isfile(meta_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                ref_text = str((json.load(f) or {}).get("ref_text") or "")
+        except Exception as e:  # noqa: BLE001 元数据坏掉不影响音频可用
+            logger.warning("参考音频元数据读取失败 %s：%s", meta_path, e)
+    try:
+        for fn in sorted(os.listdir(d)):
+            if os.path.splitext(fn)[1].lower() in VOICE_BANK_EXTS:
+                p = os.path.join(d, fn)
+                if os.path.getsize(p) > 0:
+                    return os.path.abspath(p), ref_text
+    except OSError as e:
+        logger.warning("参考音频目录不可读 %s：%s", d, e)
+    return "", ""
+
+
+def save_voice_bank_ref(dub_dir: str, character: str, src_path: str,
+                        ref_text: str = "", original_filename: str = "") -> str:
+    """把一段参考音频登记到该角色的 voice_bank（覆盖旧的），返回音频落盘路径。"""
+    d = voice_bank_dir(dub_dir, character)
+    os.makedirs(d, exist_ok=True)
+    ext = os.path.splitext(src_path)[1].lower() or ".wav"
+    if ext not in VOICE_BANK_EXTS:
+        ext = ".wav"
+    dst = os.path.join(d, f"ref{ext}")
+    # 先清掉该角色其它格式的旧参考（换格式时不留下两份，find 会取到旧的那份）
+    for fn in os.listdir(d):
+        if os.path.splitext(fn)[1].lower() in VOICE_BANK_EXTS and os.path.join(d, fn) != dst:
+            try:
+                os.remove(os.path.join(d, fn))
+            except OSError as e:
+                logger.warning("清理旧参考音频失败 %s：%s", fn, e)
+    shutil.copy2(src_path, dst)
+    save_voice_map({
+        "character": character,
+        "ref_text": str(ref_text or "").strip(),
+        "original_filename": original_filename or os.path.basename(src_path),
+        "duration_sec": (probe_audio(dst) or {}).get("duration"),
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }, os.path.join(d, "ref.json"))
+    return os.path.abspath(dst)
+
+
+def list_voice_bank(dub_dir: str) -> List[Dict]:
+    """列出该项目已登记参考音频的所有角色（供前端展示绑定状态）。"""
+    root = os.path.join(dub_dir, "voice_bank")
+    out: List[Dict] = []
+    if not os.path.isdir(root):
+        return out
+    for name in sorted(os.listdir(root)):
+        d = os.path.join(root, name)
+        if not os.path.isdir(d):
+            continue
+        ref, ref_text = find_voice_bank_ref(dub_dir, name)
+        if not ref:
+            continue
+        meta = {}
+        try:
+            with open(os.path.join(d, "ref.json"), "r", encoding="utf-8") as f:
+                meta = json.load(f) or {}
+        except Exception:  # noqa: BLE001
+            meta = {}
+        out.append({
+            "character": name,
+            "file": ref,
+            "exists": True,
+            "ref_text": ref_text,
+            "duration_sec": meta.get("duration_sec"),
+            "original_filename": meta.get("original_filename") or os.path.basename(ref),
+            "updated_at": meta.get("updated_at"),
+        })
+    return out
 
 
 # ===================== 合成客户端 =====================
@@ -760,7 +960,13 @@ class QwenTTSClient:
 
     # ---------- 高层 ----------
 
-    def _node_inputs(self, text: str, voice: dict, is_last: bool) -> Dict:
+    def _node_inputs(self, text: str, voice: dict, is_last: bool,
+                     ref_node: Optional[str] = None) -> Dict:
+        """构造一个 TTS 合成节点的 inputs。
+
+        :param ref_node: clone 模式下 `LoadAudio` 节点的 id（其 AUDIO 输出接 ref_audio）。
+            为 None 时 clone 模式不可用（调用方应已回落 preset）。
+        """
         unload = (not self._keep_loaded()) and is_last
         common = {
             "model_choice": voice.get("model_choice") or self.params["model_choice"],
@@ -776,29 +982,114 @@ class QwenTTSClient:
             "attention": self.params.get("attention", "auto"),
             "unload_model_after_generate": bool(unload),
         }
-        if voice.get("mode") == "design":
+        mode = voice.get("mode")
+        if mode == "clone":
+            # 参考音频克隆：FB_Qwen3TTSVoiceClone 用 ref_audio（+可选 ref_text）驱动音色。
+            # ⚠️ ref_node 缺失时**绝不**静默退回 CustomVoice —— 那会得到一个与用户
+            # 上传音频毫无关系的预置音色，且日志上看不出来。调用方负责先兜底。
+            inputs = dict(common, text=text,
+                          instruct=str(voice.get("instruct") or ""),
+                          x_vector_only=False)
+            if ref_node:
+                inputs["ref_audio"] = [ref_node, 0]
+            rt = str(voice.get("ref_text") or "").strip()
+            if rt:
+                inputs["ref_text"] = rt
+            return "FB_Qwen3TTSVoiceClone", inputs
+        if mode == "design":
             return "FB_Qwen3TTSVoiceDesign", dict(common, text=text,
                                                   instruct=str(voice.get("instruct") or ""))
         return "FB_Qwen3TTSCustomVoice", dict(common, text=text,
                                               speaker=voice.get("speaker") or SPEAKER_KEYS[0],
                                               instruct=str(voice.get("instruct") or ""))
 
+    def _upload_ref_audio(self, local_path: str,
+                          cache: Optional[Dict[str, Optional[str]]] = None) -> Optional[str]:
+        """上传一段参考音频到 ComfyUI input 目录，返回可写进 LoadAudio 的相对名。
+
+        走 ``/upload/image`` 端点（ComfyUI 的通用 input 文件上传，不校验 MIME，
+        与 ``comfyui_client._upload_h3_director_audio`` 同一做法），文件名带路径
+        哈希前缀防跨角色同名覆盖。失败返回 None（调用方据此回落 preset，绝不静默）。
+        """
+        if not local_path or not os.path.isfile(local_path):
+            return None
+        key = os.path.normcase(os.path.normpath(os.path.abspath(local_path)))
+        if cache is not None and key in cache:
+            return cache[key]
+        base = os.path.basename(key) or "ref.wav"
+        stem, ext = os.path.splitext(base)
+        ext = ext or ".wav"
+        tag = hashlib.md5(key.encode("utf-8", "ignore")).hexdigest()[:12]
+        fname = f"{safe_name(stem, 24)}_{tag}{ext}"
+        subdir = "mjscxt_tts_refs"
+        val: Optional[str] = None
+        try:
+            with open(key, "rb") as fh:
+                ctype = ("audio/wav" if ext.lower() == ".wav"
+                         else "audio/mpeg" if ext.lower() == ".mp3" else "audio/flac")
+                blob = fh.read()
+            result = _http_multipart_upload(
+                f"{self.comfyui_url}/upload/image",
+                field="image", filename=fname, content=blob, content_type=ctype,
+                extra_fields={"overwrite": "true", "type": "input", "subfolder": subdir})
+            up = result.get("name") or fname
+            sub = result.get("subfolder") or subdir
+            val = f"{sub}/{up}" if sub else up
+            logger.info("QwenTTS 参考音频已上传：%s → %s", base, val)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("QwenTTS 参考音频上传失败 %s：%s", key, e)
+            val = None
+        if cache is not None:
+            cache[key] = val
+        return val
+
     def synthesize_batch(self, items: List[Dict],
                          progress_cb: Optional[Callable[[int, int, dict, str], None]] = None,
                          timeout: int = None) -> List[Dict]:
-        """批量合成：items = [{text, voice, out_path, store_prefix}]，逐句回填产物信息"""
+        """批量合成：items = [{text, voice, out_path, store_prefix}]，逐句回填产物信息
+
+        clone 模式（voice["mode"]=="clone"）时，按 voice["ref_audio"] 上传参考音频并
+        注入一个 LoadAudio 节点复用（同一批内同路径只上传一次）。上传失败或 ref_audio
+        缺失 → **回落 preset 音色**并在结果里记 `clone_fallback`，绝不静默产出一个
+        与参考音频无关的音色还装作克隆成功。
+        """
         timeout = int(timeout or self.params.get("timeout", 1200))
         prompt: Dict = {}
         bindings: List[Dict] = []
+        _ref_cache: Dict[str, Optional[str]] = {}
+        _ref_nodes: Dict[str, str] = {}      # 上传后的相对名 → LoadAudio 节点 id
         for i, it in enumerate(items):
-            ctype, inputs = self._node_inputs(it["text"], it["voice"], i == len(items) - 1)
+            voice = dict(it["voice"] or {})
+            ref_node: Optional[str] = None
+            fallback_note = ""
+            if voice.get("mode") == "clone":
+                _ref_local = str(voice.get("ref_audio") or "").strip()
+                _up = self._upload_ref_audio(_ref_local, _ref_cache) if _ref_local else None
+                if _up:
+                    ref_node = _ref_nodes.get(_up)
+                    if ref_node is None:
+                        ref_node = f"ra{len(_ref_nodes)}"
+                        _ref_nodes[_up] = ref_node
+                        prompt[ref_node] = {"class_type": "LoadAudio",
+                                            "inputs": {"audio": _up}}
+                else:
+                    # 克隆不可用 → 回落 preset（保留原 speaker），并记账
+                    fallback_note = ("参考音频缺失或上传失败" if not _ref_local
+                                     else "参考音频上传失败")
+                    voice["mode"] = "preset"
+                    voice.setdefault("speaker", SPEAKER_KEYS[0])
+            ctype, inputs = self._node_inputs(it["text"], voice, i == len(items) - 1,
+                                              ref_node=ref_node)
             cv, sv = f"cv{i}", f"sv{i}"
             prompt[cv] = {"class_type": ctype, "inputs": inputs}
             prompt[sv] = {"class_type": "SaveAudio",
                           "inputs": {"audio": [cv, 0], "filename_prefix": it["store_prefix"]}}
-            bindings.append({"cv": cv, "sv": sv, "item": it})
+            _it = dict(it, voice=voice)
+            bindings.append({"cv": cv, "sv": sv, "item": _it,
+                             "clone_fallback": fallback_note})
 
-        logger.info(f"QwenTTS 批量合成 {len(items)} 句 → prompt 节点 {len(prompt)} 个")
+        logger.info("QwenTTS 批量合成 %d 句 → prompt 节点 %d 个（clone 参考音频 %d 个）",
+                    len(items), len(prompt), len(_ref_nodes))
         prompt_id = self._submit(prompt)
         # G-03：try/finally 确保 ComfyUI TTS 模型卸载。_wait 抛 TTSError（超时/执行失败）时，
         # 前面已加载的模型未卸载（只有最后一句节点设了 unload_model_after_generate）。
@@ -821,6 +1112,8 @@ class QwenTTSClient:
                    "speaker": it["voice"].get("speaker"), "mode": it["voice"].get("mode"),
                    "seed": it["voice"].get("seed"), "out_path": os.path.abspath(it["out_path"]),
                    "prompt_id": prompt_id}
+            if b.get("clone_fallback"):
+                rec["clone_fallback"] = b["clone_fallback"]
             if not raw:
                 rec.update({"ok": False, "error": "ComfyUI 未返回音频文件"})
                 results.append(rec)

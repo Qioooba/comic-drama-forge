@@ -119,6 +119,51 @@ export interface Character {
   updated_at?: string;
 }
 
+// --- Character Outfits（角色服装变体 / 衣柜） ---
+/**
+ * 服装变体条目：GET /api/assets/character/outfits。
+ * 产物目录 output/assets/characters/<项目>/<角色名>/outfits/<outfit_key>/，
+ * 内部布局与主设定目录一致（base.png + 切分档位图）。
+ */
+export interface CharacterOutfit {
+  outfit_key: string;
+  /** 服装描述（outfit.json 档案优先，回落 meta sidecar 提示词里的服装段） */
+  desc: string;
+  /** base.png 已就绪且非空 */
+  ready: boolean;
+  /** 各切分档位是否已生成（与主设定目录同名的 sheet_split 产物） */
+  views: { front: boolean; left: boolean; back: boolean; half: boolean };
+}
+
+export interface CharacterOutfitsResponse {
+  success: boolean;
+  /** outfits 目录不存在时为空数组（fail-open） */
+  outfits: CharacterOutfit[];
+}
+
+export interface CharacterOutfitGenerateResponse {
+  task_id: string;
+  status: string;
+  outfit_key?: string;
+  character?: string;
+  /** 已存在同 key 且 base.png 就绪时的幂等跳过（此时 task_id 为空串） */
+  skipped?: boolean;
+  message?: string;
+}
+
+// --- 参考音频克隆角色声线 ---
+export interface VoiceBankItem {
+  character: string;
+  /** 参考音频绝对路径 */
+  file: string;
+  exists: boolean;
+  /** 该音频里实际说出的那句话（填了克隆相似度更高） */
+  ref_text: string;
+  duration_sec?: number | null;
+  original_filename?: string;
+  updated_at?: string | null;
+}
+
 // --- Relations ---
 export interface Relation {
   id: string;
@@ -343,6 +388,90 @@ export interface StoryboardCanvasResponse {
   };
   cards: StoryboardShot[];
   shot_order: string[];
+}
+
+// --- 分镜九宫格候选构图（2026-10-01，对标 BigBanana：一图 9 候选 → 选格裁切） ---
+/**
+ * POST /api/storyboard/grid-candidates 的返回（异步发起）：
+ * body {project_name, episode_no, shot_id} → 任务写入 generation_state，
+ * 进度用 GET /api/generation/status/<task_id> 轮询。
+ */
+export interface ShotGridStartResponse {
+  success: boolean;
+  task_id: string;
+  status: string;
+}
+
+/**
+ * generation_state 里九宫格任务的状态字段（app.py `_grid_worker` 写入）：
+ * completed 时带 grid_url（= /api/storyboards/file/<项目>/shot_NN_grid.png，3x3 候选图）；
+ * failed / cancelled 时带 error 原文。running 中只有 phase / project / shot 等展示字段。
+ */
+export interface ShotGridTaskState {
+  /** running / completed / failed / cancelled（不写死字面量联合：后端可扩展新状态） */
+  status: string;
+  phase?: string;
+  progress?: number;
+  project?: string;
+  shot?: string | number;
+  started_at?: string;
+  /** 完成态才有：九宫格候选网格图地址，可直接作为 <img src> */
+  grid_url?: string;
+  result?: { grid?: string };
+  error?: string;
+}
+
+/**
+ * GET /api/generation/status/<task_id>：历史上存在两种返回形态
+ * （{success, task:{…}} 信封 与 状态字段平铺顶层），前端读取时按 `task ?? 顶层` 兼容。
+ */
+export interface ShotGridStatusResponse {
+  success?: boolean;
+  task?: ShotGridTaskState;
+  [k: string]: unknown;
+}
+
+/**
+ * POST /api/storyboard/grid-apply 的返回：把选中的格（cell 1-9，行优先）从九宫格图
+ * 等分裁切为该镜正式分镜图（人工定稿，不再走 AI 质检；旧图移入回收站可恢复）。
+ */
+export interface ShotGridApplyResponse {
+  success: boolean;
+  project: string;
+  shot_id: string;
+  /** 实际应用的格号（1-9） */
+  cell: number;
+  /** 裁切产物落盘绝对路径（仅展示用，不要拿去请求） */
+  applied: string;
+  /** 新分镜图访问地址（/api/storyboards/file/<项目>/shot_NN.png） */
+  url: string;
+  /** 被移入回收站的旧产物清单 */
+  cleared?: Array<{ category?: string; path?: string }>;
+  hint?: string;
+  error?: string;
+}
+
+// --- Video 批量重生成（2026-10-02） ---
+/** POST /api/video/retry-shots-batch 逐镜结果：单镜失败不拖垮整批 */
+export interface VideoRetryBatchItem {
+  shot_id: string;
+  success: boolean;
+  path?: string;
+  /** 可直接播放/下载的地址 */
+  url?: string;
+  error?: string;
+}
+
+/** POST /api/video/retry-shots-batch 整包返回（同步端点，全部镜头跑完才返回） */
+export interface VideoRetryBatchResponse {
+  success: boolean;
+  /** 本次提交的镜头数 */
+  total: number;
+  /** 成功数 */
+  ok_count: number;
+  results: VideoRetryBatchItem[];
+  /** 整包失败原因（如超过单次 12 个上限） */
+  error?: string;
 }
 
 // --- TTS ---

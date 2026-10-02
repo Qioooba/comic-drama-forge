@@ -191,6 +191,14 @@ export const Download = (p: IconProps) => (
   </Svg>
 );
 
+/** 上传 */
+export const Upload = (p: IconProps) => (
+  <Svg {...p}>
+    <path d="M12 21V9M7 13l5-5 5 5" />
+    <path d="M4 4h16" />
+  </Svg>
+);
+
 /** 重试 */
 export const RefreshCw = (p: IconProps) => (
   <Svg {...p}>

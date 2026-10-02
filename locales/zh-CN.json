@@ -587,7 +587,82 @@
     "off": "已关闭",
     "confirmClose": "超分任务在后台继续执行，关闭面板不会中断。"
   },
+  "assets": {
+    "outfit": {
+      "title": "服装变体",
+      "empty": "暂无服装变体",
+      "ready": "已就绪",
+      "generating": "生成中",
+      "add": "+ 新增服装变体",
+      "submitting": "提交中…",
+      "keyPlaceholder": "服装名（如：战甲 / 便服），≤40 字符",
+      "descPlaceholder": "服装描述（如：玄铁战甲，肩覆兽首，暗红披风）",
+      "required": "请填写服装名与服装描述",
+      "started": "已提交服装变体生成，完成后可在分镜参考图中按服装名对档",
+      "skipped": "该服装变体已存在（如需重画请稍后在生成侧带 overwrite）",
+      "failed": "服装变体提交失败",
+      "hint": "生成走与角色设定图相同的质检链路；分镜 / 单镜重跑在本镜服装提示能匹配到该服装名时优先使用变体图，否则回落主设定图。"
+    }
+  },
+  "uploadSheet": {
+    "entry": "上传形象图 → 三视图",
+    "title": "上传角色形象图",
+    "layoutTitle": "图片需按此版式排好",
+    "layoutHint": "上排：正面 / 左侧面 / 背面三张全身；下排：正面半身（胸像）。图会直接当作角色设定图切分，不做重绘——人物外形 100% 保留。",
+    "view": {
+      "front": "正面",
+      "left": "左侧",
+      "back": "背面",
+      "half": "半身"
+    },
+    "character": "角色",
+    "customName": "手动输入角色名…",
+    "characterPlaceholder": "角色名（不含 / \\）",
+    "file": "形象图文件",
+    "choose": "选择图片",
+    "reselect": "重新选择",
+    "noFile": "支持 PNG / JPG / WEBP",
+    "overwrite": "覆盖已有设定图（默认已存在则跳过）",
+    "needCharacter": "请先选择或输入角色名",
+    "needFile": "请先选择形象图",
+    "uploading": "上传并切分中…",
+    "submit": "上传并切分",
+    "ok": "已上传并切分 {n} 张视角图（零 GPU）",
+    "skipped": "该角色已有设定图；如需替换请勾选「覆盖已有设定图」",
+    "failed": "上传失败"
+  },
+  "precip": {
+    "title": "资产沉淀过程",
+    "loadFailed": "无法读取沉淀过程（不影响图片查看）",
+    "badge": {
+      "userUpload": "用户上传"
+    },
+    "summary": {
+      "done": "{done}/{total} 步"
+    },
+    "stat": {
+      "qc": "质检 {n} 次",
+      "lessons": "教训 {n} 条",
+      "views": "视角 {n} 张"
+    },
+    "status": {
+      "done": "完成",
+      "failed": "未达标",
+      "pending": "待执行",
+      "skipped": "无此步"
+    },
+    "qc": {
+      "attempt": "第 {n} 次",
+      "score": "{score} 分",
+      "passed": "通过",
+      "failed": "打回"
+    },
+    "lesson": {
+      "from": "来自项目：{project}"
+    }
+  },
   "wb": {
+    "assetsTitle": "资产",
     "overview": "概览",
     "autopilot": "自动生产",
     "keyframes": "关键帧",
@@ -1209,7 +1284,24 @@
     "workflowTitle": "工作流程说明",
     "workflowStep1": "先生成 TTS 配音（每集台词合成音频）",
     "workflowStep2": "再进行音画混音（将配音与视频片段合成）",
-    "workflowStep3": "最后进行音频质检（确认音质达标）"
+    "workflowStep3": "最后进行音频质检（确认音质达标）",
+    "voiceTitle": "角色声线（参考音频克隆）",
+    "voiceHint": "上传某角色的一段清晰人声（3–15 秒、单人、无背景音乐），该角色下次配音即自动用克隆声线，全剧音色一致。",
+    "voiceCloneUnavailable": "当前 ComfyUI 未提供参考音频克隆节点（FB_Qwen3TTSVoiceClone / LoadAudio），克隆暂不可用。",
+    "voiceNoCharacters": "剧本还没有角色，先生成剧本或直接上传后手动指定角色。",
+    "voiceBoundTag": "已绑定 · {sec}s",
+    "voiceRefText": "参考原文：",
+    "voiceUpload": "上传音频",
+    "voiceReplace": "重传",
+    "voicePreview": "试听",
+    "voiceUnbind": "解绑",
+    "voicePreviewLabel": "克隆试听",
+    "voiceBound": "已绑定参考音频",
+    "voiceUnbound": "已解绑参考音频",
+    "voiceUploadFailed": "参考音频上传失败",
+    "voicePreviewFailed": "试听失败",
+    "voiceDeleteFailed": "解绑失败",
+    "voicePreviewReady": "试听已生成，可播放确认"
   },
   "brand": {
     "mark": "漫",
@@ -1380,7 +1472,40 @@
     "episodeGenerateFailed": "整集视频生成启动失败",
     "generateVideo": "生成视频",
     "videoModeSaved": "视频生成方式已保存",
-    "videoModeSaveFailed": "视频生成方式保存失败"
+    "videoModeSaveFailed": "视频生成方式保存失败",
+    "grid": {
+      "button": "九宫格候选",
+      "buttonHint": "一次生成 9 种机位/构图候选，点选一格裁切为该镜分镜图",
+      "modalTitle": "镜头 #{seq} · 九宫格候选构图",
+      "pickHint": "点击选中某一格（1-9，行优先），应用后裁切为该镜正式分镜图",
+      "generating": "正在生成九宫格候选构图…（ComfyUI 出图可能需要一两分钟，请保持页面打开）",
+      "regenerate": "重新生成",
+      "cellN": "第 {n} 格",
+      "pickedCell": "已选第 {n} 格",
+      "apply": "应用所选格",
+      "applying": "应用中…",
+      "applied": "镜头 #{seq} 已应用第 {cell} 格为新分镜图",
+      "applyFailed": "应用所选格失败",
+      "generateFailed": "九宫格候选构图生成失败",
+      "imageAlt": "镜头 {seq} 的 3x3 候选构图网格图"
+    }
+  },
+  "video": {
+    "batchRetry": {
+      "button": "批量重生成",
+      "buttonHint": "勾选镜头后批量重生成视频（单次最多 12 个）",
+      "pickShot": "选择镜头 #{seq} 参与批量重生成",
+      "selectedCount": "已选 {n}/{max} 镜",
+      "confirmTitle": "批量重生成视频",
+      "confirmBody": "将重新生成选中的 {n} 个镜头视频：{shots}。",
+      "confirmHint": "逐镜调用视频模型，可能耗时数分钟，期间请保持页面打开；完成后该集成片会被标记为「需重新合成」。",
+      "running": "批量重生成中…",
+      "done": "批量重生成完成：成功 {ok} / 共 {total}",
+      "partial": "批量重生成完成：成功 {ok} / 共 {total}，其余失败",
+      "failedItem": "镜头 {shot_id}：{error}",
+      "unknownError": "原因未知",
+      "submitFailed": "批量重生成请求失败"
+    }
   },
   "toolLabel": {
     "apply_creative_settings": "套用创作设定",
