@@ -11,6 +11,7 @@ import type {
   AnalyticsData,
   KeyframePlanResponse,
   StoryboardCanvasResponse,
+  StoryboardShot,
   TTSEnv, TTSPlanResponse, TTSTask,
   MixEnv, MixPlanResponse, MixTask, MixStatusResponse,
   QCConfig, QCResponse,
@@ -22,6 +23,11 @@ import type {
   AIConfigResponse, AITestResult,
   UpscaleEnv, UpscaleSource, UpscaleSubmitResponse, UpscaleTask, UpscaleArtifact,
   AgentJob, AgentTool, AgentGuards, AgentKillState,
+  CharacterOutfitsResponse, CharacterOutfitGenerateResponse,
+  VoiceBankItem,
+  VideoRetryBatchResponse,
+  ShotGridStartResponse,
+  ShotGridApplyResponse,
 } from '../types';
 
 const API_BASE = '/api';
@@ -39,7 +45,7 @@ async function readError(response: Response): Promise<string> {
     // 后端常带 `hint`（例如「这集可能是兜底生成的，没有台词」）或 `guide`
     // （例如视觉模型不适配的替代建议）。这些是给用户看的处置办法，
     // 只把 error 抛出去会让用户看到问题却不知道怎么办。
-    const extra = data?.hint || data?.guide;
+    const extra = data?.hint || data?.guide || data?.layout_hint;
     if (typeof extra === 'string' && extra.trim()) {
       detail = detail ? `${detail}（${extra.trim()}）` : extra.trim();
     }
@@ -59,9 +65,14 @@ async function request<T>(
   path: string,
   options: RequestInit = {}
 ): Promise<T> {
+  // FormData 必须让浏览器自行生成 multipart boundary —— 一旦手工带上
+  // Content-Type: application/json，boundary 就没了，后端 request.files 收到空列表。
+  const isForm = typeof FormData !== 'undefined' && options.body instanceof FormData;
   const response = await fetch(`${API_BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json', ...options.headers },
     ...options,
+    headers: isForm
+      ? { ...options.headers }
+      : { 'Content-Type': 'application/json', ...options.headers },
   });
   if (!response.ok) {
     throw new Error(await readError(response));
@@ -495,10 +506,22 @@ export const keyframesApi = {
 
 // --- Storyboard ---
 export const storyboardApi = {
-  canvas: (project: string, episode?: number) =>
-    request<StoryboardCanvasResponse>(
+  canvas: async (project: string, episode?: number) => {
+    const data = await request<StoryboardCanvasResponse>(
       `/storyboard/canvas/${encodeURIComponent(project)}${episode ? `?episode_no=${episode}` : ''}`
-    ),
+    );
+    // P3-2（Toonflow 借鉴）：分镜 schema 运行时校验——后端字段缺失时响亮降级
+    // （丢弃异常卡片并 console.warn），而不是渲染到一半白屏。
+    const raw = (data.cards || []) as StoryboardShot[];
+    const cards = raw.filter(
+      (c): c is NonNullable<typeof c> => !!c && typeof c === 'object' && !!String(c.shot_id || '').trim()
+    );
+    if (cards.length !== raw.length) {
+      // eslint-disable-next-line no-console
+      console.warn(`[storyboard] 丢弃 ${raw.length - cards.length} 张缺少 shot_id 的异常分镜卡片`);
+    }
+    return { ...data, cards };
+  },
   reorder: (data: { project_name: string; episode_no?: number; order: string[] }) =>
     request<{ success: boolean; shot_order: string[] }>(
       '/storyboard/shot/reorder',
@@ -529,6 +552,20 @@ export const storyboardApi = {
       `/storyboard/nine-grid/${encodeURIComponent(grid_id)}/select`,
       { method: 'POST', body: JSON.stringify({ project, selected_index }) }
     ),
+  // ---- 分镜九宫格候选构图（2026-10-01，对标 BigBanana：一图 9 候选→选格裁切） ----
+  // 返回类型对齐后端实际契约（app.py api_storyboard_grid_candidates / grid_apply）：
+  // gridApply 实际回 {success, project, shot_id, cell, applied, url, cleared, hint}，
+  // 此前只声明了 {success, applied, url}，调用方读 cell 会编译报错。
+  gridCandidates: (projectName: string, episodeNo: number, shotId: string) =>
+    request<ShotGridStartResponse>('/storyboard/grid-candidates', {
+      method: 'POST',
+      body: JSON.stringify({ project_name: projectName, episode_no: episodeNo, shot_id: shotId }),
+    }),
+  gridApply: (projectName: string, episodeNo: number, shotId: string, cell: number) =>
+    request<ShotGridApplyResponse>('/storyboard/grid-apply', {
+      method: 'POST',
+      body: JSON.stringify({ project_name: projectName, episode_no: episodeNo, shot_id: shotId, cell }),
+    }),
 };
 
 /** 视频生成方式（**项目级**设定，与后端 config.VIDEO_MODES 一致）
@@ -564,6 +601,16 @@ export const videoApi = {
       /** 后端已把同集旧成片标记为「需重新合成」 */
       deliverable_marked_stale?: boolean;
     }>('/video/retry-shot', { method: 'POST', body: JSON.stringify(data) }),
+
+  // ---- 批量重生成镜头视频（2026-10-02）：POST /api/video/retry-shots-batch ----
+  // 与 retry-shot 一样是**同步端点**：逐镜等 ComfyUI 出片后才整体返回，可能耗时数分钟，
+  // 前端必须给 loading 并防重复提交。单次最多 12 个；单镜失败不拖垮整批，
+  // 逐镜看 results[].success / error。同集旧成片由后端标记为「需重新合成」。
+  retryShotsBatch: (projectName: string, episodeNo: number | undefined, shotIds: string[]) =>
+    request<VideoRetryBatchResponse>('/video/retry-shots-batch', {
+      method: 'POST',
+      body: JSON.stringify({ project_name: projectName, episode_no: episodeNo, shot_ids: shotIds }),
+    }),
 
   /**
    * 生成该集视频：把该集 N 个镜头一次提交给 H3，**生成方式由 mode 决定**
@@ -615,6 +662,19 @@ export const ttsApi = {
       '/tts/generate',
       { method: 'POST', body: JSON.stringify(data) }
     ),
+  // ---- 场景九宫格机位预览（2026-10-01，对标 BigBanana 候选构图） ----
+  sceneGridPreview: (projectName: string, name: string) =>
+    request<{ success: boolean; task_id: string; total: number }>('/scenes/grid-preview', {
+      method: 'POST',
+      body: JSON.stringify({ project_name: projectName, name }),
+    }),
+  sceneGridApply: (projectName: string, name: string, angle: string) =>
+    request<{ success: boolean; angle: string }>('/scenes/grid-apply', {
+      method: 'POST',
+      body: JSON.stringify({ project_name: projectName, name, angle }),
+    }),
+  sceneGridFileUrl: (projectName: string, sceneDir: string, file: string) =>
+    `${API_BASE}/scenes/grid/file/${encodeURIComponent(projectName)}/${sceneDir}/${file}`,
   status: (taskId: string) => request<TTSTask>(`/tts/status/${taskId}`),
   tasks: () => request<{ success: boolean; items: TTSTask[] }>('/tts/tasks'),
   list: (project: string) =>
@@ -623,6 +683,42 @@ export const ttsApi = {
     ),
   file: (project: string, filename: string) =>
     `${API_BASE}/tts/file/${encodeURIComponent(project)}/${filename}`,
+  // ---- 参考音频克隆角色声线（2026-10-06）----
+  voiceBank: (project: string) =>
+    request<{
+      success: boolean;
+      items: VoiceBankItem[];
+      clone_available: boolean;
+      supported_exts: string[];
+    }>(`/tts/voice-bank?project_name=${encodeURIComponent(project)}`),
+  /** 上传某角色的参考音频（ref_text = 该音频里实际说出的那句话，填了相似度更高） */
+  voiceBankUpload: (data: {
+    project_name: string;
+    character: string;
+    file: File;
+    ref_text?: string;
+  }) => {
+    const fd = new FormData();
+    fd.append('file', data.file);
+    fd.append('project_name', data.project_name);
+    fd.append('character', data.character);
+    if (data.ref_text) fd.append('ref_text', data.ref_text);
+    return request<{ success: boolean; character?: string; file?: string; duration_sec?: number; message?: string }>(
+      '/tts/voice-bank/upload',
+      { method: 'POST', body: fd }
+    );
+  },
+  voiceBankDelete: (project: string, character: string) =>
+    request<{ success: boolean; message?: string }>('/tts/voice-bank/delete', {
+      method: 'POST',
+      body: JSON.stringify({ project_name: project, character }),
+    }),
+  /** 用已绑定的参考音频试听克隆效果（不读 voice_map，直接以 clone 模式合成） */
+  voiceBankPreview: (data: { project_name: string; character: string; text?: string }) =>
+    request<{ success: boolean; url: string; text_used: string; voice: any }>(
+      '/tts/voice-bank/preview',
+      { method: 'POST', body: JSON.stringify(data) }
+    ),
 };
 
 // --- Mix ---
@@ -975,6 +1071,142 @@ export const providersApi = {
 export const generationApi = {
   status: (taskId: string) =>
     request<{ success: boolean; task: any }>(`/generation/status/${taskId}`),
+};
+
+// --- Character Outfits（角色服装变体 / 衣柜，2026-10-02） ---
+// 后端：POST /api/assets/character/outfit（生成，复用资产生成全链路，产物落到
+//       characters/<项目>/<角色>/outfits/<outfit_key>/）；
+//       GET /api/assets/character/outfits（列表；outfits 目录不存在时后端返回空数组）。
+export const characterOutfits = {
+  /** 列出角色已登记的服装变体（含 ready / 各档位是否已切分） */
+  list: (projectName: string, character: string) => {
+    const qs = new URLSearchParams({ project_name: projectName, character });
+    return request<CharacterOutfitsResponse>(`/assets/character/outfits?${qs.toString()}`);
+  },
+  /**
+   * 生成服装变体（后台任务，进度走 generationApi.status(task_id)）。
+   * outfit_key 会被后端安全化（剔除 \ / : * ? " < > |、≤40 字符）；
+   * 已存在同 key 且 base.png 就绪时后端默认幂等跳过（带 overwrite=true 强制重画）。
+   */
+  generate: (data: {
+    project_name: string;
+    character: string;
+    outfit_key: string;
+    outfit_desc: string;
+    style?: string;
+    overwrite?: boolean;
+  }) =>
+    request<CharacterOutfitGenerateResponse>('/assets/character/outfit', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+};
+
+// --- 上传角色形象图 → 三视图（本地切分，零 GPU）---
+export interface UploadSheetResponse {
+  success: boolean;
+  /** true = 已落 base.png 但版式不符、未能切分（下游回落整图） */
+  derive_ok?: boolean;
+  /** 已有 base.png 且未带 overwrite 时后端幂等跳过 */
+  skipped?: boolean;
+  character?: string;
+  outfit_key?: string;
+  base?: string;
+  views?: Record<string, string>;
+  view_files?: Record<string, string>;
+  message?: string;
+  error?: string;
+  /** 期望的版式说明（切分失败时给用户看） */
+  layout_hint?: string;
+}
+export const characterSheetUpload = {
+  /**
+   * 上传角色形象图。图片会**直接落 base.png** 再本地切分出 front/left/back/half，
+   * 不做 GPU 重绘、不做图片质检 —— 人物外形 100% 保留。
+   * 因此上传图需已按分档版式排好：上排正面/左侧/背面三全身 + 下排一格正面半身。
+   * outfit_key 为空 = 挂到角色主设定；非空 = 挂到对应服装变体档。
+   */
+  upload: (data: {
+    project_name: string;
+    character: string;
+    file: File;
+    outfit_key?: string;
+    overwrite?: boolean;
+  }) => {
+    const fd = new FormData();
+    fd.append('file', data.file);
+    fd.append('project_name', data.project_name);
+    fd.append('character', data.character);
+    if (data.outfit_key) fd.append('outfit_key', data.outfit_key);
+    if (data.overwrite) fd.append('overwrite', '1');
+    // 不手写 Content-Type：浏览器需自行补 multipart boundary
+    return request<UploadSheetResponse>('/assets/character/upload-sheet', {
+      method: 'POST',
+      body: fd,
+    });
+  },
+};
+
+// --- 资产沉淀过程（时间线）---
+// 资产不是「一下就有的」：抽取 → 写提示词 → 出图 → 质检（可能重画 N 次）→ 沉淀教训
+// → 切分入库。后端把这些散落在质检历史 / 产物元数据 / 教训库三处的痕迹聚合成一条
+// 时间线返回，供资产详情页可视化。
+export type PrecipitationStatus = 'done' | 'failed' | 'pending' | 'skipped';
+
+export interface PrecipitationItem {
+  /** 键值型条目（extract/prompt/base/derive/store 用） */
+  key?: string;
+  value?: string;
+  /** 质检条目（qc 步骤用） */
+  attempt?: number | null;
+  passed?: boolean;
+  score?: number | null;
+  reason?: string;
+  issues?: string[];
+  at?: string | null;
+  seed?: number | null;
+  /** 教训条目（lesson 步骤用） */
+  issue?: string;
+  category?: string;
+  priority?: string;
+  project?: string;
+}
+
+export interface PrecipitationStep {
+  id: string;
+  label: string;
+  status: PrecipitationStatus;
+  detail: string;
+  items: PrecipitationItem[];
+  at?: string | null;
+}
+
+export interface AssetPrecipitationResponse {
+  success: boolean;
+  kind: string;
+  name: string;
+  project: string;
+  asset_dir?: string;
+  script_path?: string;
+  steps: PrecipitationStep[];
+  summary: {
+    total_steps: number;
+    done: number;
+    qc_attempts: number;
+    qc_passed: boolean;
+    lessons: number;
+    views: string[];
+    is_user_upload: boolean;
+  };
+}
+
+export const assetPrecipitation = {
+  /** 某资产的沉淀过程（纯只读；读失败后端降级为空步骤，不抛 500）。 */
+  get: (project: string, kind: string, name: string) =>
+    request<AssetPrecipitationResponse>(
+      `/projects/${encodeURIComponent(project)}/asset-precipitation` +
+        `?kind=${encodeURIComponent(kind)}&name=${encodeURIComponent(name)}`
+    ),
 };
 
 // --- Export ---

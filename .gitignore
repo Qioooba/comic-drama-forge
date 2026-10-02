@@ -161,3 +161,7 @@ prompt_enhance_config.json
 
 # 桌面打包产物
 electron-app/dist/
+
+# 工具运行态缓存（2026-10-02 上线审计）：会话 hook 状态 / 运行历史 / 发现台账，
+# 全是本机会话级临时数据，因机而异、无协作价值，不入库。
+.mimosa/

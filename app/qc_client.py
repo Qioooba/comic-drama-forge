@@ -151,6 +151,22 @@ CONTINUITY_NOTE = (
     "不要凭空臆造「与上一镜不一致」，直接跳过本项。"
 )
 
+# 逐段主体一致性门禁（2026-10-01，借鉴 Story Claw 的逐段 VLM 门禁）：整集视频按
+# 镜头时间戳切帧送检时，追加本段——要求 QC 模型**逐时间区间**核对同一角色的
+# 面部/服装/体型是否漂移（换装/换脸/发色漂移均算），命中即列「主体一致性漂移」。
+# ⚠️ 接线点（P2-3 待实施）：check_video 的帧切片按镜头时间戳分组后，对每组追加
+#    本段 + 该组对应的角色设定图；常量先行以固化判定口径，接线前不产生行为变化。
+SUBJECT_CONSISTENCY_NOTE = (
+    "\n【逐段主体一致性判定·重要】本次待检视频的抽帧已按「镜头时间区间」分组：\n"
+    "  · 同一角色在**同一镜头区间内**：面部 / 发型 / 服装 / 体型 必须保持一致，"
+    "区间中途出现换脸 / 换装 / 发色漂移 属**致命缺陷**；\n"
+    "  · 同一角色**跨镜头区间**：在场景未切换的前提下，服装与配饰必须延续；"
+    "镜头切换导致背景变化属正常，不得据此扣分；\n"
+    "  · 每个区间独立给出结论：在 issues 中以「[Shot N] 主体一致性漂移：<具体项>」"
+    "格式逐条写明，便于定位到具体镜头；\n"
+    "  · 若某区间画面无法辨认（过暗/过糊），如实标注「无法核对」，不得臆造缺陷。"
+)
+
 # 人物性别一致性（2026-09-28）：资产图实测出现「角色名是「三百年旧怨女子」（女性）、
 # 出图却是短发男性脸型体格」的致命错误 —— 而质检侧**完全没有性别判据**，模型只按
 # 发色/瞳色/服装比对，性别画反也能拿高分入库。这里补一条资产核对项。
@@ -644,7 +660,8 @@ DEFAULT_SCRIPT_PROMPT = (
     "13. camera 应为「景别+运镜」写法（如 中景跟拍 / 特写推入）\n\n"
     "【可执行性评估】\n"
     "14. 总时长应接近目标时长（{target_duration} 秒）\n"
-    "15. 每个镜头时长应在 3-12 秒范围内\n"
+    "15. 每个镜头时长应在 {shot_duration_min}-{shot_duration_max} 秒范围内"
+    "（另有 {shot_duration_silent} 秒的纯画面静默镜基准）\n"
     "16. 本系统不产出旁白：镜头没有台词是**允许**的（纯画面镜/空镜），"
     "只要该镜的 audio_cues 写了音效或配乐提示即算合格；"
     "但如果某镜既没有台词、又没写 audio_cues，成片到该镜会既无人声也无音效，判为问题。\n"
@@ -2122,9 +2139,14 @@ def check_image(image_path: str, shot_desc: str = "", cfg: dict = None,
         prompt = prompt + "\n" + str(blocking_spec).strip()
         blocking_used = True
     # ---- 设定一致性核对：把生成时用的参考图一并送检 ----
+    # ⚠️ 2026-10-02 修复：这里曾被写成三参 cfg.get("image_ref_compare",
+    #    "image_blocking_ref_compare", True) → dict.get 最多 2 个参数，只要
+    #    ref_images 非空就抛 TypeError（而生产三处调用都在传 ref_images），
+    #    导致有设定图的分镜质检 100% 失败。回落到两参原口径。
+    # ⚠️ 本开关与上面 :2130 的 image_blocking_ref_compare 是**两件事**，别混：
+    #    那个只控制 3D 基准图的「文字规格」是否入提示词，默认 False。
     ref_list = []
-    if ref_images and cfg.get("image_ref_compare",
-    "image_blocking_ref_compare", True):
+    if ref_images and cfg.get("image_ref_compare", True):
         seen = {os.path.abspath(image_path)}
         if blocking_used:
             seen.add(os.path.abspath(blocking_ref))
@@ -2721,7 +2743,9 @@ def check_video(video_path: str, shot_desc: str = "", cfg: dict = None,
                 override: dict = None, frames_dir: str = None,
                 fallback_meta: dict = None, style: str = "",
                 expected_duration: float = None,
-                frame_ratio: list = None) -> dict:
+                frame_ratio: list = None,
+                segment_ranges: list = None,
+                ref_images: list = None) -> dict:
     """视频质检：ffmpeg 抽帧 → 多模态判定。永不抛异常。
     override 仅用于「测试连通性」临时传参，不落盘。
     style：目标风格串，用于「风格达标」判定；为空则不做风格检测。
@@ -2729,6 +2753,11 @@ def check_video(video_path: str, shot_desc: str = "", cfg: dict = None,
         超 video_max_drift（默认 30%）计入 issues；为空 / 0 时跳过该项判定。
     frame_ratio：D-05（P1）—— 按占比指定抽帧时间点，整集模式传「每段中点」，
         使抽帧真正覆盖每一段（不再受 video_frame_count 默认 3 / 上限 6 约束）。
+    segment_ranges：P2-3 逐段主体一致性门禁（2026-10-01 接线）—— 各镜头段时间区间
+        [{"name", "start", "end"}]（秒，整集模式按段时长累加）。提供时抽帧按区间分组、
+        追加 SUBJECT_CONSISTENCY_NOTE 逐段判定口径；未提供时行为与旧版完全一致。
+    ref_images：角色设定图锚点（本地路径列表），附在抽帧之后送检（≤MAX_REF_IMAGES），
+        供「角色是否漂移」的比对；仅与 segment_ranges 同时生效。
     """
     cfg = cfg or _empty_config()
     if not cfg.get("enabled"):
@@ -2760,6 +2789,61 @@ def check_video(video_path: str, shot_desc: str = "", cfg: dict = None,
     prompt = prompt + WATERMARK_EXEMPT_NOTE + CRITICAL_RULE_NOTE + FRAMING_TOLERANCE_NOTE
     if style_norm:
         prompt = prompt + STYLE_CHECK_NOTE.replace("{style}", style_norm)
+    # P2-3 逐段主体一致性门禁（2026-10-01 接线，借鉴 Story Claw 逐段 VLM 门禁）：
+    # 整集模式传入「各段(镜头)时间区间 + 角色设定图锚点」时，抽帧按区间分组、提示词
+    # 追加 SUBJECT_CONSISTENCY_NOTE 逐段判定口径，并把锚点图附在抽帧之后送检 ——
+    # 「同一角色段内换脸/换装/跨段服装漂移」从此有据可判。未传时与旧版完全一致（零回归）。
+    segs_norm: list = []
+    for _r in (segment_ranges or []):
+        if not isinstance(_r, dict):
+            continue
+        try:
+            _s0 = float(_r.get("start") or 0.0)
+            _e0 = float(_r.get("end") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if _e0 > _s0:
+            segs_norm.append({"name": str(_r.get("name") or ""),
+                              "start": _s0, "end": _e0})
+    refs_norm: list = []
+    for _p in (ref_images or []):
+        _p = str(_p or "")
+        if _p and os.path.isfile(_p) and _p not in refs_norm:
+            refs_norm.append(_p)
+    refs_norm = refs_norm[:MAX_REF_IMAGES]
+    vision_images = list(fr["frames"])
+    if segs_norm:
+        def _seg_idx(ts: float) -> int:
+            # 帧时间戳落在哪个区间算哪段；因时长漂移落不进任何区间时归到最近段
+            # （H3 截断/补白会让实测时间轴与期望累计时长错位，不能因此丢帧）
+            for _i, _sr in enumerate(segs_norm):
+                if _sr["start"] <= ts < _sr["end"]:
+                    return _i
+            _best, _bd = 0, None
+            for _i, _sr in enumerate(segs_norm):
+                _d = min(abs(ts - _sr["start"]), abs(ts - _sr["end"]))
+                if _bd is None or _d < _bd:
+                    _best, _bd = _i, _d
+            return _best
+        _fmeta = fr.get("frame_meta") or []
+        _frame_seg = [_seg_idx(float((fm or {}).get("actual_ts") or 0.0))
+                      for fm in _fmeta]
+        _groups = []
+        for _i, _sr in enumerate(segs_norm):
+            _hits = [f"第{k + 1}帧" for k, _si in enumerate(_frame_seg) if _si == _i]
+            _label = _sr["name"] or f"Shot {_i + 1}"
+            _groups.append(f"{_label}（{_sr['start']:.1f}~{_sr['end']:.1f}s）："
+                           + ("、".join(_hits) if _hits else "无抽帧命中"))
+        prompt = prompt + ("\n【抽帧分组（按镜头时间区间）】" + "；".join(_groups) + "\n")
+        prompt = prompt + SUBJECT_CONSISTENCY_NOTE
+        if refs_norm:
+            prompt = (prompt + f"\n【设定参考锚点】抽帧图片之后另有 {len(refs_norm)} 张"
+                      "该集生成时使用的角色设定参考图（按角色顺序）：请以它们为外观锚点，"
+                      "判定各镜头区间内角色面部/发型/服装/体型是否漂移；"
+                      "参考图本身不是待检画面，不得因参考图的构图/画质/风格扣分。\n")
+            vision_images = list(fr["frames"]) + refs_norm
+        logger.info("视频质检[逐段一致性]：%d 段区间分组，%d 张角色锚点图随帧送检",
+                    len(segs_norm), len(refs_norm))
     # G9/O1 确定性闸门（视频客观层，零模型依赖）：命中致命缺陷（无音轨/时长超差/全帧未校验/fps异常）
     # → blocked=True、passed=False，AI 层仍跑但不短路，避免误杀。
     # A-19：``_video_objective_issues`` 现返回结构化项 {code, fatal, msg}，致命性由
@@ -2771,7 +2855,7 @@ def check_video(video_path: str, shot_desc: str = "", cfg: dict = None,
     (fr.get("meta") or {}).update({"objective_issues": obj_issues,
                                   "objective_fatal": obj_fatal})
     try:
-        verdict = _run_vision(ep, prompt, fr["frames"], cfg)
+        verdict = _run_vision(ep, prompt, vision_images, cfg)
     except Exception as e:  # noqa: BLE001
         logger.warning(f"视频质检调用失败：{e}")
         # AI 层失败也要透出客观层致命缺陷（不能让视频质检因 AI 不可用就漏掉无音轨/时长问题）
@@ -2795,6 +2879,11 @@ def check_video(video_path: str, shot_desc: str = "", cfg: dict = None,
                     "timestamps": fr.get("timestamps") or [],
                     "duration_source": (fr.get("meta") or {}).get("source"),
                     "video_meta": fr.get("meta") or {}})
+    if segs_norm:
+        # P2-3 接线留痕：本次质检按段分组判定，便于报表/教训库区分整集抽帧口径
+        verdict["subject_gate"] = {"segments": len(segs_norm),
+                                   "ref_images": len(refs_norm),
+                                   "frames_total": len(fr["frames"])}
     # G9：把客观层 issues 并入 AI 层 verdict（AI 不报的客观缺陷仍保留；
     # 客观 fatal 项命中关键缺陷词表的会被 find_critical_issues 进一步识别）
     if obj_issues:
@@ -3521,7 +3610,17 @@ def _validate_script_92rules(script: dict) -> list:
 #: 不在剧本这一层）。
 SHOT_DURATION_MIN_OK = config.SHOT_DURATION_MIN
 SHOT_DURATION_MAX_OK = config.SHOT_DURATION_MAX
-SHOT_DURATION_TOLERANCE = 2.0     # 超出边界的容差（模型四舍五入 / 台词长度微调）
+#: 超出边界的容差（模型四舍五入 / 台词长度微调）。
+#:
+#: ⚠️⚠️ 2026-10-02 修复（静默死规则）：容差必须**小于** MIN，否则下限判据
+#:   `duration < MIN - TOL` 恒不成立 → 「单镜过短」这条校验**形同虚设**。
+#:   历史经过：MIN 从 3.0 重标定到 2.0 时，容差 2.0 未跟着下调 →
+#:   `2.0 - 2.0 = 0.0`，连 0.5 秒的镜头都不再报警（0.6 秒的静默镜基准也一并失去保护）。
+#:   现按 0.5s 设定（保留浮点/取整宽容，且远小于 MIN）：
+#:   · 下限判据 `MIN - TOL = 1.5` → 短于 1.5 秒才报「过短」（有效）
+#:   · 上限判据 `MAX + TOL = 8.5` → 长于 8.5 秒才报「过长」（有效）
+#: 改 MIN/MAX 时**必须同批复核本值是否仍 < MIN**。
+SHOT_DURATION_TOLERANCE = 0.5
 
 #: 每集总时长的**产品口径容差**（2026-09-26 新增）。
 #: ⚠️ 上下文：产品口径是「每集 1-2 分钟，最长不超过 3 分钟」
@@ -3720,11 +3819,25 @@ def check_script(script_path: str = None, script_data: dict = None,
     # 调用AI进行深度质检
     prompt_template = cfg.get("script_prompt") or DEFAULT_SCRIPT_PROMPT
     script_json = json.dumps(script_data, ensure_ascii=False, indent=2)
-    
+
+    # ⚠️ 单镜时长口径**必须由 config 常量生成**（2026-10-02 修复）：
+    #    这里曾硬编码「3-12 秒」，而生成端已按参考片重标定到 2~8 秒 →
+    #    送检大模型拿到的合规区间与确定性校验（下面 _validate_script_92rules 用的
+    #    SHOT_DURATION_MIN_OK/MAX_OK，同为 config 单一来源）**互相打架**：
+    #    模型会放过 9-10 秒镜头、或把 2.5 秒镜头报成过短。
+    #    改成占位符后，改 config 就自动同步，杜绝再次漂移。
+    #    ⚠️ 用户若在配置里自定义了 script_prompt（旧文本仍含「3-12 秒」），
+    #    replace 不会命中占位符 → 保持用户原文，属预期（用户口径优先）。
     prompt = prompt_template.replace(
         "{style}", style or "国漫古风"
     ).replace(
         "{target_duration}", str(target_duration)
+    ).replace(
+        "{shot_duration_min}", f"{SHOT_DURATION_MIN_OK:g}"
+    ).replace(
+        "{shot_duration_max}", f"{SHOT_DURATION_MAX_OK:g}"
+    ).replace(
+        "{shot_duration_silent}", f"{config.SHOT_DURATION_SILENT:g}"
     ).replace(
         "{script_data}", script_json[:8000]  # 限制长度，避免超出上下文
     )

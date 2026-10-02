@@ -35,6 +35,7 @@ from config import (
     KEYFRAME_CHAIN_MODE, WORKFLOW_TEMPLATE,
     CHARACTER_SHEET_VIEWS, ASSET_VIEW_STEMS,
     CHARACTER_SHEET_CELLS, CHARACTER_SHEET_GRID, CHARACTER_SHEET_HALF_BAND,
+    CHARACTER_SHEET_LAYOUT_ZH,
     CHARACTER_HALF_VIEWS,
     SCENE_VIEW_KEYS, SCENE_VIEW_LABELS, SCENE_VIEW_ANGLE_ZH,
     SCENE_ANGLE_TO_VIEW, SCENE_VIEWS_ENABLED, SCENE_VIEW_MAX_RETRIES,
@@ -90,6 +91,8 @@ import providers
 import comfyui_models
 import log_viewer
 import asset_name_match
+import scene_grid
+import model_capabilities
 import prompt_qc
 import qc_client
 import qc_coverage
@@ -120,7 +123,10 @@ from tts_client import (
     QwenTTSClient, TTSError, check_environment as tts_env_check,
     build_dub_plan, default_voice_map, normalize_voice, save_voice_map,
     load_voice_map, list_voices as tts_list_voices, probe_audio as probe_audio_info,
-    concat_audio, clean_line_text
+    concat_audio, clean_line_text,
+    # 参考音频克隆（2026-10-06）
+    save_voice_bank_ref, find_voice_bank_ref, list_voice_bank, voice_bank_dir,
+    clone_available as tts_clone_available, VOICE_BANK_EXTS
 )
 from upscale_client import (
     VideoUpscaler, UpscaleError, check_environment as upscale_env_check,
@@ -1349,6 +1355,226 @@ def api_project_asset_detail(pid):
                                                "reference_prompt_en": meta.get("reference_prompt_en") or "",
                                                "appearance": meta.get("appearance") or ""}]}},
         "downloads": [v["url"] for v in views],
+    })
+
+
+# ===================== 资产沉淀过程可视化（2026-10-06） =====================
+# 需求：资产不是「一下就有的」，而是「抽取 → 写提示词 → 出图 → 质检（可能重画 N 次）
+# → 沉淀教训 → 切分入库」这样一条流水线跑出来的。此前这些步骤散落在质检历史
+# （QC_DIR/<项目>/asset_<名称>.json）、产物旁路元数据（*.meta.json）与教训库
+# （output/lessons/lessons.jsonl）三处，用户在界面上只能看到「最后那张图」，
+# 看不到「它被改了几次、为什么改、学到了什么」。
+#
+# 本接口把三处数据按资产聚合成一条**时间线**，供前端在资产详情里渲染。
+# 纯只读：不触发任何生成，不写盘，读失败一律降级成空步骤（绝不 500）。
+
+#: 沉淀过程的步骤定义（id / 中文名 / 英文名）。前端按此顺序渲染步骤条。
+_PRECIP_STEPS = (
+    ("extract", "资产抽取", "Extraction"),
+    ("prompt", "提示词定稿", "Prompt"),
+    ("base", "基础图出图", "Base image"),
+    ("qc", "质检迭代", "QC iterations"),
+    ("lesson", "教训沉淀", "Lessons"),
+    ("derive", "视角切分", "View derivation"),
+    ("store", "入库完成", "Stored"),
+)
+
+
+def _precip_meta_of(asset_dir: str, filename: str) -> dict:
+    """读某个产物的旁路元数据（<产物>.meta.json），失败返回 {}。"""
+    p = os.path.join(asset_dir, f"{filename}.meta.json")
+    if not os.path.isfile(p):
+        return {}
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception as e:  # noqa: BLE001
+        app.logger.debug("产物元数据读取失败 %s：%s", p, e)
+        return {}
+
+
+@app.route('/api/projects/<path:pid>/asset-precipitation', methods=['GET'])
+def api_project_asset_precipitation(pid):
+    """某资产的沉淀过程（时间线 + 步骤状态），供资产详情可视化。
+
+    query: kind=character|item|scene, name=<资产名>
+    → {success, steps:[{id,label,status,detail,at,items[]}], summary:{...}}
+    """
+    rec = project_store.get_project(pid)
+    if not rec:
+        return jsonify({"error": "项目不存在", "ref": pid}), 404
+    kind = (request.args.get('kind') or 'character').strip().lower()
+    name = (request.args.get('name') or '').strip()
+    key = rec["dir_key"]
+
+    kind_map = {"character": "characters", "characters": "characters",
+                "item": "items", "items": "items",
+                "scene": "scenes", "scenes": "scenes"}
+    if kind not in kind_map:
+        return jsonify({"error": f"不支持的资产类型：{kind}"}), 400
+    folder_kind = kind_map[kind]
+    if not name or "/" in name or "\\" in name or ".." in name:
+        return jsonify({"error": "资产名称非法", "name": name}), 400
+
+    hit = project_store.find_kind_dir(key, folder_kind, name)
+    asset_dir = hit.get("asset_dir") or ""
+    steps: list = []
+
+    def _step(sid: str, status: str, detail: str = "", items=None, at=None) -> dict:
+        label = dict((s[0], s[1]) for s in _PRECIP_STEPS).get(sid, sid)
+        return {"id": sid, "label": label, "status": status,
+                "detail": detail, "items": items or [], "at": at}
+
+    # ---- 1. 资产抽取：剧本里这个资产的档案 ----
+    _char_meta = {}
+    _script_path = ""
+    try:
+        for sp in project_store.project_scripts(key):
+            try:
+                with open(sp, "r", encoding="utf-8") as f:
+                    d = json.load(f) or {}
+            except Exception:  # noqa: BLE001
+                continue
+            for x in (d.get(folder_kind) or []):
+                if isinstance(x, dict) and str(x.get("name") or "") == name:
+                    _char_meta = dict(x)
+                    _script_path = sp
+                    break
+            if _char_meta:
+                break
+    except Exception as e:  # noqa: BLE001
+        app.logger.debug("资产抽取信息读取失败：%s", e)
+    if _char_meta:
+        _fields = [(k, str(_char_meta.get(k) or "").strip())
+                   for k in ("appearance", "personality", "age", "gender", "category", "owner")
+                   if str(_char_meta.get(k) or "").strip()]
+        steps.append(_step("extract", "done",
+                           f"从剧本抽取到 {len(_fields)} 项设定",
+                           items=[{"key": k, "value": v[:200]} for k, v in _fields]))
+    else:
+        steps.append(_step("extract", "skipped", "剧本里没有该资产的档案（可能为手工上传）"))
+
+    # ---- 2. 提示词定稿 ----
+    base_meta = _precip_meta_of(asset_dir, "base.png") if asset_dir else {}
+    _prompt = str(_char_meta.get("reference_prompt_zh") or base_meta.get("prompt") or "").strip()
+    if _prompt:
+        steps.append(_step("prompt", "done", f"{len(_prompt)} 字",
+                           items=[{"key": "prompt", "value": _prompt[:1200]}]))
+    else:
+        steps.append(_step("prompt", "skipped", "未记录提示词"))
+
+    # ---- 3. 基础图出图 + 4. 质检迭代（同一份历史，拆成两步展示） ----
+    hist = {}
+    try:
+        hist = qc_client.read_history(QC_DIR, key, "asset", name) or {}
+    except Exception as e:  # noqa: BLE001
+        app.logger.debug("资产质检历史读取失败：%s", e)
+    records = [r for r in (hist.get("records") or []) if isinstance(r, dict)]
+    base_records = [r for r in records if str(r.get("stage") or "").startswith("基础图")
+                    or r.get("stage") == "资产基础图质检"]
+    if not base_records:
+        base_records = records    # 旧数据没有 stage 字段时全当基础图阶段
+
+    _source = (base_meta.get("extra") or {}).get("source") if base_meta else ""
+    _has_base = bool(asset_dir) and os.path.isfile(os.path.join(asset_dir, "base.png"))
+    if base_meta and _source == "user_upload":
+        steps.append(_step("base", "done", "用户上传（未走 GPU 出图）",
+                           items=[{"key": "file", "value": "base.png"}]))
+    elif base_meta or _has_base:
+        _wf = base_meta.get("workflow") or ""
+        steps.append(_step("base", "done",
+                           f"seed={base_meta.get('seed')}"
+                           + (f"；工作流 {_wf}" if _wf else ""),
+                           items=[{"key": "seed", "value": str(base_meta.get('seed') or '')},
+                                  {"key": "workflow", "value": _wf}]))
+    else:
+        steps.append(_step("base", "pending", "尚未出图"))
+
+    if base_records:
+        _passed = next((r for r in base_records if r.get("passed")), None)
+        _scores = [r.get("score") for r in base_records if r.get("score") is not None]
+        _qitems = []
+        for r in base_records:
+            _qitems.append({
+                "attempt": r.get("attempt"),
+                "passed": bool(r.get("passed")),
+                "score": r.get("score"),
+                "reason": str(r.get("reason") or "")[:300],
+                "issues": [str(x)[:160] for x in
+                           (list(r.get("issues") or []) + list(r.get("critical_issues") or []))[:6]],
+                "at": r.get("time"),
+                "seed": r.get("seed"),
+            })
+        _detail = (f"共 {len(base_records)} 次尝试"
+                   + (f"，第 {_passed.get('attempt')} 次达标" if _passed else "，未达标")
+                   + (f"；评分 {min(_scores)}→{max(_scores)}" if len(_scores) > 1 else
+                      (f"；评分 {_scores[0]}" if _scores else "")))
+        steps.append(_step("qc", "done" if _passed else "failed", _detail, items=_qitems,
+                           at=(base_records[-1] or {}).get("time")))
+    else:
+        steps.append(_step("qc", "skipped", "无质检记录（可能质检未开启或为用户上传）"))
+
+    # ---- 5. 教训沉淀（该资产提示词命中的教训） ----
+    _lessons = []
+    try:
+        if _prompt:
+            _m = prompt_memory.get_memory(PROJECT_OUTPUT_DIR)
+            # 用 suggestions_with_priority（返回 dict 列表）而非 suggestions
+            # （后者返回渲染好的字符串，分类/优先级信息已丢，无法结构化展示）
+            sug = _m.suggestions_with_priority("asset", _prompt, max_hints=8) or []
+            _lessons = [{
+                "issue": str(x.get("issue") or "")[:200],
+                "category": x.get("category") or "",
+                "priority": x.get("priority") or "",
+                "project": x.get("project") or "",
+                "score": x.get("score"),
+            } for x in sug if isinstance(x, dict) and str(x.get("issue") or "").strip()]
+    except Exception as e:  # noqa: BLE001
+        app.logger.debug("教训召回失败：%s", e)
+    if _lessons:
+        steps.append(_step("lesson", "done",
+                           f"命中 {len(_lessons)} 条历史教训（下次重画时用于改写提示词）",
+                           items=_lessons))
+    else:
+        steps.append(_step("lesson", "skipped", "无相关教训"))
+
+    # ---- 6. 视角切分 ----
+    _views = project_store._views_of(asset_dir) if asset_dir else []
+    _view_names = [v["view"] for v in _views]
+    _derived = [k for k in ("front", "left", "back", "half") if k in _view_names]
+    _view_meta = _precip_meta_of(asset_dir, "front.png") if asset_dir else {}
+    if _derived:
+        _mode = ((_view_meta.get("extra") or {}).get("derive_mode") or "sheet_crop")
+        steps.append(_step("derive", "done",
+                           f"切分出 {len(_derived)} 张视角图（{_mode}）",
+                           items=[{"key": "views", "value": "、".join(_derived)},
+                                  {"key": "derive_mode", "value": _mode}]))
+    else:
+        steps.append(_step("derive", "skipped",
+                           "无派生视角（物品/场景仅一张基础图，或切分失败已回落整图）"))
+
+    # ---- 7. 入库 ----
+    if _views:
+        steps.append(_step("store", "done",
+                           f"入库 {len(_views)} 个文件：{'、'.join(_view_names)}",
+                           items=[{"key": "dir", "value": asset_dir}]))
+    else:
+        steps.append(_step("store", "pending", "尚未入库任何图片"))
+
+    _done = sum(1 for s in steps if s["status"] == "done")
+    return jsonify({
+        "success": True, "kind": kind_map[kind], "name": name, "project": key,
+        "asset_dir": asset_dir, "script_path": _script_path,
+        "steps": steps,
+        "summary": {
+            "total_steps": len(steps),
+            "done": _done,
+            "qc_attempts": len(base_records),
+            "qc_passed": bool(next((r for r in base_records if r.get("passed")), None)),
+            "lessons": len(_lessons),
+            "views": _derived,
+            "is_user_upload": _source == "user_upload",
+        },
     })
 
 
@@ -2598,6 +2824,46 @@ def api_video_retry_shot():
         return _video_retry_shot_impl()
 
 
+@app.route('/api/video/retry-shots-batch', methods=['POST'])
+@_autopilot_guard
+def api_video_retry_shots_batch():
+    """批量单镜重生成（2026-10-02）：body = {project_name, episode_no?, shot_ids: [...]}
+
+    逐镜**串行**复用 `_video_retry_shot_impl` 的完整链路（切段 / 提示词预检 /
+    生成 / 质检 / 落盘 / manifest 回写），GPU 闸门包住**整个批次**（批内不再嵌套
+    加锁 —— impl 本身无闸门，闸门在单镜路由壳上）。单镜失败不中断批次；
+    上限 12 镜防误触全量重跑。同步返回逐镜结果（前端逐条展示）。
+    """
+    data = request.json or {}
+    ids = data.get('shot_ids')
+    if not isinstance(ids, list) or not [s for s in ids if str(s).strip()]:
+        return jsonify({"success": False,
+                        "error": "shot_ids 必须是非空数组（如 [\"shot_03\", \"shot_07\"]）"}), 400
+    ids = [str(s).strip() for s in ids if str(s).strip()][:12]
+    base_body = {k: v for k, v in data.items() if k != 'shot_ids'}
+    results = []
+    with gpu_task_gate.run_gpu_task(
+            f"video_retry_batch_{uuid.uuid4().hex[:8]}", "批量单镜重生成"):
+        for sid in ids:
+            body = dict(base_body)
+            body['shot_id'] = sid
+            try:
+                with app.test_request_context(json=body):
+                    resp = _video_retry_shot_impl()
+                    payload = (resp[0].get_json() if isinstance(resp, tuple)
+                               else resp.get_json())
+                    status = resp[1] if isinstance(resp, tuple) else resp.status_code
+                    results.append({"shot_id": sid, "http_status": status,
+                                    **(payload if isinstance(payload, dict) else {})})
+            except Exception as e:  # noqa: BLE001  单镜失败不断批次
+                app.logger.warning("[批量重生成] 镜头 %s 失败：%s", sid, e)
+                results.append({"shot_id": sid, "success": False, "error": str(e)})
+    ok_n = sum(1 for r in results if r.get("success"))
+    app.logger.info("[批量重生成] 完成：%d/%d 镜成功", ok_n, len(results))
+    return jsonify({"success": ok_n > 0, "total": len(results), "ok_count": ok_n,
+                    "results": results})
+
+
 def _video_retry_shot_impl():
     data = request.json or {}
     # G4：判空看原始入参（_safe_project('') 返回真值 'project'，死守卫）
@@ -2670,10 +2936,14 @@ def _video_retry_shot_impl():
             _r_want_half = _framing_wants_half_shot(shot)
             _r_char_imgs, _r_char_refs = [], []
             for _mc in (_r_matched or []):
-                _p = _pick_char_view(_r_char_idx.get(_mc) or {}, _r_want_half)
+                _e = _r_char_idx.get(_mc) or {}
+                # 2026-10-02 服装变体：本镜服装提示（shot.outfit / shot.character_outfits）
+                # 能解析出已生成的 outfit_key → 参考图优先取 outfits/<key>/ 同档位图；
+                # 解析不出 / 未生成回落主设定图（_shot_outfit_dir 返回 ''，fail-open）。
+                _p = _pick_char_view(_e, _r_want_half,
+                                     _shot_outfit_dir(shot, _mc, _e.get("_dir") or ""))
                 if _p and _p not in _r_char_imgs:
                     _r_char_imgs.append(_p)
-                    _e = _r_char_idx.get(_mc) or {}
                     _r_char_refs.append({"name": _mc,
                                          "appearance": _e.get("appearance")
                                          or _e.get("description") or ""})
@@ -3142,7 +3412,7 @@ def api_generate_script():
 # ===== 步骤2/3/4：资产生成（角色/物品/场景 + 多视角） =====
 
 def _generate_asset_task(task_id: str, assets: list, asset_type: str, project_name: str,
-                         style: str = "", overwrite: bool = False):
+                         style: str = "", overwrite: bool = False, sub_dir: str = ""):
     """后台资产生成任务：基础图 + （角色）由整图本地切分派生的视角单图
 
     P0 修复（④⑤）：全链路接入 AI 质检——基础图必须送检；不达标自动重生成（换 seed），
@@ -3151,6 +3421,12 @@ def _generate_asset_task(task_id: str, assets: list, asset_type: str, project_na
     A-2 P0 断点续跑：新增 overwrite 参数（默认 False）。已达标入库的资产
     （目录内已有非空图，判据同 pipeline.probe_assets）直接跳过，不再重复
     「生成→质检→重画」；overwrite=True 时强制全量重生成。
+
+    服装变体（衣柜，2026-10-02）：新增 sub_dir 可选参数（默认空串 = 行为与从前
+    完全一致）。非空时把该资产的落盘目录（含 base.png / 切分视角图 / meta
+    sidecar / 质检历史）整体挂到「主设定目录 + sub_dir」下（如 outfits/<key>），
+    用于角色服装变体 —— 生成链路（提示词预检 / 质检 / 重试 / 切分）零改动，
+    仅目录多一层。
 
     风格落地（2026-09-18 修复）：新增 style 参数。此前该任务**完全没有风格入参**，
     资产提示词只有 bible 的 reference_prompt_zh（实测其中零风格词），于是物品/角色/场景
@@ -3170,6 +3446,24 @@ def _generate_asset_task(task_id: str, assets: list, asset_type: str, project_na
             "item": comfyui_client.generate_item_base,
             "scene": comfyui_client.generate_scene_base,
         }[asset_type]
+
+        # 服装变体（衣柜）子目录防御：sub_dir 只应是「outfits/<安全键>」这类相对
+        # 子路径（由 /api/assets/character/outfit 传入）。这里再做一次纵深防御——
+        # 归一后含「..」/ 盘符 / 绝对路径前缀的一律按空串处理（fail-open，回落主
+        # 设定目录，与该参数不存在时的行为完全一致）。
+        if sub_dir:
+            _sd = os.path.normpath(str(sub_dir)).replace("\\", "/").strip("/")
+            if not _sd or _sd.startswith("..") or "/../" in f"/{_sd}/" or ":" in _sd:
+                app.logger.warning("资产子目录参数非法，按主设定目录处理：%r", sub_dir)
+                sub_dir = ""
+            else:
+                sub_dir = _sd
+
+        def _asset_full_dir(asset_name: str) -> str:
+            """该资产的落盘目录：主设定目录（base_dir/<项目>/<名称>），或
+            （服装变体）主设定目录 + sub_dir 子目录。sub_dir 为空时与从前逐字节一致。"""
+            d = os.path.join(base_dir, project_name, asset_name)
+            return os.path.join(d, sub_dir) if sub_dir else d
 
         # 风格（文字部分，如画风/色调）仍从总控敲定的 style 串解析；
         # 画幅**按资产类型内置写死**（2026-09-22 需求，不跟随视频比例）：
@@ -3217,8 +3511,7 @@ def _generate_asset_task(task_id: str, assets: list, asset_type: str, project_na
                 # ⚠️ 只在「已就绪」时提前 continue；未就绪项继续走下面的重要性过滤
                 #    与完整生成链路，临时道具的 skip 路径不受影响。
                 if not overwrite:
-                    _ready_img = _first_existing_asset_image(
-                        os.path.join(base_dir, project_name, name))
+                    _ready_img = _first_existing_asset_image(_asset_full_dir(name))
                     if _ready_img:
                         app.logger.info("资产已达标入库，断点续跑跳过：%s（%s）",
                                         name, _ready_img)
@@ -3257,9 +3550,15 @@ def _generate_asset_task(task_id: str, assets: list, asset_type: str, project_na
                         "current_asset": name, "phase": "基础图"
                     })
 
-                asset_dir = os.path.join(base_dir, project_name, name)
+                asset_dir = _asset_full_dir(name)
                 os.makedirs(asset_dir, exist_ok=True)
-                scratch_dir = os.path.join(scratch_root, f"{asset_type}_{name}")
+                # 质检暂存目录：服装变体（sub_dir 非空）带子目录标签，避免与同一角色
+                # 主设定图的并发生成互相 prune 掉对方的 try 中间产物；sub_dir 为空时
+                # 目录名与从前逐字节一致（零回归）。
+                _scratch_tag = sub_dir.replace("/", "_") if sub_dir else ""
+                scratch_dir = os.path.join(
+                    scratch_root,
+                    f"{asset_type}_{name}" + (f"_{_scratch_tag}" if _scratch_tag else ""))
                 os.makedirs(scratch_dir, exist_ok=True)
                 _qc_prune_attempts(scratch_dir)   # G8③：清理上一轮遗留的过期 try（只留最近 4）
                 _g_hint = asset_prompt_kit.gender_hint(asset); qc_desc = f"资产类型：{asset_type}；资产名称：{name}；{(_g_hint + '；') if _g_hint else ''}资产设定：{str(prompt_zh)[:400]}"
@@ -3657,7 +3956,7 @@ def _generate_asset_task(task_id: str, assets: list, asset_type: str, project_na
                                  name, type(_asset_err).__name__, _asset_err)
                 results.append({
                     "name": name, "success": False,
-                    "dir": os.path.join(base_dir, project_name, name),
+                    "dir": _asset_full_dir(name),
                     "stage": "异常中断", "qc_blocked": False,
                     "error": f"{type(_asset_err).__name__}: {_asset_err}",
                 })
@@ -3922,6 +4221,346 @@ def api_autopilot_reset_asset():
                             "若命中跨项目资产库指纹可能直接复用旧图，要换形象请先改描述"})
 
 
+# ===================== 场景九宫格机位预览（2026-10-01，对标 BigBanana 候选构图） =====================
+# 场景 base 图 → 9 个机位各一张同场景变体 + 3x3 拼接预览（scene_grid.py）。
+# 「应用」= 选中机位图升级为该场景新 base（旧 base 移入回收站），分镜参考图与
+# 按机位出图自动沿用新视角。GPU 任务走统一闸门（与生产串行，不抢卡）。
+
+def _find_scene_asset_dir(project_name: str, name: str) -> str:
+    """按名称定位场景资产目录（scenes/<项目>/<名称>）"""
+    d = os.path.join(SCENES_DIR, project_name, name)
+    return d if os.path.isdir(d) else ""
+
+
+def _scene_grid_prompt_for(project_name: str, name: str) -> str:
+    """场景内容描述：优先读剧本 scenes[].reference_prompt_zh / appearance"""
+    try:
+        script = _load_script_for(project_name, 1) or {}
+        for sc in (script.get("scenes") or []):
+            if not isinstance(sc, dict):
+                continue
+            if str(sc.get("name") or "").strip() == name or \
+                    str(sc.get("location") or "").strip() == name:
+                return str(sc.get("reference_prompt_zh") or sc.get("appearance") or "").strip()
+    except Exception as e:  # noqa: BLE001
+        app.logger.debug("场景九宫格读取剧本场景描述失败：%s", e)
+    return ""
+
+
+@app.route('/api/scenes/grid-preview', methods=['POST'])
+def api_scenes_grid_preview():
+    """异步发起场景九宫格机位预览（9 个机位逐张生成 + 3x3 拼接），返回 task_id"""
+    data = _body()
+    project_name, err = _project_or_400((data.get('project_name') or '').strip())
+    if err is not None:
+        return err
+    name = (data.get('name') or '').strip()
+    if not name or '/' in name or '\\' in name or name in ('.', '..'):
+        return jsonify({"success": False,
+                        "error": "场景名不能为空且不得含路径分隔符"}), 400
+    asset_dir = _find_scene_asset_dir(project_name, name)
+    if not asset_dir:
+        return jsonify({"success": False,
+                        "error": f"未找到场景资产目录（{name}），请先生成场景资产"}), 404
+    base_png = os.path.join(asset_dir, "base.png")
+    if not os.path.isfile(base_png):
+        return jsonify({"success": False,
+                        "error": "该场景还没有 base 图，请先生成场景资产"}), 400
+    task_id = f"scene_grid_{project_name}_{int(time.time() * 1000)}"
+    style = _project_style(project_name)
+    scene_prompt = _scene_grid_prompt_for(project_name, name)
+    seed = random.randint(1, 2 ** 31 - 1)
+
+    with lock:
+        generation_state[task_id] = {
+            "status": "running", "phase": "场景九宫格机位预览",
+            "total": len(scene_grid.SCENE_GRID_ANGLES), "current": 0, "progress": 0,
+            "project": project_name, "scene": name,
+            "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+    def _grid_worker():
+        def _cb(done, total, item):
+            with lock:
+                generation_state[task_id].update({
+                    "current": done, "total": total,
+                    "progress": int(done / max(total, 1) * 100),
+                    "phase": f"机位 {done + 1}/{total}：{(item or {}).get('label', '')}",
+                })
+        try:
+            with gpu_task_gate.run_gpu_task(task_id, "场景九宫格机位预览"):
+                out = scene_grid.generate_scene_grid(
+                    comfyui_client, project_name, name, base_png,
+                    scene_prompt, style, asset_dir, seed=seed, progress_cb=_cb)
+            _dir_name = os.path.basename(asset_dir)
+            with lock:
+                generation_state[task_id].update({
+                    "status": "completed", "progress": 100, "result": out,
+                    "grid_url": (f"/api/scenes/grid/file/{project_name}/{_dir_name}"
+                                 "/grid/grid_preview.png") if out.get("grid") else "",
+                    "angle_urls": [
+                        {"key": a["key"], "label": a["label"],
+                         "url": f"/api/scenes/grid/file/{project_name}/{_dir_name}/{a['key']}.png"}
+                        for a in (out.get("angles") or [])],
+                })
+        except cancellation.Cancelled as e:
+            with lock:
+                generation_state[task_id].update({"status": "cancelled", "error": str(e)})
+        except Exception as e:  # noqa: BLE001
+            app.logger.error("场景九宫格生成失败：%s", e, exc_info=True)
+            with lock:
+                generation_state[task_id].update({"status": "failed", "error": str(e)})
+
+    threading.Thread(target=_grid_worker, daemon=True, name=task_id).start()
+    return jsonify({"success": True, "task_id": task_id, "status": "started",
+                    "total": len(scene_grid.SCENE_GRID_ANGLES)})
+
+
+@app.route('/api/scenes/grid/file/<project_name>/<path:relpath>')
+def api_scenes_grid_file(project_name, relpath):
+    """九宫格产物文件服务（限 scenes/<项目>/<场景>/grid/ 内，防目录穿越）"""
+    project_name = _safe_project(project_name)
+    base = os.path.abspath(os.path.join(SCENES_DIR, project_name))
+    filepath = os.path.abspath(os.path.join(base, relpath.replace("\\", "/").lstrip("/")))
+    grid_root = os.path.abspath(os.path.join(base, "grid"))
+    if not filepath.startswith(grid_root + os.sep) or not os.path.isfile(filepath):
+        abort(404)
+    return send_file(filepath, conditional=True)
+
+
+@app.route('/api/scenes/grid-apply', methods=['POST'])
+def api_scenes_grid_apply():
+    """把选中的机位预览图升级为场景新 base（旧 base 移入回收站，可恢复）"""
+    data = _body()
+    project_name, err = _project_or_400((data.get('project_name') or '').strip())
+    if err is not None:
+        return err
+    name = (data.get('name') or '').strip()
+    angle_key = (data.get('angle') or '').strip()
+    if not name or not angle_key:
+        return jsonify({"success": False, "error": "name 与 angle 必填"}), 400
+    asset_dir = _find_scene_asset_dir(project_name, name)
+    if not asset_dir:
+        return jsonify({"success": False, "error": f"未找到场景资产目录（{name}）"}), 404
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    trash_root = os.path.join(PROJECT_OUTPUT_DIR, "projects", "_trash", "scene_grid",
+                              f"{stamp}_{project_name}")
+    cleared, skipped = [], []
+    try:
+        res = scene_grid.apply_grid_angle(
+            asset_dir, angle_key,
+            lambda src: _trash_move(src, "scene_grid_base", trash_root, cleared, skipped))
+    except FileNotFoundError as e:
+        return jsonify({"success": False, "error": str(e)}), 404
+    app.logger.info("[scene-grid-apply] 项目=%s 场景=%s 机位=%s（清理 %d 项）",
+                    project_name, name, angle_key, len(cleared))
+    return jsonify({"success": True, "project": project_name, "name": name,
+                    "angle": angle_key, **res, "cleared": cleared, "skipped": skipped,
+                    "hint": "选中机位图已升级为场景 base；下次分镜参考图生成立即使用新视角；"
+                            "各机位视角图可在资产重生时刷新"})
+
+
+# ===================== 分镜九宫格候选构图（2026-10-01，对标 BigBanana） =====================
+# 一镜一次生成「3x3 九候选构图联系表」→ 选格裁切为正式分镜图。与 best-of-N 相比：
+# 一次生成出 9 个机位变体，省时省卡；选格可由 QC 模型打分或用户手动指定。
+
+@app.route('/api/storyboard/grid-candidates', methods=['POST'])
+def api_storyboard_grid_candidates():
+    """为一镜生成九宫格候选构图（异步）。body: {project_name, episode_no, shot_id}"""
+    data = _body()
+    project_name, err = _project_or_400((data.get('project_name') or '').strip())
+    if err is not None:
+        return err
+    try:
+        episode_no = max(1, int(data.get('episode_no') or 1))
+    except (TypeError, ValueError):
+        episode_no = 1
+    shot_key = (data.get('shot_id') or '').strip()
+    script = _load_script_for(project_name, episode_no) or {}
+    shots = script.get("shots") or []
+    shot = next((s for s in shots if isinstance(s, dict) and
+                 (str(s.get("shot_id")) == shot_key or
+                  str(_shot_seq(s.get("shot_id"), 0)) == shot_key.replace("shot_", ""))), None)
+    if shot is None:
+        return jsonify({"success": False,
+                        "error": f"剧本里找不到镜头：{shot_key}"}), 404
+    char_idx = _build_asset_index(script.get("characters") or [], project_name, "character")
+    item_idx = _build_asset_index(script.get("items") or [], project_name, "item")
+    scene_idx = _build_asset_index(script.get("scenes") or [], project_name, "scene")
+    refs = _allocate_storyboard_refs(shot, char_idx, item_idx, scene_idx, project_name)
+    if not refs:
+        return jsonify({"success": False,
+                        "error": "该镜无可用参考图（请先生成资产生成）"}), 400
+    style = data.get('style') or _project_style(project_name)
+    _res = style_kit.resolve(style, default_ratio=style_kit.DEFAULT_RATIO,
+                             megapixels=style_kit.storyboard_megapixels())
+    refs = _unify_ref_canvas(refs, _res["size"], project_name)
+    refs = _cap_storyboard_refs(refs, shot)
+    labels = [r[1] for r in refs]
+    seq = _shot_seq(shot.get("shot_id"), 1)
+    task_id = f"shot_grid_{project_name}_{int(time.time() * 1000)}"
+
+    with lock:
+        generation_state[task_id] = {
+            "status": "running", "phase": "分镜九宫格候选构图",
+            "project": project_name, "shot": shot.get("shot_id"),
+            "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+    def _grid_worker():
+        try:
+            with gpu_task_gate.run_gpu_task(task_id, "分镜九宫格候选构图"):
+                result = comfyui_client.generate_shot_grid_candidates(
+                    shot, labels, [r[2] for r in refs], project_name,
+                    f"shot_{seq:02d}", style=style,
+                    seed=random.randint(1, 2 ** 31 - 1), size=_res["size"])
+            grid_png = (result.get("files") or [""])[0]
+            if not grid_png or not os.path.isfile(grid_png):
+                raise RuntimeError("九宫格候选构图生成未返回文件")
+            # 集级目录（2026-10-02 修复）：分镜画布读 epNN/ 子目录，grid 产物此前
+            # 落平铺目录，第 2 集起选格结果不会出现在该集画布 —— 与
+            # _update_storyboard_manifest_shot 的目录/URL 口径对齐。
+            _flat = os.path.join(STORYBOARDS_DIR, project_name)
+            _sb_dir = _ep_dir(_flat, episode_no)
+            _sub = os.path.basename(_sb_dir) if _sb_dir != _flat else ""
+            dst = os.path.join(_sb_dir, f"shot_{seq:02d}_grid.png")
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(grid_png, dst)
+            with lock:
+                generation_state[task_id].update({
+                    "status": "completed", "progress": 100,
+                    "grid_url": (f"/api/storyboards/file/{project_name}/"
+                                 f"{_sub + '/' if _sub else ''}shot_{seq:02d}_grid.png"),
+                    "result": {"grid": dst},
+                })
+        except cancellation.Cancelled as e:
+            with lock:
+                generation_state[task_id].update({"status": "cancelled", "error": str(e)})
+        except Exception as e:  # noqa: BLE001
+            app.logger.error("分镜九宫格候选构图失败：%s", e, exc_info=True)
+            with lock:
+                generation_state[task_id].update({"status": "failed", "error": str(e)})
+
+    threading.Thread(target=_grid_worker, daemon=True, name=task_id).start()
+    return jsonify({"success": True, "task_id": task_id, "status": "started"})
+
+
+@app.route('/api/storyboard/grid-apply', methods=['POST'])
+def api_storyboard_grid_apply():
+    """把九宫格里选中的格（1-9）裁切为该镜正式分镜图（旧图移入回收站，可恢复）。
+
+    ⚠️ 选格应用视为**用户人工定稿**：裁切结果直接入库，不再走图片 AI 质检。
+    """
+    data = _body()
+    project_name, err = _project_or_400((data.get('project_name') or '').strip())
+    if err is not None:
+        return err
+    try:
+        episode_no = max(1, int(data.get('episode_no') or 1))
+    except (TypeError, ValueError):
+        episode_no = 1
+    shot_key = (data.get('shot_id') or '').strip()
+    try:
+        cell = max(1, int(data.get('cell') or 0))
+    except (TypeError, ValueError):
+        return jsonify({"success": False, "error": "cell 必须是 1-9 的整数"}), 400
+    if cell > 9:
+        return jsonify({"success": False, "error": "cell 必须是 1-9"}), 400
+    seq = _shot_seq(shot_key, 0)
+    if seq <= 0:
+        return jsonify({"success": False, "error": f"无法解析镜号：{shot_key}"}), 400
+    # 集级目录（2026-10-02 修复）：与 grid-candidates / 分镜画布同口径，第 2 集
+    # 起读写 epNN/ 子目录，选格裁切结果才能落到该集画布实际读取的位置。
+    _flat = os.path.join(STORYBOARDS_DIR, project_name)
+    _sb_dir = _ep_dir(_flat, episode_no)
+    _sub = os.path.basename(_sb_dir) if _sb_dir != _flat else ""
+    grid_png = os.path.join(_sb_dir, f"shot_{seq:02d}_grid.png")
+    if not os.path.isfile(grid_png):
+        return jsonify({"success": False,
+                        "error": f"九宫格候选图不存在：{grid_png}（请先生成候选构图）"}), 404
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    trash_root = os.path.join(PROJECT_OUTPUT_DIR, "projects", "_trash", "shot_grid",
+                              f"{stamp}_{project_name}")
+    dst = os.path.join(_sb_dir, f"shot_{seq:02d}.png")
+    cleared, skipped = [], []
+    if os.path.isfile(dst):
+        _trash_move(dst, "storyboards", trash_root, cleared, skipped)
+    comfyui_client.crop_grid_cell(grid_png, cell - 1, dst)
+    app.logger.info("[shot-grid-apply] 项目=%s 集=%s 镜=%s 第 %d 格已应用（旧图 %d 项入回收站）",
+                    project_name, episode_no, shot_key, cell, len(cleared))
+    return jsonify({"success": True, "project": project_name, "shot_id": shot_key,
+                    "cell": cell, "applied": dst,
+                    "url": (f"/api/storyboards/file/{project_name}/"
+                            f"{_sub + '/' if _sub else ''}shot_{seq:02d}.png"),
+                    "cleared": cleared,
+                    "hint": "选中格已裁切为该镜正式分镜图（人工定稿，未走 AI 质检）"})
+
+
+# ===================== P2-2：RefMod 节点探测 + UI→API 兼容自检（Fizgig/MiniMaxH3Mod） =====================
+
+@app.route('/api/comfyui/refmod-status', methods=['GET'])
+def api_comfyui_refmod_status():
+    """探测 ComfyUI 是否安装 RefMod / MiniMaxH3Mod 节点 + UI→API 兼容自检（P2-2 PoC）。
+
+    RefMod：把一个角色的多张参考图/视频打包成单个 .safetensors，像 LoRA 一样
+    直接喂给 H3 context（免训练、不占参考图槽位）。未安装时先 clone
+    ComfyUI-MiniMaxH3Mod 到 custom_nodes 并重启 ComfyUI，再回来看本接口。
+
+    在既有返回键（success / comfyui / installed / nodes / hint，不可达时
+    success=False + error + 502）基础上追加 ``refmod`` 结构化结果：
+
+        {"refmod": {"reachable": bool, "nodes": [{"class", "input"}],
+                    "poc": {"node_class", "ui_to_api_ok", "api_nodes",
+                            "missing_inputs", "error"?}}}
+
+    poc 是对探测到的**第一个** refmod 类节点跑的 UI→API 兼容自检
+    （comfyui_client.refmod_ui_to_api_poc：合成最小 UI 图 → to_api →
+    validate_api_prompt）。fail-open：ComfyUI 不可达 / 节点不存在 / 任何异常
+    都返回结构化结果，绝不抛错、不影响任何生成链路。
+    """
+    # 模块级函数必须从模块对象 import（本文件里 `comfyui_client` 名字被实例占用，
+    # 见文件顶部 import 处注释；函数内 from-import 命中的是 sys.modules 里的模块）
+    from comfyui_client import probe_refmod_nodes, refmod_ui_to_api_poc
+    try:
+        probe = probe_refmod_nodes(timeout=15)
+        # 与旧实现一致按类名排序（object_info 键序不保证稳定），排序后第一个即 PoC 对象
+        nodes = sorted(probe.get("nodes") or [],
+                       key=lambda n: str((n or {}).get("class") or ""))
+        names = [n.get("class") for n in nodes if isinstance(n, dict) and n.get("class")]
+        base = {
+            "success": bool(probe.get("reachable")),
+            "comfyui": COMFYUI_URL,
+            "installed": bool(names),
+            "nodes": names,
+            "hint": ("已安装，可进入 RefMod PoC" if names else
+                     "未安装：clone ComfyUI-MiniMaxH3Mod 到 custom_nodes 后重启 ComfyUI"),
+        }
+        refmod = {"reachable": bool(probe.get("reachable")), "nodes": nodes}
+        if probe.get("error"):
+            refmod["error"] = probe.get("error")
+        # 对第一个 refmod 类节点跑 UI→API 兼容自检（失败只记录，不影响探测结论）
+        if refmod["reachable"] and nodes:
+            first = nodes[0]
+            try:
+                refmod["poc"] = refmod_ui_to_api_poc(
+                    first.get("class"), first.get("input") or {}, timeout=15)
+            except Exception as e:  # noqa: BLE001  PoC 兜底（其内部已 fail-open，正常到不了这里）
+                refmod["poc"] = {"node_class": first.get("class"), "ui_to_api_ok": False,
+                                 "api_nodes": 0, "missing_inputs": [],
+                                 "error": f"{type(e).__name__}: {e}"}
+        base["refmod"] = refmod
+        if not probe.get("reachable"):
+            # 保持既有 502 契约（success=False + error），并附结构化 refmod 不可用结果
+            base["error"] = probe.get("error") or "ComfyUI 不可达"
+            return jsonify(base), 502
+        return jsonify(base)
+    except Exception as e:  # noqa: BLE001  整体 fail-open：绝不把异常抛成裸 HTML 500
+        err = f"{type(e).__name__}: {e}"
+        return jsonify({"success": False, "comfyui": COMFYUI_URL, "installed": False,
+                        "nodes": [], "hint": "RefMod 探测/自检异常", "error": err,
+                        "refmod": {"reachable": False, "nodes": [], "error": err}}), 502
+
+
 @app.route('/api/assets/generate', methods=['POST'])
 def api_generate_assets():
     """生成资产（角色/物品/场景，含多视角）"""
@@ -3967,6 +4606,537 @@ def api_generate_assets():
     thread.start()
 
     return jsonify({"task_id": task_id, "status": "started"})
+
+
+# ===================== 角色服装变体（衣柜，2026-10-02） =====================
+# 目录约定：output/assets/characters/<项目>/<角色名>/outfits/<outfit_key>/，
+# 内部文件布局与主设定目录相同（base.png + front/left/back/half.png，由整图本地
+# 切分派生 —— 复用 _generate_asset_task 的「生成→质检→重试→切分」全链路，见其
+# sub_dir 参数）。端点加在 api_generate_assets 旁边：同为「消费已产出提示词 +
+# ComfyUI 出图 + 质检」链路，不读 AI 凭证，故同样不挂 AI 前置门禁。
+# ⚠️ 零回归约束：所有新行为都以「服装变体目录存在」为前提 —— 目录不存在时查询
+# 返回空数组、取图回落主设定图（fail-open，任何异常只 log 不抛）。
+
+#: 服装变体子目录名（挂在角色主设定目录下）
+_OUTFITS_DIRNAME = "outfits"
+#: 服装描述追加进提示词的标记（幂等判据，见 _append_outfit_prompt）
+_OUTFIT_PROMPT_MARK = "；本套服装："
+#: 服装档案文件名（生成发起时先落一份 outfit_key/desc 记录，查询端点回显描述用）
+_OUTFIT_RECORD_FILE = "outfit.json"
+#: 变体档位（与主设定目录的切分产物同名，来自 sheet_split 链路）
+_OUTFIT_VIEW_STEMS = ("front", "left", "back", "half")
+
+
+def _sanitize_outfit_key(raw) -> str:
+    """outfit_key 安全化：剔除路径非法字符 ``\\ / : * ? " < > |`` 与首尾空白、
+    截断到 40 字符，防路径穿越。
+
+    剔完为空（或只剩 ``.`` / ``..`` —— 分别是目录自身与上级，同样算穿越）返回
+    ''，由调用方按 400 拒绝。刻意**不用** _safe_project：那是项目键收敛规则，
+    会把任意输入坍缩成合法键（恒非空），而 outfit_key 必须能被 400 明确拒绝。
+    """
+    s = str(raw or "").strip()
+    for _ch in '\\/:*?"<>|':
+        s = s.replace(_ch, "")
+    s = s.strip()
+    if not s or s in (".", ".."):
+        return ""
+    return s[:40]
+
+
+def _append_outfit_prompt(base_prompt: str, outfit_desc: str) -> str:
+    """把「；本套服装：{outfit_desc}」追加到角色提示词末尾（幂等）。
+
+    幂等实现：服装段**只追加在串尾**，故追加前把已有的尾段剥掉再接新段 ——
+    同一 desc 重复追加结果不变（不重复），desc 改动时旧描述被替换而非叠两段。
+    """
+    base = str(base_prompt or "").strip()
+    desc = str(outfit_desc or "").strip()
+    if not desc:
+        return base
+    base = re.sub(r"；本套服装：.*$", "", base).strip()
+    if base:
+        return f"{base}{_OUTFIT_PROMPT_MARK}{desc}"
+    return f"本套服装：{desc}"
+
+
+def _character_outfit_dir(project_name: str, character: str, outfit_key: str = "") -> str:
+    """角色服装变体目录（outfit_key 为空时是 outfits 根目录）"""
+    d = os.path.join(CHARACTERS_DIR, project_name, character, _OUTFITS_DIRNAME)
+    return os.path.join(d, outfit_key) if outfit_key else d
+
+
+def _find_script_character(project_name: str, character: str) -> dict:
+    """从项目剧本（_load_script_for）按名字（含别名归一）找角色档案；找不到返回 {}
+
+    用途：服装变体的提示词要在「角色主设定」之上追加服装描述，主设定来自剧本
+    characters[].reference_prompt_zh；appearance / gender 等字段也一并透传，
+    供生成端 ensure_prompt_gender 不变量与质检描述使用。
+    """
+    _norm = _normalize_char_alias(character)
+    try:
+        for c in ((_load_script_for(project_name, None) or {}).get("characters") or []):
+            if isinstance(c, dict) and \
+                    _normalize_char_alias(str(c.get("name") or "")) == _norm:
+                return dict(c)
+    except Exception as e:  # noqa: BLE001  剧本读失败不阻断（回落主设定 meta）
+        app.logger.warning("服装变体读取剧本角色档案失败（忽略）：%s", e)
+    return {}
+
+
+def _character_base_prompt(project_name: str, character: str) -> str:
+    """角色主设定的参考提示词：剧本 characters[].reference_prompt_zh 优先，
+    回落主设定目录 base.png.meta.json 的 prompt（O2 产物旁路元数据）。
+
+    都拿不到返回 ''——此时变体提示词只含服装段，生成端的性别不变量会按剩余
+    字段兜底；与「剧本缺角色描述」的既有资产生成行为同口径，不额外阻断。
+    """
+    p = str(_find_script_character(project_name, character).get("reference_prompt_zh")
+            or "").strip()
+    if p:
+        return p
+    try:
+        meta_path = os.path.join(CHARACTERS_DIR, project_name, character,
+                                 "base.png.meta.json")
+        if os.path.isfile(meta_path):
+            with open(meta_path, "r", encoding="utf-8") as f:
+                return str((json.load(f) or {}).get("prompt") or "").strip()
+    except Exception as e:  # noqa: BLE001
+        app.logger.warning("服装变体读取主设定 meta 失败（忽略）：%s", e)
+    return ""
+
+
+def _outfit_desc_of(outfit_dir: str) -> str:
+    """该服装变体的描述：outfit.json 档案优先，回落 base.png.meta.json
+    提示词里的「；本套服装：…」尾段。任何失败返回 ''（查询列表不因此报错）。"""
+    try:
+        rec_path = os.path.join(outfit_dir, _OUTFIT_RECORD_FILE)
+        if os.path.isfile(rec_path):
+            with open(rec_path, "r", encoding="utf-8") as f:
+                desc = str((json.load(f) or {}).get("desc") or "").strip()
+            if desc:
+                return desc
+    except Exception as e:  # noqa: BLE001
+        app.logger.debug("服装档案读取失败（回落 meta sidecar）：%s", e)
+    try:
+        meta_path = os.path.join(outfit_dir, "base.png.meta.json")
+        if os.path.isfile(meta_path):
+            with open(meta_path, "r", encoding="utf-8") as f:
+                prompt = str((json.load(f) or {}).get("prompt") or "")
+            _m = re.search(r"；本套服装：(.+)$", prompt)
+            if _m:
+                return _m.group(1).strip()
+    except Exception as e:  # noqa: BLE001
+        app.logger.debug("服装 meta 回读失败（忽略）：%s", e)
+    return ""
+
+
+# ===================== 上传角色形象图 → 三视图（2026-10-06） =====================
+# 需求：用户手里已有角色画稿（自己画的 / 外包出的 / 别处满意的一张），希望直接
+# 用这张图当角色的「设定图基准」，而不是让模型按提示词重新抽一次外形。
+#
+# 关键取舍（**本地切分，不是参考图重绘**）：
+#   · 上传图直接落 `base.png`（= 角色设定整图），再走 `sheet_split` 现有链路切出
+#     front/left/back/half —— 零 GPU、零质检、秒出，且**人物外形 100% 保留**
+#     （模型重绘一定会改写脸/发型，这正是用户上传画稿要避免的）。
+#   · 因此上传图必须**本身就已按分档版式排好**（上排正面/左侧/背面三全身，
+#     下排一格正面半身）。版式不符 → `SheetSplitError` → 明确报错并回滚，
+#     绝不落一张切不动的 base.png 污染下游（下游会拿它当参考图）。
+#   · 上传即视为**已定稿**，不做图片质检（`view_gate` 记 skipped）：用户上传
+#     自己的画稿，质检判「不合格」既无意义又会把用户的东西删掉。
+#
+# 与服装变体（outfits/<key>）的关系：同一张上传图可以挂到主设定，也可以挂到
+# 某个服装变体档；由 `outfit_key` 决定落位（空 = 主设定）。
+# 幂等：默认已存在 base.png 即跳过；overwrite=true 强制覆盖。
+
+#: 上传形象图允许的扩展名（与 project_store._views_of 的图片白名单同口径）
+_UPLOAD_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp")
+
+
+@app.route('/api/assets/character/upload-sheet', methods=['POST'])
+def api_character_upload_sheet():
+    """上传角色形象图 → 落 base.png → 本地切分三视图（零 GPU）。
+
+    form-data: file（图片，必填）, project_name, character, outfit_key?（空=主设定）,
+               overwrite?（"1"/"true" 强制覆盖）
+
+    返回：{success, character, base, views:{front,left,back,half}, derive_error?}
+      · derive_error 非空 = 图已落 base.png 但**版式不符未能切分**（下游会回落
+        整图，属可用状态），此时 success 仍为 True 但带 `derive_ok: false` 提示。
+      · 只有「图本身不可读 / 版式不符且 overwrite 已覆盖旧图」才 4xx/回滚。
+    """
+    files = request.files.getlist('file') or request.files.getlist('files')
+    if not files:
+        return jsonify({"success": False,
+                        "error": "未收到图片，请通过 file 字段上传"}), 400
+    f = files[0]
+    project_name, err = _project_or_400(
+        (request.form.get('project_name') or request.args.get('project_name') or '').strip())
+    if err is not None:
+        return err
+    character = (request.form.get('character') or request.args.get('character') or '').strip()
+    outfit_key = _sanitize_outfit_key(
+        request.form.get('outfit_key') or request.args.get('outfit_key'))
+    _ow_raw = (request.form.get('overwrite') or request.args.get('overwrite') or '').strip()
+    # 宽容布尔（与 qc_client._as_bool 同口径）：表单/query 传 "1"/"true"/"on"/"yes" 都算真
+    overwrite = _ow_raw.lower() not in ("", "0", "false", "no", "off")
+
+    # 角色名是路径段，与 api_character_outfit_generate 同一守卫口径
+    if not character or '/' in character or '\\' in character or character in ('.', '..'):
+        return jsonify({"success": False,
+                        "error": "character（角色名）不能为空且不得含路径分隔符"}), 400
+    # outfit_key 传了但非法（非空且清洗后为空）→ 明确拒绝，不静默当主设定
+    _ow_in = (request.form.get('outfit_key') or request.args.get('outfit_key') or '').strip()
+    if _ow_in and not outfit_key:
+        return jsonify({"success": False,
+                        "error": "outfit_key 非法（≤40 字符，剔除 \\ / : * ? \" < > |）"}), 400
+
+    raw_name = _safe_upload_name(f.filename)
+    ext = os.path.splitext(raw_name)[1].lower()
+    if ext not in _UPLOAD_IMAGE_EXTS:
+        return jsonify({"success": False,
+                        "error": f"不支持的图片格式 {ext or '（无扩展名）'}；"
+                                 f"支持 {'、'.join(_UPLOAD_IMAGE_EXTS)}"}), 400
+
+    asset_dir = (_character_outfit_dir(project_name, character, outfit_key) if outfit_key
+                 else os.path.join(CHARACTERS_DIR, project_name, character))
+    base_dst = os.path.join(asset_dir, "base.png")
+    if not overwrite and os.path.isfile(base_dst) and os.path.getsize(base_dst) > 0:
+        return jsonify({"success": True, "skipped": True, "character": character,
+                        "outfit_key": outfit_key, "base": base_dst,
+                        "message": "该角色已有设定图（base.png 已就绪）；"
+                                   "如需替换请带 overwrite=true"})
+
+    # 暂存上传件 → 校验可解码 → 统一转 PNG 落 base.png
+    os.makedirs(UPLOAD_TMP_DIR, exist_ok=True)
+    tmp_path = os.path.join(
+        UPLOAD_TMP_DIR,
+        f"sheet_{time.strftime('%Y%m%d%H%M%S')}_{os.urandom(4).hex()}{ext}")
+    _old_backup = ""
+    try:
+        f.save(tmp_path)
+        try:
+            from PIL import Image
+            with Image.open(tmp_path) as _im:
+                _w, _h = _im.size
+                _im.convert("RGB")
+        except Exception as _ie:  # noqa: BLE001 不可解码的图绝不能入库
+            return jsonify({"success": False,
+                            "error": f"图片无法读取或已损坏：{type(_ie).__name__} {_ie}"}), 400
+
+        os.makedirs(asset_dir, exist_ok=True)
+        # overwrite 时先把旧 base 挪走做回滚点：切分失败要能把旧状复原
+        if os.path.isfile(base_dst):
+            _old_backup = base_dst + ".preupload.bak"
+            try:
+                shutil.copy2(base_dst, _old_backup)
+            except OSError as _be:
+                app.logger.warning("上传形象图：旧 base.png 备份失败（忽略）：%s", _be)
+                _old_backup = ""
+        with Image.open(tmp_path) as _im:
+            _im.convert("RGB").save(base_dst, format="PNG")
+        app.logger.info("[上传形象图] %s/%s%s ← %s（%dx%d）",
+                        project_name, character, f" ({outfit_key})" if outfit_key else "",
+                        raw_name, _w, _h)
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+    # ---- 本地切分三视图（与 _generate_asset_task 同一条 sheet_split 链路） ----
+    derive_error = ""
+    views: dict = {}
+    try:
+        views = sheet_split.split_sheet_to_files(
+            base_dst, asset_dir, CHARACTER_SHEET_VIEWS,
+            logger=app.logger, prune=False,
+            cells=CHARACTER_SHEET_CELLS, grid=CHARACTER_SHEET_GRID,
+            band_fallback=CHARACTER_SHEET_HALF_BAND)
+    except Exception as _dv_err:  # noqa: BLE001 切分失败不删除用户上传的原图
+        derive_error = f"{type(_dv_err).__name__}: {_dv_err}"
+        app.logger.warning(
+            "上传形象图切分失败（%s/%s）：%s —— 已保留整图，下游将回退它当参考图。"
+            "请确认图版式为「上排正面/左侧/背面三张全身 + 下排一格正面半身」",
+            project_name, character, _dv_err)
+        # 切分失败且是覆盖场景：恢复旧图（新版式不符，别把上一张好图弄没了）
+        if _old_backup and os.path.isfile(_old_backup):
+            try:
+                shutil.copy2(_old_backup, base_dst)
+                app.logger.info("上传形象图：切分失败已回滚旧 base.png")
+            except OSError as _re:
+                app.logger.warning("回滚旧 base.png 失败（忽略）：%s", _re)
+        try:
+            os.remove(_old_backup)
+        except OSError:
+            pass
+        return jsonify({"success": False, "derive_ok": False,
+                        "character": character, "outfit_key": outfit_key,
+                        "base": base_dst,
+                        "error": f"图片版式不符合角色设定图版式，未能切分三视图：{derive_error}",
+                        "layout_hint": CHARACTER_SHEET_LAYOUT_ZH}), 400
+
+    if _old_backup:
+        try:
+            os.remove(_old_backup)
+        except OSError:
+            pass
+
+    # 切分成功 → 清理不再产出的陈旧视角（如旧实现遗留的 right.png）
+    try:
+        sheet_split.prune_stale_views(
+            asset_dir, keep=CHARACTER_SHEET_VIEWS,
+            known=ASSET_VIEW_STEMS, logger=app.logger)
+    except Exception as _pe:  # noqa: BLE001
+        app.logger.warning("上传形象图：清理陈旧视角失败（忽略）：%s", _pe)
+
+    # 旁路元数据：显式标注「用户上传」，与模型生成的资产可区分、可追溯
+    _view_gate = {"accept": True, "blocked": False, "skipped": True,
+                  "label": "用户上传（未质检）",
+                  "reason": "用户上传的定稿形象图，不做图片质检", "critical_issues": []}
+    try:
+        _write_artifact_meta(
+            base_dst, kind="asset_base", project_name=project_name,
+            seed=None, prompt="", workflow_key=None, qc=_view_gate,
+            asset_name=character,
+            extra={"asset_type": "character", "source": "user_upload",
+                   "original_filename": raw_name, "outfit_key": outfit_key or None})
+    except Exception as _me:  # noqa: BLE001
+        app.logger.warning("上传形象图：元数据写入失败（忽略）：%s", _me)
+
+    return jsonify({"success": True, "derive_ok": True, "skipped": False,
+                    "character": character, "outfit_key": outfit_key,
+                    "base": base_dst,
+                    "views": {k: os.path.basename(v) for k, v in views.items()},
+                    "view_files": views,
+                    "layout_hint": CHARACTER_SHEET_LAYOUT_ZH,
+                    "message": f"已上传并切分 {len(views)} 张视角图（零 GPU）"})
+
+
+@app.route('/api/assets/character/outfit', methods=['POST'])
+def api_character_outfit_generate():
+    """生成角色服装变体（衣柜）。
+
+    body = {project_name, character(角色名), outfit_key, outfit_desc, style?, overwrite?}
+    返回 {task_id, status:"started"}（与 api_generate_assets 同构，进度轮询
+    /api/generation/status/<task_id>）。已存在同 outfit_key 且 base.png 非空 →
+    默认跳过（A-2 overwrite 语义，overwrite=true 强制重画）。
+    """
+    data = _body()
+    project_name, err = _project_or_400((data.get('project_name') or '').strip())
+    if err is not None:
+        return err
+    character = (data.get('character') or '').strip()
+    outfit_key = _sanitize_outfit_key(data.get('outfit_key'))
+    outfit_desc = str(data.get('outfit_desc') or '').strip()
+    overwrite = bool(data.get('overwrite'))
+    # 角色名是路径段，与 api_autopilot_reset_asset 同一守卫口径
+    if not character or '/' in character or '\\' in character or character in ('.', '..'):
+        return jsonify({"success": False,
+                        "error": "character（角色名）不能为空且不得含路径分隔符"}), 400
+    if not outfit_key:
+        return jsonify({"success": False,
+                        "error": "outfit_key 不能为空（≤40 字符，剔除 \\ / : * ? \" < > |）"}), 400
+    if not outfit_desc:
+        return jsonify({"success": False, "error": "outfit_desc（服装描述）不能为空"}), 400
+
+    outfit_dir = _character_outfit_dir(project_name, character, outfit_key)
+    # A-2 断点续跑语义：已有同 key 且 base.png 非空 → 默认跳过（幂等入口）
+    _base_png = os.path.join(outfit_dir, "base.png")
+    if not overwrite and os.path.isfile(_base_png) and os.path.getsize(_base_png) > 0:
+        return jsonify({"success": True, "skipped": True, "task_id": "",
+                        "outfit_key": outfit_key, "character": character,
+                        "message": "该服装变体已存在（base.png 已就绪）；如需重画请带 overwrite=true"})
+
+    # 角色基础设定（剧本优先，回落主设定 meta）→ 追加服装描述（幂等）
+    _base_prompt = _character_base_prompt(project_name, character)
+    _merged_prompt = _append_outfit_prompt(_base_prompt, outfit_desc)
+    asset = _find_script_character(project_name, character)
+    asset.update({
+        "name": character,
+        "reference_prompt_zh": _merged_prompt,
+        "prompt_zh": _merged_prompt,
+    })
+    if not str(asset.get("appearance") or "").strip():
+        # 剧本里没有 appearance 时把合并提示词兜进去，保证 qc_desc / 性别判据有料可用
+        asset["appearance"] = _merged_prompt
+
+    # 服装档案：先落 outfit.json（查询端点回显 desc 用；写失败不影响生成 ——
+    # ready 判据看 base.png，desc 还有 meta sidecar 兜底）
+    try:
+        os.makedirs(outfit_dir, exist_ok=True)
+        atomic_write_json(os.path.join(outfit_dir, _OUTFIT_RECORD_FILE), {
+            "outfit_key": outfit_key,
+            "desc": outfit_desc,
+            "character": character,
+            "project": project_name,
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        })
+    except Exception as _oe:  # noqa: BLE001
+        app.logger.warning("服装变体档案写入失败（不影响生成）：%s", _oe)
+
+    task_id = f"outfit_{project_name}_{uuid.uuid4().hex[:12]}"
+    with lock:
+        generation_state[task_id] = {
+            "status": "running", "asset_type": "character",
+            "progress": 0, "total": 1, "current": 0,
+            "phase": "基础图", "results": [],
+            "overwrite": overwrite,
+            "project_name": project_name, "step": "asset_outfit",
+            "character": character, "outfit_key": outfit_key,
+        }
+    # 线程 + 状态登记照抄 api_generate_assets（裸线程，资产链路不进 GPU 闸门）；
+    # 生成→质检→重试→切分全链路由 _generate_asset_task 承担，变体经 sub_dir 落位
+    thread = threading.Thread(
+        target=_generate_asset_task,
+        args=(task_id, [asset], "character", project_name,
+              data.get('style') or _project_style(project_name), overwrite,
+              os.path.join(_OUTFITS_DIRNAME, outfit_key))
+    )
+    thread.daemon = True
+    thread.start()
+    app.logger.info("[服装变体] 项目=%s 角色=%s 服装=%s（overwrite=%s）任务=%s 已启动",
+                    project_name, character, outfit_key, overwrite, task_id)
+    return jsonify({"task_id": task_id, "status": "started",
+                    "outfit_key": outfit_key, "character": character})
+
+
+def _bigram_overlap(a: str, b: str) -> float:
+    """字符 2-gram 重叠率（|A∩B| / |B|）：服装文本与变体描述的模糊匹配打分。"""
+    a = re.sub(r"\s+", "", str(a or ""))
+    b = re.sub(r"\s+", "", str(b or ""))
+    if len(a) < 2 or len(b) < 2:
+        return 0.0
+    ga = {a[i:i + 2] for i in range(len(a) - 1)}
+    gb = {b[i:i + 2] for i in range(len(b) - 1)}
+    return len(ga & gb) / max(1, len(gb))
+
+
+def _episode_outfit_overrides(project_name: str, episode_no: int) -> dict:
+    """跨集一致性巩固（2026-10-02）：把本集各角色的服装状态解析成衣柜变体 key。
+
+    服装文本来源（按优先级）：本集 state_in.character_states[].outfit（continuity
+    按集登记的服装状态）→ bible.current_outfit。变体匹配：outfits/<key>/outfit.json
+    的 desc 与服装文本做 2-gram 重叠打分，最高分且 >0 才采用 —— 分不清就不指定，
+    走主设定图（宁缺毋滥，绝不因猜错服装而错挂参考图）。
+    :return: {角色名: outfit_key}；无 state / 无变体 / 匹配不上 → {}（零回归）
+    """
+    try:
+        from config import CONTINUITY_DIR as _cont_dir
+        from continuity import load_state as _load_ep_state
+        _st = _load_ep_state(_cont_dir, project_name, int(episode_no)) or {}
+    except Exception:  # noqa: BLE001
+        _st = {}
+    want: dict = {}
+    for cs in ((_st.get("state_in") or {}).get("character_states") or []):
+        if isinstance(cs, dict) and str(cs.get("name") or "").strip():
+            want[str(cs.get("name")).strip()] = str(cs.get("outfit") or "").strip()
+    if not want:
+        try:
+            from continuity import load_bible as _load_bible
+            _bible = _load_bible(_cont_dir, project_name) or {}
+            for c in (_bible.get("characters") or []):
+                if isinstance(c, dict) and str(c.get("name") or "").strip():
+                    want[str(c.get("name")).strip()] = str(
+                        c.get("current_outfit") or "").strip()
+        except Exception:  # noqa: BLE001
+            return {}
+    want = {k: v for k, v in want.items() if v}
+    if not want:
+        return {}
+
+    proj_char_root = os.path.join(CHARACTERS_DIR, project_name)
+    if not os.path.isdir(proj_char_root):
+        return {}
+    out: dict = {}
+    try:
+        _char_dirs = os.listdir(proj_char_root)
+    except OSError:
+        return {}
+    for char_name in _char_dirs:
+        outfit_root = os.path.join(proj_char_root, char_name, _OUTFITS_DIRNAME)
+        if not os.path.isdir(outfit_root):
+            continue
+        text = want.get(char_name) or ""
+        # 别名容错：want 的键可能带别名，做一次包含匹配
+        if not text:
+            text = next((v for k, v in want.items()
+                         if k in char_name or char_name in k), "")
+        if not text:
+            continue
+        best_key, best_score = "", 0.0
+        try:
+            _keys = os.listdir(outfit_root)
+        except OSError:
+            continue
+        for key in _keys:
+            rec = os.path.join(outfit_root, key, _OUTFIT_RECORD_FILE)
+            desc = ""
+            try:
+                if os.path.isfile(rec):
+                    with open(rec, "r", encoding="utf-8") as _f:
+                        desc = str((json.load(_f) or {}).get("desc") or "")
+            except Exception:  # noqa: BLE001
+                desc = ""
+            if not desc:
+                continue
+            _s = _bigram_overlap(desc, text)
+            if _s > best_score:
+                best_key, best_score = key, _s
+        if best_key and best_score > 0:
+            out[char_name] = best_key
+    if out:
+        app.logger.info("[服装变体] 本集服装覆盖：%s", out)
+    return out
+
+
+@app.route('/api/assets/character/outfits', methods=['GET'])
+def api_character_outfits_list():
+    """列出角色服装变体（衣柜）：query = project_name, character。
+
+    返回 [{outfit_key, desc, ready(base.png 存在且>0字节),
+    views:{front/left/back/half 是否存在}}]。outfits 目录不存在 / 任何读取异常
+    → 空数组（fail-open，绝不抛错）。
+    """
+    project_name = _safe_project((request.args.get('project_name') or '').strip())
+    character = (request.args.get('character') or '').strip()
+    if not project_name or not character or '/' in character or '\\' in character \
+            or character in ('.', '..'):
+        return jsonify({"success": False, "error": "project_name 与 character 必填",
+                        "outfits": []}), 400
+    outfits_root = _character_outfit_dir(project_name, character)
+    out = []
+    if not os.path.isdir(outfits_root):
+        # 目录不存在 = 该角色还没做过服装变体（正常态，不是错误）
+        return jsonify({"success": True, "outfits": out})
+    try:
+        # 纵深防御（安全复查 2026-10-02）：listdir 条目本不可能携带路径分隔符
+        # （listdir 不返回 ./..，文件名也无法含 \ /），此处仍显式校验 realpath
+        # 未越出 outfits_root，阻断符号链接等非常规文件系统状态造成的目录逃逸。
+        _root_real = os.path.realpath(outfits_root)
+        for _dir_name in sorted(os.listdir(outfits_root)):
+            _od = os.path.join(outfits_root, _dir_name)
+            if not os.path.isdir(_od):
+                continue
+            if not os.path.realpath(_od).startswith(_root_real + os.sep):
+                app.logger.warning("[服装变体] 异常目录项已跳过（越界防护）：%s", _dir_name)
+                continue
+            _base_png = os.path.join(_od, "base.png")
+            _ready = os.path.isfile(_base_png) and os.path.getsize(_base_png) > 0
+            _views = {}
+            for _stem in _OUTFIT_VIEW_STEMS:
+                _vp = os.path.join(_od, f"{_stem}.png")
+                _views[_stem] = os.path.isfile(_vp) and os.path.getsize(_vp) > 0
+            out.append({
+                "outfit_key": _dir_name,
+                "desc": _outfit_desc_of(_od),
+                "ready": _ready,
+                "views": _views,
+            })
+    except Exception as e:  # noqa: BLE001  目录枚举失败按空数组处理（fail-open）
+        app.logger.warning("服装变体列表读取失败（返回空数组）：%s", e)
+        out = []
+    return jsonify({"success": True, "outfits": out})
 
 
 @app.route('/api/generation/status/<task_id>', methods=['GET'])
@@ -4289,7 +5459,7 @@ def _framing_wants_half_shot(shot: dict) -> bool:
     return _camera_key(_raw) in _FRAMING_HALF_SHOT
 
 
-def _pick_char_view(char_payload: dict, want_half: bool) -> str:
+def _pick_char_view(char_payload: dict, want_half: bool, outfit_dir: str = "") -> str:
     """按景别从角色资产里挑一张参考图：``want_half`` 优先半身档，否则优先全身档。
 
     ⚠️ 必须**优雅降级**：新资产才有 ``half.png``（2026-09-25 起），存量项目只有
@@ -4299,18 +5469,84 @@ def _pick_char_view(char_payload: dict, want_half: bool) -> str:
       · 要半身 → half → front → base（旧资产没有半身档，用全身档总比没有强）
       · 要全身 → front → base → half（极端情况下至少给一张）
     每一级都要求文件存在且非空（复用既有 ``_first_existing`` 口径）。
+
+    服装变体（衣柜，2026-10-02）：``outfit_dir`` 非空时（调用方已解析出本镜
+    outfit_key 且 outfits/<key>/ 存在）**优先**在该变体目录里走同一条档位回退链；
+    变体目录没有可用档位 / 目录消失 / 任何异常 → 回落主设定图（fail-open，
+    与该参数不存在时的行为完全一致 —— 零回归约束）。
     """
     payload = char_payload or {}
     # 半身档键名取自 config.CHARACTER_HALF_VIEWS（当前是 ("half",)）——不硬编码
     # 字符串，日后加「正面半身 / 侧面半身」两档时只需改 config，这里自动跟着走。
     order = (tuple(CHARACTER_HALF_VIEWS) + ("front", "base")) if want_half \
         else (("front", "base") + tuple(CHARACTER_HALF_VIEWS))
+    if outfit_dir:
+        try:
+            _od = comfyui_client.resolve_local_path(outfit_dir) or outfit_dir
+            if os.path.isdir(_od):
+                _hit = _first_existing(*[os.path.join(_od, f"{k}.png") for k in order])
+                if _hit:
+                    return _hit
+        except Exception as _oe:  # noqa: BLE001  变体取图失败绝不拖垮参考图链
+            app.logger.debug("服装变体取图失败（回落主设定图）：%s", _oe)
     cands = [comfyui_client.resolve_local_path(payload.get(k) or "") for k in order]
     # 资产目录约定路径兜底（前端未上报时）
     d = payload.get("_dir")
     if d and os.path.isdir(d):
         cands += [os.path.join(d, f"{k}.png") for k in order]
     return _first_existing(*cands) or ""
+
+
+def _shot_outfit_dir(shot: dict, character_name: str, char_dir: str) -> str:
+    """解析「本镜服装提示」→ 该角色**已生成**的服装变体目录（outfits/<key>/）。
+
+    服装提示来源（按优先级）：
+      ① ``shot["outfit"]``（本镜服装提示，字符串）；
+      ② ``shot["character_outfits"]`` 按角色名查（值可为字符串，或
+         {outfit_key|key|outfit|desc: ...} 形态的字典；键走别名归一匹配）。
+    解析：剥掉「本套服装：/服装：/outfit(_key)?:」前缀后，与该角色主设定目录下
+    ``outfits/`` 的**已存在**子目录名做精确匹配（含书名号/引号剥离与安全化键）——
+    只认磁盘上真实存在的变体，解析出的名字没建过目录就回落主设定图。
+
+    ⚠️ fail-open：任何一步解析不出 / outfits 目录不存在 → 返回 ''，调用方按
+    「无变体」走主设定图（与改造前行为完全一致）。查不到表也绝不抛异常。
+    """
+    if not isinstance(shot, dict) or not char_dir or not os.path.isdir(char_dir):
+        return ""
+    outfit_root = os.path.join(char_dir, _OUTFITS_DIRNAME)
+    try:
+        known = [d for d in os.listdir(outfit_root)
+                 if os.path.isdir(os.path.join(outfit_root, d))]
+    except OSError:
+        return ""
+    if not known:
+        return ""
+    raw = str(shot.get("outfit") or "").strip()          # ① 本镜服装提示（优先）
+    if not raw:
+        co = shot.get("character_outfits")               # ② 按角色名查
+        if isinstance(co, dict):
+            v = co.get(character_name)
+            if v is None:
+                _norm = _normalize_char_alias(character_name)
+                for k, vv in co.items():
+                    if _normalize_char_alias(str(k)) == _norm:
+                        v = vv
+                        break
+            if isinstance(v, dict):
+                v = (v.get("outfit_key") or v.get("key")
+                     or v.get("outfit") or v.get("desc") or "")
+            raw = str(v or "").strip()
+    if not raw:
+        return ""
+    _m = re.match(r"^(?:本套服装|服装|outfit(?:_key)?)\s*[:：=]\s*(.+)$", raw)
+    cand = (_m.group(1) if _m else raw).strip()
+    for k in (cand, cand.strip("「」《》\"'“”‘’")):
+        if k in known:
+            return os.path.join(outfit_root, k)
+    _sk = _sanitize_outfit_key(cand)
+    if _sk and _sk in known:
+        return os.path.join(outfit_root, _sk)
+    return ""
 
 
 def _scene_view_for_shot(shot) -> str:
@@ -4373,7 +5609,8 @@ def _pick_scene_view(scene_payload: dict, shot) -> str:
 
 def _h3_shot_ref_components(shot: dict, char_idx: dict, item_idx: dict, scene_idx: dict,
                             character_refs: list = None,
-                            main_char_img: list = None) -> list:
+                            main_char_img: list = None,
+                            outfit_map: dict = None) -> list:
     """把一个分镜解析成**有序参考图组件**（不构建提示词、不决定槽位）。
 
     返回 ``[{"kind": "character"|"item"|"scene", "name": str,
@@ -4402,11 +5639,19 @@ def _h3_shot_ref_components(shot: dict, char_idx: dict, item_idx: dict, scene_id
     out: list = []
 
     # ---- 本镜角色：每人一张（按景别对档），去重保序 ----
+    # outfit_map（2026-10-02 服装变体）：「角色名 → outfits/<key>/ 目录」的可选映射，
+    # 由调用方解析本镜服装提示（shot.outfit / shot.character_outfits）后传入；
+    # None（默认）/ 缺该角色 → 走主设定图，与旧行为逐字一致（视频 worker 调用点
+    # 位于 6200 行后的区域、本轮不可改动，故暂以默认 None 接线，见最终报告）。
     _want_half = _framing_wants_half_shot(shot)
     _seen_paths: set = set()
     for _mc in (_match_shot_chars(shot, char_idx) or []):
         _entry = char_idx.get(_mc) or {}
-        _p = _pick_char_view(_entry, _want_half)
+        _od = ""
+        if outfit_map:
+            _od = str(outfit_map.get(_mc)
+                      or outfit_map.get(_normalize_char_alias(_mc)) or "")
+        _p = _pick_char_view(_entry, _want_half, _od)
         if not _p or _p in _seen_paths:
             continue
         _seen_paths.add(_p)
@@ -4583,7 +5828,11 @@ def _allocate_storyboard_refs(shot: dict, char_idx: dict, item_idx: dict, scene_
         payload = char_idx.get(name, {}) or {}
         # 2026-09-25 景别对档：近景/特写/中景优先取 half.png（半身胸像），
         # 全景/远景优先取 front.png（全身）；档位缺失时逐级回退（见 _pick_char_view）。
-        img = _pick_char_view(payload, _want_half)
+        # 2026-10-02 服装变体：本镜服装提示（shot.outfit 优先，其次
+        # shot.character_outfits 按角色名查）能解析出已生成的 outfit_key →
+        # 参考图优先取 outfits/<key>/ 的同档位图；解析不出/未生成回落主设定图。
+        img = _pick_char_view(payload, _want_half,
+                              _shot_outfit_dir(shot, name, payload.get("_dir") or ""))
         if not img or img in used_paths:
             continue
         used_paths.add(img)
@@ -5771,7 +7020,8 @@ def api_generate_videos():
     if _mode_req and _mode_req not in ('per_shot', 'episode', 'keyframe'):
         return jsonify({"error": f"mode 参数非法: {_mode_req}"
                                  f"（仅支持 per_shot / episode / keyframe）"}), 400
-    mode = _mode_req or project_store.video_mode(project_name) or 'per_shot'
+    # 2026-10-01：只保留整集一次生成（per_shot / keyframe 废弃）
+    mode = _mode_req or project_store.video_mode(project_name) or 'episode'
     timeout_per_segment = int(data.get('timeout_per_segment') or 900)
     episode_tag = str(data.get('episode_tag') or '').strip()
     # 跨镜链式：上一镜尾帧 = 下一镜首帧（auto / always / off，默认取 KEYFRAME_CHAIN_MODE）
@@ -5977,6 +7227,14 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
         if _style_res.get("style"):
             shots = [dict(s, style=(s.get("style") or _style_res["style"]))
                      for s in (shots or []) if isinstance(s, dict)]
+        # 按模型能力归一化镜头参数（Toonflow 借鉴吸收点 #1，2026-10-01）：
+        # duration 钳位、引用列表补齐、shot_id 补齐——fail-open，归一失败按原样继续。
+        try:
+            shots, _norm_notes = model_capabilities.normalize_shots_for_h3(shots)
+            if _norm_notes:
+                app.logger.info("[视频] 镜头参数归一化：%s", "；".join(_norm_notes[:3]))
+        except Exception as _norm_err:  # noqa: BLE001
+            app.logger.warning("镜头参数归一化失败（按原 shots 继续）：%s", _norm_err)
         videos_dir = _ep_dir(os.path.join(VIDEOS_DIR, project_name), episode_no)
         os.makedirs(videos_dir, exist_ok=True)
         try:
@@ -6008,8 +7266,46 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
                 app.logger.info("[视频] 参考图已由磁盘资产补齐：角色 %d / 合计 %d",
                                 len(main_char_img), len(ref_imgs))
             else:
-                app.logger.warning("[视频] 磁盘资产目录里也没有可用参考图 —— 本集将无角色锚点生成，"
-                                   "人物一致性无法保证（检查 output/assets/characters/%s）", project_name)
+                # 优化#1（2026-10-01）：连磁盘兜底都拿不到参考图 → 角色资产从未生成或
+                # 目录被清空。此前只 warning 后照跑（人物全靠模型自由发挥，成片必 OOC）。
+                # 现在自动补做：从剧本取角色清单，同步触发生成（上限 4 个、总等待 30 分钟），
+                # 完成后重新收集参考图再继续；补做失败/超时不阻塞出片（fail-open）。
+                app.logger.warning("[视频] 磁盘资产目录里也没有可用参考图 → 自动补做角色资产…")
+                try:
+                    _scr0 = _load_script_for(project_name, episode_no) or {}
+                    _need = [c for c in (_scr0.get("characters") or [])
+                             if isinstance(c, dict) and str(c.get("name") or "").strip()][:4]
+                    if _need:
+                        _task_id = f"character_{project_name}_{uuid.uuid4().hex[:12]}"
+                        with lock:
+                            generation_state[_task_id] = {
+                                "status": "running", "asset_type": "character",
+                                "progress": 0, "total": len(_need), "current": 0,
+                                "phase": "基础图", "results": [],
+                                "overwrite": False, "auto_repair": True}
+                        _t0 = threading.Thread(
+                            target=_generate_asset_task,
+                            args=(_task_id, _need, "character", project_name,
+                                  _project_style(project_name), False))
+                        _t0.daemon = True
+                        _t0.start()
+                        _t0.join(timeout=1800)     # 上限 30 分钟，超时不阻塞出片
+                        if _t0.is_alive():
+                            app.logger.warning("[视频] 资产补做超时（30 分钟）→ 按无锚点继续")
+                        _re_chars, _re_scenes = _collect_asset_refs(project_name)
+                        if _re_chars:
+                            character_refs = _re_chars
+                            main_char_img = _collect_reference_images(character_refs[:1], [])
+                            ref_imgs = _collect_reference_images(character_refs, scene_refs)
+                            app.logger.info("[视频] 资产补做完成：角色参考图已重新挂载"
+                                            "（主角锚点 %d / 合计 %d）",
+                                            len(main_char_img), len(ref_imgs))
+                except Exception as _e:  # noqa: BLE001
+                    app.logger.warning("[视频] 资产自动补做失败（继续生成）：%s", _e)
+                if not (main_char_img or ref_imgs):
+                    app.logger.warning("[视频] 补做后仍无参考图 —— 本集将无角色锚点生成，"
+                                       "人物一致性无法保证（检查 output/assets/characters/%s）",
+                                       project_name)
         app.logger.info(f"视频参考图解析结果: {ref_imgs}；主角锚点: {main_char_img}")
 
         # B-18 P1-7：构建角色索引，供 _shot_segment 逐镜匹配参考图（与分镜链路口径对齐）
@@ -6130,8 +7426,23 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
                 _comps = (_comps_map.get(str(sid))
                           if isinstance(_comps_map, dict) else None)
                 if _comps is None:
+                    # 优化#2 接线（2026-10-01）：本镜角色声明了服装（shot.outfit /
+                    # shot.character_outfits）且对应变体资产已生成 → 用变体参考图；
+                    # 无声明或变体不存在时逐字走旧逻辑（_shot_outfit_dir 返回空）。
+                    _outfit_map = {}
+                    for _cn in (char_idx or {}).keys():
+                        try:
+                            _od = _shot_outfit_dir(
+                                shot, str(_cn),
+                                os.path.join(CHARACTERS_DIR, project_name, str(_cn)))
+                        except Exception as _oe:  # noqa: BLE001
+                            _od = ""
+                            app.logger.debug("[服装变体] 解析失败（回落主设定图）：%s", _oe)
+                        if _od:
+                            _outfit_map[str(_cn)] = _od
                     _comps = _h3_shot_ref_components(shot, char_idx, item_idx, scene_idx,
-                                                     character_refs, main_char_img)
+                                                     character_refs, main_char_img,
+                                                     outfit_map=_outfit_map or None)
                 _seg_comps = [c for c in _comps if not _h3_is_common_comp(c, _c_keys)]
                 _shot_char_refs = [c for c in _seg_comps if c.get("kind") == "character"]
                 _shot_item_refs = [c for c in _seg_comps if c.get("kind") == "item"]
@@ -6269,6 +7580,31 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
             #    也让「公共用哪些资产」在工作流 JSON 里显式可查。
             #    ⚠️ keyframe 模式的 refs 是「首帧+尾帧」两句式（与 char/item/scene 三段式
             #    声明不是同一套编号），公共块不参与 —— 故该模式整集放弃公共化。
+            # 跨集一致性巩固（2026-10-02）：① 上集 state_out 供首镜跨集衔接；
+            # ② 本集服装状态 → 衣柜变体 key 覆盖表，供逐镜参考图取变体。
+            # 两者加载失败都按「无上集/无覆盖」处理（fail-open，零回归）。
+            _prev_ep_state = {}
+            _outfit_ovr = {}
+            try:
+                if _epn and int(_epn) > 1:
+                    from config import CONTINUITY_DIR as _cont_dir
+                    from continuity import load_state as _load_ep_state
+                    # ⚠️ 2026-10-02 修复（off-by-one）：load_state(dir, key, ep) 读的是
+                    #    **指定那一集**的 state，取「上集」必须减 1 —— canonical 见
+                    #    continuity.py:1343 / :1888 的 `int(episode_no) - 1`。
+                    #    原先传 int(_epn)（本集）→ 本集 state 尚不存在时 `or {}` 静默
+                    #    退回「无上集」（fail-open 不崩，但锚点是错的）；而本集 state
+                    #    已存在（重跑/续跑）时会把**本集**当上集做首镜跨集衔接。
+                    _prev_ep_state = _load_ep_state(_cont_dir, project_name,
+                                                    int(_epn) - 1) or {}
+            except Exception as _ce:  # noqa: BLE001
+                app.logger.debug("[跨集衔接] 上集 state 加载失败（按无上集处理）：%s", _ce)
+            try:
+                _outfit_ovr = _episode_outfit_overrides(
+                    project_name, int(_epn or 1)) or {}
+            except Exception as _oe:  # noqa: BLE001
+                app.logger.debug("[服装变体] 本集覆盖解析失败（不指定变体）：%s", _oe)
+
             _common = []
             if mode != 'keyframe':
                 _common, _comps_map = _h3_plan_common_refs(
@@ -6280,12 +7616,35 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
             for i, shot in enumerate(shots):
                 shot_id = shot.get('shot_id', i + 1)
                 seq = _shot_seq(shot_id, i + 1)
+                # 跨集一致性巩固：本镜角色未显式声明服装时，套用本集 state 推出的
+                # 衣柜变体覆盖（_shot_outfit_dir 消费 shot["character_outfits"]）
+                if _outfit_ovr:
+                    _co = dict(shot.get("character_outfits") or {})
+                    for _cn, _ok in _outfit_ovr.items():
+                        _co.setdefault(_cn, _ok)
+                    if _co:
+                        shot["character_outfits"] = _co
                 seg, sb_local = _shot_segment(shot, seq, qc_cfg,
                                               common=_common, common_keys=_common_keys)
                 # ⚠️ 整集模式**每个分镜可能产出多个段**（长镜切段，见 _shot_segment）。
                 # 必须 extend 而非 append：H3 工作流段数 = len(segments)，少一段就等于
                 # 该镜只生成了一半时长；且段顺序即时间轴顺序，extend 保持镜头内子段连续。
                 _shot_segs = seg if isinstance(seg, list) else [seg]
+                # 优化#4 段间衔接（2026-10-02 细化版）：逻辑提纯到
+                # h3_prompt_kit.transition_clause —— 同场延续 / 换场 / 机位切换 /
+                # 跨集首镜（用上集 state_out 承接）四种情形各自措辞；只加在本镜
+                # **首段**（镜内子段本就是同镜延续，写「上一镜」反而误导）。
+                if _shot_segs:
+                    _link = ""
+                    if i > 0:
+                        _link = h3_prompt_kit.transition_clause(
+                            shots[i - 1] if i - 1 < len(shots) else {}, shot)
+                    elif _epn and int(_epn) > 1:
+                        _link = h3_prompt_kit.transition_clause(
+                            None, shot, _prev_ep_state or {})
+                    if _link:
+                        _shot_segs[0]["prompt"] = str(
+                            _shot_segs[0].get("prompt") or "") + "\n" + _link
                 segs.extend(_shot_segs)
                 # shot_meta_map 是**按镜头**的报表（每镜一条），时长取该镜各子段之和 ——
                 # 与切段前的 seg["duration"] 口径一致，前端/报表不会因切段而变。
@@ -6332,10 +7691,34 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
                     app.logger.warning(
                         "[整集质检] 段时长不可用（segs=%d）→ 退回配置抽帧数（可能漏检中段）",
                         len(segs))
+                # P2-3 逐段主体一致性门禁（2026-10-01 接线）：段时长累加成绝对时间区间，
+                # 角色索引里的设定图作为外观锚点，一并交 check_video 按段分组逐段判定。
+                _seg_ranges = []
+                _t_acc = 0.0
+                for _s in segs:
+                    try:
+                        _d = float(_s.get("duration") or 0.0)
+                    except (TypeError, ValueError):
+                        _d = 0.0
+                    if _d > 0:
+                        _seg_ranges.append({"name": str(_s.get("name") or ""),
+                                            "start": _t_acc, "end": _t_acc + _d})
+                        _t_acc += _d
+                _qc_refs = []
+                for _v in (char_idx or {}).values():
+                    _p = str((_v or {}).get("image") or "")
+                    if _p and _p not in _qc_refs:
+                        _qc_refs.append(_p)
+                _qc_refs = _qc_refs[:4]
+                if _seg_ranges:
+                    app.logger.info("[整集质检] 逐段一致性门禁：%d 段时间区间 + %d 张角色锚点图",
+                                    len(_seg_ranges), len(_qc_refs))
                 verdict = qc_client.check_video(video_path, _episode_qc_desc(shots), cfg,
                                                frames_dir=fr_dir,
                                                style=style,
                                                frame_ratio=_qc_ratios or None,
+                                               segment_ranges=_seg_ranges or None,
+                                               ref_images=_qc_refs or None,
                                                expected_duration=sum(
                                                    float(s.get("duration") or 0.0) for s in shots))
                 gate = _qc_gate(verdict)
@@ -9259,9 +10642,18 @@ def _qc_ref_images(shot: dict, char_idx: dict, item_idx: dict, scene_idx: dict,
              _pick_scene_view(_scene_e, shot))
     if not out:
         # 兜底：本镜没登记角色/物品时，用生成侧实际用的那几张（至少保住场景锚点）
+        # ⚠️ 2026-10-02 修复：必须**跳过构图基准图**。生成侧 refs 的第 1 项可能是
+        #    `("3D构图基准", ...)`（见下方 refs.insert(0, (..., "3D构图基准", ...))）——
+        #    那是**无面人偶预演图**，实测把它当设定图送检会严重污染判定
+        #    （同图 score 88 → 35，且诱发臆造缺陷，见 qc_client.check_image 的定论）。
+        #    原先兜底无差别收下 refs，等于从「质检输入」这个后门把基准图放了回去。
         for r in (fallback_refs or []):
-            if isinstance(r, (list, tuple)) and len(r) >= 3:
-                _add(str(r[1]), r[2])
+            if not (isinstance(r, (list, tuple)) and len(r) >= 3):
+                continue
+            _kind, _label = str(r[0] or ""), str(r[1] or "")
+            if "构图基准" in _kind or "构图基准" in _label:
+                continue
+            _add(_label, r[2])
     return out[:qc_client.MAX_REF_IMAGES]
 
 
@@ -12304,6 +13696,169 @@ def api_tts_voice_map_save():
     path = os.path.join(_dub_project_dir(project_name), "voice_map.json")
     save_voice_map(voice_map, path)
     return jsonify({"success": True, "path": path, "voice_map": voice_map})
+
+
+# ===================== 参考音频克隆角色声线（2026-10-06） =====================
+# 链路：上传参考音频 → 落 <dub>/voice_bank/<角色>/ref.<ext> → 试听确认 →
+#       build_dub_plan 自动把该角色切到 clone 模式（显式模式优先，不被覆盖）。
+# 开关在**前端**（音色面板）：绑定/解绑 + 试听。后端只做「存/查/删/试听」。
+
+
+@app.route('/api/tts/voice-bank', methods=['GET'])
+def api_tts_voice_bank_list():
+    """列出本项目已绑定参考音频的角色（含时长/原文/更新时间）。"""
+    project_name = _safe_project(request.args.get('project_name') or '')
+    if not project_name:
+        return jsonify({"success": False, "error": "缺少 project_name"}), 400
+    items = list_voice_bank(_dub_project_dir(project_name))
+    return jsonify({"success": True, "items": items,
+                    "clone_available": tts_clone_available(),
+                    "supported_exts": list(VOICE_BANK_EXTS)})
+
+
+@app.route('/api/tts/voice-bank/upload', methods=['POST'])
+def api_tts_voice_bank_upload():
+    """上传某角色的参考音频（form-data: file, project_name, character, ref_text?）。
+
+    ref_text = 这段参考音频里**实际说出的那句话**。填了克隆相似度显著更高，
+    但可留空（节点支持 x_vector_only 路径，只用说话人向量）。
+    """
+    files = request.files.getlist('file') or request.files.getlist('files')
+    if not files:
+        return jsonify({"success": False, "error": "未收到音频，请通过 file 字段上传"}), 400
+    f = files[0]
+    project_name, err = _project_or_400(
+        (request.form.get('project_name') or request.args.get('project_name') or '').strip())
+    if err is not None:
+        return err
+    character = (request.form.get('character') or request.args.get('character') or '').strip()
+    ref_text = str(request.form.get('ref_text') or request.args.get('ref_text') or '').strip()
+    if not character or '/' in character or '\\' in character or character in ('.', '..'):
+        return jsonify({"success": False,
+                        "error": "character（角色名）不能为空且不得含路径分隔符"}), 400
+
+    raw_name = _safe_upload_name(f.filename)
+    ext = os.path.splitext(raw_name)[1].lower()
+    if ext not in VOICE_BANK_EXTS:
+        return jsonify({"success": False,
+                        "error": f"不支持的音频格式 {ext or '（无扩展名）'}；"
+                                 f"支持 {'、'.join(VOICE_BANK_EXTS)}"}), 400
+
+    os.makedirs(UPLOAD_TMP_DIR, exist_ok=True)
+    tmp_path = os.path.join(UPLOAD_TMP_DIR,
+                            f"vref_{time.strftime('%Y%m%d%H%M%S')}_{os.urandom(4).hex()}{ext}")
+    try:
+        f.save(tmp_path)
+        # 客观校验：能读出时长且落在合理区间。参考音频太短克隆不出音色、
+        # 太长拖慢每次合成（每次都要解码），都要在入口拦下并给出可读原因。
+        info = probe_audio_info(tmp_path)
+        if not info.get("ok"):
+            return jsonify({"success": False,
+                            "error": f"音频无法读取：{info.get('error') or '解码失败'}"}), 400
+        dur = float(info.get("duration") or 0)
+        if dur < tts_client.VOICE_BANK_MIN_SEC:
+            return jsonify({"success": False,
+                            "error": f"参考音频过短（{dur:.1f}s）—— 建议 3–15 秒清晰人声"}), 400
+        if dur > tts_client.VOICE_BANK_MAX_SEC:
+            return jsonify({"success": False,
+                            "error": f"参考音频过长（{dur:.1f}s > "
+                                     f"{tts_client.VOICE_BANK_MAX_SEC:.0f}s）—— 请截取 3–15 秒"}), 400
+
+        dub_dir = _dub_project_dir(project_name)
+        dst = save_voice_bank_ref(dub_dir, character, tmp_path,
+                                  ref_text=ref_text, original_filename=raw_name)
+        app.logger.info("[参考音频] %s/%s ← %s（%.1fs）", project_name, character, raw_name, dur)
+    except Exception as e:  # noqa: BLE001
+        app.logger.warning("参考音频入库失败：%s", e)
+        return jsonify({"success": False, "error": f"参考音频保存失败：{e}"}), 500
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+    return jsonify({"success": True, "character": character, "file": dst,
+                    "ref_text": ref_text, "duration_sec": dur,
+                    "clone_available": tts_clone_available(),
+                    "message": f"已绑定参考音频（{dur:.1f}s）；该角色下次配音将自动使用克隆声线"})
+
+
+@app.route('/api/tts/voice-bank/delete', methods=['POST'])
+def api_tts_voice_bank_delete():
+    """解绑某角色的参考音频（删掉整个 voice_bank/<角色>/ 目录）。
+
+    只删 voice_bank 子目录内的内容（由 voice_bank_dir 给出路径），不递归到别处。
+    """
+    data = _body()
+    project_name, err = _project_or_400((data.get('project_name') or '').strip())
+    if err is not None:
+        return err
+    character = (data.get('character') or '').strip()
+    if not character or '/' in character or '\\' in character or character in ('.', '..'):
+        return jsonify({"success": False,
+                        "error": "character（角色名）不能为空且不得含路径分隔符"}), 400
+    d = voice_bank_dir(_dub_project_dir(project_name), character)
+    removed = []
+    if os.path.isdir(d):
+        try:
+            for fn in os.listdir(d):
+                p = os.path.join(d, fn)
+                if os.path.isfile(p):
+                    os.remove(p)
+                    removed.append(fn)
+            os.rmdir(d)
+        except OSError as e:
+            app.logger.warning("解绑参考音频失败 %s：%s", d, e)
+            return jsonify({"success": False, "error": f"删除失败：{e}"}), 500
+    return jsonify({"success": True, "character": character, "removed": removed,
+                    "message": "已解绑参考音频" if removed else "该角色未绑定参考音频"})
+
+
+@app.route('/api/tts/voice-bank/preview', methods=['POST'])
+def api_tts_voice_bank_preview():
+    """用已绑定的参考音频试听克隆效果（合成一句样例文本）。
+
+    body = {project_name, character, text?}
+    刻意**不读** voice_map：直接以 clone 模式合成，让用户在决定保存前先听效果。
+    """
+    data = _body()
+    project_name, err = _project_or_400((data.get('project_name') or '').strip())
+    if err is not None:
+        return err
+    character = (data.get('character') or '').strip()
+    if not character:
+        return jsonify({"success": False, "error": "缺少 character"}), 400
+    text = clean_line_text(data.get('text') or '', character) or \
+        f"我是{character}，今日便让你见识见识。"
+    if not tts_clone_available():
+        return jsonify({"success": False,
+                        "error": "当前 ComfyUI 未提供参考音频克隆节点"
+                                 "（FB_Qwen3TTSVoiceClone / LoadAudio）"}), 503
+    dub_dir = _dub_project_dir(project_name)
+    ref, ref_text = find_voice_bank_ref(dub_dir, character)
+    if not ref:
+        return jsonify({"success": False,
+                        "error": f"角色「{character}」未绑定参考音频，请先上传"}), 400
+    voice = normalize_voice({
+        "mode": "clone", "ref_audio": ref, "ref_text": ref_text,
+        "speaker": "Ryan", "seed": 0,
+    })
+    preview_dir = os.path.join(dub_dir, "preview")
+    os.makedirs(preview_dir, exist_ok=True)
+    out_path = os.path.join(preview_dir,
+                            f"clone_{int(time.time())}_{tts_client.safe_name(character, 12)}.wav")
+    try:
+        client = QwenTTSClient(out_root=DUB_DIR, params=TTS_DEFAULT_PARAMS)
+        rec = client.synthesize_one(text, voice, out_path)
+    except TTSError as e:
+        return jsonify({"success": False, "error": str(e)}), 502
+    if not rec.get("ok"):
+        return jsonify({"success": False, "error": rec.get("error") or "合成失败",
+                        "clone_fallback": rec.get("clone_fallback")}), 502
+    info = probe_audio_info(rec["out_path"])
+    return jsonify({"success": True, "result": rec, "audio": info, "voice": voice,
+                    "url": _dub_audio_url(project_name, rec["out_path"]),
+                    "text_used": text})
 
 
 @app.route('/api/tts/preview', methods=['POST'])
