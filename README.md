@@ -378,4 +378,117 @@ custom_nodes/
 
 ---
 
-**版本**: 2.6.1 | **日期**: 2026-09-28
+
+
+## 📦 打包与分发（新增）
+
+本项目提供两种桌面打包方式，适配不同场景：
+
+### 方式一：PyInstaller 单文件（推荐用于纯后端服务 + 浏览器访问）
+
+⚠️ **必须在纯 ASCII 路径下构建并运行**（中文路径会导致 PyInstaller 6.x 单文件 bootloader 报错 "Could not create temporary directory!"）
+
+```bash
+# 1. 准备纯 ASCII 构建目录（示例）
+D:\build\mjscxt_src
+# 2. 复制源码到纯 ASCII 目录
+xcopy /E /I "C:\Users\liujianghua\WorkBuddy\2026-09-09-16-55-22\漫剧生成系统" D:\build\mjscxt_src\
+
+# 3. 进入构建目录
+cd D:\build\mjscxt_src
+
+# 4. 安装依赖
+pip install -r requirements.txt
+pip install pyinstaller
+
+# 5. 执行打包（自动部署到 ~/mjscxt_desktop/msjcxt.exe）
+python build_exe.py
+
+# 6. 产物位置
+# dist/漫剧工坊.exe          (中文路径，仅供备用，双击会崩)
+# ~/mjscxt_desktop/msjcxt.exe  (纯 ASCII，可直接双击运行)
+# ~/mjscxt_desktop/datadir.txt  (指向数据根，需指向纯 ASCII 路径，如 D:\mjscxt_data)
+```
+
+**运行要求**：
+- 双击 `msjcxt.exe`，后端自动起在 `http://127.0.0.1:5210`
+- 浏览器手动打开或脚本自动拉起（策略允许时）
+- 数据根建议设为纯 ASCII（如 `D:\mjscxt_data`），`datadir.txt` 写入该路径
+
+---
+
+### 方式二：Electron + electron-builder（推荐用于自带窗口的桌面应用）
+
+⚠️ **构建目录、输出目录、Electron 资源目录必须全程纯 ASCII**，否则会出现：
+- `registration_protocol_win.cc(108) CreateFile: 系统找不到指定的文件`
+- 单实例锁冲突（`singleInstanceLock=false` 直接退出）
+- 自解压临时目录创建失败
+
+```bash
+# 1. 准备纯 ASCII 构建目录（示例：D:\build\mjscxt\）
+mkdir D:\build\mjscxt
+
+# 2. 复制 electron-app 到纯 ASCII 目录
+xcopy /E /I "C:\Users\liujianghua\WorkBuddy\2026-09-09-16-55-22\漫剧生成系统\electron-app" D:\build\mjscxt\electron-app\
+
+# 3. 进入构建目录
+cd D:\build\mjscxt\electron-app
+
+# 4. 安装依赖
+npm install
+
+# 5. 关键：修改 main.js 端口为 5210（与 PyInstaller 版后端端口一致）
+#    const DEFAULT_PORT = 5210;  (原为 5000)
+
+# 6. 执行打包
+npm run build:win
+
+# 7. 产物位置（均在 D:\build\mjscxt\dist\）
+# comic-drama-forge-Setup-1.1.0.exe        # NSIS 安装包 (~133 MB)
+# comic-drama-forge-Portable-1.1.0.exe     # 单文件便携版 (~132 MB，双击即用)
+# win-unpacked/漫剧工坊.exe                # 解压版绿色启动最快 (~180 MB)
+```
+
+**运行要求**：
+- 首次运行前建议清理残留锁：`Remove-Item -Recurse -Force "$env:APPDATA\mjscxt-desktop"`
+- 双击 `comic-drama-forge-Portable-1.1.0.exe` 或 `win-unpacked/漫剧工坊.exe`
+- 自动检测 5210 端口：若已有后端则复用，否则自动启动内置 Python 后端
+- 主窗口加载 `http://127.0.0.1:5210`，无需浏览器
+
+---
+
+### 两种方式对比
+
+| 特性 | PyInstaller (msjcxt.exe) | Electron (便携版/安装版) |
+|------|--------------------------|---------------------------|
+| **前端形态** | 浏览器访问 5210 端口 | 自带 Chromium 窗口，无需浏览器 |
+| **体积** | ~52 MB | ~132 MB (便携) / ~180 MB (解压版) |
+| **启动速度** | ~5 秒 | ~30 秒 (首次自解压/播种资源镜像) |
+| **后端复用** | 固定 5210，单实例 | 复用 5210 或自启内置 Python |
+| **适用场景** | 服务器/无人值守/远程桌面 | 本地桌面交互、演示、离线使用 |
+| **更新机制** | 手动替换 EXE | 内置自动更新（资源增量/整包） |
+| **路径要求** | 纯 ASCII 部署目录 + datadir.txt | 纯 ASCII 构建目录 + 输出目录 |
+
+---
+
+### GitHub Release 发布流程
+
+```bash
+# 1. 完成上述两种打包
+# 2. 创建 tag 并推送
+git tag v2.6.2
+git push origin v2.6.2
+
+# 3. GitHub Actions 自动运行 .github/workflows/desktop-release.yml
+#    - 烘焙 Python + 收集后端资源
+#    - Electron 打包
+#    - 创建 Release 并上传 3 个产物
+# 4. 本地验证：下载 Release 页面的 Portable exe，双击测试
+```
+
+> **注意**：Electron 更新配置在 `electron-app/update-config.js`，需与实际发 Release 的仓库 `owner/repo` 一致，否则客户端更新会静默空转。
+
+---
+
+
+**版本**: 2.6.2 | **日期**: 2026-10-04
