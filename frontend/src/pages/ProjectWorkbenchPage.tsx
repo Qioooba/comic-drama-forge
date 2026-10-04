@@ -586,21 +586,33 @@ function OverviewTab({
     }
   };
 
-  /** 弹窗底部「确认无误，改写为分镜剧本」：以文学剧本为原文重写成结构化分镜剧本 */
-  const handleScreenplayRewrite = async () => {
-    if (!novelId || spEpisode == null || spRewriting) return;
+  /** 两段式第二步：以文学剧本为原文重写成结构化分镜剧本。
+   *  2026-10-04 起无需人工确认：「生成文学剧本」轮询到 completed 后由 openScreenplay
+   *  自动调用本函数（等价于旧版自动点「确认无误」按钮）；弹窗底部确认按钮已改为
+   *  流程状态展示，不再有手动入口。
+   *  - chapter 显式传参：自动链路里同批 setState 尚未落地，读 spEpisode 会拿到旧章号；
+   *  - stillCurrent 令牌守卫：自动链路传 openScreenplay 的 isCurrent，用户切章后迟到的
+   *    改写结果不再动 UI；防重入由 spRewriting 兜底（改写中不允许再次触发）。 */
+  const runScreenplayRewrite = async (chapter: number, stillCurrent?: () => boolean) => {
+    if (!novelId || spRewriting) return;
+    const alive = stillCurrent ?? (() => spAliveRef.current);
     setSpRewriting(true);
     setSpError('');
+    setSpRewritten(false);
     try {
-      const r = await episodesApi.generate(novelId, { chapters: [spEpisode], use_screenplay: true });
+      const r = await episodesApi.generate(novelId, { chapters: [chapter], use_screenplay: true });
       // 兼容同步/异步两种返回：带 task_id 则轮询到完成
       const taskId = r?.task_id;
-      if (taskId) await pollGenerationTask(String(taskId), () => spAliveRef.current);
+      if (taskId) {
+        await pollGenerationTask(String(taskId), alive, t('wb.screenplayRewriteFailed'), t('wb.screenplayRewriteTimeout'));
+      }
+      if (!alive()) return;
       toast.success(t('wb.screenplayRewriteDone'));
-      setSpOpen(false);
+      // 成功后弹窗保持打开，底部状态条显示「✅ 分镜剧本已生成」；剧集列表在背后刷新
+      setSpRewritten(true);
       fetchEpisodes();
     } catch (err) {
-      setSpError(err instanceof Error ? err.message : t('wb.screenplayRewriteFailed'));
+      if (alive()) setSpError(err instanceof Error ? err.message : t('wb.screenplayRewriteFailed'));
     } finally {
       setSpRewriting(false);
     }
@@ -1433,7 +1445,8 @@ function OverviewTab({
         )}
       </div>
 
-      {/* 文学剧本弹窗（人审层）：展示/生成本章文学剧本 + 两段式改写入口 */}
+      {/* 文学剧本弹窗（人审层）：展示/生成本章文学剧本；生成完成后自动改写为分镜剧本
+          （2026-10-04 起无需人工确认，弹窗底部为流程状态条而非确认按钮） */}
       <ScreenplayModal
         isOpen={spOpen}
         episodeNo={spEpisode}
@@ -1441,9 +1454,9 @@ function OverviewTab({
         loading={spLoading}
         generating={spGenerating}
         rewriting={spRewriting}
+        rewritten={spRewritten}
         error={spError}
         onClose={() => setSpOpen(false)}
-        onConfirmRewrite={handleScreenplayRewrite}
       />
     </div>
   );
@@ -1452,8 +1465,10 @@ function OverviewTab({
 // ========== 文学剧本弹窗（人审层，两段式第一步） ==========
 // 展示 / 生成本章文学剧本。正文为 Markdown 文本：项目无 markdown 渲染依赖
 // （package.json 仅 react/react-dom/react-router），按约定用 whitespace-pre-wrap
-// 的正文样式直接展示，不引入新依赖。底部「确认无误，改写为分镜剧本」触发
-// 两段式第二步（POST episodes/generate {chapters:[章号], use_screenplay:true}）。
+// 的正文样式直接展示，不引入新依赖。
+// 2026-10-04 起两段式第二步自动化：生成完成后由 OverviewTab 自动触发改写，
+// 底部不再是「确认无误」按钮，而是流程状态条（生成中 → 自动改写中 → 已完成）；
+// 失败在正文上方红色块展示。回看已有剧本不自动改写，底部只留「关闭」。
 function ScreenplayModal({
   isOpen,
   episodeNo,
@@ -1461,9 +1476,9 @@ function ScreenplayModal({
   loading,
   generating,
   rewriting,
+  rewritten,
   error,
   onClose,
-  onConfirmRewrite,
 }: {
   isOpen: boolean;
   episodeNo: number | null;
@@ -1471,9 +1486,9 @@ function ScreenplayModal({
   loading: boolean;
   generating: boolean;
   rewriting: boolean;
+  rewritten: boolean;
   error: string;
   onClose: () => void;
-  onConfirmRewrite: () => void;
 }) {
   const { t } = useApp();
   return (
@@ -1486,15 +1501,28 @@ function ScreenplayModal({
       size="xl"
       footer={
         <div className="flex w-full flex-wrap items-center gap-2">
-          <Button variant="secondary" onClick={onClose} disabled={rewriting}>
+          {/* 流程状态条：正在生成文学剧本… → 正在自动改写为分镜剧本… → ✅ 已生成
+              （三个状态互斥；失败走正文上方红色错误块，此处恢复只读「关闭」） */}
+          {generating && (
+            <span role="status" className="inline-flex items-center gap-1.5 text-sm text-ink-2">
+              <span className="h-3.5 w-3.5 shrink-0 animate-spin rounded-full border-2 border-brand border-t-transparent" />
+              {t('wb.screenplayAutoGenerating')}
+            </span>
+          )}
+          {rewriting && (
+            <span role="status" className="inline-flex items-center gap-1.5 text-sm text-ink-2">
+              <span className="h-3.5 w-3.5 shrink-0 animate-spin rounded-full border-2 border-brand border-t-transparent" />
+              {t('wb.screenplayAutoRewriting')}
+            </span>
+          )}
+          {!generating && !rewriting && rewritten && (
+            <span role="status" className="inline-flex items-center gap-1.5 text-sm font-medium text-success-strong">
+              <CheckCircle2 className="h-4 w-4 shrink-0" />
+              {t('wb.screenplayAutoDone')}
+            </span>
+          )}
+          <Button variant="secondary" onClick={onClose} disabled={rewriting} className="ml-auto">
             {t('common.close')}
-          </Button>
-          <Button
-            onClick={onConfirmRewrite}
-            disabled={loading || generating || !content || rewriting}
-            loading={rewriting}
-          >
-            {rewriting ? t('wb.screenplayRewriting') : t('wb.screenplayConfirmRewrite')}
           </Button>
         </div>
       }

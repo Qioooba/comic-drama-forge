@@ -1,6 +1,6 @@
 {
   "name": "mjscxt-desktop",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "漫剧工坊桌面版：Electron 壳 + 本地 Flask 后端（serve.py）",
   "main": "main.js",
   "private": true,
