@@ -17,11 +17,16 @@
 //   后端启动时优先用覆盖层（由 main.js 设 MJSCXT_RESOURCE_DIR 指向它，serve.py 侧读只读资源时合并）。
 
 // GitHub 仓库（公开）。release 资产命名规范见下。
-// 默认仓库 = git remote origin（zdljh/mjscxt）。运行时可用 userData/update.json
-// 的 owner/repo 覆盖（将来换仓库/分发行版无需改代码）。
+// ⚠️ 必须与「实际发 Release 的仓库」一致：本仓 git remote origin =
+//    xianjing2000/comic-drama-forge，`.github/workflows/desktop-release.yml` 也把
+//    Release 发在这里。两者不一致 → 客户端只会去另一个仓库找 `releases/latest`，
+//    找不到就永久静默、自动更新空转（且不会报错，极难发现）。
+// ⚠️ 旧注释声称「运行时可用 userData/update.json 覆盖 owner/repo」——**该覆盖并未实现**
+//    （updater.js:78-79 直接读本常量，全仓无 update.json 读取代码）。换仓库/分发行版
+//    请改这里并重新发版。
 const GITHUB = {
-  owner: 'zdljh',
-  repo: 'mjscxt',
+  owner: 'xianjing2000',
+  repo: 'comic-drama-forge',
   apiBase: 'https://api.github.com',
   // 资产下载前缀（公开仓库匿名：直接走对象直链，不必走 api 逐字节）
   downloadBase: 'https://github.com',

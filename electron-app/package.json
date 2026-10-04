@@ -7,7 +7,8 @@
   "scripts": {
     "start": "electron .",
     "pack:backend": "node pack_backend.js",
-    "build:win": "electron-builder --win"
+    "build:win": "electron-builder --win",
+    "build:win:local": "electron-builder --win --config.electronDist=C:/Users/liujianghua/mjscxt_desktop/electron"
   },
   "devDependencies": {
     "electron": "^31.0.0",
@@ -75,7 +76,6 @@
     "portable": {
       "artifactName": "漫剧工坊-Portable-${version}.${ext}"
     },
-    "electronDist": "C:/Users/liujianghua/mjscxt_desktop/electron",
     "electronVersion": "33.4.11",
     "directories": {
       "output": "dist"

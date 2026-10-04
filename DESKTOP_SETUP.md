@@ -27,11 +27,19 @@ npm start
 
 # 收集后端资源 + 打包为EXE（前后端自包含，零 Python 安装）
 node pack_backend.js
-npm run build:win
+npm run build:win          # ← CI / 有网环境（electron-builder 自行下载 Electron）
+npm run build:win:local    # ← 本机离线/受限网络（复用本地已备好的 Electron 目录）
 ```
+> ⚠️ **`build.electronDist` 已从 `package.json` 移除**，改为只在 `build:win:local`
+> 里以 `--config.electronDist=<本机 Electron 目录>` 传入。原因：写在 `package.json`
+> 里会带上**本机绝对路径**，GitHub Actions runner 上不存在该路径 ⇒ 打包必失败；
+> 而本机受限网络下又下不动 Electron，需要一个本机专用入口。**两者不可混用。**
+>
 > 桌面版支持**自动更新**（资源增量 / 整包，SHA256 校验，GitHub 匿名下载）：
 > 启动检查一次 + 每 24h 静默轮询 + 菜单「帮助 → 检查更新」。
-> 发版走根目录 `.github/workflows/desktop-release.yml`（打 tag 自动发 Release）。
+> 发版走根目录 `.github/workflows/desktop-release.yml`（打 tag `v*` 自动发 Release）。
+> ⚠️ `electron-app/update-config.js` 的 `GITHUB.owner/repo` 必须与实际发 Release 的仓库
+> 一致，否则客户端更新会**静默空转**（找不到 release 且不报错）。
 
 ## 打包EXE
 

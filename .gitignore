@@ -49,6 +49,10 @@ __pycache__/
 *.so
 .Python
 build/
+# ⚠️ 例外：electron-builder 的品牌图标必须入库，否则 CI 打包只能用 Electron 默认图标
+#    （packaging/build 等其它 build/ 仍按上一行忽略；negation 必须先放行目录再放行内容）
+!electron-app/build/
+!electron-app/build/**
 develop-eggs/
 dist/
 downloads/
