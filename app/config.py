@@ -43,6 +43,7 @@ def _derive_comfyui_paths(root: str) -> dict:
         os.path.join(root, "ComfyUI"),
     ]
     for base in candidates:
+        # 只认“真实存在的目录”：避免旧逻辑在无网/未装 ComfyUI 时误判
         if os.path.isdir(os.path.join(base, "models")):
             return {
                 "workflows": os.path.join(base, "user", "default", "workflows"),
@@ -50,7 +51,7 @@ def _derive_comfyui_paths(root: str) -> dict:
                 "output": os.path.join(base, "output"),
                 "models": os.path.join(base, "models"),
             }
-    # 无法探测时按 portable 结构兜底
+    # 无法探测时按 portable 结构兜底（与旧行为一致，不改变未配置时的默认值）
     base = os.path.join(root, "ComfyUI", "ComfyUI")
     return {
         "workflows": os.path.join(base, "user", "default", "workflows"),

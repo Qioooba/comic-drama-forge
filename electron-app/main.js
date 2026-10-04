@@ -52,7 +52,8 @@ const DEFAULT_PROJECT_ROOT = path.resolve(__dirname, '..');
 // 已知 venv python（用户机上的默认解释器）
 const KNOWN_PYTHON =
   'C:\\Users\\liujianghua\\.workbuddy\\binaries\\python\\envs\\mjscxt\\Scripts\\python.exe';
-const DEFAULT_PORT = 5000;
+// 桌面版专用端口：避免与浏览器版/PyInstaller 版共用 5210 时串数据根
+const DEFAULT_PORT = 5211;
 
 // 环形缓冲：子进程 stdout/stderr 最多保留 500 行
 const LOG_RING_MAX = 500;
@@ -163,7 +164,7 @@ function resolveBackendLayout() {
       // 而 Electron 对含 .asar 的路径一律按存档解析，目录不是合法存档 →
       // package.json 读不到 → 双击无反应、静默退出。改普通目录 + 改名即可根治。
       servePy: useMirror ? mirrorServe : path.join(res, 'backend', 'serve.py'),
-      dataDir: app.getPath('userData'), // 可写数据区（output/novels/*.config.json/密钥）
+      dataDir: path.join(app.getPath('userData'), 'mjscxt-data'), // 可写数据区（output/novels/*.config.json/密钥）
       cwd: useMirror ? mirror : res,
     };
   }
@@ -246,13 +247,13 @@ async function findFreePort() {
   throw new Error('5001–5999 端口均被占用，无法启动后端');
 }
 
-// 端口决策：5000 被占用且 GET / 是 200 → 复用；否则找空闲端口
+// 端口决策：桌面版**永不复用外部后端**。
+// 旧逻辑会因 5210/5000 上已有健康 Flask 就直接复用，导致项目数据写到别的进程的数据根，
+// 表现为「桌面版每次打开都是空项目」。现在：
+// - 只有“本进程自己 spawn 且 childAlive”才复用（见 startBackend）；
+// - 若默认端口被占用，直接找下一个空闲端口，始终保证桌面版有自己的后端与数据根。
 async function resolvePort() {
   if (await isPortListening(DEFAULT_PORT)) {
-    if ((await httpGetStatus(`http://127.0.0.1:${DEFAULT_PORT}/`)) === 200) {
-      return { port: DEFAULT_PORT, reuse: true };
-    }
-    // 被占用但不是我们的 Flask → 找下一个
     const port = await findFreePort();
     return { port, reuse: false };
   }
@@ -475,14 +476,7 @@ async function startBackend() {
     if (!fs.existsSync(layout.servePy)) {
       throw new Error(`找不到后端入口 ${layout.servePy}（请确认已运行 build:win 打包或项目路径正确）`);
     }
-    const { port, reuse } = await resolvePort();
-    if (reuse) {
-      // 已有健康实例（例如浏览器版）占用 → 直接复用，不 spawn
-      backend.reused = true;
-      backend.port = port;
-      backend.starting = false;
-      return backend;
-    }
+    const { port } = await resolvePort();
     logLines.length = 0;
     backend.port = port;
     const childEnv = {
@@ -807,11 +801,26 @@ function createWindow() {
     },
   });
   if (saved && saved.maximized) win.maximize();
-  win.once('ready-to-show', () => win.show());
+  win.once('ready-to-show', () => {
+    bootLog('window ready-to-show -> show');
+    win.show();
+  });
+  // 兜底：若 15s 内 ready-to-show 仍未触发（例如后端 5000 迟迟未就绪导致页面
+  // 渲染不出来），强制显示窗口，避免"主进程活着但窗口永远藏在后台"的静默卡死。
+  // 无论卡在哪一步，用户都能看到窗口（哪怕里面是"后端未就绪"），且日志可查。
+  setTimeout(() => {
+    if (!win.isDestroyed() && !win.isVisible()) {
+      bootLog('window show fallback: ready-to-show 未按时到来，强制 show');
+      win.show();
+    }
+  }, 15000);
   win.on('resize', () => saveWindowState(win));
   win.on('move', () => saveWindowState(win));
   win.on('close', () => saveWindowState(win));
   const port = backend.port || DEFAULT_PORT;
+  win.webContents.on('did-fail-load', (e, code, desc, url) => {
+    bootLog(`window did-fail-load code=${code} desc=${desc} url=${url}`);
+  });
   win.loadURL(`http://127.0.0.1:${port}/`);
   return win;
 }

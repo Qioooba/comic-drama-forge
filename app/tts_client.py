@@ -29,7 +29,7 @@ import urllib.parse
 import urllib.request
 from typing import Callable, Dict, List, Optional, Tuple
 
-from config import COMFYUI_URL, MODELS_DIR, TTS_DEFAULT_PARAMS, KEEP_MODEL_LOADED
+from config import COMFYUI_URL, MODELS_DIR, PROJECT_ROOT_DIR, TTS_DEFAULT_PARAMS, KEEP_MODEL_LOADED
 from dialogue_utils import (
     normalize_lines as _norm_dlg_lines, dialogue_text as _dlg_text,
     dialogue_speaker as _dlg_speaker,
@@ -237,16 +237,39 @@ def check_environment(comfyui_url: str = COMFYUI_URL) -> Dict:
     except Exception as e:
         logger.debug("speakers 字段取值失败（忽略）：%s", e)
 
-    # 模型权重：models/qwen-tts 下逐项核对
-    if os.path.isdir(TTS_MODEL_ROOT):
+    # 模型权重：支持显式目录 + 多个常见 ComfyUI 布局，避免模块导入期路径被卡死。
+    # 优先顺序：MJSCXT_TTS_MODEL_ROOT > 当前 MODELS_DIR > ComfyUI portable/standard 布局 > 项目内 models/qwen-tts。
+    explicit_root = os.environ.get("MJSCXT_TTS_MODEL_ROOT", "").strip()
+    model_root_candidates = [explicit_root, TTS_MODEL_ROOT]
+    for base in (MODELS_DIR, os.path.join(MODELS_DIR, ".."), PROJECT_ROOT_DIR):
+        if not base:
+            continue
+        model_root_candidates.append(os.path.normpath(os.path.join(base, "qwen-tts")))
+        model_root_candidates.append(os.path.normpath(os.path.join(base, "ComfyUI", "ComfyUI", "models", "qwen-tts")))
+        model_root_candidates.append(os.path.normpath(os.path.join(base, "ComfyUI", "models", "qwen-tts")))
+
+    resolved_model_root = ""
+    seen = set()
+    for cand in model_root_candidates:
+        if not cand or cand in seen:
+            continue
+        cand = os.path.normpath(cand)
+        seen.add(cand)
+        if not os.path.isdir(cand):
+            continue
+        children = []
         try:
-            result["model_dirs"] = sorted(
-                d for d in os.listdir(TTS_MODEL_ROOT)
-                if os.path.isdir(os.path.join(TTS_MODEL_ROOT, d)))
-        except OSError as e:
-            result["reasons"].append(f"模型目录不可读：{e}")
-    else:
-        result["reasons"].append(f"模型根目录不存在：{TTS_MODEL_ROOT}")
+            children = [x for x in os.listdir(cand) if os.path.isdir(os.path.join(cand, x))]
+        except OSError:
+            continue
+        if children:
+            resolved_model_root = cand
+            result["model_dirs"] = sorted(children)
+            break
+    result["model_root"] = resolved_model_root or TTS_MODEL_ROOT
+
+    if not resolved_model_root:
+        result["reasons"].append(f"模型根目录不存在（已尝试：{', '.join(sorted(x for x in seen if x))}）")
 
     found_names = " ".join(result["model_dirs"]).lower()
     for expect, desc in TTS_MODEL_EXPECTED:
@@ -256,8 +279,8 @@ def check_environment(comfyui_url: str = COMFYUI_URL) -> Dict:
             "name": expect, "desc": desc, "found": bool(hit), "matched": hit,
         })
     custom_ok = any(m["found"] for m in result["expected_models"] if "CustomVoice" in m["name"])
-    if not custom_ok:
-        result["reasons"].append("未找到 CustomVoice 预置音色权重（models/qwen-tts 下）")
+    if not custom_ok and resolved_model_root:
+        result["reasons"].append(f"未找到 CustomVoice 预置音色权重（{resolved_model_root} 下）")
 
     result["available"] = not result["reasons"]
     return result

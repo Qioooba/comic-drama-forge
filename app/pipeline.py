@@ -1479,6 +1479,71 @@ def _deliverable_of(ctx, steps: dict) -> str:
     return ""
 
 
+def _prefetch_next_scripts(ctx: dict, limit: int = 1) -> None:
+    """后台预热：当前集进入 GPU 任务前，先生成后续 1 集剧本，避免图片/视频排队等 LLM。
+
+    特点：
+    - 非阻塞：起一个后台线程执行，主流程不等待；
+    - 只落剧本 JSON，不碰 ComfyUI，不与当前 GPU 任务抢显存；
+    - 幂等：若目标集剧本已存在直接跳过（probe_script）。
+    """
+    A = _A()
+    try:
+        if int(ctx["episode_no"] or 0) > 1:
+            return
+        if not ctx.get("novel_meta") or not ctx.get("chapter"):
+            return
+        meta = ctx["novel_meta"]
+        key = ctx["project_key"]
+        style = ctx["config"].get("style") or ""
+        target_shots = int(ctx["config"].get("target_shots") or 12)
+        # 只预取下一集，防止一口气把后续全部章节都跑掉
+        next_no = int(ctx["episode_no"] or 0) + 1
+        import autopilot as _autopilot
+        chapters, text = _autopilot.chapters_and_text(meta)
+        if not chapters or not text:
+            logger.debug("剧本预热：无可用章节/正文，跳过 project=%s ep=%s", key, next_no)
+            return
+        # 定位下一集对应章节
+        ch_next = None
+        for idx in range(next_no - 1, len(chapters)):
+            if idx < 0:
+                break
+            c = chapters[idx]
+            if isinstance(c, dict) and c.get("text"):
+                ch_next = c
+                break
+        if not ch_next:
+            logger.debug("剧本预热：未找到第 %s 集对应章节", next_no)
+            return
+        # 已存在直接跳过
+        script_path = A.novel_to_script.episode_script_path(A.SCRIPT_DIR, key, next_no, key)
+        if _nonempty(script_path):
+            logger.info("剧本预热：第 %s 集剧本已存在，跳过 %s", next_no, script_path)
+            return
+
+        def _worker():
+            try:
+                client = A._current_llm_client()
+                if not client or not getattr(client, "configured", False):
+                    logger.warning("剧本预热：文本模型未配置，跳过 %s", key)
+                    return
+                conv = A.continuity.convert_chapter_with_continuity(
+                    client, meta, text, ch_next, key, A.CONTINUITY_DIR,
+                    style=style, target_shots=target_shots, episode_no=next_no,
+                    save_dir=A.SCRIPT_DIR,
+                )
+                logger.info("剧本预热：第 %s 集剧本已生成 %s", next_no, conv.get("script_path") or "")
+            except Exception as e:  # noqa: BLE001
+                logger.warning("剧本预热：第 %s 集生成失败（不影响当前集）：%s", next_no, e)
+
+        t = threading.Thread(target=_worker, daemon=True, name=f"prefetch-script-{key}-{next_no}")
+        t.start()
+        logger.info("剧本预热：已启动后台线程生成第 %s 集剧本（project=%s）", next_no, key)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("剧本预热调度失败（忽略，不影响主流程）：%s", e)
+
+
 def backfill_style_from_ai_settings(config: dict, project_name: str,
                                     episode_no: int = 0) -> str:
     """风格回填（2026-09-22 P-2 风格未生效）：config.style 为空时，从 AI 总控落盘的
@@ -1605,6 +1670,10 @@ def run_episode(config: dict, project_name: str, episode_no: int, novel_meta: di
             # 已存在的剧本要先读进来，后续步骤（资产/分镜/视频）都依赖它
             if step != "script" and not ctx.get("script"):
                 ctx["script"] = _load_script_into_ctx(ctx)
+
+            # 后台预热：第一集完成剧本后，进入 GPU 任务前预取后续集剧本（非阻塞）
+            if step == "script":
+                _prefetch_next_scripts(ctx)
 
             ctx["progress"](f"{STEP_LABELS[step]}…", result_pct(result, step), phase=step)
             out, attempts = _run_step_with_retry(step, ctx)

@@ -1051,24 +1051,132 @@ def _project_cover_path(dir_key: str) -> str:
     return os.path.join(project_store.paths(dir_key)["root"], "cover.png")
 
 
+def _collect_project_cast_images(rec: dict, kind_pref: str = "") -> tuple:
+    """收集项目角色资产图，返回（主角/英雄参考图列表，反派参考图列表，主角数量，反派数量）。
+
+    判定依据：book_outline.json 的 characters[].role（primary/antagonist/villain），
+    无大纲时回落为“前 2 个主角 + 后 1 个反派”的保守截断，避免误把配角焊进封面。
+    资产图优先取 base.png / front.png（与现有资产目录约定一致）。
+    """
+    dir_key = rec["dir_key"]
+    project = str(rec.get("name") or dir_key).strip()
+    roots = [CHARACTERS_DIR, ITEMS_DIR, SCENES_DIR]
+    base_map = {"character": CHARACTERS_DIR, "item": ITEMS_DIR, "scene": SCENES_DIR}
+
+    def _img_for(name: str, prefs: tuple) -> str:
+        for d in roots:
+            cand = os.path.join(d, project, str(name), "base.png")
+            if os.path.isfile(cand):
+                return cand
+        for p in prefs:
+            cand = os.path.join(CHARACTERS_DIR, project, str(name), p)
+            if os.path.isfile(cand):
+                return cand
+        return ""
+
+    # 大纲优先：主角团 = role in (primary, hero, protagonist, champion)
+    # 反派 = role in (antagonist, villain, rival, enemy)
+    outline = None
+    try:
+        import book_outline as bo
+        text, _ch = novel_parser.read_novel_text(NOVELS_DIR, rec.get("novel_id") or "")
+        chunks = novel_parser.split_novel(text)
+        outline = bo.load_outline(dir_key, text, len(chunks) or 0, CONTINUITY_DIR) or bo.load_outline(dir_key, text, 0, CONTINUITY_DIR)
+    except Exception as e:  # noqa: BLE001
+        app.logger.debug("读取 book_outline 失败，使用默认主角/反派映射：%s", e)
+        outline = None
+
+    hero_names, villain_names = [], []
+    if outline and isinstance(outline.get("characters"), list):
+        for c in outline["characters"]:
+            if not isinstance(c, dict):
+                continue
+            nm = str(c.get("name") or "").strip()
+            if not nm:
+                continue
+            role = str(c.get("role") or c.get("camp") or "").strip().lower()
+            if role in ("primary", "hero", "protagonist", "champion", "main") or c.get("is_protagonist"):
+                hero_names.append(nm)
+            elif role in ("antagonist", "villain", "rival", "enemy", "main_villain") or c.get("is_antagonist"):
+                villain_names.append(nm)
+        hero_names = hero_names[:6]
+        villain_names = villain_names[:3]
+    else:
+        # 无大纲时：保守取角色目录里前 2 个有 base.png 的作主角，后 1 个作反派（避免把群演误判成反派）
+        chars_dir = os.path.join(CHARACTERS_DIR, project)
+        if os.path.isdir(chars_dir):
+            all_names = [d for d in sorted(os.listdir(chars_dir)) if os.path.isdir(os.path.join(chars_dir, d))]
+            hero_names = all_names[:2]
+            villain_names = all_names[-1:] if len(all_names) > 2 else []
+
+    hero_imgs = [_img_for(n, ("base.png", "front.png", "half.png")) for n in hero_names]
+    villain_imgs = [_img_for(n, ("base.png", "front.png", "half.png")) for n in villain_names]
+    hero_imgs = [p for p in hero_imgs if p]
+    villain_imgs = [p for p in villain_imgs if p]
+    return hero_imgs, villain_imgs, len(hero_imgs), len(villain_imgs)
+
+
+def _cover_prompt_from_outline(rec: dict, outline: dict, hero_imgs: list, villain_imgs: list) -> str:
+    """从大纲与主角/反派图片数量生成封面提示词（人物参考仅用于身份锚点，不强制画满）"""
+    dir_key = rec["dir_key"]
+    cfg = project_store.read_config(dir_key)
+    style = str(cfg.get("style") or "").strip()
+    name = str(rec.get("name") or dir_key).strip()
+
+    # 大纲摘要：取 story_summary（若存在）作为主题基调
+    summary = ""
+    if outline:
+        summary = str(outline.get("story_summary") or "").strip()[:200]
+    primary = 0
+    if outline and isinstance(outline.get("characters"), list):
+        primary = sum(1 for c in outline["characters"] if c.get("role") in ("primary", "hero", "protagonist", "main") or c.get("is_protagonist"))
+    if summary:
+        base = f"漫剧主视觉封面插画，《{name}》：{summary}"
+    else:
+        base = f"漫剧主视觉封面插画，《{name}》主题氛围场景"
+    # 加入风格 + 光影 + 构图（与旧版一致，避免画质下降）
+    base += "，戏剧性光影，电影感构图，景深层次丰富，高细节，画面中不出现任何文字"
+    # 如有角色参考图，追加“主角团/反派”人数（不点名，避免把群演误画成反派）
+    extras = []
+    if hero_imgs:
+        extras.append(f"主角团 {len(hero_imgs)} 人")
+    if villain_imgs:
+        extras.append(f"反派 {len(villain_imgs)} 人")
+    if extras:
+        base += "，" + "、".join(extras)
+    if style:
+        base += f"，风格：{style}"
+    return base
+
+
 def _generate_project_cover(rec: dict, seed=None) -> str:
     """生成项目封面并落到项目根目录 cover.png，返回落盘绝对路径。
 
-    走场景生图链路（16:9 横版，与项目卡片 aspect-video 一致）：场景模板自带
-    去人 + 去水印 + 负向冲突清理，比裸 t2i 稳；封面要的是氛围主视觉而非人像
-    （项目刚建时角色资产多半还没生成，也避开人物一致性问题）。
+    新版：优先读 book_outline.json 作为主题输入，并用主角/反派角色资产图作为参考（最多 3 张），
+    走故事板/参考图生成链路，若资产缺失则回落到旧的场景 t2i 链路（保持无角色时也能出图）。
     """
     dir_key = rec["dir_key"]
     cfg = project_store.read_config(dir_key)
     style = str(cfg.get("style") or "").strip()
-    name = str(rec.get("name") or "").strip()
-    prompt = (f"漫剧主视觉封面插画，《{name}》主题氛围场景，戏剧性光影，电影感构图，"
-              f"景深层次丰富，高细节，画面中不出现任何文字")
-    # 封面图也是「图片生成」，与资产图同档（1.5MP；旧行为吃 aspect_size 默认 0.5）
+    name = str(rec.get("name") or dir_key).strip()
     size = style_kit.aspect_size((16, 9), style_kit.asset_megapixels()) or (960, 544)
-    outs = comfyui_client.generate_scene_base(
-        prompt, seed=seed, style=style, size=size,
-        filename_prefix=f"comic_drama/{dir_key}_cover")
+
+    hero_imgs, villain_imgs, hero_n, villain_n = _collect_project_cast_images(rec)
+    refs = (hero_imgs[:2] + villain_imgs[:1])[:3]  # 最多 3 张参考（避免过多图导致模型偏脸）
+    if refs:
+        # 有参考图时走故事板链路，把主角/反派图作为身份锚点，画面仍保留场景与光影
+        prompt = _cover_prompt_from_outline(rec, None, hero_imgs, villain_imgs)
+        outs = comfyui_client.generate_storyboard(
+            prompt, refs, seed=seed, size=size,
+            filename_prefix=f"comic_drama/{dir_key}_cover",
+        )
+    else:
+        # 无参考图时回落到场景 t2i（旧逻辑，保证封面始终能生成）
+        prompt = (f"漫剧主视觉封面插画，《{name}》主题氛围场景，戏剧性光影，电影感构图，"
+                  f"景深层次丰富，高细节，画面中不出现任何文字")
+        outs = comfyui_client.generate_scene_base(
+            prompt, seed=seed, style=style, size=size,
+            filename_prefix=f"comic_drama/{dir_key}_cover")
     if not outs:
         raise RuntimeError("ComfyUI 未返回任何图片")
     cover = _project_cover_path(dir_key)
