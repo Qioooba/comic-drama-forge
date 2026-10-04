@@ -22,9 +22,9 @@ Electron 主进程 (main.js)
  ├─ 日志环形缓冲（500 行）→ 菜单「查看日志」/ 超时对话框
  ├─ 更新系统（updater.js + update-config.js，纯 Node 无第三方依赖）
  │   · 资源增量：下载 resources-x.y.z.zip → SHA256SUMS 强校验 → 覆盖资源镜像 → 重启后端生效
- │   · 整包：下载 漫剧工坊-Portable-x.y.z.exe → 校验 → 用户确认后才 spawn 接管 + 自重启
+ │   · 整包：下载 comic-drama-forge-Portable-x.y.z.exe（ASCII 名，GitHub 会吞中文）→ 校验 → 用户确认后才 spawn 接管 + 自重启
  │   · 触发：启动检查一次 + 每 24h 静默轮询 + 菜单「帮助 → 检查更新」
- │   · 来源：GitHub 公开仓库 release（zdljh/mjscxt），匿名下载
+ │   · 来源：GitHub 公开仓库 release（xianjing2000/comic-drama-forge），匿名下载
  └─ 优雅停机：SIGINT → 10s → taskkill /PID <pid> /T /F 兜底
 ```
 
@@ -49,7 +49,7 @@ cd electron-app
 npm install            :: 拉 electron + electron-builder（Node 18+）
 npm start              :: 开发运行（自动起/复用本机 venv 后端，不设数据目录重定向）
 node pack_backend.js   :: 收集 _backend/{app,workflows,locales,main.py}（源码 + 只读资源）
-npm run build:win      :: electron-builder 打 NSIS + Portable（产物名 漫剧工坊-Setup/Portable-<v>.exe）
+npm run build:win      :: electron-builder 打 NSIS + Portable（产物名 comic-drama-forge-Setup/Portable-<v>.exe，必须 ASCII 名）
 ```
 
 **独立 exe（前后端自包含，零 Python 安装）**：

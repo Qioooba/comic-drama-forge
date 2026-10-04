@@ -33,12 +33,15 @@ const GITHUB = {
 };
 
 // 资产命名规范（与 .github/workflows/desktop-release.yml 对齐）：
-//   漫剧工坊-Portable-x.y.z.exe    整包 bootstrapper（portable target）
-//   resources-x.y.z.zip           资源增量包（workflows+locales+app 只读资源）
-//   SHA256SUMS.txt                上述资产的 sha256 清单（一行一资产： <hex>  <文件名>）
-//   resource-manifest.json        增量包内文件清单 + 版本（updater 校验用，可选）
+//   comic-drama-forge-Portable-x.y.z.exe  整包 bootstrapper（portable target）
+//   resources-x.y.z.zip                   资源增量包（workflows+locales+app 只读资源）
+//   SHA256SUMS.txt                        上述资产的 sha256 清单（一行一资产： <hex>  <文件名>）
+//   resource-manifest.json                增量包内文件清单 + 版本（updater 校验用，可选）
+// ⚠️ 资产名必须 ASCII：GitHub Release 会吞掉文件名里的中文（如 漫剧工坊-Portable-…exe
+//    上传后变成 -Portable-…exe，前缀被剥离），导致 updater 按中文名找不到资产、自动更新
+//    永久空转。故 portable 名用仓库名 comic-drama-forge，与「实际发 Release 的仓库」同源。
 const ASSET = {
-  portable: (v) => `漫剧工坊-Portable-${v}.exe`,
+  portable: (v) => `comic-drama-forge-Portable-${v}.exe`,
   resources: (v) => `resources-${v}.zip`,
   sha256sums: 'SHA256SUMS.txt',
   manifest: 'resource-manifest.json',

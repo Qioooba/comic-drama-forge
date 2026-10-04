@@ -1,9 +1,12 @@
 # 漫剧工坊 桌面版发布流水线（GitHub Actions）
 # 触发：打 tag v1.2.3 自动发；或手动 workflow_dispatch 指定 version。
-# 产物（与 electron-app/update-config.js 的 ASSET 命名严格对齐）：
-#   漫剧工坊-Portable-<v>.exe   整包（含嵌入式 Python + 后端 + 前端）
-#   resources-<v>.zip          资源增量包（app/workflows/locales，不含 Python）
-#   SHA256SUMS.txt             两个资产的 sha256 清单（updater 强校验用）
+# 产物（与 electron-app/update-config.js 的 ASSET 命名严格对齐，**必须 ASCII**）：
+#   comic-drama-forge-Portable-<v>.exe  整包（含嵌入式 Python + 后端 + 前端）
+#   resources-<v>.zip                   资源增量包（app/workflows/locales，不含 Python）
+#   SHA256SUMS.txt                      两个资产的 sha256 清单（updater 强校验用）
+# ⚠️ 资产名必须 ASCII：GitHub Release 会吞掉文件名里的中文（如 漫剧工坊-Portable-…exe
+#    上传后变成 -Portable-…exe，中文前缀被剥离）→ updater 按中文名找不到资产、自动更新
+#    永久空转。故 portable 名用仓库名 comic-drama-forge。
 # 发 Release（draft=false，公开仓库匿名可下载）。
 
 name: Desktop Release
@@ -103,7 +106,7 @@ jobs:
           & $dst\python.exe -c "import flask, waitress, cryptography, openai, anthropic; print('backend deps ok')"
         shell: pwsh
 
-      # 打 Windows 便携包（electron-builder，产物名 漫剧工坊-Portable-<v>.exe）
+      # 打 Windows 便携包（electron-builder，产物名 comic-drama-forge-Portable-<v>.exe）
       - name: Build portable exe
         working-directory: electron-app
         run: npx electron-builder --win portable --x64
@@ -116,12 +119,12 @@ jobs:
           Compress-Archive -Path "_backend\app","_backend\workflows","_backend\locales" -DestinationPath "dist\resources-$v.zip" -Force;
         shell: pwsh
 
-      # 生成 SHA256SUMS.txt
+      # 生成 SHA256SUMS.txt（文件名须与 portable target 实际产物 ASCII 名一致）
       - name: Write SHA256SUMS.txt
         working-directory: electron-app/dist
         run: |
           $v = "${{ steps.ver.outputs.version }}";
-          $files = @("漫剧工坊-Portable-$v.exe","resources-$v.zip");
+          $files = @("comic-drama-forge-Portable-$v.exe","resources-$v.zip");
           $lines = @();
           foreach ($f in $files) {
             $h = (Get-FileHash $f -Algorithm SHA256).Hash.ToLower();
@@ -159,6 +162,28 @@ jobs:
         run: |
           find dist -maxdepth 1 -type f -printf '%f  %s bytes\n'
 
+      # 自愈：若该 tag 已存在旧 Release（含被 GitHub 篡改过名的旧资产），先整个删掉，
+      # 避免 softprops update 时新旧资产并存。本机无 PAT、匿名 API 删 Release 是 403，
+      # 故借 CI 的 GITHUB_TOKEN（contents:write 已授权）完成；删不掉不阻塞（|| true）。
+      - name: Delete existing release (self-heal)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v${{ needs.build-win.outputs.version }}"
+          REPO="${{ github.repository }}"
+          RID=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/repos/$REPO/releases/tags/$TAG" \
+            | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('id') or '')" || true)
+          if [ -n "$RID" ]; then
+            echo "existing release $TAG -> id $RID, deleting (removes stale renamed assets)..."
+            curl -s -X DELETE -H "Authorization: token $GITHUB_TOKEN" \
+              "https://api.github.com/repos/$REPO/releases/$RID" > /dev/null || true
+            echo "old release removed."
+          else
+            echo "no existing release for $TAG; nothing to delete."
+          fi
+        shell: bash
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         env:
@@ -169,7 +194,8 @@ jobs:
           draft: false
           prerelease: false
           generate_release_notes: false
+          delete: true
           files: |
-            dist/漫剧工坊-Portable-${{ needs.build-win.outputs.version }}.exe
+            dist/comic-drama-forge-Portable-${{ needs.build-win.outputs.version }}.exe
             dist/resources-${{ needs.build-win.outputs.version }}.zip
             dist/SHA256SUMS.txt

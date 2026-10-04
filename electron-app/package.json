@@ -71,10 +71,10 @@
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
-      "artifactName": "漫剧工坊-Setup-${version}.${ext}"
+      "artifactName": "comic-drama-forge-Setup-${version}.${ext}"
     },
     "portable": {
-      "artifactName": "漫剧工坊-Portable-${version}.${ext}"
+      "artifactName": "comic-drama-forge-Portable-${version}.${ext}"
     },
     "electronVersion": "33.4.11",
     "directories": {
