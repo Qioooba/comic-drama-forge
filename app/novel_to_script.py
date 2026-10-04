@@ -745,7 +745,7 @@ def extract_chunk_outline(client, chunk: dict, novel_title: str,
   "scenes": [{{"name": "场景名", "location": "地点类型", "appearance": "环境特征，30 字以内"}}],
   "key_beats": ["按原文顺序列出本段关键情节节点，每条 30 字以内，最多 12 条（分镜阶段会读取完整原文，这里只做索引，不要逐句复述、不要写成英文）"]
 }}
-【登记口径·不设数量上限】characters / items / scenes **不设数量上限**：原文登记了多少就报多少（characters 按戏份从大到小排）；items 仍按三问过滤（见上方 importance 判定），临时道具一律不进 items；无名群演（老人甲、村民若干、路人）不登记，只登记有名有戏的角色。"""
+【登记口径·不设数量上限】characters / items / scenes **不设数量上限**：原文登记了多少就报多少（characters 按戏份从大到小排）；items 仍按三问过滤（见上方 importance 判定），临时道具一律不进 items；纯背景路人（无台词、无独立动作、不推进情节，如老人甲、村民若干）不登记；但共同推进情节的一方阵营／敌群／首领或群像（有共同称谓、各自开腔或行动）必须登记——有具名首领就登首领，只有共同称谓的群体就登记为一个群像角色（name 用群体称谓如「正道群敌」，role 标敌方，appearance 写可辨识代表形象）。"""
     label = f"outline#{chunk.get('index')}"
     hit = _cache_get(cache_dir, "outline", prompt, events, label)
     if hit is not None and hit.get("_chunk"):
@@ -909,10 +909,10 @@ def build_bible(client, outlines: list, novel_title: str, style: str, episodes: 
   "style": "{style}",
   "characters": [{{"name": "姓名", "gender": "性别，只允许「男」或「女」两个值；必须按原文的人物称谓/代词/姓名线索推断后明确给出，禁止留空或写「未知」", "age": "年龄", "identity": "身份/阵营（15 字以内）", "appearance": "静态外貌定妆（含发色/瞳色/脸型/体格/标志特征等**不随剧情变化的特征**，**必须包含性别（如「女性」「男子」）**，**不含会逐集变化的服饰/配饰——那些写进 outfit**，60 字以内；若上方设定库已锁定则该字段必须与锁定值逐字一致）", "outfit": "本集服装状态（**动态特征：逐集可变的服饰/配饰，与静态 appearance 解耦**——appearance 是定妆照约束的静态外貌，outfit 是分镜画面约束的本集服装），20 字以内，与上集结尾一致；若本集确有换装必须体现原因", "personality": "性格（30 字以内）", "voice_style": "配音风格（15 字以内）", "reference_prompt_zh": "中文参考图提示词：角色三视图设定图，60 字以内，**必须写明角色性别（如开头写「女性角色，」「男性角色，」）**，只写画面可见的具体特征——发色发型、瞳色、脸型、服装款式与材质配色、标志配饰、三视图版式（**必须写明「正面、侧面、背面三张全身视图横排，从头到脚完整入画、同一角色身高比例一致」**，不要写成半身/胸像）；**严禁写任何风格词/画风词/质量词**（如「国漫」「3D渲染」「电影级」「高清」「精致」）", "reference_prompt_en": "English prompt for a character reference sheet with three full-body views (front, side, back laid out horizontally, head-to-toe, consistent body proportions), under 45 words, must explicitly state the character's gender (e.g. 'a woman,' / 'a man,'), comma-separated CONCRETE visual keywords (hair color and style, eye color, face shape, outfit material and colors, signature accessories, view layout). It MUST be an accurate translation of reference_prompt_zh. Never romanize Chinese concepts into invented pinyin (「国漫」 must become 'Chinese animated style', NOT 'xuanxuan'); never write style or quality words — the program appends them"}}],
   "items": [{{"name": "物品名", "category": "武器/法宝/道具/服饰", "appearance": "外观（50 字以内）, reference_prompt_zh（只写物品本体：造型/材质/颜色/纹样/尺寸感）", "owner": "持有人", "importance": "重要/临时。判定三问（任一答案为「是」即判临时）：①删掉它剧情还成立吗？②它只是随手用的日常物品吗？③它只是场景陈设吗？", "reference_prompt_zh": "中文参考图提示词，50 字以内，只写形制、材质、颜色、纹样与磨损状态；**严禁写风格词/画风词/质量词**", "reference_prompt_en": "English prompt for an item prop sheet, under 40 words, comma-separated concrete visual keywords (shape, material, color, pattern, wear). Accurate translation of reference_prompt_zh; no invented pinyin, no style or quality words"}}],
-  "scenes": [{{"name": "场景名", "location": "地点类型（**同一个场所的不同机位、朝向或景别一律视作同一个 location**，不要重复建场景；只有当边界、入口、功能区或固定结构真的不同时才算新地点）", "appearance": "环境与氛围（70 字以内）：把「压抑/肃杀/温暖」翻译成**已有依据的空间选择**——通道宽窄、光比强弱、材质反射、空气状态（雾/尘/雪/烟）、色温关系；不得为造气氛而新增剧情事故、封锁出口或搬动固定结构。并点明此空间能承载的戏：谁掌控入口、座位与视线高点，谁会被阻拦、围观或逼入死角，哪件道具可被交接、摔碎或藏匿（撑不起对抗、羞辱、救援、揭露与反转的空间，不要写成核心场景）", "scene_lighting": "该场景的**统一光影基调**（30 字以内）：整个场景所有镜头共享的主光源/时间/色温（如「黄昏暖调逆光」「冷蓝月光」「正午顶光」），用于消除同场景内逐镜光影漂移；无明确光源倾向时写「自然漫射光」。此字段只写光影，不写风格词/画风词/质量词，也不要出现人物", "reference_prompt_zh": "中文参考图提示词，90 字以内，**地理优先**：用「从哪个入口看向哪个方向、前中后景分别是什么、锚点在彼此哪一侧」的两两关系来写，不堆装饰清单。必写：①空间身份与功能；②观察方向与可见边界；③入口与通道如何连通；④1-3 个固定锚点及其左右前后相对关系；⑤前景/中景/背景层次与一处尺度参照；⑥墙地顶材质与主次色。最后写时间天气与光源方向。**严禁写风格词/画风词/质量词，且不要出现人物**（保持空场，才能作为地理参考被后续镜头反复复用）", "reference_prompt_en": "English prompt for an environment concept art sheet, under 60 words, comma-separated concrete visual keywords. Geography-first: state the viewpoint and what falls in foreground, midground and background, then entrance and circulation, then one to three fixed anchors as pairwise relations (what sits left or right of what), then materials and palette, then time, weather and light direction. Spatial layout, architecture, no decoration inventory, no people. Accurate translation of reference_prompt_zh; no invented pinyin, no style or quality words"}}],
+  "scenes": [{{"name": "场景名", "location": "地点类型（**同一个场所的不同机位、朝向或景别一律视作同一个 location**，不要重复建场景；只有当边界、入口、功能区或固定结构真的不同时才算新地点）", "appearance": "环境与氛围（70 字以内）：把「压抑/肃杀/温暖」翻译成**已有依据的空间选择**——通道宽窄、光比强弱、材质反射、空气状态（雾/尘/雪/烟）、色温关系；不得为造气氛而新增剧情事故、封锁出口或搬动固定结构。并点明此空间能承载的戏：谁掌控入口、座位与视线高点，谁会被阻拦、围观或逼入死角，哪件道具可被交接、摔碎或藏匿（撑不起对抗、羞辱、救援、揭露与反转的空间，不要写成核心场景）", "scene_lighting": "该场景的**统一光影基调**（30 字以内）：整个场景所有镜头共享的主光源/时间/色温（如「黄昏暖调逆光」「冷蓝月光」「正午顶光」），用于消除同场景内逐镜光影漂移；无明确光源倾向时写「自然漫射光」。此字段只写光影，不写风格词/画风词/质量词，也不要出现人物", "int_ext": "本场景内外景（只填「内景」「外景」「内外景」三值之一：封闭空间＝内景、露天＝外景、跨内外＝内外景）", "time_of_day": "本场景时间（8 字以内，如「黄昏」「夜」「清晨」「雨夜」「正午」；必须与 scene_lighting 的时间口径一致）", "reference_prompt_zh": "中文参考图提示词，90 字以内，**地理优先**：用「从哪个入口看向哪个方向、前中后景分别是什么、锚点在彼此哪一侧」的两两关系来写，不堆装饰清单。必写：①空间身份与功能；②观察方向与可见边界；③入口与通道如何连通；④1-3 个固定锚点及其左右前后相对关系；⑤前景/中景/背景层次与一处尺度参照；⑥墙地顶材质与主次色。最后写时间天气与光源方向。**严禁写风格词/画风词/质量词，且不要出现人物**（保持空场，才能作为地理参考被后续镜头反复复用）", "reference_prompt_en": "English prompt for an environment concept art sheet, under 60 words, comma-separated concrete visual keywords. Geography-first: state the viewpoint and what falls in foreground, midground and background, then entrance and circulation, then one to three fixed anchors as pairwise relations (what sits left or right of what), then materials and palette, then time, weather and light direction. Spatial layout, architecture, no decoration inventory, no people. Accurate translation of reference_prompt_zh; no invented pinyin, no style or quality words"}}],
   "production_notes": {{"style_guide": "画面与叙事风格说明（60 字以内）"}}
 }}
-【硬性约束】characters / items / scenes **不设数量上限**——原文有多少就登记多少，不得为省篇幅合并或丢弃条目；characters 按戏份从大到小排序，无名群演（老人甲、村民若干、路人）不登记；items 仍按三问过滤（①删掉它剧情还成立吗？②只是随手用的日常物品吗？③只是场景陈设吗？任一答案为「是」即剔除，临时道具不得进 items）；不要输出示例里的占位文字。若上方提供了「项目级设定库」，则已登记角色的 name / gender / appearance / personality 必须与该库完全一致（禁止改名、禁止改性别、禁止改外观），只允许更新 outfit（当前服装状态）。
+【硬性约束】characters / items / scenes **不设数量上限**——原文有多少就登记多少，不得为省篇幅合并或丢弃条目；characters 按戏份从大到小排序；纯背景路人（无台词、无独立动作、不推进情节，如老人甲、村民若干）不登记，但共同推进情节的一方阵营／敌群／首领或群像（有共同称谓、各自开腔或行动）必须登记——有具名首领就登首领，只有共同称谓的群体就登记为一个群像角色（name 用群体称谓如「正道群敌」，role 标敌方，appearance 写可辨识代表形象）；items 仍按三问过滤（①删掉它剧情还成立吗？②只是随手用的日常物品吗？③只是场景陈设吗？任一答案为「是」即剔除，临时道具不得进 items）；不要输出示例里的占位文字。若上方提供了「项目级设定库」，则已登记角色的 name / gender / appearance / personality 必须与该库完全一致（禁止改名、禁止改性别、禁止改外观），只允许更新 outfit（当前服装状态）。
 【风格红线·重要变更】风格词由**程序在生成前统一追加**（幂等，不会重复），不再由你写。因此 characters / items / scenes 三个数组里每一条 reference_prompt_zh 与 reference_prompt_en **都不得自行写风格词、画风词或质量词**——自己写了会导致风格在提示词里出现两遍（实测就是「中国古风玄幻漫剧风格。风格：中国古风玄幻漫剧，画面精致…」这种重复），属于不合格输出。你只需专注描述画面里看得见的具体特征，把风格判断交给程序。
 【格式红线】直接以 {{ 作为输出的第一个字符；严禁输出任何推理过程、思考草稿、英文说明、markdown 代码块标记或前后缀解释文字；各条目字段描述尽量精炼，但**不得为控制篇幅而丢弃或合并角色/物品/场景条目**（数量上限已取消，超长由程序自动提高额度重试）。"""
     # 断点缓存：命中则跳过模型汇总（未命中时行为与加缓存前完全一致）。
@@ -1079,7 +1079,7 @@ def build_shots_for_chunk(client, bible: dict, outline: dict, chunk: dict, shots
 【本段剧情摘要】{outline.get('summary', '')}
 【本段情节要点】{json.dumps(outline.get('key_beats') or [], ensure_ascii=False)}
 【输出要求】严格只输出一个 JSON 对象，不要 markdown 代码块、不要解释文字，结构如下：
-{{"shots": [{{"camera": "景别+运镜（必须取自上方运镜术语表，如 中景跟随/近景轻推，10 字以内）", "shot_type": "景别（只填以下 {len(SHOT_TYPES)} 值之一：{_SHOT_TYPE_ENUM_ZH}；局部=只拍手部/道具的插入镜；与 camera 里的景别词保持一致；本镜确实无法确定景别时写空字符串）", "camera_motion": "运镜（只填运镜词，优先用上方【克制运镜·推荐】的 固定/轻推/轻摇/跟随/轻手持；无运镜的静止镜头填「固定」）", "location": "所属场景名（必须来自可用场景）", "description": "画面内容描述（80 字以内，只写人物动作过程与关键构图：谁做了什么、怎么做的、在画面什么位置；外貌衣着/环境光线只在推动剧情或首次出场时写，不逐句铺陈，禁止写背景陈述/世界观/来历评述）", "visual_detail": "画面补充细节（可选；当 description 之外还有更细的关键动作过程/环境细节时写在这里，80 字以内；没有多余细节时写空字符串）", "dialogue": [{{"speaker": "说话角色名（必须与可用角色完全一致）", "text": "该角色台词（≤30 字；原文对话尽量原样保留；角色的自语/心声写成该角色本人的台词）"}}], "emotion": "情绪（8 字以内）", "edit_reason": "剪辑动机（20~30字，具体说明这一镜为什么切/承担什么叙事功能，禁止写可套用的空话，如：切掉环境只留下他的反应/用空间拉开取代告别对白/物件回环把十年压缩到一张纸上）", "beat": "叙事节拍（本镜所处节拍，只填「开场」「触发」「高潮」「收尾」四值之一；拿不准填「触发」）", "audio_cues": "音效/配乐提示（60 字以内，只写环境音/音效/配乐，不写人声）", "characters_in_shot": ["出场角色名"], "first_frame": "首帧画面（运动开始前那一刻的静态快照：画面主体与构图，40字以内；无明显运动变化写空字符串）", "last_frame": "末帧画面（运动结束后的终态，40字以内；与首帧相同或无运动时写空字符串）", "motion": "运动描述（严格区分【摄影机运动】推拉摇移跟升降 与【画面内运动】人物/物体自身动作；30字以内；静止镜头写空字符串）", "items_in_shot": ["出场物品名"]}}]}}
+{{"shots": [{{"camera": "景别+运镜（必须取自上方运镜术语表，如 中景跟随/近景轻推，10 字以内）", "shot_type": "景别（只填以下 {len(SHOT_TYPES)} 值之一：{_SHOT_TYPE_ENUM_ZH}；局部=只拍手部/道具的插入镜；与 camera 里的景别词保持一致；本镜确实无法确定景别时写空字符串）", "camera_motion": "运镜（只填运镜词，优先用上方【克制运镜·推荐】的 固定/轻推/轻摇/跟随/轻手持；无运镜的静止镜头填「固定」）", "location": "所属场景名（必须来自可用场景）", "description": "画面内容描述（80 字以内，只写人物动作过程与关键构图：谁做了什么、怎么做的、在画面什么位置；外貌衣着/环境光线只在推动剧情或首次出场时写，不逐句铺陈，禁止写背景陈述/世界观/来历评述）", "visual_detail": "画面补充细节（可选；当 description 之外还有更细的关键动作过程/环境细节时写在这里，80 字以内；没有多余细节时写空字符串）", "dialogue": [{{"speaker": "说话角色名（必须与可用角色完全一致）", "text": "该角色台词（≤30 字；原文对话尽量原样保留；角色的自语/心声写成该角色本人的台词）"}}], "emotion": "情绪（8 字以内）", "edit_reason": "剪辑动机（20~30字，具体说明这一镜为什么切/承担什么叙事功能，禁止写可套用的空话，如：切掉环境只留下他的反应/用空间拉开取代告别对白/物件回环把十年压缩到一张纸上）", "beat": "叙事节拍（本镜所处节拍，只填「开场」「触发」「高潮」「收尾」四值之一；拿不准填「触发」）", "audio_cues": "音效/配乐提示（60 字以内，只写环境音/音效/配乐，不写人声）", "characters_in_shot": ["出场角色名"], "first_frame": "首帧画面（运动开始前那一刻的静态快照：画面主体与构图，40字以内；无明显运动变化写空字符串）", "last_frame": "末帧画面（运动结束后的终态，40字以内；与首帧相同或无运动时写空字符串）", "motion": "运动描述（严格区分【摄影机运动】推拉摇移跟升降 与【画面内运动】人物/物体自身动作；30字以内；静止镜头写空字符串）", "caption": "字幕（**默认写空对象 {{}}**；仅当本镜承担时空落点交代或集尾悬念时才写，形如 {{"text": "字幕文字（≤20字）", "kind": "时间地点/回溯/悬念 三值之一"}}。字幕是后期叠加的文字，不进画面描述、不产生人声）", "items_in_shot": ["出场物品名"]}}]}}
 【禁止输出 prompt_h3 字段】视频提示词由程序在生成阶段按 H3 规范自动构建（它会结合当次实际传入的参考图，生成 subject_definitions / summary / retention_analysis / detailed_description / overall_soundscape / non_diegetic_music 六段）。你在剧本阶段并不知道最终配几张参考图，写出来的英文提示词缺少 <Picture N> 标签，反而会覆盖规范提示词导致出片偏离设定。因此**不要写 prompt_h3、不要写英文提示词**；把画面信息全部写进 description 即可。
 【站位与动作（3D 导演台依赖，逐镜必填）】每一镜都要写：\n
   ① blocking：本镜出场角色的**站位**，每个出场角色一条，形如 
@@ -1092,6 +1092,11 @@ def build_shots_for_chunk(client, bible: dict, outline: dict, chunk: dict, shots
 【台词要求】dialogue 必须是数组，数组元素为 {{"speaker": 角色名, "text": 台词}}；speaker 必须精确等于「可用角色」中的名字，禁止写“旁白/众人”等未登记角色；无台词的镜头 dialogue 写 []（空数组），禁止写成字符串或 null。角色的心理活动改写成该角色**本人**的自语台词时，speaker 仍写角色名（不要写成「旁白」，本系统没有旁白角色）。dialogue **只承载**：原文对话、以及原文明确心理活动/独白改写的第一人称自语——第三人称叙述与背景补叙**禁止**写成任何角色开口的台词（改写规则 8）。
 【台词预算（防成片截断）】单个镜头的 dialogue **合计不超过 {speech_budget} 字**（≈6.7 秒配音）。台词过多时**先精简冗余语气词与重复表述**，仍超预算才拆成相邻镜头——配音是按镜头时间轴铺的，单镜台词超出镜头时长会被成片尾部静默截掉。
 【音轨说明（本系统不产出旁白）】成片没有画外音解说，配音链路**只读 dialogue**：audio_cues 里写「雨声」「风声」这类音效**不会产生人声**。因此：① 有对话或自语的镜头必须写 dialogue，禁止把台词塞进 description / visual_detail / audio_cues；② 纯画面/纯动作镜头允许没有台词（该镜成片留白，由音效与配乐铺底），但**必须**在 audio_cues 写明音效/配乐提示；③ **严禁**凭空编造原文里没有的台词来「凑人声」——宁可留白，也不要无中生有。
+【字幕/转场（caption）】本系统不产出旁白，**时空跳跃靠字幕点明落点**。只在三种情况写 caption：
+①上下集之间时间/地点发生跳变（kind=时间地点，如「一年后」「青茅山·古月山寨」）；
+②本镜是时空回溯的落点（kind=回溯，如「春秋蝉，逆转时光。」）；
+③本集结尾仍有未回收伏笔、需要留住悬念（kind=悬念）。
+**其余镜头一律写空对象**——字幕滥用会打断观感。caption.text ≤20 字，只写交代时空或悬念的短句；**禁止**复述台词、禁止写画面描述、禁止把台词搬进字幕。
 【硬性约束】shots 数组元素个数必须在 {shots_target} ~ {shots_cap} 之间：只把原文里**推动剧情的冲突/转折/关键动作/金句**落到镜头里，纯背景补叙、纯环境描写（不推进剧情）**直接删去、不单独成镜**；name 字段必须与上面「可用角色/物品/场景」中的名字完全一致，不要新造名字。若上方给出「本集必须出现的原文金句」，必须把每句**原样**写进对应角色的 dialogue.text（不得改写、不得拆分、不得省略）。上一集已发生的事件禁止在本集重演。
 【关键情节自检】写完回看上方「剧情摘要/情节要点」，确认每个关键情节都有对应镜头；纯背景补叙、纯环境描写若未推进剧情应当已删去，**不要求逐句覆盖原文**。记住：本系统没有旁白，背景补叙与环境描写靠画面承载、绝不写成台词，心理活动靠神态动作或第一人称角色自语承载。"""
     label = f"shots#{chunk.get('index')}"
@@ -1586,6 +1591,35 @@ def audit_shots_structure(raw_shots, bible: dict, tag: str = "") -> list:
         if beat_raw and beat_raw not in _BEAT_WHITELIST:
             _add("beat_off_whitelist", f"镜#{idx + 1} beat=「{beat_raw[:12]}」越出白名单，"
                                        f"将被归一为「{_DEFAULT_BEAT}」", idx)
+        # 1b) caption（字幕/转场）的形状 / 长度 / 取值 / 放置（2026-10-02）
+        # 与 _norm_caption 的实际行为同源：越界会被截断/归一。场景中途的字幕**不会**
+        # 被丢弃（保留模型意图），但字幕只该用于时空落点与集尾悬念，故 report-only 提示。
+        _cap = s.get("caption")
+        if _cap not in (None, "", {}, []):
+            if isinstance(_cap, str):
+                _cap_text, _cap_kind = _cap.strip(), ""
+            elif isinstance(_cap, dict):
+                _cap_text = str(_cap.get("text") or "").strip()
+                _cap_kind = str(_cap.get("kind") or "").strip()
+            else:
+                _cap_text, _cap_kind = "", ""
+                _add("caption_type_drift",
+                     "镜#%d caption 类型为 %s（应为字符串或对象），将被丢弃"
+                     % (idx + 1, type(_cap).__name__), idx)
+            if _cap_text:
+                if len(_cap_text) > CAPTION_MAX_CHARS:
+                    _add("caption_overflow",
+                         "镜#%d 字幕 %d 字超出上限 %d，将被截断"
+                         % (idx + 1, len(_cap_text), CAPTION_MAX_CHARS), idx)
+                if _cap_kind and _cap_kind not in CAPTION_KINDS:
+                    _add("caption_kind_off_whitelist",
+                         "镜#%d 字幕 kind=「%s」越出白名单，将被归一为「%s」"
+                         % (idx + 1, _cap_kind[:8], CAPTION_KINDS[0]), idx)
+                _prev_loc = str(shots[idx - 1].get("location") or "").strip() if idx else ""
+                if idx and _prev_loc == str(s.get("location") or "").strip():
+                    _add("caption_misplaced",
+                         "镜#%d 的字幕出现在场景中途（上一镜同场景）：字幕只用于时空落点"
+                         "或集尾悬念，建议前移到本场首镜" % (idx + 1), idx)
         # 2) dialogue.speaker 不在角色表（下游 tts 落到 NARRATION 兜底）
         dlg = s.get("dialogue")
         if isinstance(dlg, list):
@@ -2056,6 +2090,173 @@ def _split_multi_action_row(row: dict) -> list:
                 row.get("shot_id"), a["description"][:30], b["description"][:30])
     return [a, b]
 
+# ---- 场次表头 + 字幕/转场（2026-10-02，对齐标准剧本格式）----
+# 参考改编稿用【第一场】外景·无名山巅·黄昏 的场记头组织镜头，并用「字幕」交代
+# 时空跳跃（如「春秋蝉，逆转时光。」）。本模块原先只有 location + scene_lighting，
+# 没有内外景/时间/场次号，也没有一等字幕字段 —— 这里补齐。
+INT_EXT_VALUES = ("内景", "外景", "内外景")
+CAPTION_MAX_CHARS = 24
+CAPTION_KINDS = ("时间地点", "回溯", "悬念")
+
+_INT_EXT_HINTS = (
+    ("内景", ("殿", "阁", "堂", "室", "房", "厅", "廊", "洞", "牢", "狱", "塔",
+              "祠堂", "居所", "屋", "密室", "帐", "轿")),
+    ("外景", ("山巅", "山顶", "山道", "广场", "野外", "街", "城门", "河", "湖", "海",
+              "天空", "悬崖", "荒野", "庭院", "屋顶", "林", "田野", "门外", "坡")),
+)
+
+_TIME_HINTS = (
+    ("黄昏", ("黄昏", "夕阳", "落日", "残阳", "暮色", "傍晚", "日暮")),
+    ("夜", ("夜", "月", "星空", "烛", "灯", "漆黑", "黑暗", "凌晨", "深更")),
+    ("清晨", ("清晨", "朝阳", "拂晓", "黎明", "日出", "晨光", "早上")),
+    ("日", ("正午", "白日", "日光", "午后", "上午", "晴空")),
+)
+
+
+def derive_int_ext(scene: dict) -> str:
+    """从场景名/光影/参考提示词推断内外景（确定性兜底）。
+
+    供**没有 int_ext 字段的旧 bible**（已落盘的存量项目）使用，保证新字段对
+    老数据也有值；同时作为模型输出越界时的归一目标。只看空间身份词，不猜剧情。
+    """
+    blob = " ".join(str((scene or {}).get(k) or "") for k in
+                    ("name", "location", "scene_lighting", "appearance",
+                     "reference_prompt_zh"))
+    for label, hints in _INT_EXT_HINTS:
+        if any(h in blob for h in hints):
+            return label
+    return "外景"
+
+
+def derive_time_of_day(scene: dict) -> str:
+    """从光影基调推断时间（确定性兜底，口径与 scene_lighting 保持一致）。"""
+    blob = " ".join(str((scene or {}).get(k) or "") for k in
+                    ("scene_lighting", "name", "appearance", "reference_prompt_zh"))
+    for label, hints in _TIME_HINTS:
+        if any(h in blob for h in hints):
+            return label
+    return "日"
+
+
+def normalize_scene_meta(scene: dict):
+    """场景的内外景 / 时间：模型给了就用（白名单归一），没给则确定性推导。"""
+    scene = scene if isinstance(scene, dict) else {}
+    ie = str(scene.get("int_ext") or "").strip()
+    if ie not in INT_EXT_VALUES:
+        ie = derive_int_ext(scene)
+    tod = " ".join(str(scene.get("time_of_day") or "").split())[:8] or derive_time_of_day(scene)
+    return ie, tod
+
+
+def normalize_scenes_meta(scenes: list) -> list:
+    """就地补齐所有场景的 int_ext / time_of_day，返回同一列表（便于链式调用）。"""
+    for s in (scenes or []):
+        if isinstance(s, dict):
+            ie, tod = normalize_scene_meta(s)
+            s["int_ext"] = ie
+            s["time_of_day"] = tod
+    return scenes
+
+
+def scene_heading(scene_no: int, int_ext: str, location: str, time_of_day: str) -> str:
+    """标准场记头：【第N场】外景·无名山巅·黄昏（缺项自动回落，不留空占位符）"""
+    return "【第%d场】%s·%s·%s" % (int(scene_no or 0), (int_ext or "外景").strip(),
+                                   (location or "未标场景").strip(),
+                                   (time_of_day or "日").strip())
+
+
+def assign_scene_numbers(shots: list) -> list:
+    """按「连续同一场景」给镜头编场次号，返回场次表（就地写回 shot）。
+
+    标准编剧口径：**一场戏 = 同一地点的一段连续戏**。地点再次出现（闪回、时空
+    回溯回到此处）算新的一场 —— 这正是观众需要被点明落点的地方。幂等：重复调用
+    只会得到同一结果，因此可在补镜前后各跑一次。
+    """
+    flow = []
+    last_loc = None
+    cur = None
+    for sh in (shots or []):
+        if not isinstance(sh, dict):
+            continue
+        loc = str(sh.get("location") or "").strip()
+        if cur is None or loc != last_loc:
+            cur = {
+                "scene_no": len(flow) + 1,
+                "location": loc,
+                "int_ext": str(sh.get("int_ext") or "").strip() or "外景",
+                "time_of_day": str(sh.get("time_of_day") or "").strip() or "日",
+                "shot_ids": [],
+            }
+            cur["heading"] = scene_heading(cur["scene_no"], cur["int_ext"], loc,
+                                           cur["time_of_day"])
+            flow.append(cur)
+            last_loc = loc
+        sh["scene_no"] = cur["scene_no"]
+        sh["scene_heading"] = cur["heading"]
+        cur["shot_ids"].append(sh.get("shot_id"))
+    for s in flow:
+        s["shot_count"] = len(s["shot_ids"])
+        s["start_shot_id"] = s["shot_ids"][0] if s["shot_ids"] else None
+        s["end_shot_id"] = s["shot_ids"][-1] if s["shot_ids"] else None
+    return flow
+
+
+def collect_scene_flow(shots: list) -> list:
+    """只读汇总：按 shot 上已写好的 scene_no 收起场次表（不改动镜头）。
+
+    与 assign_scene_numbers 的分工：后者负责编号并写回镜头；本函数在剧本落盘前
+    （覆盖率补镜之后）重新收表，保证补生成的镜头也被计入场次。
+    """
+    flow = []
+    for sh in (shots or []):
+        if not isinstance(sh, dict):
+            continue
+        try:
+            no = int(sh.get("scene_no") or 0)
+        except (TypeError, ValueError):
+            no = 0
+        if no <= 0:
+            continue
+        if not flow or flow[-1]["scene_no"] != no:
+            flow.append({
+                "scene_no": no,
+                "location": str(sh.get("location") or ""),
+                "int_ext": str(sh.get("int_ext") or ""),
+                "time_of_day": str(sh.get("time_of_day") or ""),
+                "heading": str(sh.get("scene_heading") or ""),
+                "shot_ids": [],
+            })
+        flow[-1]["shot_ids"].append(sh.get("shot_id"))
+    for s in flow:
+        s["shot_count"] = len(s["shot_ids"])
+        s["start_shot_id"] = s["shot_ids"][0] if s["shot_ids"] else None
+        s["end_shot_id"] = s["shot_ids"][-1] if s["shot_ids"] else None
+    return flow
+
+
+def _norm_caption(raw) -> dict:
+    """字幕/转场文本规范化：{text, kind}；空/无效返回 {}（形状恒定，前端好判）。
+
+    ⚠️ 字幕是**后期叠加**的叙事装置（时空落点、回溯、集尾悬念）：
+    ① 绝不进画面提示词（prompt_qc 硬原则：画面内不得出现文字）；
+    ② 不产生人声、不占配音预算（配音链路只读 dialogue）；
+    ③ 是否真的烧进成片，由项目既有开关 subtitle_enabled 决定（默认关闭）。
+    """
+    if isinstance(raw, str):
+        text, kind = raw, ""
+    elif isinstance(raw, dict):
+        text = raw.get("text") or ""
+        kind = str(raw.get("kind") or "").strip()
+    else:
+        return {}
+    text = " ".join(str(text).split())[:CAPTION_MAX_CHARS]
+    if not text:
+        return {}
+    if kind not in CAPTION_KINDS:
+        kind = CAPTION_KINDS[0]
+    return {"text": text, "kind": kind}
+
+
 def _norm_shots(raw_shots: list, bible: dict, episodes: int, start_id: int = 1) -> list:
     scenes = [s.get("name") for s in (bible.get("scenes") or []) if isinstance(s, dict)]
     chars = [c.get("name") for c in (bible.get("characters") or []) if isinstance(c, dict)]
@@ -2065,6 +2266,13 @@ def _norm_shots(raw_shots: list, bible: dict, episodes: int, start_id: int = 1) 
     # 旧剧本 / bible 无 scene_lighting 字段 → 映射值为空串，下游走原有逐镜+情绪兜底（零变化）。
     scene_light_map = {
         str(s.get("name") or "").strip(): str(s.get("scene_lighting") or "").strip()
+        for s in (bible.get("scenes") or [])
+        if isinstance(s, dict) and str(s.get("name") or "").strip()
+    }
+    # 场次表头（2026-10-02）：场景的内外景/时间同样按场景名落表，镜头直接取用。
+    # 旧 bible 没有这两个字段 → normalize_scene_meta 从场景名/光影确定性推导，老项目也有值。
+    scene_meta_map = {
+        str(s.get("name") or "").strip(): normalize_scene_meta(s)
         for s in (bible.get("scenes") or [])
         if isinstance(s, dict) and str(s.get("name") or "").strip()
     }
@@ -2126,6 +2334,7 @@ def _norm_shots(raw_shots: list, bible: dict, episodes: int, start_id: int = 1) 
                     "不静默回落首个场景", loc, "、".join(x for x in scenes if x)[:120])
         if not loc and scenes:
             loc = scenes[0]
+        _smeta = scene_meta_map.get(loc) or ("外景", "日")
         row = {
             "shot_id": sid,
             "duration": 5,
@@ -2138,6 +2347,10 @@ def _norm_shots(raw_shots: list, bible: dict, episodes: int, start_id: int = 1) 
             # P4-A 场景共享光影：按解析后的 loc 取该场景统一光影基调（同场景镜头同源，
             # 消除逐镜漂移）。旧剧本 loc 未命中或场景无该字段 → 空串，下游走逐镜/情绪兜底。
             "scene_lighting": scene_light_map.get(loc, ""),
+            # 内外景 / 时间（2026-10-02）：供【第N场】场记头与字幕落点提示取用。
+            # 旧 bible 无这两字段 → _smeta 已确定性推导，不留空。
+            "int_ext": _smeta[0],
+            "time_of_day": _smeta[1],
             # description：限长 200 字（前端展示与 prompt 体量控制用）。
             # 但画面细节不丢：原始描述若超长，把超出的部分拆进 visual_detail（分镜图/视频
             # 提示词会把它并回画面主体）。历史缺陷：description 截断 200 字后剩余细节
@@ -2168,6 +2381,11 @@ def _norm_shots(raw_shots: list, bible: dict, episodes: int, start_id: int = 1) 
             # 只保留四值白名单，越界/未识别值归一到「触发」；供下游节奏分层与时长加成取用。
             "beat": _norm_beat(s.get("beat")),
             "audio_cues": str(s.get("audio_cues") or "").strip()[:60],
+            # 字幕/转场（2026-10-02）：后期叠加的时空落点/悬念文字。
+            # **不进画面提示词**（画面内不得出现文字的硬原则），也不产生人声；
+            # 是否烧进成片由项目既有开关 subtitle_enabled 决定（默认关闭）。
+            # 形状恒为 dict，无字幕时为 {}，前端可直接判真假值。
+            "caption": _norm_caption(s.get("caption")),
             # 视频提示词：**剧本阶段不再信任模型自写的文本**。
             # 历史缺陷：这里原样保留模型写的「英文画面描述（60 词以内）」，一句无
             # <Picture N> 标签的裸英文，会在生成期把结构化 H3 构建器整个顶掉
@@ -2215,6 +2433,8 @@ def _norm_shots(raw_shots: list, bible: dict, episodes: int, start_id: int = 1) 
             (f"{d['speaker']}：{d['text']}" if d.get("speaker") else d.get("text") or "")
             for d in row["dialogue"]
         ).strip()
+        # 字幕纯文本：前端与成片字幕渲染直接读它（无字幕时空串）
+        row["caption_text"] = str((row.get("caption") or {}).get("text") or "")
         # P0-2 修复（上游补齐）：只有台词、没有画面描述的镜头，在生成期提示词预检里会命中
         #   「镜头缺少画面描述（description / visual_detail / storyboard_prompt_zh 均为空）」
         # 这条**致命且不可自愈**的缺陷（prompt_qc._check_storyboard → fatal）→ 该镜永远
@@ -2278,6 +2498,10 @@ def _norm_shots(raw_shots: list, bible: dict, episodes: int, start_id: int = 1) 
     # 参考片风格对齐（2026-09-30）：运镜归一 / 极端景别收窄 / 补足「局部」插入镜。
     # 必须放在集数分配之前 —— 对齐会改变镜数与 shot_id，集数分配要看到最终镜头表。
     shots = align_shots_to_reference(shots, start_id)
+    # 场次编号（2026-10-02）：按「连续同一场景」编【第N场】场记头。
+    # 必须放在 align_shots_to_reference 之后 —— 对齐会改变镜数与 shot_id，
+    # 场次号要看到最终镜头表；幂等，落盘前还会再收一次（含覆盖率补镜）。
+    assign_scene_numbers(shots)
     # 分配集数
     n = len(shots)
     if n:
@@ -2412,8 +2636,10 @@ def convert_novel_to_script(client, novel_meta: dict, novel_text: str, style: st
     items = _norm_list(bible.get("items"), None,
                        ["name", "category", "appearance", "owner", "importance",
                         "reference_prompt_zh", "reference_prompt_en"])
-    scenes = _norm_list(bible.get("scenes"), None,
-                        ["name", "location", "appearance", "scene_lighting", "reference_prompt_zh", "reference_prompt_en"])
+    scenes = normalize_scenes_meta(_norm_list(
+        bible.get("scenes"), None,
+        ["name", "location", "appearance", "scene_lighting", "int_ext", "time_of_day",
+         "reference_prompt_zh", "reference_prompt_en"]))
     if not characters:
         raise LLMError("模型未返回有效角色设定，转换中止")
     # 风格：以调用方传入的 style 为准 + 确定性补写（模型不得自写风格，统一由此收尾）
@@ -2473,6 +2699,12 @@ def convert_novel_to_script(client, novel_meta: dict, novel_text: str, style: st
     # 随机倒向一边、质检必然抓到另一边 → 无限重试、整集跑不过。落盘前按 appearance 收敛。
     asset_prompt_kit.reconcile_script({"characters": characters, "shots": shots})
 
+    # 场次表（2026-10-02）：落盘前重新编号并收表 —— 覆盖率补生成/一致性修复新增的
+    # 镜头也要落在正确的【第N场】里，不能出现没场次号的孤儿镜头。
+    # 先编号（就地写回每镜 scene_no / scene_heading），再只读取器收表。
+    # 注意：assign_scene_numbers 返回的是**场次表**，collect_scene_flow 要的是**镜头表**。
+    assign_scene_numbers(shots)
+    scene_flow = collect_scene_flow(shots)
     script = {
         "title": bible["title"],
         "theme": bible["theme"],
@@ -2480,10 +2712,13 @@ def convert_novel_to_script(client, novel_meta: dict, novel_text: str, style: st
         "characters": characters,
         "items": items,
         "scenes": scenes,
+        # 场次表：按出场顺序的【第N场】内外景·地点·时间，供前端场记板与成片字幕定位
+        "scene_flow": scene_flow,
         "shots": shots,
         "production_notes": {
             "total_shots": len(shots),
             "estimated_duration": len(shots) * 5,
+            "scene_count": len(scene_flow),
             "style_guide": str((bible.get("production_notes") or {}).get("style_guide") or "")[:300],
         },
         "metadata": {
@@ -2870,6 +3105,17 @@ def split_chapter_for_episodes(chapter: dict, text: str = "",
 
     返回 `[{"part": 1..N, "parts": N, "start": int, "end": int, "char_count": int}]`。
     """
+    # 2026-10-03 用户决策（收口）：默认「一章 = 一集」，不按内容体量拆分。
+    # ⚠️ 开关放在**本函数入口**而非各调用方 —— 托管/手动批量/断点提议预览
+    # （split-plan）/run-once 全部经由这里，口径必然一致（此前只改 autopilot
+    # 调用方时，「前置解析」卡片仍按旧口径提「拆 N 集/需人工确认」，口径打架）。
+    # 设 env MJSCXT_EPISODE_SPLIT=1 可恢复按内容体量拆分。
+    if str(os.environ.get("MJSCXT_EPISODE_SPLIT") or "").strip().lower() \
+            not in ("1", "true", "yes", "on"):
+        return [{"part": 1, "parts": 1,
+                 "start": int(chapter.get("start") or 0),
+                 "end": int(chapter.get("end") or 0),
+                 "char_count": int(chapter.get("char_count") or 0)}]
     seg_start = int(chapter.get("start") or 0)
     seg_end = int(chapter.get("end") or 0)
     if seg_end < seg_start:
@@ -3096,8 +3342,10 @@ def convert_chapter_to_script(client, novel_meta: dict, novel_text: str, chapter
     items = _norm_list(bible.get("items"), 3,
                        ["name", "category", "appearance", "owner", "importance",
                         "reference_prompt_zh", "reference_prompt_en"])
-    scenes = _norm_list(bible.get("scenes"), 8,
-                        ["name", "location", "appearance", "scene_lighting", "reference_prompt_zh", "reference_prompt_en"])
+    scenes = normalize_scenes_meta(_norm_list(
+        bible.get("scenes"), 8,
+        ["name", "location", "appearance", "scene_lighting", "int_ext", "time_of_day",
+         "reference_prompt_zh", "reference_prompt_en"]))
     if not characters:
         raise LLMError("模型未返回有效角色设定，转换中止")
     # 风格：以调用方传入的 style 为准（模型的返回值可能是自我发挥，用户意图优先）
@@ -3196,6 +3444,10 @@ def convert_chapter_to_script(client, novel_meta: dict, novel_text: str, chapter
     asset_prompt_kit.reconcile_script({"characters": characters, "shots": shots})
 
     project_name = episode_project_name(novel_meta.get("name") or novel_title, episode_no)
+    # 场次表（2026-10-02）：落盘前重新编号并收表 —— 覆盖率补生成/一致性修复新增的
+    # 镜头也要落在正确的【第N场】里，不能出现没场次号的孤儿镜头。
+    assign_scene_numbers(shots)
+    scene_flow = collect_scene_flow(shots)
     script = {
         "title": bible["title"],
         "episode_no": int(episode_no),
@@ -3205,10 +3457,13 @@ def convert_chapter_to_script(client, novel_meta: dict, novel_text: str, chapter
         "characters": characters,
         "items": items,
         "scenes": scenes,
+        # 场次表：按出场顺序的【第N场】内外景·地点·时间，供前端场记板与成片字幕定位
+        "scene_flow": scene_flow,
         "shots": shots,
         "production_notes": {
             "total_shots": len(shots),
             "estimated_duration": len(shots) * 5,
+            "scene_count": len(scene_flow),
             # C⑥：style_guide 提升为项目级唯一配置（continuity 提供时优先，不再每集各写一套）
             "style_guide": str(_ctx_block(continuity_ctx, "style_guide_text")
                                or (bible.get("production_notes") or {}).get("style_guide") or "")[:300],

@@ -29,7 +29,10 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "make_sample", "build_prompt", "parse_patterns", "derive_patterns",
+    "build_structure_prompt", "structure_rows", "parse_structure",
+    "analyze_chapter_structure",
     "MAX_PATTERNS", "MAX_PATTERN_LEN", "SAMPLE_CHARS",
+    "STRUCTURE_PREVIEW_CHARS", "STRUCTURE_MAX_ROWS",
 ]
 
 # LLM 最多返回几条章节标题正则（防止模型失控生成一长串）
@@ -151,3 +154,168 @@ def derive_patterns(client, text: str, hint: str = "") -> list:
     else:
         logger.info("chapter_llm：LLM 未给出有效正则（或样本无章节标记），用纯正则切分")
     return pats
+
+
+# ===================== 章节目录结构体检（2026-10-02） =====================
+# 背景：CHAPTER_PATTERNS 用同一条正则匹配「第[数字][章回节卷篇集部]」，于是
+# 「第一卷：魔性不改」这种**卷标题**也会被切成一个独立章节 —— 它的正文为 0，
+# 下游按集取章就取到这个空壳，模型只能凭 11 个字的标题凭空编剧本
+#（实测：《蛊真人》第 1 集产出 8 个镜头全是自造的四字口号，整半章内容丢失，
+# 覆盖率却报 100% —— 因为根本没有正文单元可核对）。
+# novel_parser.collapse_shell_chapters 用「去掉标题行后正文近空」这一硬信号解决了
+# 标准情形；但真实书籍的目录千奇百怪（分卷里套章、卷末有番外、短章本来就短、
+# 标题格式不规则……），纯规则判断不了「这个短条目到底是不是真章节」。
+# 所以这里让 LLM 像人一样读目录 + 抽读开头，判断哪些条目只是结构标题、哪些是正文，
+# 并给出「真正的第一章」——在生成剧本之前完成这次体检（结果缓存进 meta，全书一次）。
+STRUCTURE_PREVIEW_CHARS = 160
+STRUCTURE_MAX_ROWS = 200
+
+_STRUCTURE_SYSTEM_PROMPT = (
+    "你是「小说章节目录结构分析器」。用户会给你一本书的章节目录，每项含序号、标题、"
+    "字数，以及该项开头的正文抽读。请判断这本书的真实结构，指出哪些条目只是"
+    "结构标题（如「第一卷 X」「第一部 X」这类分卷/分部名，本身没有正文），"
+    "哪些才是真正的正文章节，并给出第一个真正的正文章节的序号。"
+)
+
+
+def structure_rows(chapters, text, preview_chars=STRUCTURE_PREVIEW_CHARS,
+                   max_rows=STRUCTURE_MAX_ROWS):
+    """把章节表压成给 LLM 看的目录行（序号 / 标题 / 字数 / 开头正文抽读）。
+
+    超长目录只取前段 + 末尾 5 条：分卷问题几乎都出在开头，末尾用来让模型确认
+    「后面的条目都是正常章节」，避免它只看前若干行就误判全书结构。
+    """
+    if not chapters:
+        return []
+    lim = max(20, int(max_rows or STRUCTURE_MAX_ROWS))
+    picked = list(chapters[:lim])
+    if len(chapters) > lim:
+        picked = picked + list(chapters[-5:])
+    out = []
+    for ch in picked:
+        if not isinstance(ch, dict):
+            continue
+        try:
+            seg = text[int(ch.get("start") or 0):int(ch.get("end") or 0)]
+        except (TypeError, ValueError):
+            seg = ""
+        nl = seg.find("\n")
+        body = seg[nl + 1:] if nl >= 0 else ""
+        body = re.sub(r"\s+", " ", body).strip()
+        out.append({
+            "index": ch.get("index"),
+            "title": str(ch.get("title") or "").strip(),
+            "char_count": ch.get("char_count"),
+            "preview": body[: int(preview_chars or STRUCTURE_PREVIEW_CHARS)],
+        })
+    return out
+
+def _structure_example():
+    return ('{"structure": "卷-节", "volume_indices": [1], "content_count": 2348, '
+            '"first_content_index": 2, "first_content_title": "第一节：xxx", '
+            '"notes": "一句话说明"}')
+
+
+def build_structure_prompt(rows, novel_title=""):
+    """构造「章节目录结构分析」提示词（严格 JSON 输出）。纯函数，可离线单测。"""
+    lines = []
+    for r in (rows or []):
+        prev = (r.get("preview") or "").strip() or "（无正文，仅标题行）"
+        lines.append("[%s] %s | %s字 | 开头：%s" % (
+            r.get("index"), r.get("title"), r.get("char_count"), prev))
+    body = "\n".join(lines) or "（目录为空）"
+    title_block = ("书名：%s\n" % novel_title) if (novel_title or "").strip() else ""
+    return (
+        title_block
+        + "下面是这本书的章节目录（按出现顺序）。请判断：\n"
+        "1. 哪些序号的条目**只是结构标题**（分卷/分部名，本身没有正文内容）；\n"
+        "2. 哪些序号是**真正的正文章节**；\n"
+        "3. 第一个真正的正文章节的序号；\n"
+        "4. 用一句话概括这本书的层级结构（如「卷-节」「卷-章」「章」）。\n\n"
+        "判断原则：\n"
+        "- 标题是「第N卷/第N部/第N篇」且开头**没有成段正文**的 → 结构标题，不是正文章节；\n"
+        "- 标题是「第N章/第N节/第N回」且有成段正文的 → 正文章节；\n"
+        "- 不要因为标题里出现「卷」字就一律判为结构标题 —— 必须结合**有没有正文**；\n"
+        "- 短但确有正文的条目仍是正文章节，不要误判；\n"
+        "- 若整本目录都正常，volume_indices 返回空数组，first_content_index 返回 1。\n\n"
+        "只输出如下 JSON，不要解释、不要 markdown 代码块：\n"
+        + _structure_example() + "\n\n"
+        "=== 章节目录 ===\n"
+        + body
+    )
+
+def parse_structure(resp):
+    """从 LLM 响应里解析并校验「目录结构」判决（纯函数，可离线测）。
+
+    返回 {} 表示无法采信（调用方沿用规则结果）。
+    """
+    data = resp
+    if isinstance(resp, str):
+        try:
+            data = json.loads(resp)
+        except (ValueError, TypeError):
+            data = {}
+    if not isinstance(data, dict):
+        return {}
+
+    def _int(v):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
+    raw_vols = data.get("volume_indices")
+    if isinstance(raw_vols, str):
+        raw_vols = re.findall(r"\d+", raw_vols)
+    vols = []
+    if isinstance(raw_vols, list):
+        for v in raw_vols:
+            n = _int(v)
+            if n is not None and n > 0 and n not in vols:
+                vols.append(n)
+    vols.sort()
+    first = _int(data.get("first_content_index"))
+    if first is not None and first <= 0:
+        first = None
+    out = {
+        "structure": str(data.get("structure") or "").strip(),
+        "volume_indices": vols,
+        "content_count": _int(data.get("content_count")),
+        "first_content_index": first,
+        "first_content_title": str(data.get("first_content_title") or "").strip(),
+        "notes": str(data.get("notes") or "").strip(),
+    }
+    if not vols and first is None and not out["structure"]:
+        return {}
+    return out
+
+
+def analyze_chapter_structure(client, chapters, text, novel_title=""):
+    """让 LLM 体检章节目录结构（失败返回 {}，绝不抛给调用方）。
+
+    返回见 parse_structure。LLM 未配置 / 调用失败 / 结论不可采信一律返回 {}，
+    调用方据此沿用 novel_parser.collapse_shell_chapters 的规则结果。
+    """
+    if client is None or not chapters or not text:
+        return {}
+    rows = structure_rows(chapters, text)
+    if not rows:
+        return {}
+    prompt = build_structure_prompt(rows, novel_title)
+    chat = getattr(client, "chat_json_robust", None)
+    if not callable(chat):
+        logger.warning("chapter_llm：客户端无 chat_json_robust，跳过目录结构体检")
+        return {}
+    try:
+        resp = chat(prompt, system=_STRUCTURE_SYSTEM_PROMPT, max_tokens=1200)
+    except Exception as e:  # noqa: BLE001  任何 LLM 侧失败都降级
+        logger.warning("chapter_llm：目录结构体检失败，沿用规则切分：%s", e)
+        return {}
+    verdict = parse_structure(resp)
+    if verdict:
+        logger.info("chapter_llm：目录结构体检 → structure=%s 结构标题=%s 首个正文章=%s",
+                    verdict.get("structure") or "?", verdict.get("volume_indices"),
+                    verdict.get("first_content_index"))
+    else:
+        logger.info("chapter_llm：目录结构体检未给出可采信结论，沿用规则切分")
+    return verdict

@@ -658,6 +658,11 @@ def _check_h3(prompt: str, ctx, style, expect_refs: Optional[bool] = None,
     if _CN_CAMERA_RE.search(prompt):
         issues.append("镜头行使用中文景别（如「[Shot 1] 中景：」）："
                       "模板为英文景别短语（A medium shot / a close-up）")
+    # ⑤ 风格句叠词（2026-10-04）：style_suffix_en 产出「Chinese animated style」，
+    #   风格首句再拼一个 " style" → "Chinese animated style style"。实测出现在导出
+    #   工作流的每一段提示词里（确定性可判，且自愈可修）。
+    if re.search(r"\bstyle\s+style\b", prompt, re.IGNORECASE):
+        issues.append("风格句出现重复的「style style」叠词：风格声明冗余，削弱风格权重")
     return {"issues": issues, "fatal": fatal}
 
 
@@ -673,6 +678,12 @@ def _repair_h3(prompt: str, ctx, style) -> Tuple[str, List[str]]:
     """
     repairs: List[str] = []
     out = prompt
+    # ⭐ 2026-10-04：折叠风格句叠词「… style style」→「… style」。
+    #   纯确定性文本规整，不改变语义，属最安全的一类自愈。
+    _dedup = re.sub(r"\bstyle(\s+)style\b", r"style", out, flags=re.IGNORECASE)
+    if _dedup != out:
+        out = _dedup
+        repairs.append("折叠风格句重复的「style style」叠词")
     if out and not _SPOKEN_RE.search(out) and not _NO_DIALOGUE_RE.search(out):
         # 无台词镜：在 detailed_description 段内**最后一条 [Shot 节拍** 上补
         # 「no one speaks / no voice-over」。

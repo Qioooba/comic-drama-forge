@@ -715,11 +715,33 @@ def delete_project(ref: str, confirm: bool = False) -> dict:
         logger.error("删除项目 %s 时清理 continuity 缓存失败（主删除已成功，不影响）：%s", key, e)
         continuity_purge["error"] = str(e)
 
+    # 关联清理（小说库）：全局小说库与项目是「素材 vs 生产工作区」的解耦关系，删项目
+    # 默认**不**删小说（同一素材可复用到别的项目）。但当且仅当「该小说不再被任何其它
+    # 项目绑定」时，说明它已无归属 → 一并软删进回收站（可恢复），避免「删完项目，
+    # 素材库里还挂着一堆再也用不上的小说」的用户实测困惑。
+    novel_purge = {"purged": False, "novel_id": "", "report": None, "error": None}
+    _novel_id = str(rec.get("novel_id") or "").strip()
+    if _novel_id:
+        _still_bound = bool([p for p in load_index().get("projects", [])
+                             if p.get("novel_id") == _novel_id])
+        if not _still_bound:
+            try:
+                import novel_parser
+                novel_purge["report"] = novel_parser.remove_novel(
+                    NOVELS_DIR, _novel_id, trash_dir=os.path.join(PROJECT_TRASH_DIR, "_novels"))
+                novel_purge["purged"] = True
+                novel_purge["novel_id"] = _novel_id
+            except Exception as e:  # noqa: BLE001 - 关联簿记：失败不阻断主删除，只响亮降级
+                logger.error("删除项目 %s 时清理孤儿小说 %s 失败（主删除已成功，不影响）：%s",
+                             key, _novel_id, e)
+                novel_purge["error"] = str(e)
+
     return {"project": rec, "trash_dir": trash_root, "moved": moved,
             "skipped": skipped, "recoverable": True,
             "ai_chat_purge": ai_purge, "tasks_db_purge": db_purge,
             "autopilot_purge": autopilot_purge,
-            "continuity_purge": continuity_purge}
+            "continuity_purge": continuity_purge,
+            "novel_purge": novel_purge}
 
 
 # =====================================================================

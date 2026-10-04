@@ -221,16 +221,22 @@ output/
     └── {项目名}/{项目名}.mp4
 ```
 
-## 🔄 完整流程（6 步）
+## 🔄 完整流程（8 步）
 
-| 步骤 | 功能 | 技术 | 工作流模板 |
-|------|------|------|-----------|
-| 1. 剧本生成 | 主题 → 结构化 JSON（角色/物品/场景/镜头） | 文本分析模型（OpenAI 兼容·任意厂商） | — |
-| 2. 角色资产 | 基础图 + 多视图（正/左/右/背） | QwenImage2.1 + TE-Speed | 角色生成_Qwen21.json + 分镜生成_Qwen21.json |
-| 3. 物品资产 | 基础图 + 3D多视角（正/左45/右45/俯视） | QwenImage2.1 + TE-Speed | 物品生成_Qwen21.json + 分镜生成_Qwen21.json |
-| 4. 场景资产 | 基础图 + 3D多视角（正/左45/右45/俯视） | QwenImage2.1 + TE-Speed | 场景生成_Qwen21.json + 分镜生成_Qwen21.json |
-| 5. 视频生成 | 动态段数无缝视频 + 原生音频 | MiniMax H3 Director（Ref2VA） | minimax_h3_director_二采_加速.json |
-| 6. 成片输出 | 合并 + 字幕 | FFmpeg | — |
+| # | 步骤 | 功能 | 技术 | 工作流模板 |
+|---|------|------|------|-----------|
+| 1 | 剧本生成 `script` | 主题 → 结构化 JSON（角色/物品/场景/镜头） | 文本分析模型（OpenAI 兼容·任意厂商） | — |
+| 2 | 配音先行 `tts_pre` | 为**每个角色**生成一段参考音色音频（落 `voice_bank`），供视频生成锁定角色音色 | QwenTTS | — |
+| 3 | 资产 `assets` | 角色/物品/场景的基础图 + 多视角（正/左45/右45/俯视） | QwenImage2.1 + TE-Speed | 角色生成_Qwen21.json / 物品生成_Qwen21.json / 场景生成_Qwen21.json + 分镜生成_Qwen21.json |
+| 4 | 分镜图 `storyboard` | 逐镜出图（带 AI 质检与不合格重生成） | QwenImage2.1 + TE-Speed | 分镜生成_Qwen21.json |
+| 5 | 尾帧 `keyframe` | 关键帧驱动（整集模式下恒关） | — | — |
+| 6 | 视频生成 `video` | 整集一次生成的连续无缝视频，**自带 H3 原生音轨（角色对白）** | MiniMax H3 Director（Ref2VA） | h3_director_r2v_单采.json |
+| 7 | 超分 `upscale` | 对**集级原片**做 FlashVSR 超分（fail-open：环境不可用/失败只记跳过，不拖垮成片） | FlashVSR | — |
+| 8 | 成片合成 `final` | **优先采用超分产物**（落空回退整集原片）+ 字幕，输出到 `final/` | FFmpeg | — |
+
+> **配音与音画混音不是独立环节**：H3 视频自带角色对白原生音轨，`tts_pre` 只负责备好每角色参考音色
+> （视频生成时以 `audioMode=generate` 用参考音色**锁定音色**、台词由模型按各段**自生成**）。
+> `step_tts` / `step_mix` 的函数保留在代码里（不在流水线序列内），仅作回滚与手工端点用。
 
 ## 📝 剧本 JSON 格式
 
@@ -292,7 +298,7 @@ python app.py
 或直接双击 `run_app.bat`
 
 ### 3. 访问 Web 界面
-打开 **http://localhost:5000**
+打开 **http://localhost:5210**（默认端口；可用环境变量 `APP_PORT` 覆盖）
 
 ### 4. 操作流程
 1. 输入故事主题 → 点击"生成剧本"（云端 LLM）

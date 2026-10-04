@@ -15,11 +15,11 @@
 ======================  ==============================  ==============================
                         H3EpisodeBuilder（旧）            H3DirectorBuilder（本模块）
 ======================  ==============================  ==============================
-工作流结构              10 个子图实例 + 9 个 join         扁平单实例（23 节点）
+工作流结构              10 个子图实例 + 9 个 join         扁平单实例（12 节点，单采）
 段数来源                由调用方分镜数**重建拓扑**        一个 ``MiniMaxH3Director`` 吃整条 timeline
 段间衔接                ``H3ContinuousSeamlessJoinV14``   插件原生「段间引导」（尾 22 帧钉进下一段）
 参考图                  ``qwen_reference_1/2`` 两个槽      ``segment.refs`` **逐段**（最多 9 张/段）
-二采                    子图内部自带                       外接 ``MiniMaxH3DirectorRefine``
+二采                    子图内部自带                      单采模板无二采；二采回退模板外接 ``MiniMaxH3DirectorRefine``
 ======================  ==============================  ==============================
 
 因此**不能**把 Director 工作流塞给 ``H3EpisodeBuilder``——它没有 ``definitions.subgraphs``，
@@ -30,11 +30,10 @@
 1. 按调用方分镜程序化生成 ``timeline_data``（``segments`` / ``totalFrames`` / refs）；
 2. 注入**逐段**``segment.refs``（参考图走 ComfyUI ``input/`` 相对文件名，
    每段的第 j 张 = 该段提示词里的 ``<Picture {j+1}>``）；
-3. 改写 SaveVideo 的 ``filename_prefix``（新模板输出链已是**单一成片**：
-   ``Director.images → CreateVideo → NvidiaDLSSFrameInterpolation →
-   SaveVideo``，不再有「一采」那路 SaveVideo 需要裁；DLSS NR 画质增强节点
-   已删，输出链保留补帧但去掉降噪/放大），让「一次调用 = 一个 mp4」，
-   保住 ``shot_XX.mp4`` 契约；
+3. 改写 SaveVideo 的 ``filename_prefix``（2026-10-04 起的单采模板输出链已是
+   **单一成片**：``Director.images → CreateVideo → SaveVideo``；旧的二采回退模板
+   输出链含 ``NvidiaDLSSFrameInterpolation`` 补帧，构建器原样保留，让
+   「一次调用 = 一个 mp4」，保住 ``shot_XX.mp4`` 契约；
 4. 把一采链上的 ``SolAttnPatch`` 参数**完全跟随模板**（``_SOLATTN_ALIGNED_*``，
    不注入任何 LowVRAM / ChunkFF / Sage 节点——``_insert_lowvram_patches`` /
    ``_insert_refine_accel_chain`` 均已退役）。
@@ -88,6 +87,8 @@ MIN_SEGMENT_FRAMES = 5
 MAX_REFERENCE_IMAGES = 9
 #: 参考音频槽位上限（官方 Reference to Video autogrow：ref_audio_0..2，``<Audio N>``）
 MAX_REFERENCE_AUDIOS = 3
+#: 段级 LoRA 条数上限（与插件 ``segment_loras.normalize_lora_rows`` 一致，=8）
+MAX_SEGMENT_LORAS = 8
 #: 段间引导可承接的帧数（插件 ``snap_context_frames`` 只认这四档）
 CONTINUITY_OVERLAP_CHOICES = (5, 22, 39, 56)
 CONTINUITY_OVERLAP_DEFAULT = 22
@@ -116,23 +117,35 @@ _REFINE_POS: Dict[str, int] = {
     "tile_overlap": 17,
 }
 
-#: SolAttnPatch 的目标参数（一采链上的唯一 SolAttnPatch）。
-#: 2026-09-27 用户定档：**完全跟随最新模板**（``minimax_h3_director_二采_加速.json``，
-#: 23 节点版，节点 id=53）逐字段对齐，不再强制覆盖任何字段。
-#: 新模板实测：``tau=1.2 / int8_qk=False / sink_conditioning=exact_kv /
-#: morton=False / morton_curve=3d / verbose=True / dense_blocks=0-5``。
-#: ⚠️ 历史包袱（2026-09-27 竖屏实测）：``morton=True/3d`` 在本机 8GB 竖屏下曾
-#: 稳定 ``Fatal Python error: Aborted``（栈顶 ``_morton_h3.py``）。现模板已把
-#: ``morton`` 改回 ``False``（且 ``morton_curve=3d``），用户选择**完全跟随**，
-#: 不再在构建器里强制覆盖——改这里＝改所有出片口径，只在用户明确要求时动。
-_SOLATTN_ALIGNED_WV = [1.2, 0.2, 0.9, 4096, False, "exact_kv", False,
-                       "3d", True, True, False, "0-5"]
+#: SolAttnPatch 的目标参数（采链上的唯一 SolAttnPatch）。
+#: 2026-10-04 用户实测定档：视频模板换成用户**亲自跑通**的 12 节点单采工作流
+#: ``h3_director_r2v_单采.json``（节点 id=87），SolAttnPatch 口径**逐字段跟随
+#: 该实测模板**（不再沿用 2026-09-27 二采模板的 tau=1.2/int8_qk=False/exact_kv/
+#: verbose=True/dense_blocks=0-5）。实测值：``tau=1.3 / int8_qk=True /
+#: sink_conditioning=exact_kv_and_rows / verbose=False / dense_blocks=0-2,-1``。
+#: ⚠️ 安全提示（2026-09-27 竖屏实测，**继续保留**）：``morton=True`` 在本机 8GB
+#: 竖屏下曾稳定 ``Fatal Python error: Aborted``（栈顶 ``_morton_h3.py``）。
+#: 实测模板把 ``morton`` 设为 ``False``（且 ``morton_curve=3d``），用户选择
+#: **完全跟随**，故这里也保持 ``morton=False``；改这里＝改所有出片口径，
+#: 只在用户明确要求时动。
+#: 下方位置列表与 named 字典必须**逐项一一对应（共 12 项、同序）**：
+#: 位置下标取自模板 ``SolAttnPatch.inputs`` 里带 widget 的字段声明顺序。
+_SOLATTN_ALIGNED_WV = [1.3, 0.2, 0.9, 4096, True, "exact_kv_and_rows", False,
+                       "3d", True, False, False, "0-2,-1"]
 _SOLATTN_ALIGNED_NAMED = {
-    "tau": 1.2, "start_percent": 0.2, "end_percent": 0.9, "min_tokens": 4096,
-    "int8_qk": False, "sink_conditioning": "exact_kv", "morton": False,
-    "morton_curve": "3d", "int8_pv": True, "verbose": True,
-    "use_tma": False, "dense_blocks": "0-5",
+    "tau": 1.3, "start_percent": 0.2, "end_percent": 0.9, "min_tokens": 4096,
+    "int8_qk": True, "sink_conditioning": "exact_kv_and_rows", "morton": False,
+    "morton_curve": "3d", "int8_pv": True, "verbose": False,
+    "use_tma": False, "dense_blocks": "0-2,-1",
 }
+# 代码内断言：位置列表与 named 字典**逐项同序一致**（防日后单边改一处）。
+assert list(_SOLATTN_ALIGNED_NAMED.keys()) == [
+    "tau", "start_percent", "end_percent", "min_tokens", "int8_qk",
+    "sink_conditioning", "morton", "morton_curve", "int8_pv", "verbose",
+    "use_tma", "dense_blocks",
+], "SolAttnPatch named 字段顺序与位置列表不再一一对应"
+assert list(_SOLATTN_ALIGNED_NAMED.values()) == _SOLATTN_ALIGNED_WV, (
+    "SolAttnPatch 位置列表与 named 字典取值不一致")
 #: 一采链上允许被「显存补丁」跨过的**单入单出 MODEL 直通节点**。
 #: 用户会在链尾自行挂加速节点（当前是 ``EasyCache``）；补丁插在 ``SolAttnPatch``
 #: 之后、这些节点之前，从而保持它们「包在最外层」的相对位置不变。
@@ -361,6 +374,8 @@ class H3DirectorBuilder:
     def _build_timeline(self, seg_list: List[dict], *, refs: Sequence[str],
                         seg_refs: Optional[Sequence[Sequence[str]]],
                         seg_audios: Optional[Sequence[Sequence[str]]],
+                        common_ref_audios: Optional[Sequence[str]] = None,
+                        common_prompt: Optional[str] = None,
                         common_enabled: bool,
                         seg_ref_start: int = 0,
                         width: int, height: int, fps: float,
@@ -387,11 +402,20 @@ class H3DirectorBuilder:
         #    （公共图一张不生效且零报错）。K 由调用方传入（= len(global refs)）。
         ref_items = self._ref_items(refs)
         _seg_start = max(0, int(seg_ref_start or 0))
+        # ⭐ 公共参考音色（global.refAudios，2026-10-02 用户指定「取代逐段配音」）：
+        #    占 index 0..M-1（M = 公共音色数），公共段级共用同一套音色驱动口型/节奏；
+        #    取代逐段 QwenTTS 后段级 refAudios 置空（见 build() 的 common_ref_audios 分支）。
+        global_ref_audio_items = self._ref_audio_items(common_ref_audios)
 
         segments: List[dict] = []
         start = 0
         for i, (seg, frames) in enumerate(zip(seg_list, frames_each)):
             seg_start, start = start, start + frames
+            # ⭐ 段级 LoRA 透传（可选键）：调用方按场景在 ``seg["loras"]`` 挂规则行
+            #    （见 h3_segment_loras）。**仅当非空时**才写入段字典 —— 空则完全不加
+            #    该键 → 对没有场景 LoRA 的项目（旧 JSON / 关闭该功能的调用方）零行为变更。
+            #    插件在 ``editMode == "segment"`` 时按段采纳 ``segments[i].loras``。
+            _seg_loras = self._normalize_seg_loras(seg.get("loras"))
             segments.append({
                 "id": f"mscxt{i:04d}",
                 "start": seg_start,
@@ -423,6 +447,8 @@ class H3DirectorBuilder:
                 "continuityFromPrev": bool(i > 0),
                 "refImageSize": "match",
             })
+            if _seg_loras:
+                segments[-1]["loras"] = _seg_loras
 
         total = start
         output = {
@@ -461,13 +487,12 @@ class H3DirectorBuilder:
             "global": {
                 **(tpl_tl.get("global") or {}),
                 "taskType": TASK_TYPE_R2V,
-                # 留空：commonEnabled 时插件会把全局提示词拼在段提示词**前面**
-                # （``plan.py:concat_common_segment_prompt``，``gen_timeline.py:524``），
-                # 置空才能让 seg_prompt 精确等于项目自己构建的提示词。
-                # ⚠️ 这条是 commonEnabled=true 时的**隐性耦合**：一旦这里被填上内容，
-                #    每段提示词都会被加上同一段前缀（且顺序在段提示词之前）——
-                #    build() 末尾有守卫，见 ``_guard_global_prompt``。
-                "prompt": "",
+                # ⭐ 公共提示词（subject lock，2026-10-02 用户指定）：commonEnabled 时插件
+                #    把全局提示词**拼在每段提示词前面**（plan.py:concat_common_segment_prompt）。
+                #    这里由调用方传入「角色锁定 / subject_definitions」句（含
+                #    ``<Picture N>``/``<Audio N>`` 指代公共项），与段级提示词拼接成
+                #    「公共锁定 + 本镜叙事」。不传（None）→ 空串（零行为变更，段提示词=原样）。
+                "prompt": str(common_prompt or ""),
                 # ⭐ 全局 refs = **公共参考图**（用户 2026-09-30 拍板），只在
                 #    commonEnabled=true 时才会 merge 进每段（``gen_timeline.py:530``）：
                 #    插件按 index 合并、同 index 段级优先，故公共项占 index 0..K-1，
@@ -480,7 +505,7 @@ class H3DirectorBuilder:
                 "genImage": {"imageFile": ""},
                 "sourceWidth": width,
                 "sourceHeight": height,
-                "refAudios": [],
+                "refAudios": global_ref_audio_items,
                 "commonEnabled": bool(common_enabled),
                 "commonCollapsed": True,
                 "refVideos": [],
@@ -546,6 +571,53 @@ class H3DirectorBuilder:
             for i, name in enumerate(list(names or [])[:MAX_REFERENCE_AUDIOS])
             if str(name or "").strip()
         ]
+
+    @staticmethod
+    def _normalize_seg_loras(raw: Any) -> List[dict]:
+        """段级 LoRA 透传归一化（复刻插件 ``segment_loras.normalize_lora_rows`` 口径）。
+
+        调用方（``app/app.py``）在段字典上挂一个可选键 ``loras``——由
+        ``h3_segment_loras.select_loras_for_shot`` 按场景生成的规则行。本方法把它
+        归一化成插件真正接受的形状，**口径与插件一致**（不 import 插件，它在仓库外）：
+
+        * ``name``：取 ``name`` / ``lora`` / ``lora_name`` 第一个非空者（字符串化并去空白）；
+        * ``strength``：float，默认 ``1.0``，非法值回退 ``1.0``，最后 clamp 到 ``[-10, 10]``；
+        * ``active``：bool，默认 ``True``（字符串按 falsy 词判定，健壮化）；
+        * 空 ``name`` 跳过该行；
+        * 最多 ``MAX_SEGMENT_LORAS``（=8）条。
+
+        返回 ``list[dict]``；``raw`` 非 list/tuple 或全部无效 → ``[]``。
+        """
+        if not isinstance(raw, (list, tuple)):
+            return []
+        out: List[dict] = []
+        for item in raw:
+            if isinstance(item, str):
+                name = item.strip()
+                strength = 1.0
+                active = True
+            elif isinstance(item, dict):
+                name = str(item.get("name") or item.get("lora")
+                           or item.get("lora_name") or "").strip()
+                try:
+                    strength = float(item.get("strength", 1.0))
+                except (TypeError, ValueError):
+                    strength = 1.0
+                raw_active = item.get("active", True)
+                if isinstance(raw_active, str):
+                    active = raw_active.strip().lower() not in (
+                        "", "0", "false", "no", "off")
+                else:
+                    active = bool(raw_active)
+            else:
+                continue
+            if not name:
+                continue
+            strength = max(-10.0, min(10.0, strength))
+            out.append({"name": name, "strength": strength, "active": active})
+            if len(out) >= MAX_SEGMENT_LORAS:
+                break
+        return out
 
     # ------------------------------------------------------------------ 图改造
     def _drop_pre_refine_branch(self, nodes: List[dict], links: List[list]) -> List[int]:
@@ -997,6 +1069,8 @@ class H3DirectorBuilder:
     def build(self, segments: Sequence[dict], *, refs: Sequence[str] = (),
               seg_refs: Optional[Sequence[Sequence[str]]] = None,
               seg_audios: Optional[Sequence[Sequence[str]]] = None,
+              common_ref_audios: Optional[Sequence[str]] = None,
+              common_prompt: Optional[str] = None,
               common_enabled: Optional[bool] = None,
               width: Optional[int] = None, height: Optional[int] = None,
               frame_rate: float = FPS_DEFAULT, seed: Optional[int] = None,
@@ -1042,7 +1116,11 @@ class H3DirectorBuilder:
             raise ValueError(f"H3DirectorBuilder.build: frame_rate 非法 {frame_rate}")
 
         if common_enabled is None:
-            common_enabled = bool([x for x in (refs or []) if str(x or "").strip()])
+            _has_common = (
+                bool([x for x in (refs or []) if str(x or "").strip()])
+                or bool([x for x in (common_ref_audios or []) if str(x or "").strip()])
+                or bool(str(common_prompt or "").strip()))
+            common_enabled = _has_common
         common_enabled = bool(common_enabled)
         # ⭐ 公共块占用 index 0..K-1（K = 公共图张数，与 _ref_items 的清洗口径一致）。
         #    段级 refs 的 index 必须让开这 K 个槽位（见 _ref_items / _build_timeline）。
@@ -1107,6 +1185,8 @@ class H3DirectorBuilder:
 
         timeline = self._build_timeline(
             seg_list, refs=refs, seg_refs=seg_ref_lists, seg_audios=seg_audio_lists,
+            common_ref_audios=common_ref_audios,
+            common_prompt=common_prompt,
             common_enabled=common_enabled, seg_ref_start=ref_offset,
             width=w, height=h, fps=fps, frames_each=frames_each,
             ref_max_size=rmax, continuity=continuity, overlap=continuity_overlap,
@@ -1115,13 +1195,17 @@ class H3DirectorBuilder:
 
         # ---- 守卫 A：commonEnabled 时 global.prompt 会被**拼在段提示词前面** ----
         # 插件 ``concat_common_segment_prompt(common, segment)``（plan.py:201）在
-        # r2v/r2i + commonEnabled 时把全局提示词接到每段提示词**之前**。项目自己的
-        # 完整提示词放在 seg.prompt 里，全局那句一旦非空就会污染全集 → 这里守卫。
+        # r2v/r2i + commonEnabled 时把全局提示词接到每段提示词**之前**。
+        # 2026-10-02：``global.prompt`` 改由调用方主动传入 ``common_prompt``（subject lock）。
+        # 故守卫只在「未主动提供公共提示词（common_prompt 为空）但 global.prompt 仍非空」
+        # 时清空 —— 那种非空只能是模板残留（会污染全集），主动提供的要保留。
         _gbl_prompt = str((timeline.get("global") or {}).get("prompt") or "").strip()
-        if timeline.get("global", {}).get("commonEnabled") and _gbl_prompt:
+        _intentional_common_prompt = bool(str(common_prompt or "").strip())
+        if timeline.get("global", {}).get("commonEnabled") and _gbl_prompt \
+                and not _intentional_common_prompt:
             logger.warning(
-                "H3DirectorBuilder：commonEnabled=true 但 global.prompt 非空（%d 字），"
-                "插件会把它拼在每段提示词前面 → 已强制清空", len(_gbl_prompt))
+                "H3DirectorBuilder：commonEnabled=true 但 global.prompt 非空（%d 字）且未主动"
+                "提供公共提示词，疑似模板残留 → 已强制清空", len(_gbl_prompt))
             timeline["global"]["prompt"] = ""
 
         # ---- 守卫 B：槽位 index 与提示词 ``<Picture N>`` 必须一一对应 ----
@@ -1188,19 +1272,20 @@ class H3DirectorBuilder:
             pre = [n for n in nodes if n.get("type") == "SaveVideo"]
             save_video_pre = pre[-1]["id"] if len(pre) > 1 else None
 
-        # ---- 加速链对齐（2026-09-27 用户定档：纯跟随模板，停用代码注入） ----
-        # 最新模板（minimax_h3_director_二采_加速.json，23 节点版）自带**两条独立加速链**：
-        #   一采链：UNETLoader → LoraLoader → PathchSage → TESpeed → SolAttnPatch → EasyCache → Director
-        #   二采链：UNETLoader → LoraLoader → PathchSage → TESpeed → EasyCache → { BasicScheduler, Refine }
-        # （二采链**无** SolAttnPatch；两链各自独立，EasyCache 各一个），输出链：
-        #   Director.images → CreateVideo → NvidiaDLSSFrameInterpolation → SaveVideo
-        # （新增 DLSS 帧插值 + MiniMaxH3TRTVAELoader 替代 VAELoader；DLSS NR 画质增强
-        #   节点 DLSSNR_Video 已删，补帧帧直接进 SaveVideo，画质改由 FlashVSR 超分承担）。
-        # 模板**不再含** MiniMaxLowVRAMAttention / MiniMaxChunkFeedForward /
-        # MemoryEfficientSagePatch，也不再有两路 SaveVideo。
+        # ---- 加速链对齐（2026-10-04 用户定档：换单采模板，纯跟随） ----
+        # 视频模板已切到用户**亲自跑通**的 12 节点单采工作流
+        # ``h3_director_r2v_单采.json``（单实例、**单采**，无二采链）：
+        #   模型链：UNETLoader → LoraLoader → PathchSage → TESpeed → SolAttnPatch → EasyCache → Director
+        #   输出链：Director.images → CreateVideo → SaveVideo
+        # 模板**不含** MiniMaxH3DirectorRefine / BasicScheduler / NvidiaDLSSFrameInterpolation /
+        # 第二通道 UNETLoader/LoraLoader，也不含 MiniMaxLowVRAMAttention /
+        # MiniMaxChunkFeedForward / MemoryEfficientSagePatch。
         # 因此不再程序化注入任何加速节点（_insert_lowvram_patches /
         # _insert_refine_accel_chain 均已退役）——只同步 SolAttnPatch 参数
-        # （完全跟随模板，见 _SOLATTN_ALIGNED_*）。
+        # （完全跟随模板，见 _SOLATTN_ALIGNED_*；模板字面已与该常量一致）。
+        # 旧二采模板 ``minimax_h3_director_二采_加速.json`` 保留为回退
+        # （``WORKFLOW_TEMPLATE["h3_video_refine"]``），本构建器对两种模板都能工作
+        # （refine 节点缺失时 refine=None，二采开关自动降级为 no-op）。
         accel_added: Dict[str, int] = {}
         if align_accel_chain:
             sol = next((n for n in nodes if n.get("type") == "SolAttnPatch"), None)

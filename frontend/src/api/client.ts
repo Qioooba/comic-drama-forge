@@ -626,6 +626,10 @@ export const videoApi = {
     episode_no?: number;
     mode?: VideoMode;
     timeout_per_segment?: number;
+    /** 按场次生成（2026-10-03）：只生成/重做这些场（如 [3] = 只重做第 3 场） */
+    only_scenes?: number[];
+    /** true = 覆盖已有场次视频（「重做本场」必带） */
+    overwrite?: boolean;
   }) =>
     request<{
       success: boolean;
@@ -834,21 +838,95 @@ export const qcApi = {
   }) => request<any>('/qc/prompt', { method: 'POST', body: JSON.stringify(data) }),
 };
 
+// --- Episode scenes（按场次生成，2026-10-03） ---
+// 视频生产已改为「按场次生成，最后拼接成整集」：每场一个 scene_XX.mp4，
+// 全部完成后拼成 epNN_full.mp4。GET /api/episode/scenes 按集列出场次与其就绪状态。
+export interface EpisodeSceneInfo {
+  scene_no: number;
+  heading?: string;
+  location?: string;
+  int_ext?: string;
+  time_of_day?: string;
+  shot_ids: (number | string)[];
+  shot_count: number;
+  /** 分镜已完成的镜数（名字带 ok 但语义是**计数**；与 shot_count 相等即该场分镜齐全） */
+  storyboard_ok: number;
+  /** 该场视频（scene_XX.mp4）是否已生成 */
+  video_ready: boolean;
+  /** 场次视频可播放/下载地址（未生成时为空） */
+  video_url?: string;
+}
+
+export interface EpisodeScenesResponse {
+  success: boolean;
+  scene_count: number;
+  /** 该集整集成片（epNN_full.mp4）是否已拼接完成 */
+  full_video_ready: boolean;
+  scenes: EpisodeSceneInfo[];
+}
+
 // --- Episodes ---
 export const episodesApi = {
   list: (novelId: string) =>
     request<EpisodeListResponse>(`/episodes/${encodeURIComponent(novelId)}`),
   get: (novelId: string, episodeNo: number) =>
     request<Episode>(`/episodes/${encodeURIComponent(novelId)}/${episodeNo}`),
+  // 按场次生成视图（2026-10-03）：某集的场次列表 + 各场分镜/视频就绪状态。
+  // project=项目键（后端 ?project= 约定），episode_no=集号。
+  scenes: (projectKey: string, episodeNo: number) =>
+    request<EpisodeScenesResponse>(
+      `/episode/scenes?project=${encodeURIComponent(projectKey)}&episode_no=${episodeNo}`
+    ),
   // 审计 P2：后端 api_novel_episodes_generate 必须带 chapters（章节号数组）或
   // start/end —— 空包体一律 400「未选择有效章节」（旧签名无 body，接线即坏）
+  // use_screenplay=true：以「文学剧本」为原文改写成结构化分镜剧本；
+  // 不传 / false 则沿用原文（小说正文）。可能以异步任务返回（带 task_id）。
   generate: (
     novelId: string,
-    body: { chapters?: number[]; start?: number; end?: number }
+    body: { chapters?: number[]; start?: number; end?: number; use_screenplay?: boolean }
   ) =>
-    request<{ success: boolean; episode_count: number }>(
+    request<{ success: boolean; episode_count: number; task_id?: string }>(
       `/novels/${encodeURIComponent(novelId)}/episodes/generate`,
       { method: 'POST', body: JSON.stringify(body) }
+    ),
+};
+
+// --- Screenplay（文学剧本：人审层；1章=1集，episode_no 即章号） ---
+// GET  /api/novels/<novel_id>/screenplay/<episode_no>?project=<project_key>
+//      → {exists, markdown, path, project_key}
+// POST /api/novels/<novel_id>/screenplay/generate
+//      body {chapter, project_id?/project_name?, style?} → {task_id, project_key, episode_no}
+//      异步任务：轮询 generation/status/<task_id> 至 completed 后再 GET 取正文。
+export interface ScreenplayDoc {
+  exists: boolean;
+  markdown: string;
+  path?: string;
+  project_key?: string;
+}
+
+export const screenplayApi = {
+  get: (novelId: string, episodeNo: number, projectKey?: string) => {
+    const q = projectKey ? `?project=${encodeURIComponent(projectKey)}` : '';
+    return request<ScreenplayDoc>(
+      `/novels/${encodeURIComponent(novelId)}/screenplay/${episodeNo}${q}`
+    );
+  },
+  generate: (
+    novelId: string,
+    chapter: number,
+    opts?: { projectId?: string; projectName?: string; style?: string }
+  ) =>
+    request<{ success?: boolean; task_id: string; project_key?: string; episode_no?: number }>(
+      `/novels/${encodeURIComponent(novelId)}/screenplay/generate`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          chapter,
+          project_id: opts?.projectId,
+          project_name: opts?.projectName,
+          style: opts?.style,
+        }),
+      }
     ),
 };
 

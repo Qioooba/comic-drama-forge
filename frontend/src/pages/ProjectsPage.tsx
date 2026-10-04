@@ -309,6 +309,7 @@ export function ProjectsPage() {
       }
 
       let novelId = '';
+      let parsedChapters: number | null = null;
 
       if (source === 'upload') {
         if (!pendingFile) {
@@ -323,6 +324,7 @@ export function ProjectsPage() {
           throw new Error(first?.error || t('upload.failed'));
         }
         novelId = first.novel.novel_id;
+        parsedChapters = first.novel.chapter_count ?? null;
       } else {
         novelId = selectedNovel;
         if (!novelId) {
@@ -350,6 +352,10 @@ export function ProjectsPage() {
 
       if (key) {
         window.location.hash = `/?p=${encodeURIComponent(key)}`;
+      }
+      // 上传路径成功后反馈解析出的章节数（"选择已有小说"路径无此信息）。
+      if (parsedChapters !== null) {
+        toast.success(t('project.chapterParsed', { n: parsedChapters }));
       }
     } catch (e) {
       setFormError(e instanceof Error ? e.message : String(e));

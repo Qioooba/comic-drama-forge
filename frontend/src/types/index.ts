@@ -359,6 +359,14 @@ export interface StoryboardShot {
     qc?: Record<string, unknown>;
     success?: boolean;
     blocked?: boolean;
+    /**
+     * 「正在生成中」：正式产物尚未落盘（exists=false），但中间产物
+     * （storyboard_scratch/shot_NN_tryK.png）已存在 → 可展示缩略图占位。
+     * 与 exists 语义分离：exists 仍只代表正式产物已落盘。
+     */
+    generating?: boolean;
+    /** 生成中缩略图地址（/api/storyboards/scratch/...）；未生成中时为空串 */
+    scratch_url?: string;
   };
   video?: {
     exists: boolean;

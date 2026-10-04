@@ -124,12 +124,24 @@ DEFAULT_RATIO: Tuple[int, int] = (16, 9)
 #: 显式声明 9:16 时才会出现（本注释里 544×960 / 864×480 的尺寸即属此列）。
 VIDEO_MEGAPIXELS_DEFAULT: float = 0.5
 
-#: 分镜图的画幅像素预算（MP）。2026-09-28 画质提升：0.5 → 0.8。
+#: 分镜图的画幅像素预算（MP）。
+#: 2026-09-28 画质提升：0.5 → 0.8；**2026-10-02 用户要求：0.8 → 1.5**。
 #: 依据：分镜图分辨率是**全链路画质天花板** —— 分镜模板 `分镜生成_Qwen21.json`
 #: 没有尺寸节点，输出画幅完全由 _unify_ref_canvas 把参考图 cover 到这个尺寸决定。
 #: 当年压到 0.5MP 是为规避 H3 竖屏崩溃，而该崩溃真因是 SolAttn morton 组合（已解决）
 #: → 预算可以恢复。env MJSCXT_STORYBOARD_MEGAPIXELS 可覆盖。
-STORYBOARD_MEGAPIXELS_DEFAULT: float = 0.8
+#: ⚠️ 1.5MP + 16:9 → 1632×928；1:1 → 1248×1248。8GB 卡若 OOM 可回落此常量
+#:    或临时 env 覆盖（无需改代码）。
+STORYBOARD_MEGAPIXELS_DEFAULT: float = 1.5
+
+#: 资产参考图（角色三视图 / 物品 / 场景原画）的画幅像素预算（MP）。
+#: **2026-10-02 新增**：此前资产链路走 `aspect_size(ratio)` 的**函数默认值 0.5**，
+#: 于是「角色设定图」这种**决定全链路角色一致性**的关键参考图只有 0.5MP
+#: （1:1 → 736×736）—— 面部/配饰细节不足，被分镜参考图放大后就是系统性脸漂。
+#: 与分镜同档取 1.5：资产图是**静态单图**（无时序、无 latent 拼接），显存压力
+#: 远小于视频链路，提档收益/风险比最高。
+#: env MJSCXT_ASSET_MEGAPIXELS 可覆盖。
+ASSET_MEGAPIXELS_DEFAULT: float = 1.5
 
 
 def storyboard_megapixels() -> float:
@@ -158,6 +170,20 @@ def video_megapixels() -> float:
     except (TypeError, ValueError):
         return VIDEO_MEGAPIXELS_DEFAULT
     return val if 0.05 <= val <= 4.0 else VIDEO_MEGAPIXELS_DEFAULT
+
+
+def asset_megapixels() -> float:
+    """资产参考图画幅像素预算（MP）：env ``MJSCXT_ASSET_MEGAPIXELS`` 优先。
+
+    越界 / 非法值一律回落 :data:`ASSET_MEGAPIXELS_DEFAULT`（不抛异常：
+    这是显存调优参数，读错不该让整批资产挂掉）。
+    """
+    raw = str(os.environ.get("MJSCXT_ASSET_MEGAPIXELS") or "").strip()
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return ASSET_MEGAPIXELS_DEFAULT
+    return val if 0.05 <= val <= 4.0 else ASSET_MEGAPIXELS_DEFAULT
 
 # --------------------------------------------------------------------------- #
 # 资产内置画幅（2026-09-22 需求：参考资产图的画幅**写死**，不跟随视频比例）
@@ -234,11 +260,17 @@ def is_portrait(style) -> bool:
     return bool(r) and r[0] < r[1]
 
 
-def aspect_size(ratio: Optional[Tuple[int, int]], megapixels: float = 0.5,
+def aspect_size(ratio: Optional[Tuple[int, int]], megapixels: float = ASSET_MEGAPIXELS_DEFAULT,
                 multiple: int = 32) -> Optional[Tuple[int, int]]:
     """画幅 → 宽高像素（复刻 ComfyUI ``nodes_resolution`` 的算法）
 
     ``(9, 16)`` + 0.5MP + 32 → ``(544, 960)``；``(16, 9)`` → ``(960, 544)``
+
+    ⚠️ ``megapixels`` 默认值 = :data:`ASSET_MEGAPIXELS_DEFAULT`（**2026-10-02 起 1.5**）。
+       历史为字面量 ``0.5``；改用常量是为了让「资产/兜底档位」只有**一个权威来源**
+       —— 此前资产链路（`app.py` 的资产生成）与 `aspect_label` 都不传此参，
+       于是静默吃 0.5，改档位时极易漏改（这正是「资产图只有 0.5MP」的成因）。
+       需要旧行为的调用方请显式传值（视频链路传 :func:`video_megapixels`）。
     """
     if not ratio:
         return None
@@ -792,9 +824,10 @@ def resolve(style, *, default_ratio: Optional[Tuple[int, int]] = None,
             megapixels: Optional[float] = None) -> Dict[str, object]:
     """一次拿到风格落地所需的全部派生值（供各生成入口统一调用）
 
-    ``megapixels``：画幅像素预算（MP）。``None`` 时沿用 ``aspect_size`` 的
-    默认 0.5（**行为与历史一致**）；视频链路显式传
-    :func:`video_megapixels` 以便按机器显存调档。
+    ``megapixels``：画幅像素预算（MP）。``None`` 时沿用 :func:`aspect_size` 的
+    默认值（**2026-10-02 起 = :data:`ASSET_MEGAPIXELS_DEFAULT` = 1.5**，旧为 0.5）；
+    分镜链路显式传 :func:`storyboard_megapixels`、
+    视频链路显式传 :func:`video_megapixels`，以便各自独立按机器显存调档。
     """
     norm = normalize_style(style)
     ratio = aspect_ratio(norm) or default_ratio

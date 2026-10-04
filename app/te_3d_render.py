@@ -574,10 +574,16 @@ def _terminate(proc: subprocess.Popen) -> None:
 
 
 def render_blocking(shot: dict, out_dir: str, aspect: str = "9:16", width: int = 768,
-                    root_dir: str = None, timeout: float = None) -> Optional[str]:
+                    root_dir: str = None, timeout: float = None,
+                    target_size=None) -> Optional[str]:
     """按镜头渲染 3D 站位基准图，返回 PNG 路径；不可用/失败返回 ``None``。
 
     调用方必须容忍 ``None``（回退文字站位锚点），本函数不抛任何异常。
+
+    ``target_size``：期望的**输出像素画幅** ``(W, H)``（如分镜的 ``1216×672``）。
+    ⭐ 传它就不用再传 ``aspect`` 字符串 —— 裸字符串在本仓有**双语义**
+    （``style_kit`` 的 ``(16,9)``＝横屏，而本模块 ``"16:9"`` 会算成 684 高），
+    按像素对齐才能保证基准图与分镜目标画幅**逐像素一致**（见 ``fit_pixel_size``）。
     """
     try:
         import te_3d_director  # noqa: PLC0415
@@ -585,7 +591,8 @@ def render_blocking(shot: dict, out_dir: str, aspect: str = "9:16", width: int =
         logger.warning("[3D站位图] 无法导入 te_3d_director（降级）：%s", e)
         return None
     try:
-        plan = te_3d_director.build_render_plan(shot, aspect=aspect, width=width)
+        plan = te_3d_director.build_render_plan(shot, aspect=aspect, width=width,
+                                               target_size=target_size)
     except Exception as e:  # noqa: BLE001
         logger.warning("[3D站位图] 生成渲染计划失败（降级）：%s: %s", type(e).__name__, e)
         return None
@@ -600,6 +607,113 @@ def render_blocking(shot: dict, out_dir: str, aspect: str = "9:16", width: int =
                     plan.get("char_count"), plan.get("capacity"))
         return None
     return render_blocking_from_plan(plan, out_dir, timeout=timeout, root_dir=root_dir)
+
+
+#: 九宫格「9 个候选构图」→ 逐格渲染 3D 站位基准图的景别/机位对照（2026-10-03）。
+#: 键序即九宫格格序（1-9，与 build_shot_grid_candidates_prompt 的 GRID LAYOUT 变体一致）：
+#:   (1) wide establishing  (2) medium front  (3) close-up face  (4) low angle
+#:   (5) high angle        (6) over-shoulder (7) side profile  (8) extreme close-up
+#:   (9) dutch-tilt dramatic
+#: cam_key 取 config.SHOT_TYPES 景别（_FRAMING_SPAN 键），cam_angle 取 te_3d_director._ANGLE_SHOT 键。
+GRID_BLOCKING_CELLS = (
+    ("全景", "平视"),
+    ("中景", "平视"),
+    ("特写", "平视"),
+    ("近景", "仰拍"),
+    ("近景", "俯拍"),
+    ("中近景", "过肩"),
+    ("中景", "环绕"),
+    ("大特写", "平视"),
+    ("近景", "斜侧"),
+)
+
+
+def render_blocking_variant(shot, cam_key, cam_angle,
+                            out_dir, target_size=None,
+                            root_dir=None, timeout=None):
+    """按**指定景别/机位**渲染某格候选构图的 3D 站位基准图（九宫格逐格构图基准用）。
+
+    与 :func:`render_blocking` 的区别：`render_blocking` 的取景从 `shot.camera`
+    推导（单镜用）；本函数用调用方给的 `cam_key`/`cam_angle` **覆盖**取景，
+    渲出「这个候选构图该有的站位/机位」。不可用/失败一律返回 `None`（fail-open），
+    绝不阻断九宫格主链路。
+    """
+    if not (cam_key and cam_angle):
+        return None
+    try:
+        import te_3d_director  # noqa: PLC0415
+        plan = te_3d_director.build_render_plan(
+            shot, aspect="9:16", width=768, target_size=target_size,
+            cam_key=cam_key, cam_angle=cam_angle)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[3D站位图] 逐格渲染计划失败（降级）：%s: %s", type(e).__name__, e)
+        return None
+    # 同 render_blocking 的 fits 判据（空舞台/未指定取景/人数超容量 → 跳过）。
+    if not plan.get("fits", True) or not _has_character(plan):
+        return None
+    return render_blocking_from_plan(plan, out_dir, timeout=timeout, root_dir=root_dir)
+
+
+def render_blocking_grid(shot, out_dir, target_size=None,
+                         root_dir=None, timeout=None):
+    """渲染一镜九宫格全部 9 个候选构图的 3D 站位基准图，**拼成一张 3x3 联系表**返回路径。
+
+    逐格调用 :func:`render_blocking_variant` 渲出 9 张单格站位图，再用 Pillow 按九宫格
+    顺序拼成一张**与目标九宫格一一对应**的 3x3 基准网格，供生成端作 `<image1>`
+    构图基准 —— 模型「照着这张 3D 网格的机位/站位/动作来摆九宫格」。
+
+    失败降级（fail-open）：
+      * 任一格渲染失败 → 该格用空白占位（生成端仍会看到其余格的 3D 基准）；
+      * 全部失败 / 无浏览器 / Pillow 缺失 → 返回 `None`，调用方回退旧行为（纯文字站位锚点）。
+    绝不抛异常、绝不阻断九宫格主链路。
+    """
+    cells = render_blocking_grid_cells(
+        shot, out_dir, target_size=target_size, root_dir=root_dir, timeout=timeout)
+    if not cells or not any(cells):
+        return None
+    # 拼 3x3 联系表（格序即九宫格格序）。
+    try:
+        from PIL import Image  # noqa: PLC0415
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[3D站位图] Pillow 缺失（降级，返回 None）：%s", e)
+        return None
+    sizes = [(Image.open(c).size if c else (64, 64)) for c in cells]
+    cw = max(w for w, _h in sizes)
+    ch = max(h for _w, h in sizes)
+    sheet = Image.new("RGB", (cw * 3, ch * 3), (6, 6, 8))
+    for i, c in enumerate(cells):
+        if not c:
+            continue
+        try:
+            im = Image.open(c).convert("RGB").resize((cw, ch), Image.LANCZOS)
+            sheet.paste(im, ((i % 3) * cw, (i // 3) * ch))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[3D站位图] 拼贴格 %d 失败（跳过该格）：%s", i + 1, e)
+    try:
+        os.makedirs(os.path.join(out_dir, "te3d_blocking"), exist_ok=True)
+        dst = os.path.join(out_dir, "te3d_blocking", f"grid_{plan_cache_key({'shot': str(shot.get('shot_id'))})}.png")
+        sheet.save(dst, "PNG")
+        return dst
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[3D站位图] 九宫格基准图保存失败（降级）：%s", e)
+        return None
+
+
+def render_blocking_grid_cells(shot, out_dir, target_size=None,
+                               root_dir=None, timeout=None):
+    """渲染一镜九宫格全部 9 个候选构图的 3D 站位基准图，返回 9 个 PNG 路径列表。
+
+    逐格调用 :func:`render_blocking_variant`；单格失败置 `None`。列表长度恒为 9。
+    整体不可用（无浏览器/资产缺失）时由各格内部静默降级为 None。
+    """
+    if not available(root_dir):
+        return [None] * len(GRID_BLOCKING_CELLS)
+    cells = []
+    for cam_key, cam_angle in GRID_BLOCKING_CELLS:
+        cells.append(render_blocking_variant(
+            shot, cam_key, cam_angle, out_dir,
+            target_size=target_size, root_dir=root_dir, timeout=timeout))
+    return cells
 
 
 def _has_character(plan: dict) -> bool:

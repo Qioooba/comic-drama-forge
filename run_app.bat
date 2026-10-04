@@ -37,7 +37,7 @@ echo [OK] 依赖已就绪
 echo.
 echo [3/3] 启动应用（生产级 WSGI 服务器）...
 echo Python: %PYTHON%
-echo 访问地址: http://localhost:5000
+echo 访问地址: http://localhost:5210  （可用环境变量 APP_PORT 覆盖）
 echo 按 Ctrl+C 停止服务
 echo.
 REM 必须用 serve.py 而不是 app.py：Flask 自带开发服务器无法可靠处理小说上传

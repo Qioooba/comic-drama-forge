@@ -701,15 +701,59 @@ def dumps_scene_json(scene: dict, indent: int = 2) -> str:
 
 
 def plan_pixel_size(aspect: str, width: int = 768) -> Tuple[int, int]:
-    """画幅 → 渲染像素尺寸（宽固定，高按比例；未知画幅按 9:16）。"""
+    """画幅 → 渲染像素尺寸（宽固定，高按比例；未知画幅按 9:16）。
+
+    ⚠️ 本模块 ``_ASPECT_RATIO`` 的键沿用行业叫法，值的语义是 **(宽比, 高比)**：
+      * ``"9:16"``（竖屏）→ ``(9, 16)`` → 高 = 宽 × 16/9 → 又高又窄 ✔
+      * ``"16:9"``（横屏）→ ``(16, 9)`` → 高 = 宽 × 9/16 → 又宽又扁 ✔
+    故 ``h = w * bh / bw`` 本身正确（守卫 verify_te_3d_render 断言
+    ``9:16 → 高/宽 ≈ 16/9`` 一直通过）。
+
+    ⭐ 真正的坑是**跨模块语义冲突**（2026-10-02 定位，G2 存量失败的真因）：
+      ``style_kit.resolve()["ratio"]`` 返回 ``(16, 9)``＝「16:9 横屏」，
+      ``style_kit.aspect_size((16,9), 0.8MP)`` = ``1216×672``；
+      而调用方 ``app.py`` 把它手工拼成 ``"16:9"`` 传进来，本模块解出 ``1216×684``
+      —— **同一画幅、两个像素**。该基准图作 ``<image1>`` 定画布，于是分镜图
+      继承 ``684`` 高，与全局 ``672`` 打架。
+    解法：调用方改用 :func:`fit_pixel_size`（按**目标像素**反推渲染尺寸，
+    彻底绕开比例字符串的双语义），不要再手工拼 ``":".join(map(str, ratio))``。
+    """
     bw, bh = _ASPECT_RATIO.get(str(aspect or "").strip(), _ASPECT_RATIO["9:16"])
     w = max(64, int(width))
     h = max(64, int(round(w * bh / bw)))
     return w, h
 
 
+def fit_pixel_size(target_size, max_width: int) -> Tuple[int, int]:
+    """把目标像素画幅 ``(W, H)`` 按 ``max_width`` 等比缩放成渲染尺寸。
+
+    ⭐ 为什么不传 ``"W:H"`` 字符串：本模块 ``_ASPECT_RATIO`` 的键语义与
+    ``style_kit`` 的 ``ratio`` 语义**相反**（见 :func:`plan_pixel_size`），
+    字符串往返必然引入歧义。直接吃像素尺寸是**唯一不会误解**的口径：
+    只要 ``(1216, 672)`` 进、``(1216, 672)`` 出，两侧就永远一致。
+
+    返回 ``(w, h)``，已对齐到偶数（视频编码要求），且不低于 64。
+    """
+    try:
+        tw, th = int(target_size[0]), int(target_size[1])
+    except (TypeError, ValueError, IndexError, KeyError):
+        return (max(64, int(max_width)), max(64, int(round(max_width * 16 / 9.0))))
+    if tw <= 0 or th <= 0:
+        return (max(64, int(max_width)), max(64, int(round(max_width * 16 / 9.0))))
+    w = max(64, int(max_width))
+    h = max(64, int(round(w * th / float(tw))))
+    # 偶数对齐：H.264/H.265 要求宽高为偶数，奇数会被编码器裁掉一行
+    if w % 2:
+        w -= 1
+    if h % 2:
+        h -= 1
+    return (w, h)
+
+
 def build_render_plan(shot: dict, aspect: str = "9:16", width: int = 768,
-                      characters: Optional[List[str]] = None) -> dict:
+                      characters: Optional[List[str]] = None,
+                      target_size=None, cam_key: Optional[str] = None,
+                      cam_angle: Optional[str] = None) -> dict:
     """给「服务端 3D 站位图渲染器」的完整计划（``app/te_3d_render.py`` 消费）。
 
     与 :func:`build_scene_json` 的分工：
@@ -736,14 +780,20 @@ def build_render_plan(shot: dict, aspect: str = "9:16", width: int = 768,
     scene = build_scene_json(shot, aspect=aspect, characters=chars)
 
     camera_str = str(shot.get("camera") or "").strip()
-    try:
-        from comfyui_client import camera_key, camera_angle  # noqa: PLC0415
-        cam_key = camera_key(camera_str)
-        cam_angle = camera_angle(camera_str)
-    except Exception:  # noqa: BLE001
-        cam_key, cam_angle = "", ""
-    if cam_key == "中景" and not camera_str:
-        cam_key = ""
+    # ⭐ 九宫格「逐格构图基准」扩展（2026-10-03）：调用方可强制指定某格的
+    #    景别/机位（cam_key / cam_angle），渲染出该候选构图的 3D 站位基准图。
+    #    传入 None 时沿用旧口径（从 shot.camera 推导）。这一档专供九宫格逐格
+    #    构图基准用；单镜/旧调用方不传 → 行为与历史完全一致。
+    _override = bool(cam_key or cam_angle)
+    if not _override:
+        try:
+            from comfyui_client import camera_key, camera_angle  # noqa: PLC0415
+            cam_key = camera_key(camera_str)
+            cam_angle = camera_angle(camera_str)
+        except Exception:  # noqa: BLE001
+            cam_key, cam_angle = "", ""
+        if cam_key == "中景" and not camera_str:
+            cam_key = ""
 
     # ⚠️ 主体中心必须用**与 build_scene_json 相同的 spread** 计算（同画幅 + 同景别 + 同人数），
     #    否则机位会偏离主体。
@@ -751,7 +801,12 @@ def build_render_plan(shot: dict, aspect: str = "9:16", width: int = 768,
     # 瞄准点取**场景实体**均值：显式站位生效后位置会变，用旧的按序均值会瞄偏
     cx, cz = _scene_center(scene)
     position, target, fov = build_camera(cam_key, cam_angle, cx, cz)
-    w, h = plan_pixel_size(aspect, width)
+    # ⭐ 优先按**目标像素**定尺寸（唯一无歧义口径，见 fit_pixel_size）；
+    #    未给 target_size 时才回落到比例字符串（兼容既有调用方/守卫）。
+    if target_size:
+        w, h = fit_pixel_size(target_size, width)
+    else:
+        w, h = plan_pixel_size(aspect, width)
     capacity = framing_capacity(aspect, cam_key)
     _plan = {
         "width": w,

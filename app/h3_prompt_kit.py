@@ -832,7 +832,7 @@ def _mid_sentence(clause: str) -> str:
     return s[0].lower() + s[1:] if s[:1].isupper() else s
 
 
-def _style_opening(style: str) -> str:
+def _style_opening(style: str, has_dialogue: bool = False) -> str:
     """``detailed_description`` 的首句风格声明（对齐模板 ``The target video uses …``）
 
     模板首句是 ``The target video uses a Chinese xianxia cultivation drama style with
@@ -850,9 +850,18 @@ def _style_opening(style: str) -> str:
     if not body:
         return ("The target video keeps a consistent visual style across the whole "
                 "segment, with delicate lighting and stable composition.")
-    return (f"The target video uses a {body} style, with a shallow depth of field that "
-            f"keeps the speaking faces as the sharp focal plane while the background "
-            f"falls into soft bokeh.")
+    # ⭐ 无台词镜头不再说「speaking faces」（2026-10-04）：旧实现无论有无台词都写
+    #   「keeps the speaking faces as the sharp focal plane」——对无台词镜头是无效且
+    #   误导的约束（提示词凭空出现 speaking / faces）。
+    # ⭐ 去重尾部 "style"（2026-10-04）：style_suffix_en("国漫3D渲染") 产出
+    #   「Chinese animated style」，旧句再拼一个 " style" → "Chinese animated style style"
+    #   （实测出现在导出工作流的每一段提示词里，属确定性可判缺陷）。
+    _style_word = re.sub(r"[\s,]*style\s*$", "", body, flags=re.IGNORECASE).strip(" ,") or body
+    _focal = ("keeps the speaking faces as the sharp focal plane"
+              if has_dialogue else
+              "keeps the on-screen subjects as the sharp focal plane")
+    return (f"The target video uses a {_style_word} style, with a shallow depth of field "
+            f"that {_focal} while the background falls into soft bokeh.")
 
 
 def build_detailed_description(shot: dict, duration: float, style: str = "",
@@ -918,7 +927,7 @@ def build_detailed_description(shot: dict, duration: float, style: str = "",
     _first_frame = str(shot.get("first_frame") or "").strip()
     _motion = str(shot.get("motion") or "").strip()
 
-    out: List[str] = [_style_opening(style)]
+    out: List[str] = [_style_opening(style, has_dialogue=bool(lines))]
     # 首帧（运动起点静态快照）：前置到时间轴最前，给「动作从哪个画面开始」明确落点。
     if _first_frame:
         out.append(
@@ -1000,7 +1009,9 @@ def build_detailed_description(shot: dict, duration: float, style: str = "",
 
 def _subject_definitions(picture_defs: Sequence[Tuple[str, str]],
                          subjects: Sequence[Dict[str, str]],
-                         style: str = "") -> str:
+                         style: str = "",
+                         storyboard_ref_label: str = "",
+                         end_frame_ref: str = "") -> str:
     """``subject_definitions``：逐张参考图声明用途 + 逐主体描述外观（英文句式）
 
     模板写法::
@@ -1022,6 +1033,8 @@ def _subject_definitions(picture_defs: Sequence[Tuple[str, str]],
         if name:
             subj_pics[name] = pic
 
+    _sb_label = str(storyboard_ref_label or "").strip()
+    _ef_label = str(end_frame_ref or "").strip()
     for label, desc in picture_defs:
         # 找出该参考图对应的主体名（有则写进句子，便于模型建立图-人绑定）
         owner = ""
@@ -1029,7 +1042,19 @@ def _subject_definitions(picture_defs: Sequence[Tuple[str, str]],
             if pic == label:
                 owner = name
                 break
-        if owner:
+        if _sb_label and label == _sb_label:
+            # ⭐ 分镜图 = 构图/机位/站位基准（2026-10-04 修正）：旧实现落到下方 else，
+            #   把分镜图说成「environment, materials and lighting mood of the scene」——
+            #   语义错位会稀释构图锚点权重（用户反馈「视频提示词质量不高」）。
+            lines.append(
+                f"{label} is the storyboard reference for this shot, defining the "
+                f"composition, framing, camera angle and character placement (the "
+                f"staging baseline that must be followed): {desc}.")
+        elif _ef_label and label == _ef_label:
+            lines.append(
+                f"{label} is the end-frame reference for this shot, defining the final "
+                f"composition and pose the clip must settle into: {desc}.")
+        elif owner:
             lines.append(
                 f"{label} is the reference image defining the appearance, costume and "
                 f"style of {owner}, and serves as the composition anchor for their "
@@ -1167,7 +1192,8 @@ def segment_shot(shot: dict, duration, max_sec: float = None) -> List[dict]:
 
 def _retention_analysis(picture_defs: Sequence[Tuple[str, str]],
                         subjects: Sequence[Dict[str, str]], style: str = "",
-                        shots: str = "", end_frame_ref: str = "") -> str:
+                        shots: str = "", end_frame_ref: str = "",
+                        storyboard_ref_label: str = "") -> str:
     """``retention_analysis``：逐主体声明必须保留的外观项（英文句式）
 
     模板写法::
@@ -1204,7 +1230,16 @@ def _retention_analysis(picture_defs: Sequence[Tuple[str, str]],
     # 写成「the costume … follow the reference image exactly」——语义错位的假声明。
     subj_pics = {str(s.get("picture") or "").strip() for s in subjects}
     subj_pics.discard("")
+    _sb_label = str(storyboard_ref_label or "").strip()
     for label, desc in picture_defs:
+        # ⭐ 分镜图 = 构图基准（2026-10-04 修正）：旧实现按「是否主体图」二分，
+        #   分镜图被写成「scene structure / costume … follow the reference image」——
+        #   它真正要保留的是**构图、景别、机位、人物站位**。
+        if _sb_label and label == _sb_label:
+            lines.append(f"{label}{appear} (composition anchor): fully_preserved - the "
+                         f"shot's composition, framing, camera angle and character "
+                         f"placement follow this storyboard reference exactly.")
+            continue
         is_env = label not in subj_pics if subj_pics else False
         if is_env:
             lines.append(f"{label}{appear}: fully_preserved - {desc}; the scene "
@@ -1298,10 +1333,13 @@ def build_ref2va(shot: dict, picture_defs: Sequence[Tuple[str, str]],
     shots = ", ".join(f"[Shot {i}]" for i in range(1, n_beats + 1))
 
     sections = [
-        ("subject_definitions", _subject_definitions(list(picture_defs), list(subjects), style)),
+        ("subject_definitions", _subject_definitions(
+            list(picture_defs), list(subjects), style,
+            storyboard_ref_label=storyboard_ref_label, end_frame_ref=end_frame_ref)),
         ("summary", build_summary(shot, dur_f, subjects)),
         ("retention_analysis", _retention_analysis(list(picture_defs), list(subjects),
-                                                    style, shots, end_frame_ref)),
+                                                    style, shots, end_frame_ref,
+                                                    storyboard_ref_label=storyboard_ref_label)),
         ("detailed_description", build_detailed_description(shot, dur_f, style, pic_map,
                                                             end_frame_ref,
                                                             storyboard_ref_label)),

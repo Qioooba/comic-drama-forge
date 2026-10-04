@@ -83,9 +83,14 @@ def asset_key(asset: Dict[str, Any]) -> Optional[tuple]:
     kind = str(asset.get("kind") or "").strip()
     name = str(asset.get("name") or "").strip()
     pkey = _path_key(asset.get("path"))
-    if kind not in VALID_KINDS or not name or not pkey:
+    # 2026-10-02：角色按「角色级」判交集（common_key），不因服装变体（衣柜 outfits/
+    # <key>/base.png）把同一角色路径劈成多张而漏出公共池；场景/物品不设 common_key，
+    # 仍按「同一张图」判交集（档位不同不应焊死）。common_key 缺失回落路径键。
+    key_id = str(asset.get("common_key") or "").strip()
+    ident = key_id if key_id else pkey
+    if kind not in VALID_KINDS or not name or not (key_id or pkey):
         return None
-    return (kind, name, pkey)
+    return (kind, name, ident)
 
 
 def _segment_keys(assets: Iterable[Dict[str, Any]]) -> List[tuple]:

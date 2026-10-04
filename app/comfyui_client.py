@@ -459,14 +459,22 @@ def _ref_label_body(raw, index: int) -> str:
 #    · 角色/道具是否像设定，只看后面的设定图。
 BLOCKING_REF_MARK = "3D导演台构图基准"
 #: 带构图基准图时追加的协议段（官方 Attribute Disentanglement：每张图职责单一）
+#: 2026-10-03 强化：旧版提示词不够强，模型仍把人偶画进 Panel 1。
+#: 新增：明确说人偶图是「pose/composition template」，必须被角色图「完全覆盖」。
 COMPOSITION_BASELINE_SECTION = (
-    "COMPOSITION BASELINE: <image{pos}> is a 3D blocking reference (plain coloured, "
-    "faceless mannequins on a dark background). Copy ONLY its composition: how many "
-    "figures there are, who stands on the left / right, their relative depth order and "
-    "facing direction, the shot size (framing) and the camera angle. Replace those "
-    "mannequins with the characters referenced by the other images, drawn with their own "
-    "real appearance. Do NOT copy the mannequin bodies, their flat colours or their "
-    "faceless heads, and do NOT turn any character into a mannequin. "
+    "COMPOSITION BASELINE: <image{pos}> is a 3D blocking reference — a pose and "
+    "composition template made of plain coloured, faceless mannequins on a dark "
+    "background. It shows ONLY the poses, positions, and camera framing. "
+    "CRITICAL: This mannequin image is NOT part of the final output. You MUST "
+    "completely REPLACE every mannequin figure with the actual characters from the "
+    "other reference images, keeping ONLY the pose and position from this template. "
+    "The mannequin's grey/blue body, faceless head, flat colours, and geometric "
+    "shapes must NOT appear anywhere in the final image — not in any panel, not "
+    "partially, not as an underlayer. Every panel must show fully rendered characters "
+    "with faces, hair, costumes, and details from the character reference images. "
+    "Copy ONLY the composition from <image{pos}>: how many figures there are, who "
+    "stands on the left / right, their relative depth order and facing direction, "
+    "the shot size (framing) and the camera angle. "
     # ⚠️ 实测（2026-09-27）：基准图是近黑背景 + 有限地面网格，远景时上下各留出
     # 一大片平坦深色区；不说清楚模型会把它当**信箱黑边**照抄（shot_01 上下各一条
     # 黑带、画面只剩中间约一半高度）。基准图里没有真实环境，必须显式声明留白不算画框。
@@ -576,8 +584,13 @@ def scene_view_prompt_suffix(view_key: str) -> str:
     label = SCENE_VIEW_LABELS.get(key) or key
     # 与 base 同空间、只换机位：显式声明「同一场地」是防止模型把四个档理解成四个场地
     # （一旦理解错，分镜换机位就等于换场景，比没有机位档更糟）。
+    # ⚠️ 2026-10-03（B 方案）：旧句尾「建筑形制、空间关系、陈设与光照方向保持不变」里的
+    #   「**空间关系**…保持不变」是**反向指令** —— 等于叫模型别动构图，正是 left45/right45
+    #   与 base 取景雷同的帮凶。改为把「内容不变」与「机位必须变」**拆开说**：先声明同一场地、
+    #   建筑形制/陈设/光照不变（防换场地），再明确「相机站位与朝向已改、必须呈现不同取景透视」。
     return (f"。本图机位（{label}）：{angle}；"
-            f"这是同一个场地的另一个机位，建筑形制、空间关系、陈设与光照方向保持不变")
+            f"这是同一个场地，建筑形制、陈设与光照方向保持不变，"
+            f"但相机站位与朝向已经改变，必须呈现与正面机位不同的取景与透视")
 
 # 目录标注（P0-5 修复）：
 #   LoadImageOutput / LoadAudioOutput / LoadVideoOutput 等「Output 系列」读取 ComfyUI
@@ -1857,6 +1870,41 @@ class ComfyUIClient:
             return
         node["inputs"][field] = (cur.rstrip("，,。") + "，" + "，".join(negs)) if cur.strip() else "，".join(negs)
 
+    #: 角色设定图的**中文标注四区 character sheet 版式**（2026-10-03 用户指定模板）。
+    #:
+    #: 四区布局（Top / Left / Bottom / Right）：
+    #:   · 顶部主视觉区：正面/侧面/背面三视图
+    #:   · 左侧补充信息区：面部特写 + 配色板（标注毛发色、服饰色）
+    #:   · 底部局部细节区：配饰/点缀/关键身份识别元素拆解
+    #:   · 右侧全身比例区：身高比例参考
+    #:
+    #: ⚠️ 与 2026-10-02 英文版式的两点关键差异：
+    #:   ① **画面必须渲染明确中文说明文字**（"三视图设定/正面/侧面/…" + 角色特征
+    #:      标签）—— 旧英文版式结尾的 "no text" 已删除，那是反向约束；
+    #:   ② 特征标签**不写死**：`_extract_trait_labels` 从角色设定文本自动提取
+    #:      （如「冰蓝色眼眸，黑发微乱，哑光黑短外套…」→ 逐条标签），换角色不用改模板。
+    #:
+    #: ⚠️ 版式仍是**四区不对称布局**，无法做行列投影切分 → 沿用「角色图不裁剪」
+    #:    配套（`_pick_char_view` 取整图 base.png、`_generate_asset_task` 角色分支
+    #:    不切分）。改版式时两者必须同批考虑。
+    #:
+    #: ⚠️ 幂等：marker 子串 = "人物设定表"（本串字面子串，见 2026-09-25 教训：
+    #:    marker 必须是 suffix 字面子串）。质检对「画面内容文字」的口径（qc_client
+    #:    WATERMARK_EXEMPT_NOTE 文字段）已明确「内容需要的文字不算违规」，设定图
+    #:    带中文标注不会被质检误杀。
+    _CHARACTER_SHEET_CN_LAYOUT = (
+        "角色设定三视图，人物设定表，白色背景，清晰中文文字排版，"
+        "画面上必须出现明确中文说明文字，文字干净可读。"
+        "顶部主视觉区：正面、侧面、背面三视图，展示角色整体身形、服装搭配和标志性特征。"
+        "左侧补充信息区：面部特写、配色板，标注毛发色、服饰色。"
+        "底部局部细节区：配饰、点缀、关键身份识别元素拆解展示。"
+        "右侧全身比例区：人物身高比例参考图。"
+        "画面文字内容必须清晰显示：“三视图设定”“正面”“侧面”“背面”“面部特写”"
+        "“配色板”“局部细节”“身高比例”{labels_part}。"
+        "同一角色在所有视图与特写中必须完全一致（五官/发型/服装/配色/体型）。"
+        "布料褶皱自然，自然光照，高清纹理，细节丰富，纯白背景，无场景无道具。"
+    )
+
     def generate_character_base(self, prompt_zh: str, seed: int = None,
                                 style: str = "", size=None,
                                 filename_prefix: str = None) -> List[str]:
@@ -1872,57 +1920,75 @@ class ComfyUIClient:
 
     @staticmethod
     def _ensure_fullbody_prompt(prompt_zh: str, style: str = "") -> str:
-        """给角色参考图提示词确定性地补「2x2 分档多视图」版式约束（幂等）
+        """给角色参考图提示词确定性地补**中文标注四区 character sheet 版式**约束（幂等）
 
-        2026-09-23 补强：除「三人同比例」外，再显式要求**间距均匀互不遮挡**、
-        **脚底落在同一条水平线**、**纯白背景**。前两项直接对应实测里最容易
-        跑偏的两个量（三人横向粘连 / 脚底不共线），后一项避免把设定图渲染成
-        「三人合影」的写实场景（带透视景深 → 三人远近大小不一）。
-        2026-09-23（白底需求）：角色/物品参考图**不需要背景**，从「简洁纯色背景」
-        收紧为明确的「纯白背景」，避免模型自由发挥出渐变/场景/贴图。
-        画幅已同步改为 1:1（见 style_kit.ASSET_BASE_RATIO 的角色项），
-        「三人横排」版式与「竖幅画幅」的冲突已解除。
+        ⚠️ 2026-10-03（用户指定）：版式改为**中文文字排版**四区设定图 ——
+        顶部三视图 / 左侧面部特写+配色板 / 底部局部细节 / 右侧身高比例，
+        且画面必须**清晰渲染中文说明文字**（"三视图设定/正面/侧面/…" 结构标签 +
+        从设定文本自动提取的**角色特征标签**，如「冰蓝眼眸」「哑光黑短外套」）。
+        2026-10-02 的英文版式（结尾 "no text"）与该需求相反，已整段替换。
 
-        ⚠️ 2026-09-25（景别对档，**重要**）：「三张全身横排」→「上排全身 + 下排半身」
-        ---------------------------------------------------------------
-        根因（实测，见 .workbuddy/tools/diag_framing_control.py 与工作日志需求 H）：
-        分镜模板 `<image1>` 是主画布，近方形全身立绘 cover 到 9:16 竖屏要
-        **左右各裁一半** → 模型为保住立绘里「完整的全身」只能把人物缩小 →
-        **系统性偏全景/远景**，而近景/特写与立绘方向相反 → 被反向拉回、画不出来
-        （实测 shot_24 规定近景、出图近全身）。
-        业界通行做法是「**按景别分档出图**」（正脸特写 / 正脸半身 / 全身），
-        因此这里补一格**正面半身胸像**：近景/特写/中景镜头取它当 `<image1>`，
-        画幅与景别同向，画幅对抗即消失。
-        版式：**上排** 3 格全身（正面/左侧/背面）横排；**下排**独占一条横带，
-        只画 1 格正面半身胸像、居中，两侧留白。
-        ⚠️ 半身必须放**独立下排**、不能塞进上排的空隙 —— 上排塞第 4 格会把每格压窄
-        25%（全身变细长条）；且下排独占横带后行投影才能稳定把上下排分开（切分依赖此）。
-        ⚠️ 格位顺序必须与 config.CHARACTER_SHEET_LAYOUT_ZH / CHARACTER_SHEET_VIEWS 同序。
+        ⚠️ 配套改动（勿只改这一半）：「四区」版式无法再被 `sheet_split` 的
+        行列投影切分 → `_pick_char_view` 只取整图 base.png、`_generate_asset_task`
+        角色分支不再切分（见 app.py 同批改动）。
+
+        幂等：marker = "人物设定表"（suffix 字面子串，见 2026-09-25 的教训——
+        marker 必须能被二次调用识别，否则无限追加）。
         """
         text = str(prompt_zh or "").strip()
-        # 幂等判断必须在 with_style 之前做（同 style_kit._style_suffix 的坑）
-        # 判据用新标记「上下两排分档」：旧图里是「全身三视图」，命中旧标记不算已补新版式。
-        # ⚠️ marker 必须是 suffix 的**字面子串**，否则二次调用永远判不出「已补」而重复追加
-        #    （2026-09-25 实测踩过：marker 写作「上下两排分档设定图」而 suffix 里是
-        #      「上下两排分档版式」→ 幂等失效，提示词被无限追加）。
-        #    这里取两者的**公共前缀**「上下两排分档」作 marker，两边都含它。
-        marker = "上下两排分档"
-        base = text if marker in text else style_kit.with_style(text, style) if style else text
-        if marker in base:
+        marker = "人物设定表"
+        # 幂等判断在 with_style 之前做（同 style_kit._style_suffix 的坑）。
+        # 旧英文版式 marker（"character sheet"）也视为已补 —— 避免历史已拼版式的
+        # 字符串被再叠一层（宁可保持原样，也不出现双层版式）。
+        if marker in text or "character sheet" in text:
+            return text
+        base = style_kit.with_style(text, style) if style else text
+        if marker in base or "character sheet" in base:
             return base
-        suffix = ("，角色设定图采用上下两排分档设定图版式："
-                  "上排为正面、左侧面、背面三张全身视图，从左到右横排、间距均匀互不遮挡、"
-                  "同一角色同一比例、三人脚底落在同一条水平线上，"
-                  "每格完整呈现从头到脚的全身；"
-                  "下排单独一行只画一格**正面半身胸像特写**，居中放置、左右留白，"
-                  "取景自胸部以上至头顶、面部细节清晰，"
-                  "与上排全身视图为同一角色的同款发型发色、瞳色、服装配色与配饰，"
-                  "仅取景范围不同，不得改变五官与服装；"
-                  "上排三格与下排一格之间留出明显空白分隔；"
-                  "纯白背景，不要场景、道具、投影与任何背景纹理")
+        labels = ComfyUIClient._extract_trait_labels(text)
+        labels_part = ("，以及该角色特征标签：" + "、".join(labels)) if labels else ""
+        suffix = (ComfyUIClient._CHARACTER_SHEET_CN_LAYOUT
+                  .replace("{labels_part}", labels_part))
         # 剧本层提示词常以「三视图。」收尾，直接拼会得到「三视图。，…」的脏标点
         base = base.rstrip("。，,.;； ")
-        return (base + suffix) if base else suffix.lstrip("，")
+        sep = "" if base.endswith((".", "！", "?", "？")) else "。"
+        return (base + sep + suffix) if base else suffix
+
+    #: 特征标签提取的**停用词**：命中即不作为设定图上的标注文字
+    #: （这些是版式/质检/管线层的元词，不是角色特征；混进去会变成图上的乱注记）。
+    _TRAIT_LABEL_STOPWORDS = (
+        "设定", "锁定", "严格", "三视图", "参考图", "提示词", "全身", "半身",
+        "构图", "背景", "高清", "细节", "一致", "动画", "渲染", "风格", "画质",
+        "三维", "多视角", "正交", "比例尺", "标注", "文字", "品质", "质量",
+        "cinematic", "character", "sheet", "view", "texture", "lighting",
+    )
+
+    @staticmethod
+    def _extract_trait_labels(prompt_zh: str, limit: int = 12) -> List[str]:
+        """从角色设定文本提取**特征标签**（设定图上要渲染的中文说明词）。
+
+        口径：按中英文标点切短句 → 剥掉「穿着/佩戴」等动词前缀 → 丢弃空段/
+        超长短句/停用词命中 → 去重保序。
+        例：「男性，冰蓝色眼眸，黑发微乱，穿着哑光黑色短款外套，低帮战术靴」→
+        ［男性, 冰蓝色眼眸, 黑发微乱, 哑光黑色短款外套, 低帮战术靴］
+        标签**只来自设定原文**（不臆造），上限 limit 条防版式过挤。
+        """
+        out: List[str] = []
+        seen = set()
+        for seg in re.split(r"[，,、；;。：:\n\r\t]+", str(prompt_zh or "")):
+            s = seg.strip().strip("“”\"'『』「」()（）【】 ")
+            s = re.sub(r"^(?:穿着|佩着|佩戴|身着|戴着|穿上|穿|戴)", "", s).strip()
+            if not s or len(s) < 2 or len(s) > 12:
+                continue
+            if any(w in s for w in ComfyUIClient._TRAIT_LABEL_STOPWORDS):
+                continue
+            if s in seen:
+                continue
+            seen.add(s)
+            out.append(s)
+            if len(out) >= limit:
+                break
+        return out
 
     #: 物品参考图里**不该出现**的承托物/位置描述。
     #: 实测（2026-10-01）：筑基丹的 reference_prompt_zh 被剧本 LLM 写成
@@ -2382,6 +2448,18 @@ class ComfyUIClient:
                    "costume and style); cells vary ONLY in camera framing and angle as "
                    f"follows: {variants}. Do not add text, numbers, borders or labels "
                    "between cells.")
+        # ⭐ 九宫格「3D 构图基准网格」（2026-10-03）：带 3D 站位基准网格图时，声明
+        #    网格每一格必须照搬基准网格对应格的机位/站位/动作（<image1> 就是那张 3x3
+        #    基准网格，由 te_3d_render.render_blocking_grid 渲染）。
+        if has_blocking_image:
+            prompt += (
+                "\nCOMPOSITION BASELINE GRID (critical): <image1> is a 3x3 sheet of "
+                "3D blocking thumbnails (facialess mannequins) whose 9 cells correspond "
+                "1-to-1, in reading order, to the 9 cells of the output contact sheet. "
+                "For EACH output cell, mirror the camera framing, camera angle, character "
+                "placement and body action of the matching 3D blocking thumbnail in "
+                "<image1>. Use the 3D blocking thumbnails ONLY as composition, camera and "
+                "blocking references \u2014 never as identity or appearance references.")
         return prompt
 
     def generate_shot_grid_candidates(self, shot: dict, ref_labels: List[str],
@@ -2401,6 +2479,145 @@ class ComfyUIClient:
             size=size,
             timeout=timeout,
         )
+
+    def build_story_grid_sequence_prompt(shots: List[dict],
+                                         ref_labels: List[str] = None,
+                                         style: str = "") -> str:
+        """九宫格「**连贯分镜**」提示词（2026-10-02 新增）。
+
+        ⚠️ **与 `build_shot_grid_candidates_prompt` 是两件事，别混**：
+        ┌──────────────────┬──────────────────────────┬──────────────────────────┐
+        │                  │ 候选构图（已有）          │ 连贯分镜（本函数）        │
+        ├──────────────────┼──────────────────────────┼──────────────────────────┤
+        │ 9 格的含义        │ **同一时刻**的 9 个机位    │ **一个连续段落**的 9 个分镜│
+        │ 格间变化          │ 只有取景与角度            │ 机位 + 动作推进 + 情绪递进 │
+        │ 用途              │ 一图九候选，选一格裁切     │ 一次拿到整段故事板         │
+        │ 时间维度          │ 冻结                     │ **推进**（连贯成完整故事）  │
+        └──────────────────┴──────────────────────────┴──────────────────────────┘
+
+        来源：用户提供的业界九宫格分镜范式，其要点（本项目此前的实现缺后两条）：
+        1. 「视觉基底：3D国漫风格」**开篇锚定**；
+        2. 九格是「**不同的分镜，不同景别，能够连贯起来形成一个完整的故事**」；
+        3. 「**保持人物一致性**」+「所有画面角色、场景、光线与色调完全一致」；
+        4. 「画面无文字」；「每个画面左下角标数字 1-9」。
+
+        ⚠️ 第 4 条的**角标数字与「无文字」看似矛盾**，实为不同层级：
+        「无文字」= 画面内不得出现台词/字幕/背景招牌等**内容性文字**；
+        「标数字」= 后期加的制作角标。本函数按原范式**同时声明两者**并显式区分，
+        避免模型把角标当成画面内容（或反过来把内容文字当成角标放过）。
+        ⚠️ 九宫格与「一镜一图」的分辨率换算：3x3 后每格只有整图的 1/9 面积 →
+        **必须放大整图边长**，否则格内细节会低于单镜质量。调用方负责 size。
+        """
+        # 复用单镜提示词拿到完整分节（含 VISUAL BASE / IDENTITY / PRESERVE 等），
+        # 再整体改写 TASK 并把逐镜清单落成 GRID LAYOUT。
+        base_shot = dict(shots[0]) if shots else {}
+        prompt = ComfyUIClient.build_storyboard_prompt(
+            base_shot, ref_labels, has_blocking_image=False)
+        prompt = prompt.replace(
+            "TASK: Generate a single storyboard frame.",
+            "TASK: Generate ONE image laid out as a 3x3 storyboard sheet "
+            "(a nine-panel contact sheet) that tells ONE continuous sequence "
+            "in reading order, left to right, top to bottom.", 1)
+
+        lines = []
+        for i, sh in enumerate(shots[:9], start=1):
+            fr = shot_framing(sh) or ""
+            ang = camera_angle(str(sh.get("camera") or "")) or ""
+            desc = str(sh.get("description") or "").strip()
+            bits = [b for b in (fr, ang) if b]
+            head = " / ".join(bits) if bits else "follow the panel description"
+            lines.append(f"({i}) [{head}] {desc}" if desc else f"({i}) [{head}]")
+        panel_text = "\n".join(lines) if lines else "(1)…(9) follow the scene description"
+
+        prompt += (
+            "\n\nGRID LAYOUT: exactly 3 rows by 3 columns, nine panels in total, "
+            "reading order left-to-right then top-to-bottom.\n"
+            "Each panel is a DIFFERENT shot of the SAME continuous sequence — the "
+            "panels must connect in order to form one complete, coherent story. "
+            "Vary the framing and camera angle between panels; do NOT repeat the "
+            "same framing twice in a row.\n"
+            "Panel by panel:\n" + panel_text + "\n"
+            "CHARACTER CONSISTENCY (critical): the characters, their facial "
+            "identity, hairstyle, costume and props, together with the scene, "
+            "lighting direction and colour grading, must be IDENTICAL in every "
+            "one of the nine panels — only the framing, angle and the progression "
+            "of the action change.\n"
+            "TEXT RULE (important, two different things):\n"
+            "- NO content text anywhere in the artwork: no dialogue, no subtitles, "
+            "no captions, no signage, no watermark.\n"
+            "- DO print a small plain Arabic numeral (1 to 9) in the BOTTOM-LEFT "
+            "corner of each panel, as a production index mark only. The numerals "
+            "are the sole exception to the no-text rule.")
+        if style:
+            prompt += f"\nOverall visual base (must hold across all nine panels): {style}."
+        return prompt
+
+    @staticmethod
+    def build_shot_grid_keyframes_prompt(shot: dict, ref_labels: List[str] = None,
+                                         style: str = "") -> str:
+        """分镜图「**单镜九宫格 · 9 关键帧**」提示词（2026-10-02 用户指定）。
+
+        ⚠️⚠️ **粒度（用户明确纠正，勿再回退）**：「一个 5 秒的分镜就是用的 9 宫格」
+          —— 九宫格的 9 个格是**这一个镜头（shot）内随时间推进的 9 个关键帧**：
+            ✗ 不是 9 个不同镜头（那是 `build_story_grid_sequence_prompt` 的**旧错误粒度**）；
+            ✗ 不是 9 个机位候选（那是 `build_shot_grid_candidates_prompt`，选一格裁切）。
+        用途：**九宫格整图 = 分镜图本体**，H3 视频直接拿整图当构图参考
+        （用户原话「别人的 9 宫格图片就是一整张啊」——不裁切、不选格）。
+
+        与另两个九宫格函数的对照：
+        ┌─────────────────┬──────────────────────┬─────────────────────┬──────────────────────┐
+        │                 │ 候选构图（已有）       │ 连贯分镜（旧，粒度错）│ 单镜 9 关键帧（本函数）│
+        ├─────────────────┼──────────────────────┼─────────────────────┼──────────────────────┤
+        │ 9 格的含义       │ 同一时刻 9 机位        │ 9 个不同镜头         │ **一个镜头内 9 关键帧** │
+        │ 格间变化         │ 只有取景/角度          │ 镜头切换+动作递进     │ **时间推进（动作/表情/构图）** │
+        │ 时间维度         │ 冻结                  │ 镜头间推进           │ **同一镜头内推进**     │
+        │ 用途             │ 选一格裁单图           │ （错误，未接线）      │ **九宫格整图=分镜图**  │
+        └─────────────────┴──────────────────────┴─────────────────────┴──────────────────────┘
+
+        来源：用户提供的业界九宫格分镜范式（「单张图像内完整呈现 9 个关键帧，
+        保持人物一致性、画面无文字、左下角标 1-9」）+ 用户补充「一个 5 秒分镜用九宫格」。
+        ⚠️ 分辨率：3x3 后每格仅整图 1/9 面积 → **必须放大整图边长**（调用方负责 size）。
+        """
+        prompt = ComfyUIClient.build_storyboard_prompt(
+            shot, ref_labels, has_blocking_image=False)
+        prompt = prompt.replace(
+            "TASK: Generate a single storyboard frame.",
+            "TASK: Generate ONE image laid out as a 3x3 storyboard sheet (a nine-panel "
+            "contact sheet) showing NINE KEYFRAMES of this SINGLE shot, in reading "
+            "order left to right, top to bottom.", 1)
+
+        # 镜头级的景别/机位/动作摘要（提示词里已含 FRAMING / SCENE AND ACTION，
+        # 这里只补「9 关键帧的时间语义」，让模型知道这是时间切片而非空间变体）。
+        shot_desc = str(shot.get("description") or "").strip()
+        prompt += (
+            "\n\nGRID LAYOUT (single-shot keyframes): exactly 3 rows by 3 columns, "
+            "nine panels in total, reading order left-to-right then top-to-bottom.\n"
+            "All nine panels are NINE KEYFRAMES OF THE SAME SINGLE SHOT — they "
+            "advance IN TIME from the start of this shot (panel 1) to the end "
+            "(panel 9), showing how the action, the characters' poses and "
+            "expressions, and the framing evolve continuously over the shot's "
+            "duration. They are NOT nine different shots and NOT nine camera-angle "
+            "variants of one frozen moment.\n"
+            "Distribute the progression naturally across the nine panels: early "
+            "panels show the start of the action, middle panels the development, "
+            "and late panels the completion or reaction. The framing may shift "
+            "gradually with the camera movement described for this shot, but every "
+            "panel still belongs to this one continuous take.\n"
+            + (f"Shot content to advance through: {shot_desc}\n" if shot_desc else "")
+            + "CHARACTER CONSISTENCY (critical): the characters, their facial "
+            "identity, hairstyle, costume and props, together with the scene, "
+            "lighting direction and colour grading, must be IDENTICAL in every one "
+            "of the nine panels — only the progression of the action and framing "
+            "changes.\n"
+            "TEXT RULE (important, two different things):\n"
+            "- NO content text anywhere in the artwork: no dialogue, no subtitles, "
+            "no captions, no signage, no watermark.\n"
+            "- DO print a small plain Arabic numeral (1 to 9) in the BOTTOM-LEFT "
+            "corner of each panel, as a production index mark only. The numerals "
+            "are the sole exception to the no-text rule.")
+        if style:
+            prompt += f"\nOverall visual base (must hold across all nine panels): {style}."
+        return prompt
 
     @staticmethod
     def crop_grid_cell(grid_path: str, cell_index: int, out_path: str,
@@ -2455,6 +2672,7 @@ class ComfyUIClient:
         ## 分节顺序（固定）
 
           TASK            → 这一镜要生成的画面（含景别/机位硬约束，最靠前）
+          VISUAL BASE     → 画风实体前置锚定 + 反实拍声明（2026-10-02；无 style 时整段不出现）
           PRIMARY CANVAS  → <image1> 作主要画布
           COMPOSITION BASELINE → 带 3D 导演台站位基准图时，声明「只照它的构图摆」
                            （2026-09-27；不带基准图时整段不出现）
@@ -2462,7 +2680,7 @@ class ComfyUIClient:
           REFERENCE ROLES → 每张参考图各自的职责（<image2> 只提供 X）
           SCENE / ACTION  → 场景、动作、说话状态、情绪
           LIGHTING        → 光影氛围（可选，幂等）
-          STYLE           → 画面风格声明
+          STYLE           → 画面风格声明（与 VISUAL BASE **双写**，含质量尾）
           PRESERVE        → 保留子句 + 无文字硬禁令（兜底）
 
         历史教训：分镜图是质检重跑重灾区（教训库 68/73 条），其中「景别」占 45 条——
@@ -2500,6 +2718,41 @@ class ComfyUIClient:
                 f"{_CAMERA_ANGLE_SPECS[cam_angle]}.")
         sections.append("TASK: Generate a single storyboard frame.\n"
                         + "\n".join(framing_lines))
+
+        # ---------- VISUAL BASE（2026-10-02 新增：风格前置锚定）----------
+        # 来源：用户提供的业界分镜提示词范式，其结构是
+        #   「整体风格：视觉基底：3D国漫风格…生成九宫格…保持人物一致性」
+        # —— **风格锚在提示词开头**，而不是末尾。
+        #
+        # 动机（对应本项目实测缺陷）：末位 STYLE 节对**全景/远景镜**牵引力不足 ——
+        #   人物在画面中占比小、环境占比大时，模型更容易漂向「真人电影实拍感」。
+        #   实测第1集 shot_05（全景）首轮即被判 `style_mismatch=true`
+        #   （判官原话「真人电影级写实，非 3D CG」），score 85 仍被闸门拦下；
+        #   补一句「3D CG 游戏过场动画质感…数字渲染特征」后即通过。
+        #   → 把风格**前置**到 TASK 紧邻处，让它在注意力分配上不被画面内容稀释。
+        #
+        # ⚠️ **不移除末尾 STYLE**：末尾 STYLE 是**质检端同一份口径**（`camera_spec`
+        #    式的生成/质检共用标准），且 `prompt_memory` 依赖它做相似度剥离。
+        #    这里是**双写**（前置声明 + 末尾重申），不是搬移。
+        # ⚠️ **前置节只放「画风实体」不含质量词尾**：质量尾（highly detailed 等）
+        #    归 STYLE 管；两处都放会让 `prompt_qc._QUALITY_FLUFF` 剥离口径复杂化。
+        shot_style_probe = style_kit.normalize_style(shot.get("style"))
+        if shot_style_probe:
+            _base_style_en = ""
+            if hasattr(style_kit, "style_suffix_en"):
+                # with_tail=False：只取风格本体，不带质量尾
+                _base_style_en = style_kit.style_suffix_en(
+                    shot_style_probe, with_tail=False) or ""
+            if _base_style_en:
+                sections.append(
+                    f"VISUAL BASE (art style, must hold for the WHOLE frame): "
+                    f"{_base_style_en}. This is a stylized CG render, NOT live-action "
+                    f"photography and NOT a photograph of real people — every surface "
+                    f"(skin, cloth, metal, stone) must show the characteristic "
+                    f"digital-render look of this art style. This style holds equally "
+                    f"for wide and establishing shots, where characters occupy only a "
+                    f"small part of the frame; the environment must be rendered in the "
+                    f"same art style, never as photographic realism.")
 
         # ---------- PRIMARY CANVAS + IDENTITY + REFERENCE ROLES ----------
         # 官方要点：每张参考图都必须被赋予**明确且唯一**的职责，并把身份/修改目标/
@@ -2938,6 +3191,10 @@ class ComfyUIClient:
         seg_audios: List[List[str]] = None,
         audio_mode: str = None,
         common_refs: List[str] = None,
+        common_ref_audios: List[str] = None,
+        common_prompt: str = None,
+        build_only: bool = False,
+        save_build_to: str = None,
     ) -> dict:
         """H3 整集视频生成（N 段一个工作流，原生 H3ContinuousSeamlessJoinV14 衔接）
         + 整片 QC 门控。
@@ -2963,6 +3220,23 @@ class ComfyUIClient:
         n = len(segs)
         logger.info(f"[H3-episode] 整集生成：{n} 段一次提交，qc_fn={bool(qc_fn)}, "
                     f"max_retries={max_retries}")
+
+        if build_only:
+            # 工作流导出模式（2026-10-03）：只构建一次 UI 工作流（内存返回），
+            # 跳过整个「提交 → 等待成片 → 整片 QC 重试」循环 —— 零 GPU 消耗。
+            _r = self.generate_h3_sequence(
+                segments=segs, filename_prefix=filename_prefix, seed=seed,
+                timeout_per_segment=timeout_per_segment, template_file=template_file,
+                save_build_to=save_build_to, build_only=True, size=size,
+                seg_audios=seg_audios, audio_mode=audio_mode,
+                common_refs=common_refs, common_ref_audios=common_ref_audios,
+                common_prompt=common_prompt)
+            return {"files": [], "build_only": True,
+                    "workflow": _r.get("workflow"),
+                    "layout": _r.get("layout") or {},
+                    "saved": _r.get("saved") or save_build_to or "",
+                    "segments": [], "qc_results": [], "failed": False,
+                    "attempts_used": 0, "prompt_id": "", "segment_count": n}
 
         qc_results: List[dict] = []
         attempts_used = 0
@@ -2997,6 +3271,8 @@ class ComfyUIClient:
                     seg_audios=seg_audios,
                     audio_mode=audio_mode,
                     common_refs=common_refs,
+                    common_ref_audios=common_ref_audios,
+                    common_prompt=common_prompt,
                 )
             except RuntimeError as e:
                 # S12：确定性输入错误（如某段无可用参考图被拒绝提交）——
@@ -3110,10 +3386,13 @@ class ComfyUIClient:
                              timeout_per_segment: int = 900,
                              template_file: str = None,
                              save_build_to: str = None,
+                             build_only: bool = False,
                              size=None,
                              seg_audios: List[List[str]] = None,
                              audio_mode: str = None,
-                             common_refs: List[str] = None) -> dict:
+                             common_refs: List[str] = None,
+                             common_ref_audios: List[str] = None,
+                             common_prompt: str = None) -> dict:
         """H3 多段一次生成：**工作流段数 = len(segments)**，一个分镜对应一段。
 
         两条实现路径（按**模板结构**自动分流，见 `_use_director_builder`）：
@@ -3153,9 +3432,11 @@ class ComfyUIClient:
                 segs, tpl_path=tpl_path, tpl_name=tpl_name,
                 filename_prefix=filename_prefix, emit_audio=emit_audio, seed=seed,
                 timeout=timeout, timeout_per_segment=timeout_per_segment,
-                save_build_to=save_build_to, size=size,
+                save_build_to=save_build_to, build_only=build_only, size=size,
                 seg_audios=seg_audios, audio_mode=audio_mode,
-                common_refs=common_refs)
+                common_refs=common_refs,
+                common_ref_audios=common_ref_audios,
+                common_prompt=common_prompt)
 
         if common_refs:
             # 旧连续拼接路径按段重建子图、没有「公共参数」概念（global.refs 零引用）。
@@ -3164,11 +3445,30 @@ class ComfyUIClient:
                 "[H3] 旧连续拼接路径不支持公共参考图（MJSCXT_H3_BUILDER=%s），"
                 "已忽略 %d 张公共图；如需公共参数请用 Director 模板",
                 os.environ.get("MJSCXT_H3_BUILDER") or "auto", len(common_refs))
+        if common_ref_audios:
+            logger.warning(
+                "[H3] 旧连续拼接路径不支持公共参考音色（MJSCXT_H3_BUILDER=%s），"
+                "已忽略 %d 支公共音色；如需公共音色请用 Director 模板",
+                os.environ.get("MJSCXT_H3_BUILDER") or "auto", len(common_ref_audios))
+        if common_prompt:
+            logger.warning(
+                "[H3] 旧连续拼接路径不支持公共提示词 subject lock，已忽略；"
+                "如需公共锁定请用 Director 模板")
 
         builder = H3EpisodeBuilder(tpl_path)
         default_duration = float((segs[0] or {}).get("duration") or 5.0)
         wf, layout = builder.build(n, duration=default_duration,
                                    resolution_override=tuple(size) if size else None)
+        if build_only:
+            # 只构建不提交（2026-10-03 工作流导出模式）：UI 工作流**随结果内存返回**，
+            # 由调用方（app.py，用其既有 atomic_write_json）落盘 —— 本层不再直接写文件，
+            # 也不进 to_api / GPU 提交。供人工在 ComfyUI 里打开检查或离线复现。
+            logger.info("[H3][build_only] 工作流已构建（不落盘不提交），UI 节点 %s / 连线 %s",
+                        layout.get("node_total"), layout.get("link_total"))
+            return {"build_only": True, "files": [], "saved": "", "workflow": wf,
+                    "layout": {"node_total": layout.get("node_total"),
+                               "link_total": layout.get("link_total"),
+                               "segments": len(segs)}}
         if save_build_to:
             os.makedirs(os.path.dirname(save_build_to), exist_ok=True)
             with open(save_build_to, "w", encoding="utf-8") as f:
@@ -3518,12 +3818,14 @@ class ComfyUIClient:
         filename_prefix: str = "comic_drama/episode",
         emit_audio: bool = None, seed: int = None,
         timeout: int = None, timeout_per_segment: int = 900,
-        save_build_to: str = None, size=None,
+        save_build_to: str = None, build_only: bool = False, size=None,
         continuity: bool = True, continuity_overlap: int = None,
         export_mode: str = None, ref_max_size: int = None,
         seg_audios: Optional[List[List[str]]] = None,
         audio_mode: str = None,
-        common_refs: Optional[List[str]] = None) -> dict:
+        common_refs: Optional[List[str]] = None,
+        common_ref_audios: Optional[List[str]] = None,
+        common_prompt: Optional[str] = None) -> dict:
         """Director 路径实现：一条 ``timeline_data`` 承载 N 段，返回结构对齐旧路径。
 
         与旧连续拼接路径的**语义差异（务必知道）**：
@@ -3593,6 +3895,31 @@ class ComfyUIClient:
                 len(common_names), len(common_want),
                 "已内联进各段 refs（上传不全，退化为逐段携带）" if inline_common
                 else "走 global.refs + commonEnabled")
+
+        # ---------------- 公共参考音频：解析 + 上传（取代逐段配音，2026-10-02） ----------------
+        # 公共音色写进 global.refAudios（index 0..M-1），commonEnabled 时逐段共用同一套
+        # 参考音色驱动口型/节奏。取代逐段 QwenTTS：当 common_ref_audios 生效时，段级
+        # refAudios 不再需要（build() 侧仍保留段级管线，但 app.py 组装时传空段级配音）。
+        common_audio_names: List[str] = []
+        if common_ref_audios:
+            _ca_cache: Dict[str, Optional[str]] = {}
+            _ca_want: List[str] = []
+            for _ca in common_ref_audios:
+                _cal = self.resolve_local_path(_ca)
+                if not _cal or not os.path.exists(_cal):
+                    if _ca:
+                        logger.warning("[H3-Director] 公共参考音频不可用，已跳过: %s", _ca)
+                    continue
+                _ckey = os.path.normcase(os.path.normpath(os.path.abspath(_cal)))
+                if _ckey not in _ca_want:
+                    _ca_want.append(_ckey)
+            for _ck in _ca_want:
+                _cv = self._upload_h3_director_audio(_ck, _ca_cache)
+                if _cv:
+                    common_audio_names.append(_cv)
+            logger.info(
+                "[H3-Director] 公共参考音频 %d 张（声明 %d）→ global.refAudios（index 0..M-1）",
+                len(common_audio_names), len(common_ref_audios))
 
         # ---------------- 参考图：逐段解析 + 上传 ----------------
         # 同一个本地路径（跨镜共用同一张角色锚点图很常见）只上传一次。
@@ -3684,7 +4011,11 @@ class ComfyUIClient:
         #    这里优先套用用户在前端从 object_info 扫到并手选的合法值。
         #    ⚠️ 必须 fail-safe：任何异常都只告警并沿用模板原值，绝不中断主流程。
         try:
-            _model_ov = comfyui_models.overrides_for("h3_video")
+            # ⚠️ 按**实际生效的模板文件名**查槽位映射：SLOTS.targets 按模板文件名索引
+            #    （单采 12 节点 / 二采 23 节点节点 id 不同）。传 "h3_video" 这个 key
+            #    只是向后兼容写法；这里直接用 resolve 后的文件名更不易错。
+            _model_ov = comfyui_models.overrides_for_template(
+                os.path.basename(tpl_path))
             if _model_ov:
                 _applied = builder.apply_model_overrides(_model_ov)
                 if _applied:
@@ -3699,7 +4030,14 @@ class ComfyUIClient:
         #   "source" = H3 用 refAudios 里的参考音频驱动口型/节奏（逐镜 QwenTTS 配音）。
         _eff_audio_mode = audio_mode
         if _eff_audio_mode is None:
-            if any(seg_audio_names):
+            if common_audio_names:
+                # 公共参考音色取代逐段 QwenTTS 配音（2026-10-02）：用 **generate** 模式
+                # —— 公共音色（global.refAudios）作条件**锁定角色音色**，语音按各段
+                # 台词自生成。⚠️ 不用 source：source＝参考音频原样 mux，会把同一句
+                # 参考音频文本灌进每一段（台词全错配，docs/r2v-source-audio.md 明确
+                # source 要求「台词须与音频一致」）。generate = 音色统一 + 台词正确。
+                _eff_audio_mode = "generate"
+            elif any(seg_audio_names):
                 _eff_audio_mode = "source"
             else:
                 _eff_audio_mode = "generate" if emit_audio else "mute"
@@ -3713,6 +4051,8 @@ class ComfyUIClient:
             if inline_common else seg_ref_names)
         wf, layout = builder.build(
             segs, seg_refs=_seg_refs_for_build, seg_audios=seg_audio_names,
+            common_ref_audios=common_audio_names,
+            common_prompt=common_prompt,
             refs=list(common_names) if _use_global_common else (),
             common_enabled=_use_global_common,
             width=w, height=h, frame_rate=fps, seed=seed,
@@ -3736,12 +4076,29 @@ class ComfyUIClient:
                                          common_names=(common_names
                                                        if _use_global_common else None))
 
+        if build_only:
+            # 只构建不提交（Director 路径，2026-10-03）：UI 工作流**随结果内存返回**，
+            # 由调用方落盘（app.py 既有原子写工具）；本层不写文件、不 to_api、
+            # 不传参考图、不提交 GPU。layout 摘要随返回值带回便于核对段数/帧数。
+            logger.info("[H3-Director][build_only] 工作流已构建（不落盘不提交）：%d 段 / "
+                        "%s 帧 / UI 节点 %s 连线 %s", n, layout.get("total_frames"),
+                        layout.get("node_total"), layout.get("link_total"))
+            return {"build_only": True, "files": [], "saved": "", "workflow": wf,
+                    "layout": {"node_total": layout.get("node_total"),
+                               "link_total": layout.get("link_total"),
+                               "total_frames": layout.get("total_frames"),
+                               "duration_sec": layout.get("duration_sec"),
+                               "segments": len(segs),
+                               "common_refs": len(common_names or [])}}
+
         if save_build_to:
             os.makedirs(os.path.dirname(save_build_to), exist_ok=True)
             with open(save_build_to, "w", encoding="utf-8") as f:
                 json.dump(wf, f, ensure_ascii=False)
             layout["build_path"] = save_build_to
         layout["common_refs"] = list(common_names)
+        layout["common_ref_audios"] = list(common_audio_names)
+        layout["audio_mode"] = _eff_audio_mode
         layout["common_inline"] = bool(inline_common)
         logger.info(
             f"H3(Director) 工作流已就绪：{n} 段 / {layout['total_frames']} 帧"

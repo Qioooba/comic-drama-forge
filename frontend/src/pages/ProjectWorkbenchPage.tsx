@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useApp } from '@/context/AppContext';
 import { t } from '@/i18n';
-import { projectsApi, keyframesApi, storyboardApi, videoApi, ttsApi, mixApi, qcApi, exportApi, autopilotApi, upscaleApi, chatApi, agentApi, episodesApi, novelsSplitPlanApi, preflightApi, characterOutfits, characterSheetUpload, assetPrecipitation, generationApi, type VideoMode, type ChapterPreflightResult, type AssetPrecipitationResponse, type PrecipitationStatus } from '@/api/client';
+import { projectsApi, keyframesApi, storyboardApi, videoApi, ttsApi, mixApi, qcApi, exportApi, autopilotApi, upscaleApi, chatApi, agentApi, episodesApi, novelsSplitPlanApi, preflightApi, screenplayApi, characterOutfits, characterSheetUpload, assetPrecipitation, generationApi, type VideoMode, type EpisodeScenesResponse, type ChapterPreflightResult, type AssetPrecipitationResponse, type PrecipitationStatus } from '@/api/client';
 import { Button, ConfirmDialog, Input, EmptyState, ErrorState, Loading, Skeleton, Modal, Select } from '@/components/ui';
 // tab 图标統一走线性 SVG（方案 P2-10）：此前是 emoji，字号受系统字体影响且观感与全站割裂
 import {
@@ -280,10 +280,8 @@ const PRODUCTION_STEPS: { id: string; labelKey: string }[] = [
   { id: 'storyboard', labelKey: 'wb.stepStoryboard' },
   { id: 'keyframe', labelKey: 'wb.stepKeyframe' },
   { id: 'video', labelKey: 'wb.stepVideo' },
-  { id: 'final', labelKey: 'wb.stepFinal' },
-  { id: 'tts', labelKey: 'wb.stepTts' },
-  { id: 'mix', labelKey: 'wb.stepMix' },
   { id: 'upscale', labelKey: 'wb.stepUpscale' },
+  { id: 'final', labelKey: 'wb.stepFinal' },
 ];
 
 /** 生产进度卡片：轮询 /api/autopilot/status，把「当前正在生产哪一集、当前步骤、百分比、
@@ -459,6 +457,17 @@ function OverviewTab({
   const [preflightDetail, setPreflightDetail] = useState<ChapterPreflightResult | null>(null);
   const [preflightOpen, setPreflightOpen] = useState(false);
 
+  // --- 按场次生成（2026-10-03）：集行可展开「第1场/第2场/…」场次层级 ---
+  // 视频生产已改为按场次生成：每场一个 scene_XX.mp4，全部完成后拼成 epNN_full.mp4。
+  // 展开时拉 GET /api/episode/scenes（每次展开都重新拉：分镜/视频状态随生产推进变化）。
+  const [scenesOpenEps, setScenesOpenEps] = useState<number[]>([]);
+  const [scenesByEp, setScenesByEp] = useState<Record<number, EpisodeScenesResponse | null>>({});
+  const [scenesLoadingEp, setScenesLoadingEp] = useState<number | null>(null);
+  const [scenesErrByEp, setScenesErrByEp] = useState<Record<number, string>>({});
+  /** 「重做本场」进行中的键（"集:场"）；非空时所有重做按钮禁用，防止并发占满 ComfyUI */
+  const [redoBusy, setRedoBusy] = useState<string | null>(null);
+  const redoReqRef = useRef(0);
+
   const runPreflight = async (chIdx: number) => {
     if (!novelId) return;
     setPreflightRunning(chIdx);
@@ -484,6 +493,116 @@ function OverviewTab({
     if (d.exists && d.result) {
       setPreflightDetail(d.result);
       setPreflightOpen(true);
+    }
+  };
+
+  // --- 文学剧本（人审层，两段式第一步）：1章=1集，episode_no 即章号 ---
+  const [spOpen, setSpOpen] = useState(false);
+  const [spEpisode, setSpEpisode] = useState<number | null>(null);
+  const [spContent, setSpContent] = useState('');
+  const [spLoading, setSpLoading] = useState(false);
+  const [spGenerating, setSpGenerating] = useState(false);
+  const [spRewriting, setSpRewriting] = useState(false);
+  // 2026-10-04 改写已自动化：本标志仅用于弹窗底部状态条展示「✅ 分镜剧本已生成」，
+  // 打开弹窗/重新生成时重置（回看已有剧本永远走不到该状态）
+  const [spRewritten, setSpRewritten] = useState(false);
+  const [spError, setSpError] = useState('');
+  // 标签切换会卸载本组件：卸载后让任务轮询让位，不再 setState
+  const spAliveRef = useRef(true);
+  useEffect(() => {
+    spAliveRef.current = true;
+    return () => { spAliveRef.current = false; };
+  }, []);
+  // 请求令牌：A 章生成中用户改点 B 章时，丢弃 A 的迟到结果，防止跨章串内容
+  const spReqRef = useRef(0);
+
+  /** 轮询 generation 任务至终态（3s 一次，15 分钟兜底）。
+   *  ⚠️ /api/generation/status 历史上有 {success, task:{…}} 信封与顶层平铺两种形态，
+   *  按 `task ?? 顶层` 兼容读取（与九宫格候选轮询同口径）。 */
+  /** failMsg/timeoutMsg：场次重做等非剧本场景传入各自的错误文案（缺省回落剧本文案） */
+  const pollGenerationTask = async (taskId: string, isCurrent: () => boolean, failMsg?: string, timeoutMsg?: string) => {
+    const deadline = Date.now() + 15 * 60 * 1000;
+    for (;;) {
+      await new Promise(r => setTimeout(r, 3000));
+      if (!spAliveRef.current || !isCurrent()) throw new Error(failMsg || t('wb.screenplayGenerateFailed'));
+      const d: any = await generationApi.status(taskId);
+      const task = (d?.task ?? d) || {};
+      if (task.status === 'completed') return;
+      if (task.status === 'failed' || task.status === 'cancelled') {
+        throw new Error(task.error || failMsg || t('wb.screenplayGenerateFailed'));
+      }
+      if (Date.now() > deadline) throw new Error(timeoutMsg || t('wb.screenplayTimeout'));
+    }
+  };
+
+  /** 每章行「文学剧本」：已有则直接弹窗展示；没有则发起生成（异步任务轮询）后再展示 */
+  const openScreenplay = async (chapterNo: number) => {
+    if (!novelId) return;
+    const token = ++spReqRef.current;
+    const isCurrent = () => token === spReqRef.current;
+    setSpEpisode(chapterNo);
+    setSpContent('');
+    setSpError('');
+    setSpGenerating(false);
+    // 上一章迟到的改写请求被令牌作废后可能遗留 true：不许把改写态带进本章
+    setSpRewriting(false);
+    setSpRewritten(false);
+    setSpOpen(true);
+    setSpLoading(true);
+    try {
+      const doc = await screenplayApi.get(novelId, chapterNo, projectKey);
+      if (!isCurrent()) return;
+      if (doc.exists && doc.markdown) {
+        // 回看已有剧本：只展示，不自动改写（避免回看场景重复烧 LLM）
+        setSpContent(doc.markdown);
+        setSpLoading(false);
+        return;
+      }
+      // 不存在 → 生成（异步任务 + 轮询），完成后回读展示
+      const r = await screenplayApi.generate(novelId, chapterNo, { projectName: projectKey });
+      if (!r?.task_id) throw new Error(t('wb.screenplayStartFailed'));
+      setSpLoading(false);
+      setSpGenerating(true);
+      await pollGenerationTask(r.task_id, isCurrent);
+      if (!isCurrent()) return;
+      const done = await screenplayApi.get(novelId, chapterNo, projectKey);
+      if (!done.exists || !done.markdown) throw new Error(t('wb.screenplayNotGenerated'));
+      setSpContent(done.markdown);
+      // 2026-10-04 需求：文学剧本无需人工确认 —— 生成（轮询到 completed）后立即
+      // 自动改写为分镜剧本，等价于旧版自动点「确认无误」按钮。先落 spGenerating
+      // 再进改写，弹窗底部状态条才能依次显示「生成中 → 自动改写中 → 已完成」。
+      // 改写失败由 runScreenplayRewrite 内部落在 spError，不进本层 catch。
+      setSpGenerating(false);
+      await runScreenplayRewrite(chapterNo, isCurrent);
+    } catch (err) {
+      if (isCurrent()) {
+        setSpError(err instanceof Error ? err.message : t('wb.screenplayGenerateFailed'));
+      }
+    } finally {
+      if (isCurrent()) {
+        setSpLoading(false);
+        setSpGenerating(false);
+      }
+    }
+  };
+
+  /** 弹窗底部「确认无误，改写为分镜剧本」：以文学剧本为原文重写成结构化分镜剧本 */
+  const handleScreenplayRewrite = async () => {
+    if (!novelId || spEpisode == null || spRewriting) return;
+    setSpRewriting(true);
+    setSpError('');
+    try {
+      const r = await episodesApi.generate(novelId, { chapters: [spEpisode], use_screenplay: true });
+      // 兼容同步/异步两种返回：带 task_id 则轮询到完成
+      const taskId = r?.task_id;
+      if (taskId) await pollGenerationTask(String(taskId), () => spAliveRef.current);
+      toast.success(t('wb.screenplayRewriteDone'));
+      setSpOpen(false);
+      fetchEpisodes();
+    } catch (err) {
+      setSpError(err instanceof Error ? err.message : t('wb.screenplayRewriteFailed'));
+    } finally {
+      setSpRewriting(false);
     }
   };
 
@@ -527,6 +646,85 @@ function OverviewTab({
       })
       .finally(() => setSplitPlanLoading(false));
   }, [novelId, t]);
+
+  // --- 场次层级（按场次生成）：展开拉取 + 重做本场 ---
+  const fetchScenes = React.useCallback(async (episodeNo: number, silent = false) => {
+    if (!projectKey) return;
+    if (!silent) setScenesLoadingEp(episodeNo);
+    try {
+      const d = await episodesApi.scenes(projectKey, episodeNo);
+      setScenesByEp(prev => ({ ...prev, [episodeNo]: d }));
+      setScenesErrByEp(prev => { const next = { ...prev }; delete next[episodeNo]; return next; });
+    } catch (err) {
+      // 静默刷新失败时保留旧数据（展开着的面板不该因一次轮询失败闪成报错）
+      if (!silent) {
+        setScenesErrByEp(prev => ({ ...prev, [episodeNo]: err instanceof Error ? err.message : t('wb.scenesLoadFailed') }));
+      }
+    } finally {
+      if (!silent) setScenesLoadingEp(null);
+    }
+  }, [projectKey, t]);
+
+  const toggleScenes = (episodeNo: number) => {
+    const willOpen = !scenesOpenEps.includes(episodeNo);
+    setScenesOpenEps(prev => (willOpen ? [...prev, episodeNo] : prev.filter(n => n !== episodeNo)));
+    if (willOpen) void fetchScenes(episodeNo);
+  };
+
+  /** 「重做本场」：只重生成这一场（POST /videos/generate only_scenes=[X] overwrite=true），
+   *  轮询 generation/status 至终态后静默刷新场次状态。直接执行不加确认 ——
+   *  与资产「重新生成」同款项目习惯（误重做可再重做一次，非不可逆操作）。 */
+  const redoScene = async (episodeNo: number, sceneNo: number) => {
+    if (redoBusy) return;
+    const key = `${episodeNo}:${sceneNo}`;
+    const token = ++redoReqRef.current;
+    const isCurrent = () => spAliveRef.current && token === redoReqRef.current;
+    setRedoBusy(key);
+    try {
+      const r = await videoApi.generateEpisode({
+        project_name: projectKey,
+        episode_no: episodeNo,
+        only_scenes: [sceneNo],
+        overwrite: true,
+      });
+      if (r?.task_id) {
+        await pollGenerationTask(String(r.task_id), isCurrent, t('wb.sceneRedoFailed'), t('wb.sceneRedoTimeout'));
+      }
+      if (isCurrent()) toast.success(t('wb.sceneRedoDone', { n: sceneNo }));
+    } catch (err) {
+      if (isCurrent()) toast.error(err instanceof Error ? err.message : t('wb.sceneRedoFailed'));
+    } finally {
+      // 与 openScreenplay 同款：组件已卸载（切标签页）就不再 setState / 刷新
+      if (isCurrent()) {
+        setRedoBusy(null);
+        void fetchScenes(episodeNo, true);
+      }
+    }
+  };
+
+  // 集行「整集已拼接」徽标：列表加载完后对每集静默拉一次场次状态，
+  // 未展开也能看到哪些集已拼出整集成片。只读、失败静默（徽标是锦上添花）。
+  useEffect(() => {
+    if (scriptLoading || episodes.length === 0 || !projectKey) return;
+    let alive = true;
+    Promise.all(
+      episodes.map((ep: any) =>
+        episodesApi.scenes(projectKey, ep.episode_no)
+          .then(d => ({ no: ep.episode_no as number, d }))
+          .catch(() => null)
+      )
+    ).then(results => {
+      if (!alive) return;
+      const ok = results.filter(Boolean) as { no: number; d: EpisodeScenesResponse }[];
+      if (ok.length === 0) return;
+      setScenesByEp(prev => {
+        const next = { ...prev };
+        for (const { no, d } of ok) next[no] = d;
+        return next;
+      });
+    });
+    return () => { alive = false; };
+  }, [scriptLoading, episodes, projectKey]);
 
   // 加载单集详情
   // ⚠️ 后端 /api/episodes/<novel>/<ep> 的剧本正文嵌在 `script` 对象下（shots/characters/items/scenes），
@@ -634,6 +832,10 @@ function OverviewTab({
             </div>
           )}
         </div>
+
+        {/* 文学剧本（人审层）：默认收起，展开才拉取；novel_id 拿不到时整个面板不渲染。
+            面板标题旁注明「此为人审稿」—— 下方「剧本内容」区块即改写后的结构化分镜剧本。 */}
+        <ScreenplayPanel novelId={novelId} episodeNo={selectedEpisode} />
 
         <div className="bg-surface rounded-lg border border-line p-6">
           <h4 className="font-semibold text-ink-1 mb-4">{t('wb.scriptContent')}</h4>
@@ -1043,6 +1245,17 @@ function OverviewTab({
                     >
                       <div className="flex items-center justify-between">
                         <div className="flex items-center gap-3">
+                          {/* 场次层级（按场次生成）：展开/收起「第1场/第2场/…」；行本身仍点开单集详情 */}
+                          <button
+                            onClick={(e) => { e.stopPropagation(); toggleScenes(ep.episode_no); }}
+                            aria-expanded={scenesOpenEps.includes(ep.episode_no)}
+                            title={t('wb.scenesToggle')}
+                            className={`shrink-0 rounded-md p-1 text-ink-3 transition-colors hover:bg-surface-2 hover:text-ink-1 ${FOCUS_RING}`}
+                          >
+                            <svg className={`w-4 h-4 transition-transform ${scenesOpenEps.includes(ep.episode_no) ? 'rotate-90' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                            </svg>
+                          </button>
                           <span className="flex items-center justify-center w-8 h-8 rounded-full bg-brand-subtle text-brand text-sm font-semibold">
                             {ep.episode_no}
                           </span>
@@ -1078,6 +1291,17 @@ function OverviewTab({
                         </div>
 
                         <div className="flex items-center gap-4">
+                          {/* 文学剧本（人审层）：查看/生成本章文学剧本，确认后可改写为分镜剧本。
+                              行本身是可点击的大按钮，这里必须 stopPropagation 防止误开详情 */}
+                          <button
+                            onClick={(e) => { e.stopPropagation(); openScreenplay(ep.episode_no); }}
+                            disabled={spGenerating && spEpisode === ep.episode_no}
+                            title={t('wb.screenplayRowHint')}
+                            className={`inline-flex shrink-0 items-center gap-1 rounded-md border border-line bg-surface-2 px-2 py-1 text-xs font-medium text-ink-2 transition-colors hover:bg-line hover:text-ink-1 disabled:opacity-60 ${FOCUS_RING}`}
+                          >
+                            <FileText className="h-3.5 w-3.5" />
+                            {t('wb.screenplay')}
+                          </button>
                           <div className="text-right">
                             <div className="text-sm text-ink-2">
                               {t('wb.shotsRatio', { done: ep.completed_shots, total: ep.shot_count })}
@@ -1099,6 +1323,13 @@ function OverviewTab({
                              t('ep.pending')}
                           </span>
 
+                          {/* 按场次生成：该集全部场次视频已拼接成整集成片（epNN_full.mp4） */}
+                          {scenesByEp[ep.episode_no]?.full_video_ready && (
+                            <span className="inline-flex items-center gap-1 rounded-full bg-success-subtle px-2 py-1 text-xs font-medium text-success-strong">
+                              <Check className="h-3.5 w-3.5" /> {t('wb.fullVideoReady')}
+                            </span>
+                          )}
+
                           <svg className="w-5 h-5 text-ink-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
                           </svg>
@@ -1118,6 +1349,82 @@ function OverviewTab({
                         </div>
                       )}
                     </button>
+
+                    {/* 场次子列表（按场次生成）：第1场/第2场/… + 分镜/视频状态 + 重做本场。
+                        既有「点集名展开逐镜详情」不受影响 —— 本面板是新增的场次层级。 */}
+                    {scenesOpenEps.includes(ep.episode_no) && (
+                      <div className="border-t border-line bg-surface-2/50 px-4 py-3">
+                        {scenesLoadingEp === ep.episode_no && !scenesByEp[ep.episode_no] ? (
+                          <div className="flex items-center gap-2 py-1 text-sm text-ink-2">
+                            <div className="h-4 w-4 animate-spin rounded-full border-2 border-brand border-t-transparent" />
+                            {t('wb.scenesLoading')}
+                          </div>
+                        ) : scenesErrByEp[ep.episode_no] ? (
+                          <div className="flex items-center justify-between gap-3 py-1">
+                            <span className="text-sm text-danger-strong">{scenesErrByEp[ep.episode_no]}</span>
+                            <button
+                              onClick={() => fetchScenes(ep.episode_no)}
+                              className={`rounded-md bg-surface-2 px-2.5 py-1 text-xs text-ink-2 transition-colors hover:bg-line ${FOCUS_RING}`}
+                            >
+                              {t('wb.scenesRetry')}
+                            </button>
+                          </div>
+                        ) : (scenesByEp[ep.episode_no]?.scenes?.length ?? 0) === 0 ? (
+                          <p className="py-1 text-sm text-ink-3">{t('wb.scenesEmpty')}</p>
+                        ) : (
+                          <ul className="divide-y divide-line">
+                            {(scenesByEp[ep.episode_no]?.scenes || []).map((sc) => {
+                              const redoKey = `${ep.episode_no}:${sc.scene_no}`;
+                              return (
+                                <li key={sc.scene_no} className="flex flex-wrap items-center gap-2 py-2.5">
+                                  <span className="shrink-0 text-sm font-medium text-ink-1">
+                                    {t('wb.sceneNo', { n: sc.scene_no })}
+                                  </span>
+                                  {sc.heading && (
+                                    <span className="max-w-[18rem] truncate text-xs text-ink-2" title={sc.heading}>{sc.heading}</span>
+                                  )}
+                                  {sc.location && (
+                                    <span className="text-xs text-ink-3">{sc.location}</span>
+                                  )}
+                                  <span className="tabular-nums text-xs text-ink-2">{t('wb.sceneShotCount', { n: sc.shot_count })}</span>
+                                  {/* 分镜状态：齐了亮绿「分镜完成」，否则显示「分镜 k/N」 */}
+                                  {sc.shot_count > 0 && sc.storyboard_ok >= sc.shot_count ? (
+                                    <span className="rounded bg-success-subtle px-1.5 py-0.5 text-[11px] font-medium text-success-strong">
+                                      {t('wb.sceneStoryboardDone')}
+                                    </span>
+                                  ) : (
+                                    <span className="rounded bg-warning-subtle px-1.5 py-0.5 text-[11px] font-medium text-warning-strong">
+                                      {t('wb.sceneStoryboardPart', { done: sc.storyboard_ok, total: sc.shot_count })}
+                                    </span>
+                                  )}
+                                  {/* 视频状态：该场 scene_XX.mp4 是否已生成 */}
+                                  {sc.video_ready ? (
+                                    <span className="rounded bg-success-subtle px-1.5 py-0.5 text-[11px] font-medium text-success-strong">
+                                      ✓ {t('wb.sceneVideoReady')}
+                                    </span>
+                                  ) : (
+                                    <span className="rounded bg-surface-2 px-1.5 py-0.5 text-[11px] font-medium text-ink-3">
+                                      {t('wb.sceneVideoMissing')}
+                                    </span>
+                                  )}
+                                  <button
+                                    onClick={() => redoScene(ep.episode_no, sc.scene_no)}
+                                    disabled={redoBusy !== null}
+                                    title={t('wb.sceneRedoHint')}
+                                    className={`ml-auto inline-flex shrink-0 items-center gap-1 rounded-md border border-line bg-surface px-2 py-1 text-xs font-medium text-ink-2 transition-colors hover:bg-line hover:text-ink-1 disabled:opacity-60 ${FOCUS_RING}`}
+                                  >
+                                    {redoBusy === redoKey && (
+                                      <span className="h-3 w-3 animate-spin rounded-full border-2 border-brand border-t-transparent" />
+                                    )}
+                                    {redoBusy === redoKey ? t('wb.sceneRedoBusy') : t('wb.sceneRedo')}
+                                  </button>
+                                </li>
+                              );
+                            })}
+                          </ul>
+                        )}
+                      </div>
+                    )}
                   </li>
                 ))}
               </ul>
@@ -1125,6 +1432,161 @@ function OverviewTab({
           </>
         )}
       </div>
+
+      {/* 文学剧本弹窗（人审层）：展示/生成本章文学剧本 + 两段式改写入口 */}
+      <ScreenplayModal
+        isOpen={spOpen}
+        episodeNo={spEpisode}
+        content={spContent}
+        loading={spLoading}
+        generating={spGenerating}
+        rewriting={spRewriting}
+        error={spError}
+        onClose={() => setSpOpen(false)}
+        onConfirmRewrite={handleScreenplayRewrite}
+      />
+    </div>
+  );
+}
+
+// ========== 文学剧本弹窗（人审层，两段式第一步） ==========
+// 展示 / 生成本章文学剧本。正文为 Markdown 文本：项目无 markdown 渲染依赖
+// （package.json 仅 react/react-dom/react-router），按约定用 whitespace-pre-wrap
+// 的正文样式直接展示，不引入新依赖。底部「确认无误，改写为分镜剧本」触发
+// 两段式第二步（POST episodes/generate {chapters:[章号], use_screenplay:true}）。
+function ScreenplayModal({
+  isOpen,
+  episodeNo,
+  content,
+  loading,
+  generating,
+  rewriting,
+  error,
+  onClose,
+  onConfirmRewrite,
+}: {
+  isOpen: boolean;
+  episodeNo: number | null;
+  content: string;
+  loading: boolean;
+  generating: boolean;
+  rewriting: boolean;
+  error: string;
+  onClose: () => void;
+  onConfirmRewrite: () => void;
+}) {
+  const { t } = useApp();
+  return (
+    <Modal
+      isOpen={isOpen}
+      onClose={onClose}
+      preventClose={rewriting}
+      title={t('wb.screenplayModalTitle', { n: episodeNo ?? '' })}
+      description={t('wb.screenplayModalDesc')}
+      size="xl"
+      footer={
+        <div className="flex w-full flex-wrap items-center gap-2">
+          <Button variant="secondary" onClick={onClose} disabled={rewriting}>
+            {t('common.close')}
+          </Button>
+          <Button
+            onClick={onConfirmRewrite}
+            disabled={loading || generating || !content || rewriting}
+            loading={rewriting}
+          >
+            {rewriting ? t('wb.screenplayRewriting') : t('wb.screenplayConfirmRewrite')}
+          </Button>
+        </div>
+      }
+    >
+      <div className="space-y-3">
+        {error && (
+          <div className="p-3 bg-danger-subtle border border-danger/30 rounded-lg text-danger-strong text-sm break-words">
+            {error}
+          </div>
+        )}
+        {loading ? (
+          <Loading size="md" label={t('common.loading')} />
+        ) : generating ? (
+          <Loading size="md" label={t('wb.screenplayGenerating')} />
+        ) : content ? (
+          <pre className="max-h-[60vh] overflow-y-auto whitespace-pre-wrap rounded-md border border-line bg-surface-2 p-4 text-sm leading-6 text-ink-1">
+            {content}
+          </pre>
+        ) : (
+          <p className="text-sm text-ink-2">{t('wb.screenplayNotGenerated')}</p>
+        )}
+      </div>
+    </Modal>
+  );
+}
+
+// ========== 文学剧本折叠面板（单集详情，人审层） ==========
+// 默认收起、展开才拉取（与资产沉淀/服装变体面板同款 fail-open：接口异常降级为
+// 一行提示，绝不打断详情主体）。novel_id 拿不到时整个面板不渲染，零报错。
+// 下方既有「剧本内容」区块即改写后的结构化分镜剧本，两者关系在标题旁注明。
+function ScreenplayPanel({ novelId, episodeNo }: { novelId?: string; episodeNo: number | null }) {
+  const { t } = useApp();
+  const [open, setOpen] = useState(false);
+  const [markdown, setMarkdown] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  // 换集重置：上一集的剧本绝不能带进下一集
+  useEffect(() => {
+    setOpen(false);
+    setMarkdown('');
+    setError('');
+  }, [episodeNo]);
+
+  useEffect(() => {
+    if (!open || !novelId || episodeNo == null) return;
+    let alive = true;
+    setLoading(true);
+    setError('');
+    screenplayApi.get(novelId, episodeNo)
+      .then((d) => {
+        if (!alive) return;
+        if (d?.exists && d.markdown) setMarkdown(d.markdown);
+        else setError(t('wb.screenplayNotGenerated'));
+      })
+      .catch(() => { if (alive) setError(t('wb.screenplayLoadFailed')); })
+      .finally(() => { if (alive) setLoading(false); });
+    return () => { alive = false; };
+    // t 是 i18n 稳定引用；按 open/novelId/episodeNo 触发即可
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, novelId, episodeNo]);
+
+  if (!novelId || episodeNo == null) return null;
+
+  return (
+    <div className="bg-surface rounded-lg border border-line p-6">
+      <button
+        type="button"
+        onClick={() => setOpen(v => !v)}
+        aria-expanded={open}
+        className={`flex w-full items-center justify-between gap-2 rounded text-left ${FOCUS_RING}`}
+      >
+        <span className="flex min-w-0 flex-wrap items-center gap-2">
+          <FileText className="h-4 w-4 shrink-0 text-ink-2" />
+          <span className="font-semibold text-ink-1">{t('wb.screenplay')}</span>
+          <span className="text-xs font-normal text-ink-3">{t('wb.screenplayHumanTag')}</span>
+        </span>
+        <span className="shrink-0 text-xs text-ink-3">{open ? '−' : '+'}</span>
+      </button>
+      {open && (
+        <div className="mt-3">
+          {loading ? (
+            <div className="text-sm text-ink-3">{t('common.loading')}</div>
+          ) : error ? (
+            <div className="text-sm text-ink-2">{error}</div>
+          ) : (
+            <pre className="max-h-[50vh] overflow-y-auto whitespace-pre-wrap rounded-md border border-line bg-surface-2 p-4 text-sm leading-6 text-ink-1">
+              {markdown}
+            </pre>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -1249,7 +1711,8 @@ function UploadSheetModal({
       if (r.skipped) {
         toast.info(r.message || t('uploadSheet.skipped'));
       } else {
-        toast.success(t('uploadSheet.ok', { n: Object.keys(r.views || {}).length }));
+        // 2026-10-02 不裁剪：views 恒为空，改用后端返回的准确文案（否则会显示「0 张视角图」）
+        toast.success(r.message || t('uploadSheet.ok', { n: Object.keys(r.views || {}).length }));
       }
       onUploaded?.();
       onClose();
@@ -2969,17 +3432,56 @@ function StoryboardTab({ projectKey, episodeNo }: { projectKey: string; episodeN
   /** 进行中的候选生成任务（sid → task_id）：弹窗被提前关掉后重开可续接轮询，不重复烧卡 */
   const gridTaskRef = useRef<{ sid: string; taskId: string } | null>(null);
 
-  const fetchCanvas = async () => {
+  // ---- 分镜图点击放大（lightbox）----
+  /** 正在放大的分镜图：正式图或生成中 scratch 图；null = 弹窗关闭。
+   *  分镜缩略图原先没有任何点击交互（点了没反应），这里补上全屏放大查看。 */
+  const [zoomImg, setZoomImg] = useState<{ src: string; seq: number } | null>(null);
+
+  // ---- 分镜画布自动刷新（轮询）----
+  /**
+   * 画布自动刷新句柄。
+   * 背景：分镜图是「整步落盘」——未完成时 storyboards/<项目>/ 里没有文件，
+   * 生成中的图只在 QC_DIR/<项目>/storyboard_scratch/。若只靠手动刷新，
+   * 用户会长时间看到「无分镜图」而误以为卡死。这里每 3s 重拉一次 canvas，
+   * 生成中卡片即可看到 generating/scratch_url，完成后自动变成正式图。
+   */
+  const canvasPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  /**
+   * 轮询是否「有理由继续」的最新快照（避免把 loading/cards 放进 useEffect 依赖：
+   * 那会在每次 setCards 后重建定时器，轮询节奏被打乱）。
+   */
+  const canvasPollStateRef = useRef<{ generating: number; total: number; stepActive: boolean }>({
+    generating: 0, total: 0, stepActive: false,
+  });
+
+  const stopCanvasPoll = () => {
+    if (canvasPollRef.current) { clearInterval(canvasPollRef.current); canvasPollRef.current = null; }
+  };
+
+  const fetchCanvas = async (opts?: { silent?: boolean }) => {
     if (!projectKey) return;
-    setLoading(true);
-    setError('');
+    const silent = !!opts?.silent;
+    // 静默轮询不翻转 loading：否则每 3 秒整页闪一次骨架屏
+    if (!silent) setLoading(true);
+    if (!silent) setError('');
     try {
       // ⭐ 必须带集号：不带时后端只认「已生成集里最新的那集」，
       //    用户切到第 2 集却看到第 N 集的分镜（与集切换器显示的集不一致）。
       const data = await storyboardApi.canvas(projectKey, episodeNo ?? undefined);
-      setCards(data.cards || []);
+      const nextCards = data.cards || [];
+      setCards(nextCards);
       setSummary((data as any).summary || null);
+      if (silent) setError('');
+      // 记录「是否值得继续轮询」：有生成中卡片 → 继续
+      const gen = nextCards.filter((c: any) => c?.storyboard?.generating).length;
+      const total = nextCards.length;
+      canvasPollStateRef.current = {
+        generating: gen,
+        total,
+        stepActive: canvasPollStateRef.current.stepActive,
+      };
     } catch (err) {
+      if (silent) return; // 静默轮询失败：留给下一轮，不打断用户
       const msg = err instanceof Error ? err.message : t('sb.fetchFailed');
       if (msg.includes('404')) {
         setError('no-data');
@@ -2987,12 +3489,26 @@ function StoryboardTab({ projectKey, episodeNo }: { projectKey: string; episodeN
         setError(msg);
       }
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   };
 
-  // 换集必须重拉：cards 是按集落盘的分镜图/视频，混用会张冠李戴
-  useEffect(() => { fetchCanvas(); }, [projectKey, episodeNo]);
+  // 换集必须重拉：cards 是按集落盘的分镜图/视频，混用会张冠李戴。
+  // ⭐ 同时启动自动刷新轮询：生成过程中画布会持续变化（生成中卡片出现 → 转正），
+  //    不轮询则用户必须手动点刷新才能看到新图。
+  useEffect(() => {
+    if (!projectKey) return;
+    canvasPollStateRef.current = { generating: 0, total: 0, stepActive: canvasPollStateRef.current.stepActive };
+    fetchCanvas();
+    stopCanvasPoll();
+    // 5s：比九宫格轮询（3s，用户在前台等一张图）慢一档；分镜整步动辄 20+ 镜、
+    // 每镜 2-3 分钟，5s 足够让「生成中→完成」的观感接近实时，又不至于压后端。
+    canvasPollRef.current = setInterval(() => { fetchCanvas({ silent: true }); }, 5000);
+    return () => stopCanvasPoll();
+    // fetchCanvas 是每次渲染新建的闭包（内部读 projectKey/episodeNo），
+    // 只以这两个值为准重启动轮询；闭包捕获的是本次渲染的最新值，不会读到陈旧集号。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectKey, episodeNo]);
 
   // 项目级视频生成方式：进页面就回显（用户「新建项目」时选的），改成什么就按什么生成
   useEffect(() => {
@@ -3383,13 +3899,56 @@ function StoryboardTab({ projectKey, episodeNo }: { projectKey: string; episodeN
               </div>
 
               <div className="flex gap-3 mb-2">
-                <div className="w-24 h-24 shrink-0 rounded bg-surface-2 border border-line overflow-hidden flex items-center justify-center text-xs text-ink-3">
+                {(() => {
+                  // 有可放大查看的图（正式图优先，其次生成中 scratch）才让缩略框可点击
+                  const zoomSrc = (card.storyboard?.exists && card.storyboard?.url)
+                    || (card.storyboard?.generating && card.storyboard?.scratch_url);
+                  return (
+                <div
+                  role={zoomSrc ? 'button' : undefined}
+                  tabIndex={zoomSrc ? 0 : undefined}
+                  aria-label={zoomSrc ? t('sb.zoomTitle') : undefined}
+                  onClick={zoomSrc ? () => setZoomImg({ src: zoomSrc, seq: card.seq }) : undefined}
+                  onKeyDown={(e) => {
+                    if (zoomSrc && (e.key === 'Enter' || e.key === ' ')) {
+                      e.preventDefault();
+                      setZoomImg({ src: zoomSrc, seq: card.seq });
+                    }
+                  }}
+                  className={`w-24 h-24 shrink-0 rounded bg-surface-2 border overflow-hidden flex items-center justify-center text-xs text-ink-3 ${
+                    zoomSrc ? `cursor-zoom-in ${FOCUS_RING}` : ''
+                  } ${
+                    card.storyboard?.generating && !card.storyboard?.exists
+                      ? 'border-brand/50'
+                      : 'border-line'
+                  }`}
+                >
                   {card.storyboard?.exists && card.storyboard?.url ? (
                     <img src={card.storyboard.url} alt={t('sb.imageAlt', { seq: card.seq })} className="w-full h-full object-cover" />
+                  ) : card.storyboard?.generating && card.storyboard?.scratch_url ? (
+                    // 生成中：正式产物尚未落盘，但已有中间产物 → 显示实时缩略图 + 角标
+                    // ⚠️ 中间产物可能被后续 try 覆盖 → 加时间戳查询参数绕过浏览器缓存
+                    <div className="relative w-full h-full" title={t('sb.generatingHint')}>
+                      <img
+                        src={`${card.storyboard.scratch_url}${card.storyboard.scratch_url.includes('?') ? '&' : '?'}t=${Date.now()}`}
+                        alt={t('sb.imageAlt', { seq: card.seq })}
+                        className="w-full h-full object-cover"
+                      />
+                      <span className="absolute inset-x-0 bottom-0 bg-brand/85 text-white text-[10px] leading-4 text-center">
+                        {t('sb.generating')}
+                      </span>
+                    </div>
+                  ) : card.storyboard?.generating ? (
+                    <span className="flex flex-col items-center gap-1 text-brand">
+                      <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-brand" />
+                      <span>{t('sb.generating')}</span>
+                    </span>
                   ) : (
                     <span>{t('sb.noImage')}</span>
                   )}
                 </div>
+                  );
+                })()}
                 <div className="min-w-0 flex-1 text-xs space-y-1">
                   <p className="text-ink-1 line-clamp-3">{card.description}</p>
                   {card.dialogue_text && (
@@ -3573,6 +4132,25 @@ function StoryboardTab({ projectKey, episodeNo }: { projectKey: string; episodeN
                 </button>
               ))}
             </div>
+          </div>
+        )}
+      </Modal>
+
+      {/* 分镜图点击放大（lightbox）：正式图 / 生成中 scratch 图都支持；原尺寸展示，ESC / 点遮罩关闭 */}
+      <Modal
+        isOpen={zoomImg !== null}
+        onClose={() => setZoomImg(null)}
+        title={t('sb.zoomTitle')}
+        description={zoomImg ? `#${zoomImg.seq}` : ''}
+        size="full"
+      >
+        {zoomImg && (
+          <div className="flex items-center justify-center">
+            <img
+              src={zoomImg.src}
+              alt={t('sb.imageAlt', { seq: zoomImg.seq })}
+              className="max-w-full max-h-[78vh] rounded-lg border border-line bg-surface-2 object-contain"
+            />
           </div>
         )}
       </Modal>

@@ -64,6 +64,38 @@ def _subtitle_enabled_for(project: str) -> bool:
         return False
 
 
+def _caption_burn_enabled_for(project: str) -> bool:
+    """项目级「字幕/转场 caption」烧制开关（config.json 的 caption_burn_enabled），**默认 True**。
+
+    与 _subtitle_enabled_for 是**两件事**，刻意分开：
+      · subtitle_enabled（默认关）：把人物开口的台词转录成硬字幕——辅助性文字，
+        用户 2026-09-24 明确要求不要；
+      · caption_burn_enabled（默认开）：把剧本的 caption 字幕烧进成片——它是**剧情装置**
+        （时空落点、时空回溯、集尾悬念），参考稿正是靠「春秋蝉，逆转时光。」这类字幕
+        让观众看懂时空跳变；不烧观众就会看到无过渡的跳切。
+    不想要字幕的项目在其 config.json 里写 caption_burn_enabled: false 即可（也能被
+    subtitle_enabled: false 之外单独控制）。读取失败 → 回到默认 True。
+    """
+    try:
+        import project_store  # 延迟导入，避免与 project_store 形成循环依赖
+        cfg = project_store.read_config(project or "")
+        if "caption_burn_enabled" in (cfg or {}):
+            val = cfg.get("caption_burn_enabled")
+            if isinstance(val, str):
+                s = val.strip().lower()
+                return s in ("true", "1", "yes", "on")
+            return bool(val)
+        # 未显式配置：沿用配置中心的默认值（默认 True），与 _subtitle_enabled_for 同思路
+        try:
+            from config import PROJECT_DEFAULT_CONFIG
+            return bool(PROJECT_DEFAULT_CONFIG.get("caption_burn_enabled", True))
+        except Exception:  # noqa: BLE001
+            return True
+    except Exception as e:  # noqa: BLE001  开关读取失败按「默认开」处理
+        logger.warning(f"读取项目 config.caption_burn_enabled 失败（按默认开启处理）：{e}")
+        return True
+
+
 def _ep_videos_dir(project: str, ep: int) -> str:
     """该集视频片段目录（第 1 集 = 平铺目录，第 2 集起 epNN/）"""
     base = os.path.join(PROJECT_OUTPUT_DIR, "videos", project)
@@ -701,28 +733,42 @@ class VideoPostProcessor:
             return ""
 
         # 添加字幕（dialogue 兼容结构化 [{speaker,text}] 与旧字符串）
-        # 2026-09-24 用户明确要求「视频不要生成字幕」：默认不再烧硬字幕。
-        # 开关 = 项目 config.subtitle_enabled（默认 false）；读取失败按关闭处理。
+        # 2026-09-24 用户明确要求「视频不要生成字幕」：台词硬字幕默认不再烧。
+        # 2026-10-02：区分两种文字，各有独立开关——
+        #   · 台词字幕（人物开口的转录）→ subtitle_enabled，默认 false；
+        #   · 字幕/转场 caption（时空落点/回溯/集尾悬念）→ caption_burn_enabled，默认 true，
+        #     它是剧情装置：不烧观众就会看到无过渡的跳切（参考稿靠「春秋蝉，逆转时光。」交代）。
         # 注意：本函数在旧接口路径（非 pipeline 托管）下调用，无法依赖宿主模块 app，
-        # 故这里直接读配置文件，保证「界面点生成成片」这条路同样不烧字幕。
-        if not _subtitle_enabled_for(project_name):
-            logger.info(f"字幕已关闭（config.subtitle_enabled=false），跳过烧制：{output_path}")
-            logger.info(f"第 {ep} 集最终视频: {output_path}")
-            return output_path
-
-        from dialogue_utils import dialogue_text
+        # 故这里直接读配置文件，保证「界面点生成成片」这条路与 pipeline 行为一致。
+        _want_dlg = _subtitle_enabled_for(project_name)
+        _want_cap = _caption_burn_enabled_for(project_name)
         subtitles = []
-        current_time = 0
-        for shot in script.get("shots", []):
-            duration = shot.get("duration", 5)
-            text = dialogue_text(shot.get("dialogue"))
-            if text:
-                subtitles.append({
-                    "start": current_time,
-                    "end": current_time + duration,
-                    "text": text
-                })
-            current_time += duration
+        if _want_dlg or _want_cap:
+            from dialogue_utils import dialogue_text
+            current_time = 0
+            for shot in script.get("shots", []):
+                duration = shot.get("duration", 5)
+                if _want_dlg:
+                    text = dialogue_text(shot.get("dialogue"))
+                    if text:
+                        subtitles.append({
+                            "start": current_time,
+                            "end": current_time + duration,
+                            "text": text
+                        })
+                if _want_cap:
+                    # caption 兼容结构化 {text, kind} / 旧字符串 / 扁平 caption_text 三种形状
+                    _cap = shot.get("caption")
+                    if isinstance(_cap, dict):
+                        _cap = _cap.get("text")
+                    _cap = str(_cap or shot.get("caption_text") or "").strip()
+                    if _cap:
+                        subtitles.append({"start": current_time,
+                                          "end": current_time + duration,
+                                          "text": _cap})
+                current_time += duration
+        else:
+            logger.info(f"字幕全部关闭（subtitle_enabled=caption_burn_enabled=false），跳过烧制：{output_path}")
 
         if subtitles:
             self.add_subtitles(output_path, subtitles,

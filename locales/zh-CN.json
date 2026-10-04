@@ -443,6 +443,7 @@
     "deleteTitle": "删除项目",
     "editTitle": "编辑项目",
     "novelOption": "{name}（{n} 章）",
+    "chapterParsed": "已解析出 {n} 章，可在工作台按章分集生产",
     "saveFailed": "保存失败"
   },
   "upload": {
@@ -729,6 +730,24 @@
     "splitPlanNoChapters": "该小说未识别到章节标记，无法按章分集",
     "chapterNo": "章节 {n}",
     "shotsRatio": "{done} / {total} 镜头",
+    "scenesToggle": "展开/收起场次",
+    "scenesLoading": "场次加载中…",
+    "scenesLoadFailed": "场次列表加载失败",
+    "scenesRetry": "重试",
+    "scenesEmpty": "本集暂无场次数据",
+    "sceneNo": "第 {n} 场",
+    "sceneShotCount": "{n} 镜",
+    "sceneStoryboardDone": "分镜完成",
+    "sceneStoryboardPart": "分镜 {done}/{total}",
+    "sceneVideoReady": "已生成",
+    "sceneVideoMissing": "未生成",
+    "sceneRedo": "重做本场",
+    "sceneRedoBusy": "重做中…",
+    "sceneRedoHint": "重新生成本场的分镜与视频，覆盖已有成片",
+    "sceneRedoDone": "第 {n} 场已重新生成",
+    "sceneRedoFailed": "本场重做失败",
+    "sceneRedoTimeout": "本场重做超时，请稍后到输出页查看进度",
+    "fullVideoReady": "整集已拼接",
     "viewCount": "{n} 个视角",
     "assetPreview": "资产预览",
     "downloadCurrent": "下载当前图",
@@ -814,7 +833,22 @@
     "preflightKeyEvents": "关键事件",
     "preflightPersonality": "性格",
     "preflightEmotion": "本章情绪：",
-    "preflightNoData": "暂无前置解析结果，点击每集旁的灰点运行"
+    "preflightNoData": "暂无前置解析结果，点击每集旁的灰点运行",
+    "screenplay": "文学剧本",
+    "screenplayRowHint": "查看/生成本章文学剧本（人审稿），确认后可改写为分镜剧本",
+    "screenplayModalTitle": "第 {n} 集 · 文学剧本",
+    "screenplayModalDesc": "本章文学剧本供人工审阅；确认无误后一键改写为结构化分镜剧本",
+    "screenplayGenerating": "正在生成本章文学剧本…（LLM 写作中，约需几分钟）",
+    "screenplayStartFailed": "文学剧本生成任务启动失败",
+    "screenplayGenerateFailed": "文学剧本生成失败",
+    "screenplayTimeout": "文学剧本生成超时，请稍后重试",
+    "screenplayLoadFailed": "文学剧本读取失败",
+    "screenplayNotGenerated": "本章尚未生成文学剧本",
+    "screenplayConfirmRewrite": "✅ 确认无误，改写为分镜剧本",
+    "screenplayRewriting": "改写中…",
+    "screenplayRewriteDone": "已生成结构化分镜剧本，可在工作台查看",
+    "screenplayRewriteFailed": "改写分镜剧本失败",
+    "screenplayHumanTag": "此为人审稿；下方为改写后的分镜剧本"
   },
   "settings": {
     "title": "设置",
@@ -1450,6 +1484,9 @@
     "noDataHint": "请先进行剧本生成",
     "imageAlt": "镜头 {seq} 分镜图",
     "noImage": "无分镜图",
+    "generating": "生成中",
+    "generatingHint": "正在生成中（中间产物预览，未定稿）",
+    "batchGenerating": "分镜图生成中：{n} 镜",
     "video": "视频",
     "generated": "已生成",
     "notGenerated": "未生成",
@@ -1488,7 +1525,9 @@
       "applyFailed": "应用所选格失败",
       "generateFailed": "九宫格候选构图生成失败",
       "imageAlt": "镜头 {seq} 的 3x3 候选构图网格图"
-    }
+    },
+    "zoomTitle": "分镜图预览",
+    "zoomHint": "点击任意处或按 ESC 关闭"
   },
   "video": {
     "batchRetry": {

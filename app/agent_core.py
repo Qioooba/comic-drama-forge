@@ -232,7 +232,8 @@ TOOLS = [
         "name": "update_plan",
         "description": "修改自动生产计划。patch 只接受计划字段，例如 "
                        "episodes('all' 或 [1,2,3]) / target_shots / style / enable_upscale / "
-                       "upscale_scale / enable_tts / enable_mix / step_max_retries / video_mode / "
+                       "upscale_scale / enable_tts / enable_tts_pre / enable_mix / "
+                       "step_max_retries / video_mode / "
                        "auto_accept(产出即自动验收，默认 false) / auto_revive_hours(失败集挂起多久后"
                        "自动复活重试，默认 6 小时，0=永不) / max_episode_attempts 等。",
         "parameters": _schema({"project": _proj_prop(), "patch": _OBJ},

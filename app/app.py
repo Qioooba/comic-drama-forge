@@ -33,12 +33,10 @@ from config import (
     DUB_MIX_DIR, MIX_DEFAULT_PARAMS, CONTINUITY_DIR,
     TASKS_DB_PATH, TASK_QUEUE_CONCURRENCY, TASK_UNIT_MIN_BYTES,
     KEYFRAME_CHAIN_MODE, WORKFLOW_TEMPLATE,
-    CHARACTER_SHEET_VIEWS, ASSET_VIEW_STEMS,
-    CHARACTER_SHEET_CELLS, CHARACTER_SHEET_GRID, CHARACTER_SHEET_HALF_BAND,
-    CHARACTER_SHEET_LAYOUT_ZH,
-    CHARACTER_HALF_VIEWS,
+    ASSET_VIEW_STEMS,
     SCENE_VIEW_KEYS, SCENE_VIEW_LABELS, SCENE_VIEW_ANGLE_ZH,
     SCENE_ANGLE_TO_VIEW, SCENE_VIEWS_ENABLED, SCENE_VIEW_MAX_RETRIES,
+    SCENE_VIEW_DUP_PHASH_MAX,
     H3_COMMON_REFS, H3_COMMON_REFS_MAX,
     PROJECT_DEFAULT_CONFIG,
     PROMPT_ENHANCE_CONFIG_PATH, save_prompt_enhance_config, _prompt_enhance_file_flags,
@@ -48,6 +46,7 @@ from comfyui_client import (ComfyUIClient, camera_spec as _camera_spec,
                             camera_key as _camera_key, camera_angle as _camera_angle)
 import comfyui_job_store  # 崩溃免重渲检查点（2026-09-29）：种子沿用判据 + 台账查询
 import preview_gate  # 两级生产（2026-09-29）：预演不可交付 + 预演批准
+import novel_screenplay  # 文学剧本层（2026-10-03 两段式生产：文学剧本→改写为分镜表）
 import quality_stage  # 四层质量状态（2026-09-29：预演也记 A/B 层）
 # ⚠️ 注意：本文件里 `comfyui_client` 这个名字是**实例**（见下方 `comfyui_client = ComfyUIClient()`），
 # 不是模块。因此**模块级函数**（camera_spec / camera_key / get_call_stats 等）必须像上面这样
@@ -57,7 +56,8 @@ import quality_stage  # 四层质量状态（2026-09-29：预演也记 A/B 层�
 from video_postprocess import VideoPostProcessor, ensure_no_audio, ensure_audio_track
 from novel_parser import (
     SUPPORTED_EXTS, NovelParseError, ingest_novel, list_novels,
-    get_novel, preview_novel, read_novel_text, split_chapters
+    get_novel, preview_novel, read_novel_text, split_chapters,
+    ensure_chapter_structure, chapter_body_chars
 )
 from llm_client import (
     LLMClient, LLMError, LLMGatewayUnavailable, LLMTruncatedError, LLMReasoningOnlyError,
@@ -109,6 +109,7 @@ import dialogue_utils
 import h3_prompt_kit
 import h3_common_refs
 import h3_director_builder
+import h3_segment_loras
 import autonomous
 import cancellation
 import ai_memory
@@ -1063,7 +1064,8 @@ def _generate_project_cover(rec: dict, seed=None) -> str:
     name = str(rec.get("name") or "").strip()
     prompt = (f"漫剧主视觉封面插画，《{name}》主题氛围场景，戏剧性光影，电影感构图，"
               f"景深层次丰富，高细节，画面中不出现任何文字")
-    size = style_kit.aspect_size((16, 9)) or (960, 544)
+    # 封面图也是「图片生成」，与资产图同档（1.5MP；旧行为吃 aspect_size 默认 0.5）
+    size = style_kit.aspect_size((16, 9), style_kit.asset_megapixels()) or (960, 544)
     outs = comfyui_client.generate_scene_base(
         prompt, seed=seed, style=style, size=size,
         filename_prefix=f"comic_drama/{dir_key}_cover")
@@ -2355,12 +2357,61 @@ def api_keyframes_list(project_name):
 # P1-3 可视化分镜画布 + 单镜重跑
 # ==========================================================================
 
+def _storyboard_scratch_map(project):
+    """扫「分镜生成中」的中间产物 → {shot_seq: {"url", "mtime"}}。
+
+    ⭐ 为什么需要它（2026-10-02）：
+        分镜步骤是**整步落盘**的 —— 6 镜全部生成 + 质检通过后，才把图写进
+        `STORYBOARDS_DIR/<项目>/` 与 `storyboard_manifest.json`（画布的正规数据源）。
+        而生成过程本身要 2~3 分钟/镜，整步十几分钟，期间画布**一张图都取不到**，
+        用户看到的是「跑着但什么都没有」，误判为卡死或前端不刷新。
+
+    `storyboard_scratch/` 是步骤进行中每镜的落盘位置（`shot_NN_tryK.png`，见
+    下方生成侧 `scratch_png`），这里把它作为**只读的进度快照**暴露给画布，
+    仅用于「生成中」预览，**不改变** `storyboard.exists/url` 的既有语义
+    （那仍严格代表「已落盘正式产物」）。取最新 try（文件名尾部序号最大）。
+
+    失败一律返回空 dict：这是纯展示增强，绝不能让画布接口 500。
+    """
+    out = {}
+    scratch_dir = os.path.join(QC_DIR, project, "storyboard_scratch")
+    if not os.path.isdir(scratch_dir):
+        return out
+    try:
+        for fn in os.listdir(scratch_dir):
+            m = re.match(r"^shot_(\d+)_try(\d+)\.png$", fn)
+            if not m:
+                continue
+            seq, attempt = int(m.group(1)), int(m.group(2))
+            full = os.path.join(scratch_dir, fn)
+            try:
+                mtime = os.path.getmtime(full)
+            except OSError:
+                continue
+            cur = out.get(seq)
+            if cur is None or attempt > cur["_attempt"]:
+                out[seq] = {
+                    "_attempt": attempt,
+                    "url": f"/api/storyboards/scratch/{project}/{fn}",
+                    "mtime": mtime,
+                }
+    except OSError:
+        return {}
+    for v in out.values():
+        v.pop("_attempt", None)
+    return out
+
+
 @app.route('/api/storyboard/canvas/<path:project_name>', methods=['GET'])
 def api_storyboard_canvas(project_name):
     """分镜画布数据：每镜一张卡片（分镜图/视频 + 质检分 + 一致性分 + 承载原文 + 台词）
 
     卡片按剧本 shots 顺序排列；手动排序（order）保存在剧本 metadata.shot_order，
     因此画布顺序与后续视频生成顺序始终一致。
+
+    ⚠️ 2026-10-02 起每张卡片的 `storyboard` 额外带**生成中**信息（`generating` /
+    `scratch_url`），让前端在整步落盘之前就能显示「第 N 镜生成中」的预览快照；
+    每镜 `storyboard.exists` 的语义不变（仍只代表正式产物已落盘）。
     """
     project = _safe_project(os.path.basename(project_name.rstrip('/')))
     script = _load_script_for(project, request.args.get('episode_no'))
@@ -2428,6 +2479,8 @@ def api_storyboard_canvas(project_name):
         ordered = sorted(shots, key=lambda s: (order.index(str(s.get("shot_id")))
                                                 if str(s.get("shot_id")) in order else 10 ** 6))
     kf_dir = _ep_dir(os.path.join(KEYFRAMES_DIR, project), _cv_ep)
+    # 生成中快照（整步落盘之前也能预览）；纯展示增强，失败即空表
+    scratch_map = _storyboard_scratch_map(project)
     cards = []
     for i, s in enumerate(ordered):
         sid = s.get("shot_id", i + 1)
@@ -2459,6 +2512,10 @@ def api_storyboard_canvas(project_name):
                 "success": bool(sb_item.get("success")),
                 "blocked": bool(sb_item.get("qc_blocked")),
                 "error": sb_item.get("error") or "",
+                # ⭐ 生成中快照（2026-10-02）：正式产物未落盘、但 scratch 里已有该镜
+                #    的中间图时给出预览。exists/url 语义不变，前端据此显示「生成中」。
+                "generating": bool(not sb_file and scratch_map.get(seq)),
+                "scratch_url": (scratch_map.get(seq) or {}).get("url", ""),
             },
             "video": {
                 "exists": bool(vid),
@@ -2483,6 +2540,9 @@ def api_storyboard_canvas(project_name):
         "video_ready": sum(1 for c in cards if c["video"]["exists"]),
         "keyframe_end_ready": sum(1 for c in cards if c["keyframe"]["end_exists"]),
         "qc_blocked": sum(1 for c in cards if c["storyboard"]["blocked"]),
+        # ⭐ 生成中快照统计（2026-10-02）：正式产物未落盘、但 scratch 已有中间图的镜数。
+        #    前端据此显示「生成中 3/6」进度条，不必等整步完成。
+        "storyboard_generating": sum(1 for c in cards if c["storyboard"].get("generating")),
         "coverage": {
             "plot_coverage_percent": cov_report.get("plot_coverage_percent"),
             "detail_coverage_percent": cov_report.get("detail_coverage_percent"),
@@ -2990,6 +3050,10 @@ def _video_retry_shot_impl():
     _rs_sub_shots = h3_prompt_kit.segment_shot(
         shot, dur, max_sec=h3_prompt_kit.H3_SEGMENT_MAX_SEC)
     _rs_segs = []
+    # ⭐ 单镜重跑同样走 H3 Director timeline（generate_h3_sequence → 构建器），
+    #    故按与 worker 内 _shot_segment 同口径给每个子段挂场景 LoRA（同源规则表）。
+    #    优先使用 LLM 智能选择，失败则回落规则表匹配。
+    _rs_loras = h3_segment_loras.select_loras_for_shot_smart(shot)
     for _rsi, _rsub in enumerate(_rs_sub_shots):
         if mode == 'keyframe':
             # ⚠️ 与 worker 内 _shot_segment 同口径：尾帧锚定句只挂最后一段
@@ -3013,7 +3077,8 @@ def _video_retry_shot_impl():
         _rs_segs.append({"prompt": _rp,
                          "duration": float(_rsub.get("duration") or dur),
                          "reference_images": _seg_refs,
-                         "name": f"shot_{seq:02d}{_rsuf}"})
+                         "name": f"shot_{seq:02d}{_rsuf}",
+                         "loras": list(_rs_loras)})
     seg = _rs_segs[0]
 
     # ---- 提示词预检（生成前质检）----
@@ -3477,9 +3542,14 @@ def _generate_asset_task(task_id: str, assets: list, asset_type: str, project_na
         style_res = style_kit.resolve(style, default_ratio=style_kit.DEFAULT_RATIO)
         gen_style = style_res["style"]
         _base_ratio = style_kit.asset_aspect_ratio(asset_type) or style_kit.DEFAULT_RATIO
-        gen_size = style_kit.aspect_size(_base_ratio)
-        app.logger.info("[资产风格] %s 资产生成风格=%s；内置画幅 %s×%s",
-                        asset_type, gen_style or style, _base_ratio[0], _base_ratio[1])
+        # ⚠️ 像素预算**必须显式传**：2026-10-02 前此处漏传，资产图静默吃 `aspect_size`
+        #    的函数默认值 0.5MP（1:1 → 736×736），而角色设定图是**全链路角色一致性的
+        #    上游锚点** —— 参考图细节不足 → 被分镜放大后表现为系统性脸漂/色漂。
+        #    现取 asset_megapixels()（默认 1.5，env MJSCXT_ASSET_MEGAPIXELS 可覆盖）。
+        gen_size = style_kit.aspect_size(_base_ratio, style_kit.asset_megapixels())
+        app.logger.info("[资产风格] %s 资产生成风格=%s；内置画幅 %s×%s（%.2fMP）",
+                        asset_type, gen_style or style, _base_ratio[0], _base_ratio[1],
+                        style_kit.asset_megapixels())
 
         # 质检配置：任务级读取一次，本任务内所有资产共用
         qc_cfg = _qc_load_cfg()
@@ -3760,51 +3830,20 @@ def _generate_asset_task(task_id: str, assets: list, asset_type: str, project_na
                 blocked_views = []      # 保留字段：派生无「阻断」语义，恒为空
                 derive_error = None
                 if asset_type == "character":
-                    try:
-                        # 2026-09-25：版式改为「上排 3 全身 + 下排 1 半身」分档设定图，
-                        # 故按 CHARACTER_SHEET_CELLS 做**先行后列**网格切分（行投影定上下排、
-                        # 行内列投影定格），band_fallback 给行投影失败时的确定性兜底。
-                        _derived = sheet_split.split_sheet_to_files(
-                            base_dst, asset_dir, CHARACTER_SHEET_VIEWS,
-                            logger=app.logger, prune=False,
-                            cells=CHARACTER_SHEET_CELLS, grid=CHARACTER_SHEET_GRID,
-                            band_fallback=CHARACTER_SHEET_HALF_BAND)
-                    except Exception as _dv_err:  # noqa: BLE001 派生失败绝不拖垮已达标的基础图
-                        _derived = {}
-                        derive_error = f"{type(_dv_err).__name__}: {_dv_err}"
-                        app.logger.warning(
-                            "角色「%s」设定图切分失败，本次仅保留整图 %s"
-                            "（下游参考图将回退它）：%s",
-                            name, os.path.basename(base_dst), _dv_err)
-                    for vk, vpath in _derived.items():
-                        view_paths[vk] = vpath
-                        view_gate[vk] = {
-                            "accept": True, "blocked": False, "skipped": True,
-                            "label": "本地派生（继承基础图质检）",
-                            "reason": "由已达标的基础图整图切分得到，不单独质检",
-                            "critical_issues": [],
-                        }
-                        # O2：视角图旁路元数据（显式标注「由整图切分派生」，与基础图 seed 同源）
-                        _write_artifact_meta(
-                            vpath, kind="asset_view", project_name=project_name,
-                            seed=seed, prompt=orig_asset_prompt, workflow_key=None,
-                            qc=view_gate[vk], asset_name=name,
-                            extra={"asset_type": asset_type, "view": vk,
-                                   "derived_from": os.path.basename(base_dst),
-                                   "derive_mode": "sheet_crop"})
-                        saved_views.append(vk)
-                    # ⚠️ 切分**失败时也要清理**陈旧视角（2026-09-24 修正）。
-                    # 旧注释写的是「失败时保留旧图，避免删了又没有新的」，但那个顾虑不成立：
-                    # base.png 是本轮刚重画并通过质检的整图，下游 _first_existing_asset_image
-                    # 会按 _ASSET_IMG_PRIORITY（front > base）回落它 —— 一定「有新的」。
-                    # 而保留旧视角图的代价很大：旧图来自**上一轮**（可能是旧设定），却因优先级
-                    # 高于 base.png 被下游优先取走，于是「文字是新设定、参考图是旧设定」的互斥
-                    # 照旧存在（实测 逆天系统/赵天霸：重画后切分失败 → 旧发型图继续被用作参考，
-                    # 上游的外形收敛等于白做）。清掉后下游自动回落新整图。
+                    # 2026-10-02 用户指定：角色图**不裁剪**，直接保留整图 base.png。
+                    # 角色设定图已改为英文四区 character sheet（见
+                    # comfyui_client._CHARACTER_SHEET_EN_LAYOUT），四区不对称布局无法再
+                    # 做行列投影切分 → 不再产出 front/left/back/half 单视角。
+                    # 并**清掉旧视角图**：否则 _ASSET_IMG_PRIORITY（front > base）会让
+                    # 下游取到上一轮遗留的旧单视角图，与「整图」口径互斥
+                    # （即旧发型图继续被用作参考的老坑，见下方原注释）。
+                    _derived = {}
+                    derive_error = None
+                    app.logger.info("角色「%s」不裁剪：保留整图 %s（不再切分单视角）",
+                                    name, os.path.basename(base_dst))
                     try:
                         sheet_split.prune_stale_views(
-                            asset_dir, keep=CHARACTER_SHEET_VIEWS if _derived else (),
-                            known=ASSET_VIEW_STEMS, logger=app.logger)
+                            asset_dir, keep=(), known=ASSET_VIEW_STEMS, logger=app.logger)
                     except Exception as _pe:  # noqa: BLE001
                         app.logger.warning("清理陈旧视角文件失败（不影响入库）：%s", _pe)
                 elif asset_type == "scene" and SCENE_VIEWS_ENABLED:
@@ -3833,6 +3872,7 @@ def _generate_asset_task(task_id: str, assets: list, asset_type: str, project_na
                         _v_angle = SCENE_VIEW_ANGLE_ZH.get(vk) or _v_label
                         _v_dst = os.path.join(asset_dir, f"{vk}.png")
                         _v_gate = None
+                        _v_verdict = None       # 最近一次质检原始判据（丢档排障用）
                         _v_scratch = None
                         view_attempts[vk] = []   # 逐次累加（不覆盖），供结果回传与排障
                         _v_seed = seed      # 同 seed：跨档共享初始噪声，结构最相关
@@ -3878,15 +3918,38 @@ def _generate_asset_task(task_id: str, assets: list, asset_type: str, project_na
                                     f"场景机位档「{_v_label}」质检", _va + 1, _v_seed,
                                     _v_scratch, _v_verdict, style=gen_style))
                             _v_gate = _qc_gate(_v_verdict)
-                            if _v_gate["accept"]:
+                            # ⚠️ 质检接口故障（fault_open）**不算达标**：不得当「已判过」落盘。
+                            if _v_gate["accept"] and not _v_gate.get("fault_open"):
                                 break
-                            if not _v_verdict.get("ok"):
-                                break     # 质检接口异常 → 重生成无意义
+                            # 接口故障（根本没拿到判定）→ **继续循环换 seed 重试**，别当内容不合格停手；
+                            # 非接口级的「质检调用异常」重生成无意义 → 停。
+                            if not _v_verdict.get("ok") and not (
+                                    _v_verdict.get("interface_fault")
+                                    or (_v_gate or {}).get("fault_open")):
+                                break     # 质检调用异常（非接口级）→ 重生成无意义
                             # ⚠️ 刻意**不**调 _record_qc_lesson：机位档的缺陷（角度不对）
                             #    不是资产提示词的缺陷，沉淀进去会让**下一轮的基础图提示词**
                             #    被按「机位」改写，把加值项的毛病传播成资产本身的毛病。
-                        _v_ok = bool(_v_gate and _v_gate.get("accept") and _v_scratch)
+                        # 达标 = 判官放行 **且** 非接口故障放行（fault_open 不算达标）
+                        _v_ok = bool(_v_gate and _v_gate.get("accept")
+                                     and not _v_gate.get("fault_open") and _v_scratch)
+                        # 与 base 的**相似度粗筛**（撞车即丢档，2026-10-03 B 方案）：
+                        # 仅作「明显撞车」的**下限粗筛** —— 阈值见 config.SCENE_VIEW_DUP_PHASH_MAX
+                        # （=95，**不能调到 80**：真换构图的 top≈81.2、几乎没变的 left45≈84.4，
+                        #   80~95 不可分，调到 80 会误杀 top），只拦 >95 的近重复。
+                        _v_sim = None
                         if _v_ok:
+                            try:
+                                _v_sim_res = consistency.phash_similarity(base_dst, _v_scratch)
+                                if _v_sim_res.get("ok"):
+                                    _v_sim = float(_v_sim_res.get("score") or 0.0)
+                            except Exception as _vse:  # noqa: BLE001
+                                app.logger.warning(
+                                    "场景「%s」机位档「%s」相似度粗筛失败（不拦截，按达标处理）：%s",
+                                    name, _v_label, _vse)
+                        _v_dup = bool(_v_sim is not None
+                                      and _v_sim > SCENE_VIEW_DUP_PHASH_MAX)
+                        if _v_ok and not _v_dup:
                             shutil.copy2(_v_scratch, _v_dst)
                             view_paths[vk] = _v_dst
                             view_gate[vk] = _v_gate
@@ -3902,11 +3965,44 @@ def _generate_asset_task(task_id: str, assets: list, asset_type: str, project_na
                                        "derive_mode": "angle_regen",
                                        "derived_from": os.path.basename(base_dst)})
                         else:
-                            # 加值项不阻断资产：本档不提供，分镜侧逐级回落 front/base
-                            app.logger.warning(
-                                "场景「%s」机位档「%s」未达标，本次不落盘"
-                                "（分镜将回落正面档）：%s",
-                                name, _v_label, (_v_gate or {}).get("label"))
+                            # 加值项不阻断资产：本档不提供，分镜侧逐级回落 front/base。
+                            # 三种丢档原因彼此区分，并在 qc_views 里留 drop_reason 便于排障。
+                            _v_gate = _v_gate or {}
+                            _v_fault = bool(_v_gate.get("fault_open")
+                                            or (_v_verdict or {}).get("interface_fault"))
+                            if _v_dup:
+                                app.logger.warning(
+                                    "场景「%s」机位档「%s」与 base 相似度 %.1f > %.1f"
+                                    "（明显撞车 / 未换构图）→ 丢弃该档（不落盘、不判 failed，"
+                                    "分镜将回落正面档）",
+                                    name, _v_label, _v_sim, SCENE_VIEW_DUP_PHASH_MAX)
+                                view_gate[vk] = dict(
+                                    _v_gate, dropped=True, dup_similarity=round(_v_sim, 1),
+                                    drop_reason=(f"与base相似度{_v_sim:.1f}"
+                                                 f">阈值{SCENE_VIEW_DUP_PHASH_MAX:g}"))
+                            elif not _v_scratch:
+                                app.logger.warning(
+                                    "场景「%s」机位档「%s」出图失败（未产出图片）→ 丢弃该档"
+                                    "（不落盘、不判 failed，分镜将回落正面档）", name, _v_label)
+                                view_gate[vk] = dict(_v_gate, dropped=True,
+                                                     drop_reason="出图失败（未产出图片）")
+                            elif _v_fault:
+                                app.logger.warning(
+                                    "场景「%s」机位档「%s」因**质检接口故障**重试 %d 次仍未"
+                                    "取得判定 → 丢弃该档（不落盘、不判 failed，"
+                                    "分镜将回落正面档）：%s",
+                                    name, _v_label, SCENE_VIEW_MAX_RETRIES + 1,
+                                    _v_gate.get("reason") or "质检接口不可用")
+                                view_gate[vk] = dict(
+                                    _v_gate, dropped=True,
+                                    drop_reason="质检接口故障·重试后仍未取得判定")
+                            else:
+                                app.logger.warning(
+                                    "场景「%s」机位档「%s」**质检判定不达标**，本次不落盘"
+                                    "（分镜将回落正面档）：%s",
+                                    name, _v_label, _v_gate.get("label"))
+                                view_gate[vk] = dict(_v_gate, dropped=True,
+                                                     drop_reason="质检判定不达标")
                     # 清掉本档集合内**本轮不再产出**的陈旧机位图（含上一轮/旧实现遗留），
                     # 避免 UI 与资产索引把陈旧机位当成有效档展示。
                     try:
@@ -4410,9 +4506,34 @@ def api_storyboard_grid_candidates():
     def _grid_worker():
         try:
             with gpu_task_gate.run_gpu_task(task_id, "分镜九宫格候选构图"):
+                # ---- 3D 导演台：九宫格「3D 构图基准网格」（2026-10-03）----
+                # 逐格渲染 9 个候选构图的 3D 站位/机位基准，拼成一张与目标九宫格一一对应的
+                # 3x3 网格 → 作 <image1> 构图基准 → 提示词追加 COMPOSITION BASELINE GRID 段。
+                # 渲染失败静默降级为纯文字站位锚点（fail-open，绝不阻断九宫格主链路）。
+                _grid_refs = [r[2] for r in refs]
+                _grid_labels = list(labels)
+                _grid_has_blocking = False
+                try:
+                    from config import ENABLE_3D_BLOCKING_IMAGE
+                    if ENABLE_3D_BLOCKING_IMAGE:
+                        import te_3d_render
+                        if te_3d_render.available():
+                            _blk_out = os.path.join(QC_DIR, project_name, "te3d_blocking")
+                            _grid_sheet = te_3d_render.render_blocking_grid(
+                                shot, _blk_out, target_size=_res["size"]) or ""
+                            if _grid_sheet:
+                                app.logger.info("[3D导演台] 九宫格 shot=%s 3D 构图基准网格已渲染：%s",
+                                                shot.get("shot_id"), os.path.basename(_grid_sheet))
+                                _grid_refs.insert(0, _grid_sheet)
+                                _grid_labels.insert(0, "3D构图基准网格")
+                                _grid_has_blocking = True
+                except Exception as _3d_e:  # noqa: BLE001
+                    app.logger.warning("[3D导演台] 九宫格 shot=%s 3D 基准渲染失败（降级为纯文字站位）：%s",
+                                       shot.get("shot_id"), _3d_e)
                 result = comfyui_client.generate_shot_grid_candidates(
-                    shot, labels, [r[2] for r in refs], project_name,
+                    shot, _grid_labels, _grid_refs, project_name,
                     f"shot_{seq:02d}", style=style,
+                    has_blocking_image=_grid_has_blocking,
                     seed=random.randint(1, 2 ** 31 - 1), size=_res["size"])
             grid_png = (result.get("files") or [""])[0]
             if not grid_png or not os.path.isfile(grid_png):
@@ -4844,51 +4965,22 @@ def api_character_upload_sheet():
         except OSError:
             pass
 
-    # ---- 本地切分三视图（与 _generate_asset_task 同一条 sheet_split 链路） ----
-    derive_error = ""
+    # ---- 2026-10-02 用户指定：角色图**不裁剪** → 不再切分三视图 ----
+    # 角色设定图已改为英文四区 character sheet（见 comfyui_client._CHARACTER_SHEET_EN_LAYOUT），
+    # 四区不对称布局无法切分 → 上传图直接落 base.png 整图，下游取整图。
+    # 并清掉旧视角图（front/left/back/half），避免 _ASSET_IMG_PRIORITY 取到旧单视角。
     views: dict = {}
     try:
-        views = sheet_split.split_sheet_to_files(
-            base_dst, asset_dir, CHARACTER_SHEET_VIEWS,
-            logger=app.logger, prune=False,
-            cells=CHARACTER_SHEET_CELLS, grid=CHARACTER_SHEET_GRID,
-            band_fallback=CHARACTER_SHEET_HALF_BAND)
-    except Exception as _dv_err:  # noqa: BLE001 切分失败不删除用户上传的原图
-        derive_error = f"{type(_dv_err).__name__}: {_dv_err}"
-        app.logger.warning(
-            "上传形象图切分失败（%s/%s）：%s —— 已保留整图，下游将回退它当参考图。"
-            "请确认图版式为「上排正面/左侧/背面三张全身 + 下排一格正面半身」",
-            project_name, character, _dv_err)
-        # 切分失败且是覆盖场景：恢复旧图（新版式不符，别把上一张好图弄没了）
-        if _old_backup and os.path.isfile(_old_backup):
-            try:
-                shutil.copy2(_old_backup, base_dst)
-                app.logger.info("上传形象图：切分失败已回滚旧 base.png")
-            except OSError as _re:
-                app.logger.warning("回滚旧 base.png 失败（忽略）：%s", _re)
-        try:
-            os.remove(_old_backup)
-        except OSError:
-            pass
-        return jsonify({"success": False, "derive_ok": False,
-                        "character": character, "outfit_key": outfit_key,
-                        "base": base_dst,
-                        "error": f"图片版式不符合角色设定图版式，未能切分三视图：{derive_error}",
-                        "layout_hint": CHARACTER_SHEET_LAYOUT_ZH}), 400
+        sheet_split.prune_stale_views(
+            asset_dir, keep=(), known=ASSET_VIEW_STEMS, logger=app.logger)
+    except Exception as _pe:  # noqa: BLE001
+        app.logger.warning("上传形象图：清理陈旧视角失败（忽略）：%s", _pe)
 
     if _old_backup:
         try:
             os.remove(_old_backup)
         except OSError:
             pass
-
-    # 切分成功 → 清理不再产出的陈旧视角（如旧实现遗留的 right.png）
-    try:
-        sheet_split.prune_stale_views(
-            asset_dir, keep=CHARACTER_SHEET_VIEWS,
-            known=ASSET_VIEW_STEMS, logger=app.logger)
-    except Exception as _pe:  # noqa: BLE001
-        app.logger.warning("上传形象图：清理陈旧视角失败（忽略）：%s", _pe)
 
     # 旁路元数据：显式标注「用户上传」，与模型生成的资产可区分、可追溯
     _view_gate = {"accept": True, "blocked": False, "skipped": True,
@@ -4907,10 +4999,10 @@ def api_character_upload_sheet():
     return jsonify({"success": True, "derive_ok": True, "skipped": False,
                     "character": character, "outfit_key": outfit_key,
                     "base": base_dst,
-                    "views": {k: os.path.basename(v) for k, v in views.items()},
-                    "view_files": views,
-                    "layout_hint": CHARACTER_SHEET_LAYOUT_ZH,
-                    "message": f"已上传并切分 {len(views)} 张视角图（零 GPU）"})
+                    "views": {},
+                    "view_files": {},
+                    "layout_hint": "不裁剪：保留整图（character sheet 四区）",
+                    "message": "已上传（不裁剪：直接使用整张 character sheet 设定图）"})
 
 
 @app.route('/api/assets/character/outfit', methods=['POST'])
@@ -5460,26 +5552,27 @@ def _framing_wants_half_shot(shot: dict) -> bool:
 
 
 def _pick_char_view(char_payload: dict, want_half: bool, outfit_dir: str = "") -> str:
-    """按景别从角色资产里挑一张参考图：``want_half`` 优先半身档，否则优先全身档。
+    """取角色参考图：**始终返回整张设定图 base.png**（2026-10-02 起不裁剪）。
 
-    ⚠️ 必须**优雅降级**：新资产才有 ``half.png``（2026-09-25 起），存量项目只有
-    ``front.png``/``base.png``。找不到想要的档位时**逐级回退**，绝不返回空
-    （返回空会让该镜头判成「无可用参考图」而 400，把「档位缺失」升级成「不能出图」）。
-    回退链：
-      · 要半身 → half → front → base（旧资产没有半身档，用全身档总比没有强）
-      · 要全身 → front → base → half（极端情况下至少给一张）
-    每一级都要求文件存在且非空（复用既有 ``_first_existing`` 口径）。
+    ⚠️⚠️ **2026-10-02 用户指定「角色图不用裁剪，给整个图片就行」** —— 本函数
+    从「按景别对档挑 half/front/back」退化为「**只取整图 base.png**」。动机与配套：
+      · 角色设定图已改为**英文四区 character sheet**（Top 三视图 / Left 面部+配色 /
+        Bottom 细节 / Right 比例参照，见 `comfyui_client._CHARACTER_SHEET_EN_LAYOUT`），
+        四区不对称布局**无法再做行列投影切分** → 单视角切分（front/left/back/half）
+        失去产出依据；
+      · 用户要「整图给模型自己取视角」，不再由我们按景别裁单视角。
+    ⚠️ 取舍（风险已向用户说明）：取消「景别对档」会**重新引入画幅对抗**（全景/近景
+    参考图同用一张整图，近景/特写的构图牵引变弱）——这是 2026-09-25 那套「半身档」
+    要解决的问题。用户明确选择「不裁剪」，故此处按要求退化；`want_half`/`outfit_dir`
+    参数**保留签名**（调用方不破），但不再影响取图结果（仅整图）。
+    ⚠️ 回滚点：如需恢复景别对档，改回 order 的 half/front 分支即可。
 
-    服装变体（衣柜，2026-10-02）：``outfit_dir`` 非空时（调用方已解析出本镜
-    outfit_key 且 outfits/<key>/ 存在）**优先**在该变体目录里走同一条档位回退链；
-    变体目录没有可用档位 / 目录消失 / 任何异常 → 回落主设定图（fail-open，
-    与该参数不存在时的行为完全一致 —— 零回归约束）。
+    服装变体（衣柜，2026-10-02）：``outfit_dir`` 非空时**仍优先**在该变体目录里取
+    整图（base.png），变体目录没有 / 异常 → 回落主设定图（fail-open，零回归）。
     """
     payload = char_payload or {}
-    # 半身档键名取自 config.CHARACTER_HALF_VIEWS（当前是 ("half",)）——不硬编码
-    # 字符串，日后加「正面半身 / 侧面半身」两档时只需改 config，这里自动跟着走。
-    order = (tuple(CHARACTER_HALF_VIEWS) + ("front", "base")) if want_half \
-        else (("front", "base") + tuple(CHARACTER_HALF_VIEWS))
+    # 只取整图：base.png →（兜底）front.png（存量资产可能只有 front）
+    order = ("base", "front")
     if outfit_dir:
         try:
             _od = comfyui_client.resolve_local_path(outfit_dir) or outfit_dir
@@ -5656,6 +5749,7 @@ def _h3_shot_ref_components(shot: dict, char_idx: dict, item_idx: dict, scene_id
             continue
         _seen_paths.add(_p)
         out.append({"kind": "character", "name": _mc, "path": _p,
+                    "common_key": f"char:{_mc}",
                     "appearance": _entry.get("appearance")
                     or _entry.get("description") or ""})
 
@@ -5694,15 +5788,17 @@ def _h3_shot_ref_components(shot: dict, char_idx: dict, item_idx: dict, scene_id
             if not _p or _p in _seen_paths:
                 continue
             _seen_paths.add(_p)
-            _fb.append({"kind": "character", "name": _nm, "path": _p,
-                        "appearance": _ap})
+        _fb.append({"kind": "character", "name": _nm, "path": _p,
+                    "common_key": f"char:{_nm}",
+                    "appearance": _ap})
         out = _fb + out      # 角色在前（与 _h3_picture_defs 的段序一致，且保序）
     return out
 
 
 def _h3_plan_common_refs(shots: list, char_idx: dict, item_idx: dict, scene_idx: dict,
                          character_refs: list = None, main_char_img: list = None,
-                         sb_map: dict = None, use_storyboard: bool = True):
+                         sb_map: dict = None, use_storyboard: bool = True,
+                         project_name: str = ""):
     """按「全段都在用、且同一张图」挑出公共参考图（H3 Director 公共参数）。
 
     返回 ``(common, comps_map)``：
@@ -5752,6 +5848,20 @@ def _h3_plan_common_refs(shots: list, char_idx: dict, item_idx: dict, scene_idx:
     common = h3_common_refs.plan_common_refs(
         per_shot_assets, max_common=H3_COMMON_REFS_MAX,
         limit=h3_director_builder.MAX_REFERENCE_IMAGES)
+    # ⭐ 全局风格参考图（2026-10-03）：项目 config.json 的 style_ref_image 作为最后一张公共图。
+    if project_name:
+        try:
+            _proj_root = _safe_project(project_name)
+            if _proj_root:
+                _cfg = json.load(open(os.path.join(_proj_root, 'config.json'), encoding='utf-8'))
+                _style_ref = str(_cfg.get('style_ref_image') or '').strip()
+                if _style_ref:
+                    _style_ref_path = _style_ref if os.path.isabs(_style_ref) else os.path.join(_proj_root, _style_ref)
+                    if os.path.isfile(_style_ref_path) and len(common) < h3_director_builder.MAX_REFERENCE_IMAGES:
+                        common = list(common) + [{'kind':'scene','name':'全局风格参考','appearance':'global style / lighting anchor','path':_style_ref_path}]
+                        app.logger.info('[H3公共参考图] 追加全局风格参考图：%s', os.path.basename(_style_ref_path))
+        except Exception as _e:  # noqa: BLE001
+            app.logger.debug('[H3公共参考图] 风格参考图解析失败（忽略）：%s', _e)
     if common:
         app.logger.info(
             "[H3公共参考图] %d 镜中 %d 项全段共用 → 走 global.refs + commonEnabled：%s",
@@ -5766,6 +5876,221 @@ def _h3_plan_common_refs(shots: list, char_idx: dict, item_idx: dict, scene_idx:
 def _h3_is_common_comp(comp: dict, common_keys: set) -> bool:
     """该组件是否属于公共池（身份键 = 种类 + 名称 + 图片路径，与 h3_common_refs 同源）。"""
     return h3_common_refs.asset_key(comp) in common_keys
+
+
+def _project_worldview(project_name: str) -> str:
+    """取项目的「世界观设定」文本（2026-10-03）：供公共提示词 WORLD 行拼接用。
+
+    来源优先级：① autopilot plan 的 brief（总控 AI 敲定的故事概述）；
+    ② 项目 config.json 的 note。两者皆空则返回 ""（公共段不写 WORLD 行，零变更）。
+    纯只读、永不抛。
+    """
+    _pw = ""
+    try:
+        _plan = (autopilot.get_plan(project_name) or {})
+        _brief = str(_plan.get("brief") or _plan.get("worldview") or _plan.get("era_world") or "")
+        if _brief and len(_brief) <= 400:
+            _pw = _brief
+    except Exception:  # noqa: BLE001
+        pass
+    if not _pw:
+        try:
+            _proj = _safe_project(project_name)
+            if _proj:
+                _cfg = json.load(open(os.path.join(_proj, "config.json"), encoding="utf-8"))
+                _note = str(_cfg.get("note") or "")
+                if _note and len(_note) <= 200:
+                    _pw = _note
+        except Exception:  # noqa: BLE001
+            _pw = ""
+    return _pw
+
+
+def _ensure_voice_bank_refs(common: list, project_name: str, all_characters=None) -> None:
+    """确保每个公共角色在 voice_bank 里有参考音频（2026-10-03）：
+    遍历公共池的角色，若 voice_bank 里没有参考音频，用 TTS 自动生成一段短文本
+    并保存到 voice_bank，供后续 _h3_common_ref_audios 捡取。
+    任何异常只记日志、绝不阻断主流程。
+    """
+    # ⚠️ 放宽守卫（原为 `if not common:`）：存量调用方要么传非空 common、要么传非空 all_characters（恒传 char_idx），故零行为变更；放宽只为让 `tts_pre`
+    #    能以 common=[] + all_characters=<char_idx> 调用（「每角色参考音色」口径）。
+    if not common and not all_characters:
+        return
+    _dub_dir = _dub_project_dir(project_name)
+    if not _dub_dir:
+        app.logger.warning("[VoiceBank] 找不到项目 dub 目录，跳过自动生成参考音色")
+        return
+    _char_names = []
+    for _c in (common or []):
+        if isinstance(_c, dict) and _c.get("kind") == "character":
+            _n = str(_c.get("name") or "").strip()
+            if _n and _n not in _char_names:
+                _char_names.append(_n)
+    # ⭐ 追加项目全量角色（2026-10-04）：用户要求「每个角色都要生成一个参考音色」。
+    #    公共池角色之外的角色也要落 voice_bank（供后续按需作为参考音色使用）。
+    if all_characters:
+        _all_names = list(all_characters.keys()) if isinstance(all_characters, dict) else list(all_characters)
+        for _n in _all_names:
+            _n = str(_n or "").strip()
+            if _n and _n not in _char_names:
+                _char_names.append(_n)
+    if not _char_names:
+        return
+    # 获取默认 voice_map（用于拿到每个角色的默认 speaker/seed）
+    try:
+        import tts_client
+        _voice_map = tts_client.default_voice_map(
+            [{"name": n} for n in _char_names],
+            project=project_name,
+            episode=1)
+        _chars_vmap = _voice_map.get("characters", {})
+    except Exception as _e:  # noqa: BLE001
+        app.logger.warning("[VoiceBank] 无法生成默认 voice_map，跳过：%s", _e)
+        return
+    # 逐角色合成
+    import tempfile
+    for _cn in _char_names:
+        try:
+            _ref, _ = find_voice_bank_ref(_dub_dir, _cn)
+            if _ref and os.path.isfile(_ref):
+                continue  # 已有参考音频
+        except Exception:
+            pass
+        # 需要生成：用角色名+一句简短介绍做参考文本
+        _ref_text = f"我是{_cn}，这是我的声音样本。"
+        _voice = _chars_vmap.get(_cn) or {}
+        _speaker = str(_voice.get("speaker") or tts_client.SPEAKER_KEYS[0])
+        _seed = int(_voice.get("seed") or 0)
+        # 组装 TTS voice dict（用 preset 模式，不走 clone）
+        _tts_voice = {
+            "mode": "preset",
+            "speaker": _speaker,
+            "seed": _seed,
+            "instruct": "",
+            "model_choice": "1.7B",
+        }
+        # 输出路径：voice_bank 目录下的临时文件
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as _tf:
+            _tmp_path = _tf.name
+        try:
+            _dub_dir2 = _dub_project_dir(project_name)
+            _client = tts_client.QwenTTSClient(out_root=_dub_dir2, params=tts_client.TTS_DEFAULT_PARAMS)
+            _res = _client.synthesize_one(_ref_text, _tts_voice, _tmp_path, timeout=60)
+            if not _res.get("ok"):
+                app.logger.warning("[VoiceBank] %s 合成参考音频失败：%s", _cn, _res.get("error"))
+                continue
+            # 存入 voice_bank（按 ref.wav 落盘，save_voice_bank_ref 会覆盖旧文件）
+            _saved = save_voice_bank_ref(_dub_dir2, _cn, _tmp_path, ref_text=_ref_text)
+            app.logger.info("[VoiceBank] %s 自动生成参考音色：%s", _cn, _saved)
+        except Exception as _e:  # noqa: BLE001
+            app.logger.warning("[VoiceBank] %s 自动生成参考音色异常（忽略）：%s", _cn, _e)
+        finally:
+            try:
+                if os.path.isfile(_tmp_path):
+                    os.remove(_tmp_path)
+            except Exception:
+                pass
+
+
+def _h3_common_ref_audios(common: list, project_name: str) -> list:
+    """从公共池角色收集 voice_bank 参考音色本地路径（2026-10-02 公共参考音色）。
+
+    只对 ``kind == character`` 的公共项，取其在 voice_bank 里已登记的参考音频
+    （``find_voice_bank_ref``，缺则跳过＝该角色无绑定音色，绝不误挂别的声音）。
+    返回**有序**本地绝对路径列表，供 ComfyUI 侧写进 ``global.refAudios``（index 0..M-1）。
+    无公共角色 / 无音色库 / 全部缺音色 → 返回 ``[]``（零行为变更，走原 generate 无参考）。
+    """
+    _char_names = [str(c.get("name") or "").strip()
+                   for c in (common or [])
+                   if isinstance(c, dict) and c.get("kind") == "character"
+                   and str(c.get("name") or "").strip()]
+    if not _char_names:
+        return []
+    try:
+        _dub_dir = _dub_project_dir(project_name)
+    except Exception:  # noqa: BLE001
+        return []
+    _out: list = []
+    _seen = set()
+    for _cn in _char_names:
+        try:
+            _ref, _ = find_voice_bank_ref(_dub_dir, _cn)
+        except Exception:  # noqa: BLE001
+            _ref = ""
+        if not _ref or not os.path.isfile(_ref):
+            app.logger.info("[H3公共参考音色] 角色 %s 未绑定参考音色，跳过（不挂声）", _cn)
+            continue
+        _key = os.path.normcase(os.path.normpath(os.path.abspath(_ref)))
+        if _key in _seen:
+            continue
+        _seen.add(_key)
+        _out.append(_ref)
+    if _out:
+        app.logger.info("[H3公共参考音色] 公共角色音色 %d 支 → global.refAudios：%s",
+                        len(_out), "、".join(os.path.basename(x) for x in _out))
+    return _out
+
+
+def _h3_common_subject_lock(common: list, common_ref_audios: list,
+                        style: str = "", worldview: str = "", aspect: str = "") -> str:
+    """公共提示词 subject lock（2026-10-02）：角色/物品/场景锁定句 + 公共音色指代。
+
+    编号与公共槽位**逐位对齐**：公共图 index 0..K-1 → ``<Picture 1..K>``（1-based）；
+    公共音色 index 0..M-1 → ``<Audio 1..M>``。插件在 commonEnabled 时把本句拼在**每段
+    提示词之前**（plan.py:concat_common_segment_prompt），作为全集一致的主体锁定前缀，
+    段级提示词只管本镜叙事，主体外观/音色由这句统一锁定（不再逐镜重述）。
+
+    ⚠️ 提示词消费的是 ``<Picture N>``/``<Audio N>``（H3 模型认的标签）；``@image#N``
+    只是 ComfyUI 前端 @ 选择器的 UI chip，不进模型 —— 故这里用 ``<>`` 标签。
+    无公共项且无公共音色 → 返回 ``""``（零行为变更，global.prompt 留空）。
+    """
+    _parts: list = []
+    _K = len(common or [])
+    if _K:
+        _lock = ["Subject lock — keep these shared references consistent across every shot:"]
+        for _i, _c in enumerate(common or []):
+            _num = _i + 1
+            _name = str(_c.get("name") or "").strip()
+            _kind = _c.get("kind")
+            _app = str(_c.get("appearance") or _c.get("description") or "").strip()
+            _ap = (f", {_app[:80]}" if _app else "")
+            if _kind == "character":
+                _lock.append(
+                    f"<Picture {_num}> is {_name}{_ap} — keep this character's facial "
+                    "identity, hairstyle, build, outfit and rendering style identical in all shots.")
+            elif _kind == "item":
+                _lock.append(
+                    f"<Picture {_num}> is {_name}{_ap} — keep this prop's shape, material "
+                    "and colors identical in all shots.")
+            else:
+                _lock.append(
+                    f"<Picture {_num}> is the scene {_name} — keep its spatial layout and "
+                    "lighting anchor; framing follows the per-shot camera, not this image.")
+        _parts.append(" ".join(_lock))
+    _M = len(common_ref_audios or [])
+    if _M:
+        _a = " ".join(f"<Audio {_i + 1}>" for _i in range(_M))
+        _parts.append(
+            f"Reference voice timbre (shared across every shot): {_a}. "
+            "Match each character's spoken lines to their reference voice; keep the "
+            "timbre consistent.")
+    
+    # ---- 公共提示词补全：世界观 + 全局 STYLE（2026-10-03）----
+    # 按「推荐放公共参数的内容」表：公共提示词 = 角色定义(上面 subject lock) +
+    # 世界观设定 + 全局 STYLE（画风 / 比例 / 无字幕 / 稳定构图）。这些会被插件拼在
+    # **每段提示词之前**（concat_common_segment_prompt），保证全片一致；镜头特有的
+    # 动作/构图/景别/运镜/光线只写在组内，不进公共段。
+    _w = str(worldview or "").strip()
+    if _w:
+        _parts.append(f"WORLD (world setting, holds for every shot): {_w}.")
+    _st = str(style or "").strip()
+    if _st:
+        _aspect = ("/" + str(aspect or "").strip()) if str(aspect or "").strip() else ""
+        _parts.append(
+            f"GLOBAL STYLE (holds for every shot): {_st}{_aspect} vertical cinematic, "
+            "no text, no subtitles, stable composition, consistent lighting and "
+            "colour grading.")
+    return "\n".join(_parts)
 
 
 def _allocate_storyboard_refs(shot: dict, char_idx: dict, item_idx: dict, scene_idx: dict,
@@ -6177,9 +6502,15 @@ def _storyboard_worker(task_id: str, project_name: str, shots: list,
                                       megapixels=style_kit.storyboard_megapixels())
     _sb_style = _sb_style_res["style"]
     _sb_size = _sb_style_res["size"]
+    # 分镜图「单镜九宫格（9 关键帧）」开关（2026-10-02 用户指定，见 config.SB_GRID_MODE）。
+    # 开启时：① 提示词用 build_shot_grid_keyframes_prompt（一个镜头 = 3x3 九宫格 = 9 关键帧）；
+    #         ② 景别自动裁剪禁用（九宫格不能按景别裁，否则破坏 9 格结构）；
+    #         ③ 质检描述带「九宫格」口径（判官按整体一致性评，不按单帧景别判）。
+    from config import SB_GRID_MODE
+    _sb_grid_mode = bool(SB_GRID_MODE)
     if _sb_style:
-        app.logger.info("[分镜风格] 风格=%s；画幅=%s", _sb_style,
-                        _sb_style_res["label"] or "未指定（沿用模板）")
+        app.logger.info("[分镜风格] 风格=%s；画幅=%s；九宫格=%s", _sb_style,
+                        _sb_style_res["label"] or "未指定（沿用模板）", _sb_grid_mode)
         shots = [dict(s, style=(s.get("style") or _sb_style)) for s in (shots or [])
                  if isinstance(s, dict)]
     manifest_shots = []
@@ -6286,6 +6617,12 @@ def _storyboard_worker(task_id: str, project_name: str, shots: list,
                                     shot, _blk_out_dir,
                                     aspect=":".join(map(str, _sb_style_res.get("ratio") or ("16", "9"))),
                                     width=_sb_size[0],
+                                    # ⭐ 按目标像素对齐（2026-10-02）：裸 aspect 字符串在本仓
+                                    #    有双语义（style_kit 的 (16,9)＝横屏，而 te_3d_director
+                                    #    收 "16:9" 会算成 684 高）→ 基准图 1216×684 ≠ 分镜 1216×672，
+                                    #    作 <image1> 定画布会把错的画幅带进分镜图。
+                                    #    传 _sb_size 保证逐像素一致（G2 存量失败的真因）。
+                                    target_size=_sb_size,
                                 ) or ""
                                 if _blocking_ref_path:
                                     app.logger.info("[3D导演台] shot=%s 站位基准图已渲染：%s",
@@ -6293,14 +6630,22 @@ def _storyboard_worker(task_id: str, project_name: str, shots: list,
                                     item["_blocking_ref"] = _blocking_ref_path
                                     # 插入为第一张参考图（<image1>），后续参考图序号后移
                                     refs.insert(0, (_blocking_ref_path, "3D构图基准", _blocking_ref_path))
+                                    # ⭐ 基准图在 _unify_ref_canvas **之后**插入，躲过了归一
+                                    #    （2026-10-02）：它是 <image1> 画布定义者，尺寸必须与
+                                    #    _sb_size 逐像素一致，否则整个分镜画幅被它带偏。
+                                    #    这里显式再归一一次，把「插入顺序」这个隐患彻底封死。
+                                    refs = _unify_ref_canvas(refs, _sb_size, project_name)
                                     labels = [r[1] for r in refs]
                         except Exception as _3d_e:  # noqa: BLE001
                             app.logger.warning("[3D导演台] shot=%s 渲染失败（降级为纯文字站位）：%s",
                                                shot_id, _3d_e)
                             _blocking_ref_path = ""
-                    prompt = comfyui_client.build_storyboard_prompt(
-                        shot, labels,
-                        has_blocking_image=bool(_blocking_ref_path))
+                    prompt = (comfyui_client.build_shot_grid_keyframes_prompt(
+                        shot, labels, style=(shot.get("style") or _sb_style))
+                        if _sb_grid_mode
+                        else comfyui_client.build_storyboard_prompt(
+                            shot, labels,
+                            has_blocking_image=bool(_blocking_ref_path)))
                     item["prompt"] = prompt
                     orig_prompt = prompt      # 教训库的稳定键：改写后的提示词不参与指纹
                     item["refs"] = {r[0]: os.path.basename(os.path.dirname(r[2])) for r in refs}
@@ -6459,8 +6804,10 @@ def _storyboard_worker(task_id: str, project_name: str, shots: list,
                                 "shot": shot_id, "attempt": attempt + 1,
                                 "prompt": prompt, "phase": "checking", "done": False}
                         # ---- 景别后处理（C 方案，2026-09-30）：送检前若主体占比超出目标景别，自动裁剪 ----
+                        # ⚠️ 九宫格模式（2026-10-02）禁用：一张图是 3x3 九个关键帧，
+                        #    按景别裁剪会切掉 8 格、只剩一格，破坏九宫格结构。
                         _shot_type = (shot.get("shot_type") or shot.get("camera") or "").strip()
-                        if _shot_type and os.path.isfile(scratch_png):
+                        if _shot_type and not _sb_grid_mode and os.path.isfile(scratch_png):
                             try:
                                 _crop_res = qc_client.auto_crop_framing(scratch_png, _shot_type)
                                 if _crop_res.get("cropped") and os.path.isfile(_crop_res["out_path"]):
@@ -6468,8 +6815,17 @@ def _storyboard_worker(task_id: str, project_name: str, shots: list,
                                     scratch_png = _crop_res["out_path"]
                             except Exception as _crop_e:  # noqa: BLE001
                                 app.logger.warning("[分镜质检] 景别自动裁剪失败（不阻断）shot=%s: %s", shot_id, _crop_e)
+                        # 九宫格模式（2026-10-02）：质检描述加「九宫格」口径，
+                        # 判官按 9 个关键帧的整体一致性评，不按单帧景别判。
+                        _qc_desc = _qc_shot_desc(shot)
+                        if _sb_grid_mode:
+                            _qc_desc = ("本图为一张 3x3 九宫格故事板：同一镜头的 9 个关键帧，"
+                                        "随时间从左到右、从上到下推进；请评 9 格整体的角色/场景/"
+                                        "光线/色调一致性、动作推进的连贯性与画面质量，"
+                                        "不要按单帧的景别去判（景别可能随运镜在格间渐次变化）。"
+                                        + _qc_desc)
                         verdict = qc_client.check_image(
-                            scratch_png, _qc_shot_desc(shot), qc_cfg,
+                            scratch_png, _qc_desc, qc_cfg,
                             style=(shot.get("style") or _sb_style),
                             ref_images=_qc_ref_images(
                                 shot, char_idx, item_idx, scene_idx, refs),
@@ -6592,9 +6948,29 @@ def _storyboard_worker(task_id: str, project_name: str, shots: list,
                     elif "qc" not in item:
                         item["qc"] = {"enabled": False, "status": "disabled",
                                       "label": "质检未开启", "attempts": 0, "regenerated": 0}
+            except _PromptQCBlocked as _pqb:
+                # ⭐ P0（2026-10-02 实测定位）：预检阻断**必须**单独捕获。
+                #   旧实现只写 item["error"]，而 `item["success"]=True` 是成功路径里
+                #   **无条件先写**的（生成完图就置位，见上方 item.update），此后才做预检/
+                #   质检/入库。异常一抛，success 保持 True 且 file 指向从未 copy2 的路径
+                #   → manifest 谎报「6/6 成功」而正式目录一张图都没有：
+                #     · api_storyboard_canvas 按 os.path.isfile 判 exists=False（界面无图）
+                #     · 下游 video 拿这个不存在的 file 当 I2V 首帧
+                #     · 断点续跑 skip 判据也是 os.path.isfile → 永远跳不过，每轮白重跑
+                #   与下方 `item["success"]=False`（质检闸门口径）对齐：阻断即非成功。
+                app.logger.warning("镜头 %s 分镜图被提示词预检阻断：%s", shot_id, _pqb)
+                item["success"] = False
+                item["file"] = ""
+                item.pop("url", None)
+                item["error"] = str(_pqb)
             except Exception as shot_err:
                 import traceback as _tb
                 app.logger.error(f"镜头 {shot_id} 分镜图生成失败: {shot_err}\n{_tb.format_exc()}")
+                # ⭐ 同上：任何异常都不得留下「success=True 但无产物」的僵尸条目。
+                #   成功路径先置位、后续任何一步抛错都必须在这里复位（fail-closed）。
+                item["success"] = False
+                item["file"] = ""
+                item.pop("url", None)
                 item["error"] = str(shot_err)
 
             manifest_shots.append(item)
@@ -6748,6 +7124,39 @@ def _project_subtitle_enabled(project_name: str = "") -> bool:
             return bool(val)
     except Exception as e:  # noqa: BLE001  开关读取失败按「关闭」处理（安全侧）
         app.logger.warning(f"读取项目 config.subtitle_enabled 失败（按关闭处理）：{e}")
+    return default
+
+
+def _project_caption_burn_enabled(project_name: str = "") -> bool:
+    """该项目的「字幕/转场 caption」烧制开关（config.json 的 caption_burn_enabled），**默认 True**。
+
+    与 _project_subtitle_enabled 是**两件事**，刻意分开：
+      · subtitle_enabled（默认关）：把人物开口的台词转录成硬字幕——辅助性文字，
+        用户 2026-09-24 明确要求不要；
+      · caption_burn_enabled（默认开）：把剧本 caption 烧进成片——它是**剧情装置**
+        （时空落点、时空回溯、集尾悬念）。参考改编稿正是靠「春秋蝉，逆转时光。」
+        让观众看懂时空跳变；不烧就会看到无过渡的跳切。
+    不想要字幕的项目在其 config.json 写 "caption_burn_enabled": false 即可。
+    """
+    proj = _safe_project(project_name or "")
+    default = bool(PROJECT_DEFAULT_CONFIG.get("caption_burn_enabled", True))
+    try:
+        rec = project_store.get_project(proj)
+        if rec:
+            cfg = project_store.read_config(rec["dir_key"])
+            if "caption_burn_enabled" not in cfg:
+                return default
+            val = cfg.get("caption_burn_enabled")
+            if isinstance(val, str):
+                s = val.strip().lower()
+                if s in ("true", "1", "yes", "on"):
+                    return True
+                if s in ("false", "0", "no", "off", "none", "null", ""):
+                    return False
+                return default
+            return bool(val)
+    except Exception as e:  # noqa: BLE001  开关读取失败按默认处理
+        app.logger.warning(f"读取项目 config.caption_burn_enabled 失败（按默认开启处理）：{e}")
     return default
 
 
@@ -6948,6 +7357,20 @@ def api_storyboard_file(filename):
     return _serve_safe(STORYBOARDS_DIR, filename)
 
 
+@app.route('/api/storyboards/scratch/<path:project_name>/<path:filename>')
+def api_storyboard_scratch_file(project_name, filename):
+    """提供「分镜生成中」中间产物（storyboard_scratch）访问。
+
+    ⭐ 2026-10-02：分镜步骤是整步落盘，正式产物要等 6 镜全跑完才写进
+    STORYBOARDS_DIR；期间画布靠本路由读 scratch 目录显示「生成中」预览。
+    与 api_storyboard_file 同用 `_serve_safe` 做目录穿越防护
+    （base 按项目隔离在 QC_DIR/<项目>/storyboard_scratch 之内）。
+    """
+    project = _safe_project(os.path.basename(project_name.rstrip('/')))
+    base = os.path.join(QC_DIR, project, "storyboard_scratch")
+    return _serve_safe(base, filename)
+
+
 # ===== 步骤6：视频生成 =====
 
 def _blocking_spec_text(shot: dict) -> str:
@@ -7112,7 +7535,10 @@ def api_generate_videos():
                 episode_tag, _vid_ep,
                 chain_mode=chain_mode,
                 style=(data.get('style') or _project_style(project_name)),
-                overwrite=bool(data.get('overwrite')))
+                overwrite=bool(data.get('overwrite')),
+                build_only=bool(data.get('build_only')),
+                only_scenes=(data.get('only_scenes')
+                             if isinstance(data.get('only_scenes'), list) else None))
     thread = threading.Thread(target=_video_generate_worker_gated, daemon=True)
     thread.daemon = True
     thread.start()
@@ -7124,7 +7550,8 @@ def api_generate_videos():
 def _video_generate_worker(task_id, project_name, shots, character_refs,
                           scene_refs, storyboards, use_storyboard, mode,
                           timeout_per_segment, episode_tag, episode_no=None,
-                          chain_mode="auto", style="", overwrite=False):
+                          chain_mode="auto", style="", overwrite=False,
+                          build_only=False, only_scenes=None):
     """逐镜/整集/关键帧三种模式的视频生成（后台任务体，可被路由与流水线复用）
 
     overwrite：是否全量重做。默认 False —— per_shot 模式下已达标入库的
@@ -7163,7 +7590,7 @@ def _video_generate_worker(task_id, project_name, shots, character_refs,
         _video_generate_worker_body(
             task_id, project_name, shots, character_refs, scene_refs, storyboards,
             use_storyboard, mode, timeout_per_segment, episode_tag, episode_no,
-            chain_mode, style, overwrite)
+            chain_mode, style, overwrite, build_only, only_scenes)
     except cancellation.Cancelled as e:
         # 协作式中止：不是失败，落到「已取消」态，前端展示为已停止而非报错
         app.logger.info("[视频] 任务因中止信号停止（task=%s）：%s", task_id, e)
@@ -7208,7 +7635,8 @@ def _video_should_stop() -> bool:
 def _video_generate_worker_body(task_id, project_name, shots, character_refs,
                                 scene_refs, storyboards, use_storyboard, mode,
                                 timeout_per_segment, episode_tag, episode_no=None,
-                                chain_mode="auto", style="", overwrite=False):
+                                chain_mode="auto", style="", overwrite=False,
+                                build_only=False, only_scenes=None):
     """视频生成的实际业务体（外壳见 :func:`_video_generate_worker`，负责注册中止信号）"""
     try:
         # 风格/画幅：整集共用一次解析
@@ -7489,6 +7917,13 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
                 shot, dur, max_sec=h3_prompt_kit.H3_SEGMENT_MAX_SEC)
             _multi_seg = len(_seg_shots) > 1
             _segs = []
+            # ⭐ 逐分镜场景 LoRA（LLM 智能选择 + 规则表兜底，见 app/h3_segment_loras.py）：
+            #    优先调用用户配置的 AI 模型分析分镜内容，智能判断应使用哪个风格 LoRA；
+            #    若 AI 模型未配置 / 调用失败，则回落规则表匹配（按场景文本关键词）。
+            #    同一分镜的所有长镜子段继承同一套（一场戏一种画风/质感）。
+            #    editMode=segment → 插件按段采纳 segments[i].loras（模块 docstring 有机制说明）。
+            #    无命中 → []；构建器只有在非空时才把 loras 写进 timeline。
+            _shot_loras = h3_segment_loras.select_loras_for_shot_smart(shot)
             for _si, _sub in enumerate(_seg_shots):
                 _sub_dur = float(_sub.get("duration") or dur)
                 # 提示词按子段重建（keyframe / reference 两条参考图分支共用同一构建入口）
@@ -7534,7 +7969,8 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
                            if _multi_seg and _si < 26 else "")
                 _segs.append({"prompt": _sub_prompt, "duration": _sub_dur,
                               "reference_images": refs,
-                              "name": f"shot_{seq:02d}{_suffix}"})
+                              "name": f"shot_{seq:02d}{_suffix}",
+                              "loras": list(_shot_loras)})
                 if _pf_seg.get("repairs") or (_pf_seg.get("verdict") or {}).get("issues"):
                     _segs[-1]["prompt_qc"] = _pf_seg.get("verdict")
                     _segs[-1]["prompt_qc_repairs"] = _pf_seg.get("repairs") or []
@@ -7610,9 +8046,22 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
                 _common, _comps_map = _h3_plan_common_refs(
                     shots, char_idx, item_idx, scene_idx,
                     character_refs=character_refs, main_char_img=main_char_img,
-                    sb_map=sb_map, use_storyboard=use_storyboard)
+                    sb_map=sb_map, use_storyboard=use_storyboard,
+                    project_name=project_name)
             _common_keys = {h3_common_refs.asset_key(c) for c in _common}
             _common_keys.discard(None)
+            # ⭐ 公共参考音色 + 公共提示词 subject lock（2026-10-02）：统一派生，
+            #    预演/正式两个调用点共用同一份，避免两处口径漂移。
+            _ensure_voice_bank_refs(_common, project_name, all_characters=char_idx)
+            _common_audios = _h3_common_ref_audios(_common, project_name)
+            # ⭐ 公共提示词补全（2026-10-03）：世界观 + 全局 STYLE 也进公共段（与角色锁定一致
+            #    拼在每段提示词前）。世界观优先取 AI 设定面板的 era_world，缺则取项目 brief。
+            _cw_style = str(_style_res.get("style") or style or "").strip()
+            _cw_aspect = str(_style_res.get("aspect") or _style_res.get("ratio") or "").strip()
+            _cw_worldview = _project_worldview(project_name)
+            _common_prompt = _h3_common_subject_lock(
+                _common, _common_audios,
+                style=_cw_style, worldview=_cw_worldview, aspect=_cw_aspect)
             for i, shot in enumerate(shots):
                 shot_id = shot.get('shot_id', i + 1)
                 seq = _shot_seq(shot_id, i + 1)
@@ -7630,6 +8079,13 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
                 # 必须 extend 而非 append：H3 工作流段数 = len(segments)，少一段就等于
                 # 该镜只生成了一半时长；且段顺序即时间轴顺序，extend 保持镜头内子段连续。
                 _shot_segs = seg if isinstance(seg, list) else [seg]
+                # 按场次生成（2026-10-03）：段落继承所属镜头的场次号（scene_no），
+                # 视频阶段按场次分组逐场提交，最后拼接成整集。
+                for _ss in _shot_segs:
+                    try:
+                        _ss.setdefault("scene_no", int(shot.get("scene_no") or 1))
+                    except (TypeError, ValueError):
+                        _ss.setdefault("scene_no", 1)
                 # 优化#4 段间衔接（2026-10-02 细化版）：逻辑提纯到
                 # h3_prompt_kit.transition_clause —— 同场延续 / 换场 / 机位切换 /
                 # 跨集首镜（用上集 state_out 承接）四种情形各自措辞；只加在本镜
@@ -7851,6 +8307,8 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
                             qc_style=eff_style,
                             max_retries=0,      # 预演不重试：要改就重出一版预演
                             common_refs=[c["path"] for c in _common if c.get("path")],
+                            common_ref_audios=_common_audios,
+                            common_prompt=_common_prompt,
                         )
                     except Exception as _pv_err:                       # noqa: BLE001
                         app.logger.error("[预演] 生成失败：%s", _pv_err, exc_info=True)
@@ -7900,6 +8358,202 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
 
             app.logger.info(f"[episode] 整集生成开始：{len(segs)} 段，qc_on={qc_on}，max_retries={max_retries}")
 
+            # 工作流导出模式（2026-10-03）：body 带 build_only=true 时只构建整集 UI
+            # 工作流并落盘到 output/workflows_export/<项目>/epNN_h3_director_ui.json，
+            # **不提交 ComfyUI、不烧 GPU** —— UI 格式可直接导入 ComfyUI 检查/运行。
+            _build_only = bool(build_only)
+            _wf_export_path = ""
+            if _build_only and str(os.environ.get("MJSCXT_VIDEO_PER_SCENE") or "1").strip().lower() \
+                    in ("0", "false", "off", "no"):
+                # 仅旧「整集一次提交」模式的导出路径；按场次模式的导出在下方分支内
+                _wf_export_path = os.path.join(
+                    PROJECT_OUTPUT_DIR, "workflows_export", project_name,
+                    f"ep{int(episode_no or 1):02d}_h3_director_ui.json")
+                app.logger.info("[episode][build_only] 工作流将导出到：%s", _wf_export_path)
+
+            # ===== 按场次生成（2026-10-03 用户决策，默认开）=====
+            # 把整集段落按 scene_no 分组，每场一次 H3 提交（场内保留段间引导与衔接
+            # 提示词，场间是自然剪切点）→ scene_XX.mp4；全部场次完成后 ffmpeg concat
+            # 拼接成整集。逐场质检重试（比整集重试便宜一个量级）；某场失败只重做该场
+            # （已完成场次落盘复用，天然断点续跑）。env MJSCXT_VIDEO_PER_SCENE=0 切回
+            # 旧的「整集一次提交」。
+            _per_scene = str(os.environ.get("MJSCXT_VIDEO_PER_SCENE") or "1").strip().lower() \
+                not in ("0", "false", "off", "no")
+            _scene_groups = []
+            for _s in segs:
+                try:
+                    _sn = int(_s.get("scene_no") or 1)
+                except (TypeError, ValueError):
+                    _sn = 1
+                if _scene_groups and _scene_groups[-1][0] == _sn:
+                    _scene_groups[-1][1].append(_s)
+                else:
+                    _scene_groups.append((_sn, [_s]))
+
+            if _per_scene:
+                _ep_name_ps = f"{episode_tag or 'episode'}_full.mp4"
+                # 单场重做（2026-10-03）：body only_scenes=[N] 时只生成/重做指定场次；
+                # 配合 overwrite=true 可强制重画已有成片的场（断点续跑语义保持）。
+                _ovw_ps = bool(overwrite)
+                _only_scenes = only_scenes
+                if isinstance(_only_scenes, list) and _only_scenes:
+                    try:
+                        _only_set = {int(x) for x in _only_scenes}
+                        _scene_groups = [g for g in _scene_groups if g[0] in _only_set]
+                    except (TypeError, ValueError):
+                        pass
+                app.logger.info("[episode] 按场次生成：%d 场 / %d 段（build_only=%s）",
+                                len(_scene_groups), len(segs), _build_only)
+
+                if _build_only:
+                    # 导出模式：逐场构建 UI 工作流落盘（零 GPU），供人工在 ComfyUI 检查
+                    _scene_reports = []
+                    for _sn, _ssegs in _scene_groups:
+                        _sp = os.path.join(
+                            PROJECT_OUTPUT_DIR, "workflows_export", project_name,
+                            f"ep{int(episode_no or 1):02d}_scene{_sn:02d}_ui.json")
+                        _r = comfyui_client.generate_h3_sequence_sequential(
+                            segments=_ssegs,
+                            filename_prefix=(f"comic_drama/{project_name}_"
+                                             f"{episode_tag or 'episode'}_s{_sn:02d}"),
+                            timeout_per_segment=timeout_per_segment, size=_size,
+                            common_refs=[c["path"] for c in _common if c.get("path")],
+                            common_ref_audios=_common_audios,
+                            common_prompt=_common_prompt,
+                            build_only=True, save_build_to=_sp)
+                        _wfo = (_r or {}).get("workflow")
+                        if _wfo and _sp:
+                            os.makedirs(os.path.dirname(_sp), exist_ok=True)
+                            atomic_write_json(_sp, _wfo)
+                        _scene_reports.append({
+                            "scene_no": _sn, "segments": len(_ssegs),
+                            "workflow": _sp if (_wfo and os.path.isfile(_sp)) else "",
+                            "layout": (_r or {}).get("layout") or {}})
+                    _ok_n = sum(1 for _r in _scene_reports if _r.get("workflow"))
+                    with lock:
+                        generation_state[task_id].update({
+                            "status": "completed" if _ok_n == len(_scene_groups) else "failed",
+                            "progress": 100,
+                            "phase": "工作流已按场次导出（未提交 GPU）",
+                            "workflow_dir": (os.path.dirname(_scene_reports[0]["workflow"])
+                                             if _ok_n else ""),
+                            "results": [{"success": _ok_n == len(_scene_groups),
+                                         "build_only": True,
+                                         "scenes": _scene_reports}]})
+                    app.logger.info("[episode][build_only] 按场次导出完成：%d/%d 场",
+                                    _ok_n, len(_scene_groups))
+                    return
+
+                _scene_files = []
+                _scene_reports = []
+                import secrets as _secrets
+                for _gi, (_sn, _ssegs) in enumerate(_scene_groups):
+                    with lock:
+                        generation_state[task_id].update({
+                            "phase": (f"按场次生成：第 {_gi + 1}/{len(_scene_groups)} 场"
+                                      f"（scene_{_sn:02d}，{len(_ssegs)} 段）"),
+                            "progress": int(_gi / max(1, len(_scene_groups)) * 100)})
+                    _sdst = os.path.join(videos_dir, f"scene_{_sn:02d}.mp4")
+                    if (not _ovw_ps) and os.path.isfile(_sdst) and os.path.getsize(_sdst) > 0:
+                        # 断点续跑：该场已有成片直接复用（overwrite=true 时强制重画）
+                        app.logger.info("[episode][per-scene] 第 %d 场已有成片，复用：%s",
+                                        _sn, _sdst)
+                        _scene_files.append(_sdst)
+                        _scene_reports.append({"scene_no": _sn, "success": True,
+                                               "skipped": True, "path": _sdst})
+                        continue
+                    _sres = comfyui_client.generate_h3_sequence_sequential(
+                        segments=_ssegs,
+                        filename_prefix=(f"comic_drama/{project_name}_"
+                                         f"{episode_tag or 'episode'}_s{_sn:02d}"),
+                        seed=comfyui_job_store.get_or_create_seed(
+                            f"video|{project_name}|{episode_tag or 'episode'}|scene{_sn}",
+                            lambda: _secrets.randbelow(2 ** 31 - 2) + 1,
+                            live_key=(f"h3|comic_drama/{project_name}_"
+                                      f"{episode_tag or 'episode'}|scene{_sn}")),
+                        timeout_per_segment=timeout_per_segment, size=_size,
+                        qc_fn=_seg_qc_fn if qc_on else None, qc_cfg=qc_cfg,
+                        qc_style=eff_style, max_retries=max_retries,
+                        qc_stop_cb=(_ep_qc_stop_cb if qc_on else None),
+                        common_refs=[c["path"] for c in _common if c.get("path")],
+                        common_ref_audios=_common_audios,
+                        common_prompt=_common_prompt)
+                    _sf = (_sres or {}).get("files") or []
+                    if not _sf or not os.path.isfile(_sf[0]):
+                        _scene_reports.append({
+                            "scene_no": _sn, "success": False,
+                            "error": ((_sres or {}).get("error")
+                                      or "ComfyUI 未返回该场成片")})
+                        with lock:
+                            generation_state[task_id].update({
+                                "status": "failed", "success_count": 0,
+                                "error": (f"第 {_sn} 场生成失败"
+                                          f"（已完成 {_gi}/{len(_scene_groups)} 场；"
+                                          "重跑将自动跳过已完成场次）"),
+                                "results": [{"success": False,
+                                             "mode": "episode_per_scene",
+                                             "scenes": _scene_reports}]})
+                        return
+                    os.makedirs(videos_dir, exist_ok=True)
+                    shutil.move(_sf[0], _sdst)
+                    _scene_files.append(_sdst)
+                    _scene_reports.append({"scene_no": _sn, "success": True,
+                                           "path": _sdst,
+                                           "qc_results": (_sres or {}).get("qc_results") or []})
+
+                # 全部场次完成 → ffmpeg concat 拼接成整集（流复制，无重编码）
+                import subprocess as _sp_sub
+                from pathlib import Path as _P
+                dst = os.path.join(videos_dir, _ep_name_ps)
+                _concat_list = os.path.join(videos_dir, f"_concat_{episode_tag or 'ep'}.txt")
+                try:
+                    _lines = "".join(
+                        "file '" + _f.replace("\\", "/").replace("'", "'\\''") + "'\n"
+                        for _f in _scene_files)
+                    _P(_concat_list).write_text(_lines, encoding="utf-8")
+                    _rc = _sp_sub.run(
+                        ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                         "-i", _concat_list, "-c", "copy", dst],
+                        capture_output=True, text=True, timeout=3600)
+                    if (_rc.returncode != 0 or not os.path.isfile(dst)
+                            or os.path.getsize(dst) == 0):
+                        raise RuntimeError(
+                            f"ffmpeg concat 失败 rc={_rc.returncode}: "
+                            f"{(_rc.stderr or '')[-300:]}")
+                except Exception as _ce:  # noqa: BLE001
+                    app.logger.exception("[episode][per-scene] 拼接失败")
+                    with lock:
+                        generation_state[task_id].update({
+                            "status": "failed", "success_count": 0,
+                            "error": f"场次已全部生成但拼接失败：{_ce}",
+                            "results": [{"success": False, "mode": "episode_per_scene",
+                                         "scenes": _scene_reports}]})
+                    return
+
+                item = {"success": True, "mode": "episode_per_scene",
+                        "scene_count": len(_scene_groups),
+                        "segment_count": len(segs),
+                        "scenes": _scene_reports,
+                        "qc_passed": True, "attempts_used": 1,
+                        "path": dst, "url": f"{_vurl}/{_ep_name_ps}",
+                        "shots": shot_meta_map,
+                        "common_refs": [c.get("name") for c in _common],
+                        "qc": _qc_summary([], qc_declared, qc_on, max_retries)}
+                item["audio"] = _h3_audio_policy(dst)
+                with lock:
+                    generation_state[task_id]["results"].append(item)
+                    generation_state[task_id]["progress"] = 100
+                    generation_state[task_id]["phase"] = (
+                        f"按场次生成完成（{len(_scene_groups)} 场已拼接为整集）")
+                app.logger.info("[episode][per-scene] 整集拼接完成：%s（%d 场）",
+                                dst, len(_scene_groups))
+                with lock:
+                    results = generation_state[task_id]["results"]
+                    ok = sum(1 for r in results if r.get("success"))
+                    generation_state[task_id].update({
+                        "status": "completed", "success_count": ok, "error": ""})
+                return
+
             result = comfyui_client.generate_h3_sequence_sequential(
                 segments=segs,
                 filename_prefix=f"comic_drama/{project_name}_{episode_tag or 'episode'}",
@@ -7922,7 +8576,37 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
                 #   （index 0..K-1）+ commonEnabled=true → 各段的 reference_images
                 #   从 index K 起编号。顺序必须与提示词里的 <Picture 1..K> 一致。
                 common_refs=[c["path"] for c in _common if c.get("path")],
+                # ⭐ 公共参考音色（2026-10-02 取代逐段配音）：公共角色的 voice_bank 参考音
+                #   → global.refAudios（index 0..M-1）；无公共角色/无音色 → 空（零行为变更）。
+                common_ref_audios=_common_audios,
+                # ⭐ 公共提示词 subject lock（2026-10-02）：角色/物品/场景锁定 + 公共音色
+                #   指代，编号与 global.refs/refAudios 逐位对齐（<Picture 1..K>/<Audio 1..M>）。
+                common_prompt=_common_prompt,
+                build_only=_build_only,
+                save_build_to=(_wf_export_path or None),
             )
+            # 导出模式：工作流落盘即任务完成（跳过成片搬运 / QC / 历史清理全流程）
+            if _build_only:
+                _wf_obj = (result or {}).get("workflow")
+                if _wf_obj and _wf_export_path:
+                    os.makedirs(os.path.dirname(_wf_export_path), exist_ok=True)
+                    atomic_write_json(_wf_export_path, _wf_obj)
+                if _wf_obj and os.path.isfile(_wf_export_path):
+                    with lock:
+                        generation_state[task_id].update({
+                            "status": "completed", "progress": 100,
+                            "phase": "工作流已导出（未提交 GPU）",
+                            "workflow_path": _wf_export_path,
+                            "results": [{"success": True, "build_only": True,
+                                         "workflow": _wf_export_path,
+                                         "layout": (result or {}).get("layout") or {}}]})
+                    app.logger.info("[episode][build_only] 已导出：%s", _wf_export_path)
+                else:
+                    with lock:
+                        generation_state[task_id].update({
+                            "status": "failed", "success_count": 0,
+                            "error": "build_only 未产出工作流（看后端 [H3-*][build_only] 日志）"})
+                return
             files = result.get("files") or []
             episode_failed = bool(result.get("failed"))
             attempts_used = result.get("attempts_used", 1)
@@ -11602,6 +12286,26 @@ def _novel_convert_worker(task_id: str, novel_meta: dict, style: str, episodes: 
                 CONTINUITY_DIR, project_key or novel_meta.get("novel_id"))
         except Exception as _ce:  # noqa: BLE001  缓存不可用不得阻断主链路
             app.logger.warning("整本路径缓存目录解析失败（本次不落缓存）：%s", _ce)
+        # 全书结构化大纲（2026-10-02 用户指定）：整本转剧本的强制前置。
+        # 通读清洗→抽角色(按戏份)→按场景切换拆段→标剧情任务→落 book_outline.json，
+        # 后续环节只引用这一份不重读小说。失败不阻断（降级为旧流程），只响亮降级。
+        _book_outline = None
+        try:
+            import book_outline
+            cb("book_outline", 0, 1, "通读全书并生成结构化大纲（角色表+分段大纲）…", 1)
+            _book_outline = book_outline.build_outline(
+                client, novel_meta, text, style=style,
+                progress_cb=cb, continuity_dir=CONTINUITY_DIR,
+                project_key=project_key or novel_meta.get("novel_id"),
+                cache_dir=_nc_cache,
+            )
+            app.logger.info("全书大纲已生成：%s（%d 角色 / %d 段）",
+                            book_outline.outline_path(project_key or novel_meta.get("novel_id"),
+                                                       CONTINUITY_DIR),
+                            len(_book_outline.get("characters") or []),
+                            len(_book_outline.get("segments") or []))
+        except Exception as _boe:  # noqa: BLE001
+            app.logger.warning("全书大纲生成失败（降级为旧流程继续转剧本）：%s", _boe)
         script = novel_to_script.convert_novel_to_script(
             client, novel_meta, text, style=style, episodes=episodes,
             target_shots=target_shots, progress_cb=cb,
@@ -11659,7 +12363,8 @@ def _novel_convert_worker(task_id: str, novel_meta: dict, style: str, episodes: 
 def api_novel_convert(novel_id):
     """用自定义 API 把已上传小说转成 A 版剧本（后台任务）"""
     try:
-        novel_meta = get_novel(NOVELS_DIR, novel_id)
+        # 生成剧本前先做章节目录体检（LLM 判断真章节，结果缓存；失败退回规则折叠）
+        novel_meta = ensure_chapter_structure(NOVELS_DIR, novel_id, _optional_llm_client())
     except NovelParseError as e:
         return jsonify({"success": False, "error": str(e)}), 404
 
@@ -11830,6 +12535,12 @@ def api_novel_chapters(novel_id):
         "generated_count": len([e for e in _gen_by_ep.values() if e.get("shots")]),
         "unit_total": sum(len(_units_of(int(c.get("index") or 0))) for c in raw),
         "split_mode": "content",   # 分集策略：纯按内容体量自动判断（见 novel_to_script）
+        # 章节目录体检结果（LLM 读目录判断真章节；未体检时为 None）——前端据此提示
+        # 「已折叠 N 个卷/分部标题」，并说明第 1 集对应的是哪一节正文。
+        "chapter_structure": meta.get("chapter_structure") or None,
+        "chapter_structure_audited_at": meta.get("chapter_structure_audited_at"),
+        "chapter_collapse_note": (meta.get("chapter_collapse_note")
+                                  or meta.get("chapter_structure_note") or ""),
         "chapters": chapters,
     })
 
@@ -11922,6 +12633,16 @@ def api_novel_split_plan(novel_id):
         # 与生产 episode_units 同源：默认 max_sec/fixed_parts/max_shots 口径一致
         proposal = novel_to_script.propose_chapter_split(
             ch, text, max_sec=max_sec, fixed_parts=fixed_parts, max_shots=max_shots)
+        # 一章一集口径（2026-10-04 用户决策）：分集拆分已停用 —— 「超单集红线 /
+        # 建议手动拆 / 需人工确认」警告全部失效不再输出（预估镜数/秒数仅作参考）。
+        if str(os.environ.get("MJSCXT_EPISODE_SPLIT") or "").strip().lower() \
+                not in ("1", "true", "yes", "on"):
+            proposal["needs_confirm"] = False
+            proposal["total_parts"] = 1
+            proposal["message"] = "一章一集（分集拆分已停用，单集时长仅作参考）"
+            for _u in (proposal.get("units") or []):
+                if isinstance(_u, dict):
+                    _u["over_redline"] = False
         proposal["index"] = ch.get("index")
         proposal["title"] = ch.get("title")
         proposal["char_count"] = ch.get("char_count")
@@ -11977,7 +12698,8 @@ def _episode_units_for_chapters(novel_meta: dict, chapters: list) -> list:
 
 
 def _episodes_worker(task_id: str, novel_meta: dict, chapters: list, style: str,
-                     target_shots: int, overwrite: bool, project_key: str = None):
+                     target_shots: int, overwrite: bool, project_key: str = None,
+                     use_screenplay: bool = False):
     key = _novel_key(novel_meta, project_key)
     # 拍摄单元：超长章按语义边界拆成多集（单集镜头数硬上限见 novel_to_script）
     units = _episode_units_for_chapters(novel_meta, chapters)
@@ -12030,10 +12752,53 @@ def _episodes_worker(task_id: str, novel_meta: dict, chapters: list, style: str,
                 report(_ord, _ch, phase, f"第{_ep}集《{_t}》 {msg}", pct)
 
             try:
+                # 前置解析（2026-10-03 补链，用户口径：前置解析必须先于改写）：
+                # 该章还没有 preflight（人物档案/梗概/关键事件/情绪基线）时先自动
+                # 跑一次并并入项目级设定库 —— convert_chapter_with_continuity 依赖
+                # 它注入防 OOC 约束。一章一集口径下章号=集号，注入键天然对齐。
+                # 失败不阻塞改写（fail-open，只告警）。
+                try:
+                    if not chapter_preflight.load_preflight(
+                            CONTINUITY_DIR, key, int(chapter.get("index") or 0)):
+                        report(ep, chapter, "preflight",
+                               f"第{ep}集：前置解析（人物档案/梗概/关键事件/情绪基线）…", 2)
+                        _pf_seg = text[int(chapter.get("start") or 0):
+                                       int(chapter.get("end") or 0)]
+                        _pf_res = chapter_preflight.preflight_analyze(
+                            client,
+                            novel_meta.get("title") or novel_meta.get("name") or "",
+                            int(chapter.get("index") or 0),
+                            chapter.get("title") or "", _pf_seg)
+                        chapter_preflight.save_preflight(CONTINUITY_DIR, key, _pf_res)
+                        try:
+                            chapter_preflight.merge_to_bible(CONTINUITY_DIR, key, _pf_res)
+                        except Exception:  # noqa: BLE001
+                            pass
+                except Exception as _pfe:  # noqa: BLE001
+                    app.logger.warning("第%s集前置解析失败（跳过注入，不阻塞）：%s", ep, _pfe)
+                # 两段式生产（2026-10-03 ②）：use_screenplay=true 时以「文学剧本」为
+                # 原文走改写链路 —— 合成 chapter 使 start/end 覆盖剧本全文（continuity
+                # 与覆盖率校验只消费传入的 novel_text[start:end]，零内部改动即生效）。
+                # 文学剧本缺失时回退章节原文并告警（fail-open，不阻塞批量）。
+                _conv_text = text
+                _conv_chapter = chapter
+                if use_screenplay:
+                    _md = novel_screenplay.load_screenplay(
+                        key, int(unit.get("episode_no") or 0))
+                    if _md:
+                        _conv_text = _md
+                        _conv_chapter = {"index": chapter.get("index"),
+                                         "title": chapter.get("title"),
+                                         "start": 0, "end": len(_md)}
+                    else:
+                        app.logger.warning(
+                            "第%s集：文学剧本不存在，回退章节原文（建议先调用 "
+                            "/api/novels/<id>/screenplay/generate）",
+                            unit.get("episode_no"))
                 # 跨集连贯性（A/B/C/D）：项目级 bible + 上集摘要卡 + 衔接契约 + state 锚点
                 # + 相邻集六类校验 + 命中高危问题时的局部重写，全部由 continuity 编排
                 conv = continuity.convert_chapter_with_continuity(
-                    client, novel_meta, text, chapter, key, CONTINUITY_DIR,
+                    client, novel_meta, _conv_text, _conv_chapter, key, CONTINUITY_DIR,
                     style=style, target_shots=target_shots, episode_no=ep,
                     save_dir=SCRIPT_DIR, progress_cb=cb,
                 )
@@ -12157,6 +12922,195 @@ def _episodes_worker(task_id: str, novel_meta: dict, chapters: list, style: str,
             generation_state[task_id].update({"status": "failed", "error": f"分集生成异常：{e}"})
 
 
+# ===================== 文学剧本层（两段式生产 ①：人审层，2026-10-03） =====================
+
+def _screenplay_worker(task_id: str, novel_meta: dict, chapter: dict,
+                       project_key: str, style: str, episode_no: int):
+    """文学剧本生成 worker：章节正文 → LLM 场次剧本 → output/screenplays/<项目>/第N集_文学剧本.md"""
+    try:
+        text = read_novel_text(NOVELS_DIR, novel_meta["novel_id"])
+        seg = text[int(chapter.get("start") or 0):int(chapter.get("end") or 0)]
+        with lock:
+            generation_state[task_id].update({"phase": "literary", "progress": 15,
+                                              "message": "正在把本章正文改写成文学剧本…"})
+        client = _current_llm_client()
+        if not client.configured:
+            raise LLMError("尚未配置自定义 AI 接口")
+        md = novel_screenplay.generate_screenplay(
+            client, novel_meta.get("title") or novel_meta.get("name") or "",
+            chapter.get("title") or f"第{episode_no}集", seg, style)
+        with lock:
+            generation_state[task_id].update({"progress": 80, "message": "落盘…"})
+        path = novel_screenplay.save_screenplay(
+            novel_screenplay.screenplay_path(project_key, episode_no), md)
+        with lock:
+            generation_state[task_id].update({
+                "status": "completed", "progress": 100,
+                "message": "文学剧本已生成（可在前端查看，确认后再改写为分镜剧本）",
+                "screenplay_path": path,
+                "results": [{"success": True, "episode_no": episode_no,
+                             "path": path, "chars": len(md)}]})
+    except Exception as e:  # noqa: BLE001
+        app.logger.exception("文学剧本生成失败")
+        with lock:
+            generation_state[task_id].update({"status": "failed", "error": str(e)})
+
+
+@app.route('/api/novels/<novel_id>/screenplay/generate', methods=['POST'])
+def api_novel_screenplay_generate(novel_id):
+    """生成某章的文学剧本（两段式生产 ①，异步）。body: {chapter, project_id/project_name?, style?, episode_no?}"""
+    try:
+        meta = get_novel(NOVELS_DIR, novel_id)
+    except NovelParseError as e:
+        return jsonify({"success": False, "error": str(e)}), 404
+    client = _current_llm_client()
+    if not client.configured:
+        return _ai_guide_response("尚未配置自定义 AI 接口，无法生成文学剧本")
+    data = request.json or {}
+    chapters = meta.get("chapters") or []
+    try:
+        ch_idx = int(data.get("chapter") or 1)
+    except (TypeError, ValueError):
+        ch_idx = 1
+    chapter = next((c for c in chapters if int(c.get("index") or 0) == ch_idx), None)
+    if chapter is None:
+        return jsonify({"success": False, "error": f"找不到章节 {ch_idx}"}), 404
+    proj = _resolve_novel_project(data, meta)
+    key = _novel_key(meta, proj["dir_key"])
+    try:
+        episode_no = max(1, int(data.get("episode_no") or ch_idx))
+    except (TypeError, ValueError):
+        episode_no = ch_idx
+    style = (data.get("style") or _project_style(proj["dir_key"]) or "3D动漫渲染")
+    task_id = f"screenplay_{novel_id}_{episode_no}_{int(time.time())}"
+    with lock:
+        generation_state[task_id] = {"status": "running", "progress": 2,
+                                     "phase": "prepare", "message": "准备章节正文…",
+                                     "novel_id": novel_id, "project_key": key}
+    threading.Thread(target=_screenplay_worker,
+                     args=(task_id, meta, chapter, key, style, episode_no),
+                     daemon=True).start()
+    return jsonify({"success": True, "task_id": task_id, "status": "started",
+                    "project_key": key, "episode_no": episode_no})
+
+
+@app.route('/api/novels/<novel_id>/screenplay/<int:episode_no>', methods=['GET'])
+def api_novel_screenplay_get(novel_id, episode_no):
+    """读取已生成的文学剧本（Markdown）。?project= 指定项目键（缺省按小说找项目）。"""
+    try:
+        meta = get_novel(NOVELS_DIR, novel_id)
+    except NovelParseError as e:
+        return jsonify({"success": False, "error": str(e)}), 404
+    pref = (request.args.get('project') or '').strip()
+    rec = project_store.get_project(pref) if pref else project_store.find_by_novel(novel_id)
+    key = _novel_key(meta, rec["dir_key"] if rec else None)
+    path = novel_screenplay.screenplay_path(key, episode_no)
+    md = novel_screenplay.load_screenplay(key, episode_no) if os.path.isfile(path) else ""
+    return jsonify({"success": True, "exists": bool(md), "markdown": md,
+                    "path": path, "project_key": key, "episode_no": int(episode_no)})
+
+
+@app.route('/api/episode/scenes', methods=['GET'])
+def api_episode_scenes():
+    """场次级状态（层级展示用，2026-10-03）：第N集 → 第1场/第2场…
+
+    query: project=<项目键>&episode_no=N。返回每场的场次号/标题/镜数、分镜图完成数、
+    场次视频（scene_XX.mp4）是否就绪 —— 前端按「集 → 场」两级树渲染。
+    """
+    project = _safe_project(request.args.get('project') or '')
+    try:
+        episode_no = max(1, int(request.args.get('episode_no') or 1))
+    except (TypeError, ValueError):
+        episode_no = 1
+    if not project:
+        return jsonify({"success": False, "error": "project 必填"}), 400
+    script = _load_script_for(project, episode_no) or {}
+    flow = [s for s in (script.get("scene_flow") or []) if isinstance(s, dict)]
+    # 分镜 manifest（按镜 success 统计每场完成数）
+    _flat = os.path.join(STORYBOARDS_DIR, project)
+    _sb_dir = _ep_dir(_flat, episode_no)
+    _sub = os.path.basename(_sb_dir) if _sb_dir != _flat else ""
+    mpath = os.path.join(_sb_dir, "storyboard_manifest.json")
+    _mshots = {}
+    if os.path.isfile(mpath):
+        try:
+            m = read_json_strict(mpath, {})
+            _mshots = {str(s.get("shot_id")): s
+                       for s in ((m or {}).get("shots") or []) if isinstance(s, dict)}
+        except Exception:  # noqa: BLE001
+            _mshots = {}
+    vdir = _ep_dir(os.path.join(VIDEOS_DIR, project), episode_no)
+    scenes = []
+    for sc in flow:
+        sids = [str(x) for x in (sc.get("shot_ids") or [])]
+        sb_ok = sum(1 for sid in sids
+                    if (_mshots.get(sid) or {}).get("success"))
+        _sn = int(sc.get("scene_no") or len(scenes) + 1)
+        vfile = os.path.join(vdir, f"scene_{_sn:02d}.mp4")
+        scenes.append({
+            "scene_no": _sn,
+            "heading": sc.get("heading") or f"第{_sn}场",
+            "location": sc.get("location"),
+            "int_ext": sc.get("int_ext"),
+            "time_of_day": sc.get("time_of_day"),
+            "shot_ids": sids,
+            "shot_count": len(sids),
+            "storyboard_ok": sb_ok,
+            "video_ready": os.path.isfile(vfile) and os.path.getsize(vfile) > 0,
+            "video_url": (f"/api/videos/{project}/{_sub + '/' if _sub else ''}"
+                          f"scene_{_sn:02d}.mp4"),
+        })
+    full = os.path.join(vdir, f"ep{episode_no:02d}_full.mp4")
+    if not os.path.isfile(full):
+        full = os.path.join(vdir, "episode_full.mp4")
+    return jsonify({
+        "success": True, "project": project, "episode_no": episode_no,
+        "scene_count": len(scenes), "scenes": scenes,
+        "full_video_ready": os.path.isfile(full) and os.path.getsize(full) > 0,
+    })
+
+
+@app.route('/api/novels/<novel_id>/chapters/analyze', methods=['POST'])
+def api_novel_chapters_analyze(novel_id):
+    """LLM 章节目录体检：像人一样读目录，判断「哪一条才是真正的正文章节」。
+
+    在生成剧本之前调用（前端可给一个「AI 分析章节结构」按钮）。判据是
+    「标题是不是分卷/分部名」+「标题行外有没有成段正文」，结果缓存进 meta，
+    同一本书只跑一次 LLM；force=true 强制重跑。
+
+    背景：CHAPTER_PATTERNS 用同一条正则匹配「第[数字][章回节卷篇集部]」，
+    《蛊真人》的「第一卷：魔性不改」（正文 0 字）因此被当成第 1 章，
+    整集剧本全靠模型编（8 个镜头全是自造的四字口号），覆盖率还报 100%。
+    """
+    try:
+        get_novel(NOVELS_DIR, novel_id)   # 存在性校验
+    except NovelParseError as e:
+        return jsonify({"success": False, "error": str(e)}), 404
+    client = _optional_llm_client()
+    if client is None:
+        return jsonify({
+            "success": False,
+            "error": "尚未配置「文本分析模型」，无法做章节目录体检；"
+                     "系统已用规则兜底折叠（标题行外无正文即视为卷/分部标题）。"}), 400
+    force = bool((request.json or {}).get("force"))
+    try:
+        meta = ensure_chapter_structure(NOVELS_DIR, novel_id, client, force=force)
+    except NovelParseError as e:
+        return jsonify({"success": False, "error": str(e)}), 404
+    return jsonify({
+        "success": True,
+        "novel_id": novel_id,
+        "chapter_count": meta.get("chapter_count"),
+        "chapter_structure": meta.get("chapter_structure") or None,
+        "audited_at": meta.get("chapter_structure_audited_at"),
+        "note": (meta.get("chapter_collapse_note")
+                 or meta.get("chapter_structure_note") or ""),
+        "chapters": [{"index": c.get("index"), "title": c.get("title"),
+                      "char_count": c.get("char_count"), "volume": c.get("volume")}
+                     for c in (meta.get("chapters") or [])[:30]],
+    })
+
+
 @app.route('/api/novels/<novel_id>/episodes/generate', methods=['POST'])
 def api_novel_episodes_generate(novel_id):
     """按章节分集生成：单章生成 / 批量生成多集（每章一集）
@@ -12164,7 +13118,8 @@ def api_novel_episodes_generate(novel_id):
     body: {chapters:[1,2,3] | start:1,end:3, style, target_shots, overwrite}
     """
     try:
-        meta = get_novel(NOVELS_DIR, novel_id)
+        # 生成剧本前先做章节目录体检（LLM 判断真章节，结果缓存；失败退回规则折叠）
+        meta = ensure_chapter_structure(NOVELS_DIR, novel_id, _optional_llm_client())
     except NovelParseError as e:
         return jsonify({"success": False, "error": str(e)}), 404
 
@@ -12214,6 +13169,34 @@ def api_novel_episodes_generate(novel_id):
 
     if not picks:
         return jsonify({"success": False, "error": "未选择有效章节（chapters 或 start/end 至少提供一项）"}), 400
+
+    # 空壳章节防线（2026-10-02）：去掉标题行后几乎没有正文的条目绝不是可拍摄内容。
+    # 曾经拿 11 个字的「第一卷：魔性不改」跑完整条流水线：模型凭空编了 8 个镜头
+    # （「魔性不改 / 大道无情 / 唯我独尊」这类自造口号），原文台词一句没用，
+    # 整半章内容丢失，而覆盖率检查还报 100%（没有正文单元可核对 → 空集恒真）。
+    # 宁可在这里明确挡下并说清原因，也不产出整集幻觉剧本。
+    try:
+        _novel_text = read_novel_text(NOVELS_DIR, novel_id) or ""
+    except Exception as e:  # noqa: BLE001
+        app.logger.warning("空壳章节防线：正文读取失败（跳过检查）：%s", e)
+        _novel_text = ""
+    if _novel_text and len(_novel_text) > 5000:
+        _shells = []
+        for _c in picks:
+            try:
+                _body = chapter_body_chars(_novel_text, _c)
+            except Exception:  # noqa: BLE001
+                _body = 0
+            if _body < 120:
+                _shells.append("%s（%d 字）" % (_c.get("title") or _c.get("index"), _body))
+        if _shells:
+            return jsonify({
+                "success": False,
+                "error": ("下列章节去掉标题行后几乎没有正文，像是卷/分部标题而不是正文，"
+                          "不能据此生成剧本：" + "、".join(_shells[:5]) +
+                          "。请改选其后的正文章节（本书一节正文通常约 3000 字）。"),
+                "shell_chapters": _shells,
+            }), 400
     if len(picks) > EPISODE_BATCH_LIMIT:
         return jsonify({"success": False,
                         "error": f"单次批量最多 {EPISODE_BATCH_LIMIT} 集，本次选择了 {len(picks)} 集；请缩小范围"}), 400
@@ -12266,11 +13249,13 @@ def api_novel_episodes_generate(novel_id):
             "episode_dir": ep_dir,
         }
     threading.Thread(target=_episodes_worker,
-                     args=(task_id, meta, picks, style, target_shots, overwrite, key),
+                     args=(task_id, meta, picks, style, target_shots, overwrite, key,
+                           bool(data.get('use_screenplay'))),
                      daemon=True).start()
     return jsonify({
         "success": True, "task_id": task_id, "status": "started",
         "novel_id": meta.get("novel_id"), "style": style, "target_shots": target_shots,
+        "use_screenplay": bool(data.get('use_screenplay')),
         "project_id": proj["id"], "project_key": key, "project_name": proj["name"],
         "episode_dir": ep_dir,
         "chapters": [{"index": c.get("index"), "title": c.get("title"),
@@ -15498,7 +16483,8 @@ def api_autonomous_start():
     plan_overrides = {k: v for k, v in data.items()
                       if k in ('style', 'target_shots', 'video_mode', 'enable_assets',
                                'enable_keyframe', 'enable_video', 'enable_final',
-                               'enable_tts', 'enable_mix', 'step_max_retries')}
+                               'enable_tts', 'enable_tts_pre', 'enable_mix',
+                               'step_max_retries')}
 
     if not novel_id and project_name:
         # 尝试从现有计划获取 novel_id

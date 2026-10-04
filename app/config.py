@@ -417,6 +417,9 @@ PROJECT_DEFAULT_CONFIG = {
     # 但成片合成阶段仍会额外烧一层字幕（pipeline.step_final / video_postprocess.finalize_episode）。
     # 用户既然明确要求「不要生成字幕」，则默认不再烧；确需硬字幕的老项目可显式置 true。
     "subtitle_enabled": False,
+    # 字幕/转场 caption（时空落点/回溯/集尾悬念）：剧情装置，默认开。
+    # 与上面的台词字幕 subtitle_enabled 是两件事，可分别控制。
+    "caption_burn_enabled": True,
 }
 
 # ===================== 跨集连贯性（相邻两章转剧本改进 A/B/C/D） =====================
@@ -503,6 +506,14 @@ CLEAR_COMFYUI_HISTORY_INTERVAL_SEC = 300.0
 #
 # 关掉即恢复原行为：MJSCXT_ASSET_LIBRARY=0
 ASSET_LIBRARY_ENABLED = _env_bool("MJSCXT_ASSET_LIBRARY", True)
+
+# 分镜图是否用「单镜九宫格（9 关键帧）」生成（2026-10-02 用户指定）。
+# 用户原话「一个 5 秒的分镜就是用的 9 宫格」+「分镜图本体就是九宫格」：
+#   一个镜头 = 一张 3x3 九宫格 = 该镜头内随时间推进的 9 个关键帧（不是 9 个镜头、不是 9 机位候选），
+#   九宫格整图即分镜图本体，H3 视频直接拿整图当构图参考（不裁切、不选格）。
+# ⚠️ 配套：九宫格模式下景别自动裁剪（auto_crop_framing）不适用（会破坏 9 格结构），已禁用。
+# 关掉即恢复旧行为（一镜一张单帧）：MJSCXT_SB_GRID=0
+SB_GRID_MODE = _env_bool("MJSCXT_SB_GRID", True)
 
 
 # ===================== 两级生产：预演 → 批准 → 正式（2026-09-29，借鉴 ai-manga-factory） =====================
@@ -685,16 +696,22 @@ AI_SETTINGS_PATH = os.path.join(AI_CHAT_DIR, "project_settings.json")
 
 # 工作流文件
 WORKFLOW_TEMPLATE = {
-    # H3 视频生成（2026-09-27 起）：官方 Director 插件工作流，**扁平单实例**——
+    # H3 视频生成（2026-10-04 起）：官方 Director 插件工作流，**扁平单实例 · 单采**——
     # 一个 MiniMaxH3Director 节点吃整条 timeline_data，段数由 timeline.segments 决定
-    # （1 段=逐镜头；整集=N 段），段间由插件原生「段间引导」衔接，二采由外接的
-    # MiniMaxH3DirectorRefine 承担。工作流**不重建拓扑**，只程序化注入 timeline
-    # （见 app/h3_director_builder.py）。
+    # （1 段=逐镜头；整集=N 段），段间由插件原生「段间引导」衔接。
+    # 现役模板为用户**亲自跑通**的 12 节点单采工作流（单实例、无二采链、
+    # 无 BasicScheduler / MiniMaxH3DirectorRefine / DLSS）。
+    # 工作流**不重建拓扑**，只程序化注入 timeline（见 app/h3_director_builder.py）。
+    # 旧二采模板 minimax_h3_director_二采_加速.json 保留为**回退**（见下方 h3_video_refine）。
     # 旧母版「H3信号10段测试001.json」（10 个子图实例 + H3ContinuousSeamlessJoinV14
     # 按分镜数重建）仍留在 workflows/ 里，可用 MJSCXT_H3_BUILDER=legacy 一键回退。
     # 注意：判「走哪条构建路径」只看模板**结构**（有无 MiniMaxH3Director 节点），
     # 不看文件名——改这里的值不会让分流逻辑失效。
-    "h3_video": "minimax_h3_director_二采_加速.json",
+    "h3_video": "h3_director_r2v_单采.json",
+    # H3 视频 · 二采模板（**回退用，勿删**）：23 节点版（含 BasicScheduler /
+    # MiniMaxH3DirectorRefine / DLSS 补帧）。与 h3_video **互换即可切回二采模板**：
+    # 把本键的值填进 h3_video、或设 MJSCXT_WORKFLOW_MAPPING 覆盖 h3_video 皆可。
+    "h3_video_refine": "minimax_h3_director_二采_加速.json",
     # 旧连续拼接母版（回退用，勿删）
     "h3_video_legacy": "H3信号10段测试001.json",
     # ---- 图片链路：2026-09-23 起统一切换到 QwenImage2.1 + TE-Speed 加速链 ----
@@ -967,8 +984,18 @@ SCENE_VIEW_LABELS = {v["key"]: v["label"] for v in MULTIVIEW_CONFIG["item_scene_
 #: 分镜换机位就等于换场景（比没有视角档更糟）。
 SCENE_VIEW_ANGLE_ZH = {
     "front": "相机正对场景正面、镜头平视，看到场地的正面全貌",
-    "left45": "相机位于场景左前方约 45 度、镜头平视，同时看到场地左侧面与正面",
-    "right45": "相机位于场景右前方约 45 度、镜头平视，同时看到场地右侧面与正面",
+    # ⚠️ 2026-10-03 强化（B 方案）：left45 / right45 的旧措辞「相机位于场景左/右前方约 45 度」
+    # 是**纯角度**描述，实测与 front 取景几乎一样（≈base，见 SCENE_VIEW_DUP_PHASH_MAX 注释）。
+    # 照搬**唯一被实证有效**的 top 档范式 —— **给结果（画面长什么样），而不只是给角度**：
+    # 显式给出「透视消失点偏向哪侧 + 露出哪面侧墙与纵深」，并**排斥旧构图**
+    # （「不要正对的正视对称构图」），逼模型真的换站位。front / top **逐字不动**
+    # （top 是唯一被实证有效的档，动它就是引入回归）。
+    "left45": "相机移到场地左前侧斜角、镜头沿纵深方向拍摄：透视消失点明显偏向画面右侧，"
+              "画面左侧露出侧向墙面与纵深，能同时看到场地左侧面与正面，"
+              "左右两侧呈现不同的墙面与纵深；不要正对的正视对称构图",
+    "right45": "相机移到场地右前侧斜角、镜头沿纵深方向拍摄：透视消失点明显偏向画面左侧，"
+               "画面右侧露出侧向墙面与纵深，能同时看到场地右侧面与正面，"
+               "左右两侧呈现不同的墙面与纵深；不要正对的正视对称构图",
     "top": "相机升到场景正上方俯拍（鸟瞰机位），镜头垂直向下，"
            "画面以地面布局与陈设的顶面为主",
 }
@@ -1000,6 +1027,14 @@ SCENE_VIEWS_ENABLED = _env_bool("SCENE_VIEWS_ENABLED", True)
 #:    把加值项做成硬闸门曾让整批资产因一张俯视图全判失败（旧 success = not blocked_views）。
 #:    故这里重试用尽仍不达标 → **丢弃该档**（不落盘、不阻断资产），只记日志。
 SCENE_VIEW_MAX_RETRIES = max(0, _env_int("SCENE_VIEW_MAX_RETRIES", 1))
+
+#: 场景机位档 vs base 的**相似度粗筛**上限（phash，0~100）。相似度 **> 该值** 即视为
+#: 「几乎没换构图」（撞车）→ 丢弃该档（不落盘、不判 failed、不写 lesson，分镜回落正面档）。
+#: ⚠️⚠️ **不能调到 80**（实测依据，勿「顺手调紧」）：真换了构图的 `top` 档 phash≈81.2、
+#:   几乎没变的 `left45` 档 phash≈84.4 —— **80~95 区间不可分**；若用 80 做阈值会**误杀 top**
+#:   （把唯一有效的档丢掉）。故本值只作「明显撞车」的**下限粗筛**：只拦 >95
+#:   （如「对峙空地 right45」≈99.2 这类近重复），80~95 一律放行。
+SCENE_VIEW_DUP_PHASH_MAX = 95.0
 
 # ===================== 正负提示词冲突清理（P0：风格冲突修复） =====================
 # 物品生成.json / 分镜生成.json 的负向词表含「3D渲染、二次元动漫」，场景生成.json 含「3D」，

@@ -39,14 +39,18 @@ from config import (
 )
 
 # 节点类型 → 所属插件包（依据 docs/依赖清单.md §1，本机实测映射）。
+# ⚠️ 2026-10-04：H3 视频现役模板已换成 **12 节点单采**（h3_director_r2v_单采.json），
+#    故 MiniMaxH3DirectorRefine / BasicScheduler / NvidiaDLSSFrameInterpolation 这三个
+#    **仅二采回退模板**（WORKFLOW_TEMPLATE["h3_video_refine"]）需要 —— 这里**不删**映射，
+#    避免回退模板被误报「缺插件」。
 NODE_TO_PLUGIN = {
-    # H3 视频 · Director（现役 minimax_h3_director_二采_加速.json）
+    # H3 视频 · Director（现役 h3_director_r2v_单采.json；二采回退 h3_video_refine）
     "MiniMaxH3Director": {"plugin": "ComfyUI_MiniMaxH3_Director", "dir": "ComfyUI_MiniMaxH3_Director", "repo": "github.com/AIMixer/ComfyUI_MiniMaxH3_Director"},
-    "MiniMaxH3DirectorRefine": {"plugin": "ComfyUI_MiniMaxH3_Director", "dir": "ComfyUI_MiniMaxH3_Director", "repo": "github.com/AIMixer/ComfyUI_MiniMaxH3_Director"},
-    "BasicScheduler": {"plugin": "ComfyUI_MiniMaxH3_Director", "dir": "ComfyUI_MiniMaxH3_Director", "repo": "github.com/AIMixer/ComfyUI_MiniMaxH3_Director"},
+    "MiniMaxH3DirectorRefine": {"plugin": "ComfyUI_MiniMaxH3_Director", "dir": "ComfyUI_MiniMaxH3_Director", "repo": "github.com/AIMixer/ComfyUI_MiniMaxH3_Director", "note": "仅二采回退模板需要"},
+    "BasicScheduler": {"plugin": "ComfyUI_MiniMaxH3_Director", "dir": "ComfyUI_MiniMaxH3_Director", "repo": "github.com/AIMixer/ComfyUI_MiniMaxH3_Director", "note": "仅二采回退模板需要"},
     "ResolutionSelector": {"plugin": "ComfyUI_MiniMaxH3_Director / KJNodes", "dir": "ComfyUI_MiniMaxH3_Director", "repo": "github.com/AIMixer/ComfyUI_MiniMaxH3_Director", "note": "KJNodes 亦提供，任一即可"},
     "MiniMaxH3TRTVAELoader": {"plugin": "ComfyUI-H3VAE_TRT", "dir": "ComfyUI-H3VAE_TRT", "repo": "github.com/lihaoyun6/ComfyUI-H3VAE_TRT", "note": "视频 VAE 走 TRT；⚠ 音频 VAE 不能用它"},
-    "NvidiaDLSSFrameInterpolation": {"plugin": "ComfyUI-NVIDIA-DLSS-Frame-Interpolation", "dir": "ComfyUI-NVIDIA-DLSS-Frame-Interpolation", "repo": "github.com/Comfy-Org/ComfyUI-NVIDIA-DLSS-Frame-Interpolation"},
+    "NvidiaDLSSFrameInterpolation": {"plugin": "ComfyUI-NVIDIA-DLSS-Frame-Interpolation", "dir": "ComfyUI-NVIDIA-DLSS-Frame-Interpolation", "repo": "github.com/Comfy-Org/ComfyUI-NVIDIA-DLSS-Frame-Interpolation", "note": "仅二采回退模板需要"},
     "PathchSageAttentionKJ": {"plugin": "ComfyUI-KJNodes", "dir": "ComfyUI-KJNodes", "repo": "github.com/jjy1998/ComfyUI-KJNodes"},
     "EasyCache": {"plugin": "ComfyUI-KJNodes", "dir": "ComfyUI-KJNodes", "repo": "github.com/jjy1998/ComfyUI-KJNodes"},
     "XHImagePrecision": {"plugin": "ComfyUI-KJNodes", "dir": "ComfyUI-KJNodes", "repo": "github.com/jjy1998/ComfyUI-KJNodes"},
@@ -90,15 +94,15 @@ def _is_real_node_type(t: str) -> bool:
 # 模型清单（与 docs/依赖清单.md §2 **同源**，2026-09-29 审计对齐双向补齐；
 # required=False 的条目缺失只提示、不判"缺依赖"）
 MODEL_CHECKLIST = [
-    {"path": "diffusion_models\\minimaxH3Singularity_prunedInt8-d8a59c68df78.safetensors", "kind": "video_unet", "required": True, "note": "H3 UNET 主模型"},
-    {"path": "clip\\minimax-h3\\qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors", "kind": "video_clip", "required": True, "note": "H3 CLIP（minimax/Qwen3-VL）"},
-    {"path": "loras\\minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors", "kind": "video_lora", "required": True, "note": "4 步加速 LoRA"},
-    {"path": "loras\\minimax-h3\\minimax_h3_fl2v_lightx2v_turbo_4step_v0.1_comfy.safetensors", "kind": "video_lora", "required": False, "note": "fl2v 变体 LoRA（可选）"},
+    {"path": "diffusion_models\\minimax-h3\\minimax_h3_ref2va_pruned_int8_convrot.safetensors", "kind": "video_unet", "required": True, "note": "H3 UNET 主模型（现役，2026-09-27 起由 minimaxH3Singularity 换为 ref2va）"},
+    {"path": "text_encoders\\minimax-h3\\qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors", "kind": "video_clip", "required": True, "note": "H3 CLIP（minimax/Qwen3-VL）；ComfyUI 实际归在 text_encoders/ 而非 clip/"},
+    {"path": "loras\\minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors", "kind": "video_lora", "required": True, "note": "通道A 4 步加速 LoRA（单采模板 h3_director_r2v_单采.json 的 LoraLoaderModelOnly id=80，**唯一实际执行**的加速 LoRA）"},
+    {"path": "loras\\minimax_h3\\minimax_h3_fl2v_lightx2v_turbo_4step_v0.1_comfy.safetensors", "kind": "video_lora", "required": False, "note": "通道B fl2v 变体 LoRA（模板 id=55）**仅二采回退模板 h3_video_refine 使用，单采模板不加载**；H3_ENABLE_REFINE=False 时不执行，对成片零影响"},
     {"path": "vae\\minimax-h3\\minimax_h3_audio_vae_fp32.safetensors", "kind": "audio_vae", "required": True, "note": "音频 VAE"},
     {"path": "vae\\minimax_h3_vae_decoder_w4a16_awq.engine", "kind": "video_vae_trt", "required": True, "note": "TRT 视频 VAE 解码（GPU 架构专用）"},
     {"path": "vae\\minimax_h3_vae_encoder.engine", "kind": "video_vae_trt", "required": True, "note": "TRT 视频 VAE 编码（GPU 架构专用）"},
     {"path": "diffusion_models\\qwen_image_2.1_int8_convrot.safetensors", "kind": "image_unet", "required": True, "note": "QwenImage2.1 UNET"},
-    {"path": "clip\\qwen3vl_8b_int8_convrot.safetensors", "kind": "image_clip", "required": True, "note": "QwenImage2.1 CLIP"},
+    {"path": "text_encoders\\qwen3vl_8b_int8_convrot.safetensors", "kind": "image_clip", "required": True, "note": "QwenImage2.1 CLIP；ComfyUI 实际归在 text_encoders/ 而非 clip/"},
     {"path": "vae\\qwen_image_2.1_vae_bf16.safetensors", "kind": "image_vae", "required": True, "note": "QwenImage2.1 VAE"},
     {"path": "diffusion_models\\minimax_h3_latent_upscaler_3d_bf16.safetensors", "kind": "video_latent_upscaler", "required": False, "note": "latent 3D 超分（可选，未进现役模板硬校验）"},
     {"path": "FlashVSR-v1.1\\diffusion_pytorch_model_streaming_dmd.safetensors", "kind": "upscale_dit", "required": False, "note": "超分 DiT（enable_upscale=true 才需要）"},

@@ -207,6 +207,44 @@ CRITICAL_RULE_NOTE = (
     "宁可严格也不得放过有明显缺陷的画面。"
 )
 
+# 3D 国漫渲染 vs 占位人偶区分（2026-10-03 修复）：
+# 根因：视觉质检模型反复把「高质量 3D 国漫渲染分镜图」误判为「3D 占位人偶」，
+# 给出 score=0 + "画面仅显示3D基础人偶" 的荒谬结论（实测 shot_03 九宫格完整、角色/道具/
+# 场景全部正确，仍被判定为"人偶"）。
+# 本质：模型无法区分「有面部细节/服装纹理/光影的 3D 国漫角色」与「灰蓝色无面几何体人偶」。
+# 解法：在提示词中给出**视觉可辨别的硬判据**，让模型能靠图像特征自行区分。
+MANNEQUIN_DISTINCTION_NOTE = (
+    "\n【3D 渲染风格识别·重要】本系统的目标风格为 3D 国漫（三维动画渲染），"
+    "画面中的角色是**有完整面部五官、发型细节、服装纹理、光影效果的 3D 渲染人物**，"
+    "这是正常的目标输出风格，**不是缺陷**。\n"
+    "⚠️ 以下才是「占位人偶」的视觉特征（仅当画面呈现这些时才判缺陷）：\n"
+    "  · 全身灰/蓝/白单色填充，无任何面部五官（无眼睛、鼻子、嘴巴）；\n"
+    "  · 身体为简单几何体拼接（圆柱手臂、球形头、方块躯干），无服装纹理；\n"
+    "  · 背景为纯灰/纯白平面，无任何场景元素。\n"
+    "✅ 以下属于正常的 3D 国漫渲染，**不得**判为「人偶/占位图」：\n"
+    "  · 角色有清晰可辨的五官（眼睛、眉毛、嘴唇）、发型细节；\n"
+    "  · 角色穿着有纹理的服装（布料褶皱、腰带、配饰）；\n"
+    "  · 画面有光影效果（高光、阴影、环境光）；\n"
+    "  · 背景有场景元素（石壁、家具、道具、植被等）。\n"
+    "**严禁**把有面部细节的 3D 国漫角色误判为「占位人偶」并给出 score=0。"
+)
+
+# 九宫格故事板分析指南（2026-10-03 修复）：
+# 根因：QC 模型分析 3x3 故事板时，只看 1-2 个面板就下结论，导致误判。
+# 实测：shot_05_try1 的 9 个面板中 8 个都有主角方源，但 QC 判定「角色完全缺失」。
+# 本质：模型没有「逐面板分析 → 综合判定」的能力，需要显式指令引导。
+STORYBOARD_GRID_ANALYSIS_NOTE = (
+    "\n【九宫格故事板分析·重要】本图是 3x3 九宫格故事板（9 个关键帧按时间顺序排列）：\n"
+    "  · 第 1 格（左上）= 起始状态；第 5 格（中心）= 高潮/关键动作；第 9 格（右下）= 结束状态；\n"
+    "  · 其余格子 = 中间过渡帧，展示动作/表情的渐变过程。\n"
+    "⚠️ **必须逐格分析**，不得只看 1-2 格就下结论：\n"
+    "  · 先扫描全部 9 格，确认哪些格子有角色/道具/场景；\n"
+    "  · 若**多数格子**（≥5/9）包含所需元素 → 判定为「有」，不得因个别格子缺失判「无」；\n"
+    "  · 仅当**全部或绝大多数格子**（≥7/9）都缺失某元素时，才判「缺失」。\n"
+    "✅ 正确示例：若 9 格中 7 格有角色 → 角色存在（score 不因 2 格无角色而扣大分）。\n"
+    " 错误示例：只看第 1 格无角色 → 判「角色完全缺失」score=0（这是严重误判）。"
+)
+
 # 风格一致性硬规则：追加到所有图片/视频质检提示词末尾，保证用户自定义的旧配置
 # 也同样具备风格检测能力（与 WATERMARK_EXEMPT_NOTE / CRITICAL_RULE_NOTE 同一机制）。
 # {style} 由 check_image / check_video 在运行时替换为目标风格串；无风格时整段不追加。
@@ -1888,11 +1926,15 @@ def _run_vision(ep: dict, prompt: str, image_paths: list, cfg: dict) -> dict:
     payload = {
         "model": ep["model"],
         "messages": [
-            {"role": "system", "content": "你是严格、客观的漫剧内容质检员，只输出 JSON。"},
+            {"role": "system", "content": "你是严格、客观的漫剧内容质检员，只输出一个 JSON 对象，禁止输出任何思考过程、分析或解释文字。"},
             {"role": "user", "content": content},
         ],
         "temperature": 0,
-        "max_tokens": 800,
+        # 2026-10-03 fix：思考型模型把 token 花在 reasoning 里，800/1024 会在 JSON 完成前截断
+        # （content 里残留 Thinking Process 且无 “{”）→ 全部 fault_open 放行。提到 2064 后模型可输出完整 JSON。
+        # 实测：真实质检 prompt ≈1750+ 字符，思考型模型需 ~8k token 才能先想完再吐完整 JSON。
+        # 2064 在小 prompt（~100 字）够用，但真实 prompt 会被截断在思考里 → 全部 fault_open。
+        "max_tokens": cfg.get("image_max_tokens", 8192),
         "stream": False,
     }
     t0 = time.time()
@@ -2112,7 +2154,7 @@ def check_image(image_path: str, shot_desc: str = "", cfg: dict = None,
         "{shot_desc}", shot_desc or "（无）").replace(
         "{pass_score}", str(cfg.get("pass_score", 70))).replace(
         "{style}", style_norm or "（未指定）")
-    prompt = prompt + WATERMARK_EXEMPT_NOTE + CRITICAL_RULE_NOTE + FRAMING_TOLERANCE_NOTE
+    prompt = prompt + WATERMARK_EXEMPT_NOTE + CRITICAL_RULE_NOTE + FRAMING_TOLERANCE_NOTE + MANNEQUIN_DISTINCTION_NOTE + STORYBOARD_GRID_ANALYSIS_NOTE
     if style_norm:
         prompt = prompt + STYLE_CHECK_NOTE.replace("{style}", style_norm)
     # ---- 角色资产的人物性别一致性（2026-09-28）：拿不到性别时整段不追加 ----
@@ -2786,7 +2828,7 @@ def check_video(video_path: str, shot_desc: str = "", cfg: dict = None,
     ts_brief = "、".join(f"第{i + 1}帧 {fm['actual_ts']}s"
                         for i, fm in enumerate(fr.get("frame_meta") or []))
     prompt = f"共 {len(fr['frames'])} 张抽帧图片（按时间顺序；实际时间戳：{ts_brief}）。\n" + prompt
-    prompt = prompt + WATERMARK_EXEMPT_NOTE + CRITICAL_RULE_NOTE + FRAMING_TOLERANCE_NOTE
+    prompt = prompt + WATERMARK_EXEMPT_NOTE + CRITICAL_RULE_NOTE + FRAMING_TOLERANCE_NOTE + MANNEQUIN_DISTINCTION_NOTE
     if style_norm:
         prompt = prompt + STYLE_CHECK_NOTE.replace("{style}", style_norm)
     # P2-3 逐段主体一致性门禁（2026-10-01 接线，借鉴 Story Claw 逐段 VLM 门禁）：

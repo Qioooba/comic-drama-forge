@@ -9,8 +9,10 @@
 
 本模块把整条链路编排成一条**流水线**，由 autopilot 守护进程驱动：
 
-    script → assets* → storyboard → keyframe? → video → final → tts → mix
-                                                              └→ deliverable
+    script → tts_pre → assets → storyboard → keyframe → video → upscale → final
+
+（tts_pre = 为每个角色生成参考音色，供 H3 锁定角色音色并自生成对白；
+  tts / mix 已下线 —— H3 视频自带原生音轨）
 
 （assets 为项目级资产，只在首集前跑一次；keyframe 为可选模式）
 
@@ -154,25 +156,27 @@ def is_episode_running(project_name: str, episode_no: int) -> bool:
 
 #: 步骤顺序（键即步骤 id）
 #:
-#: ⭐ 2026-09-26 P0-2「配音先行」（audio-first）：在剧本产出后、分镜/视频之前插入
-#: ``tts_pre`` 步骤 —— 先 TTS 出配音、用**每镜配音音频实测总时长**回填 shot.duration，
-#: 让后续分镜/视频的画面时长服从配音时长（根治「台词时长不对 / 台词念不完」）。
-#: 后置的 ``tts`` 步骤会 probe 到 manifest 已 done 直接跳过（幂等），不重复烧 TTS。
-#: upscale 放在最末：超分针对「已配音混音」的成片做画质增强，放前面会被后续混音覆盖
+#: ⭐ 2026-10-04 收敛为 **8 步**（用户决策）：H3 视频自带**原生音轨**，配音改由
+#:    「每角色参考音色 → H3 生成对白」承担，故**移除 `tts`（配音合成）与 `mix`
+#:    （音画对齐混音）两个环节**。
+#: ``tts_pre`` 新语义：剧本后为**每个角色**生成一段参考音色音频（只做这件事，
+#:    **不再逐句合成整集配音、不再回填 `shot.duration`**）——参考音色经
+#:    `voice_bank` 落盘，视频生成时以 `audioMode=generate`（`global.refAudios`）
+#:    锁定角色音色、对白由 H3 自生成。
+#: `upscale` 紧跟 `video`：对**集级原片**（video 步产出的整集视频）超分；
+#:    `final` 优先消费超分产物，故 `final` 落在最后一步。
 STEP_SEQUENCE = ("script", "tts_pre", "assets", "storyboard", "keyframe", "video",
-                 "final", "tts", "mix", "upscale")
+                 "upscale", "final")
 
 STEP_LABELS = {
     "script": "剧本生成",
-    "tts_pre": "配音先行（锁定画面时长）",
+    "tts_pre": "配音先行（角色参考音色）",
     "assets": "资产（角色/物品/场景）",
     "storyboard": "分镜图",
     "keyframe": "尾帧（关键帧驱动）",
     "video": "视频生成",
-    "final": "成片合成",
-    "tts": "配音合成",
-    "mix": "音画对齐混音",
     "upscale": "超分（FlashVSR）",
+    "final": "成片合成",
 }
 
 #: 需要「质检门禁」的步骤（不达标必须重试，不允许静默通过）
@@ -195,16 +199,19 @@ DEFAULT_CONFIG = {
     "enable_keyframe": False,
     "enable_video": True,
     "enable_final": True,
+    # TTS 总开关：控制 `tts_pre` 里「每角色参考音色」的实际合成。
     "enable_tts": True,
-    "enable_mix": True,
+    # 混音默认关闭（2026-10-04，10→8 步）：H3 原生音轨生效后，混音会与它冲突 ——
+    # 有分离音效轨时 H3 人声会被当 vocals 剔掉、无则双重人声；且 `mix` 已不在 STEP_SEQUENCE。
+    "enable_mix": False,
     # 超分（FlashVSR）：默认开启。⚠️ 这一步是画质增强而非出片必需环节，
     # step_upscale 全程 fail-open——环境不可用或执行失败一律记 skipped，
     # 绝不把已经跑通的成片拖成失败。
     "enable_upscale": True,
     "upscale_scale": 2,            # 超分倍率，FlashVSR 支持 2 / 3 / 4
-    # ⭐ 2026-09-26 P0-2「配音先行」：默认开启。True = 剧本后先 TTS，用配音音频实测
-    # 时长回填 shot.duration（画面时长服从配音）；False = 回退旧时序（画面先、配音后）。
-    # 仅在「无台词 / 纯动作剧」或调试对比时关闭。
+    # ⭐「配音先行」（2026-10-04 新语义）：默认开启。True = 剧本后为**每个角色**生成
+    # 一段参考音色音频，供 H3 以 `audioMode=generate` 锁定角色音色并自生成对白。
+    # （不再逐句合成整集配音、不再回填 shot.duration。）仅在调试或无需参考音色时关闭。
     "enable_tts_pre": True,
     "video_mode": "episode",       # episode（整集一次生成，连续无缝）/ per_shot（逐镜独立）/ keyframe
     # 关键帧「跨镜链式」：auto=同场景才串 / always=无条件串 / off=关闭。
@@ -746,116 +753,65 @@ def _script_path(ctx) -> str:
 
 
 def step_tts_pre(ctx) -> dict:
-    """配音先行（P0-2）：剧本产出后立即 TTS，用配音音频实测时长回填每镜画面时长
+    """配音先行：剧本后为**每个角色**生成一段参考音色音频（2026-10-04 新语义）
 
-    为什么需要它
-    ------------
-    旧时序是「画面先、配音后」：视频的 ``shot.duration`` 由剧本估算（约 3.47 字/秒的
-    密度）决定，配音则在最后才合成。副作用是**台词比画面长时被硬截断、比画面短时
-    画面空转**（用户实测反馈「台词时长不对 / 台词念不完」）。
+    为什么是「每角色参考音色」而不是「逐句配音」
+    --------------------------------------------
+    H3 视频**自带原生音轨**：视频生成时以 `audioMode=generate` + 公共参考音色
+    （`global.refAudios`）锁定角色音色，对白由 H3 按画面/提示词**自生成**。
+    因此「剧本后先逐句 TTS 整集配音」不再需要 —— 那是旧「画面先、配音后」时序的产物。
+    本步只需把**每个角色**的参考音色备好，供后续视频生成捡取。
 
-    本步骤在剧本后、分镜/视频前先跑一遍 TTS，得到每镜配音音频的**实测总时长**，
-    然后把它回填为 ``shot.duration`` 的**下限**（只拉长不缩短）：
-
-    - 配音时长 > 剧本估算时长 → 拉长到配音时长（保证台词念得完）
-    - 配音时长 ≤ 剧本估算时长 → 保持剧本时长（保证镜头不因台词短而一闪而过）
-
-    这样后续 storyboard / video 读到的 duration 就是「配音决定的画面时长」，
-    真正实现 audio-first。后置 ``tts`` 步骤会 probe 到 manifest 已 done 直接跳过，
-    不会重复烧 TTS。
+    产物落点
+    --------
+    参考音色由 `app._ensure_voice_bank_refs` 经 `save_voice_bank_ref` 落到
+    ``<DUB_DIR>/<项目>/voice_bank/<角色>/ref.wav``；视频生成时由
+    `app._h3_common_ref_audios` 捡取为 H3 的公共参考音频。
 
     幂等与回退
     ----------
-    - ``enable_tts_pre=False`` 时整步跳过（回退旧时序），零行为变更。
-    - 该集无台词（manifest 无 lines）时跳过回填，直接放行。
-    - 回填后的剧本**写回磁盘**（后续步骤从磁盘/ctx 读 duration 都一致），
-      写入失败只告警不阻断（视频仍可用旧估算时长跑，不因回填失败卡死整集）。
+    - ``enable_tts_pre=False`` 整步跳过；``enable_tts=False`` 跳过（不合成参考音色）。
+    - 剧本无角色且无镜头 → 跳过。
+    - 本步是**纯增强**：任何异常（TTS / 磁盘 / 网络）只告警并返回 ``skipped``，
+      绝不把整集拖失败（沿用旧的 fail-open 精神）。
     """
     cfg = ctx["config"]
     if not cfg.get("enable_tts_pre"):
         return {"ok": True, "skipped": True,
-                "detail": {"note": "配音先行已关闭（enable_tts_pre=False），回退画面先、配音后"}}
+                "detail": {"note": "配音先行已关闭（enable_tts_pre=False）"}}
+    if not cfg.get("enable_tts"):
+        return {"ok": True, "skipped": True,
+                "detail": {"note": "TTS 已关闭（enable_tts=False），跳过参考音色生成"}}
 
-    # 该集是否真的需要配音：无台词则整个前置步骤无意义，直接放行
+    # 该集是否有可处理的内容：无角色且无镜头则整个前置步骤无意义，直接放行
     script = ctx.get("script") or {}
     if not script:
         script = _load_script_into_ctx(ctx)
         ctx["script"] = script
-    if not (script.get("shots") or []):
-        return {"ok": True, "skipped": True, "detail": {"note": "剧本无镜头，跳过配音先行"}}
-
-    # 复用 step_tts 的完整合成逻辑（含 manifest 幂等：已 done 会跳过合成、直接返回 manifest）
-    tts_out = step_tts(ctx)
-    if not tts_out.get("ok"):
-        # ⚠️ 配音先行失败不应拖垮整集：画面仍可用剧本估算时长继续生成。
-        # 但按「音频决定画面时长」的目标，失败时应如实告知（降级到旧时序），
-        # 而不是静默 —— 这里 fail-open：记 warning、返回 ok 让流水线继续。
-        logger.warning("第%s集 配音先行失败，画面时长回退剧本估算（不阻断）：%s",
-                       ctx["episode_no"], tts_out.get("error"))
+    if not (script.get("characters") or []) and not (script.get("shots") or []):
         return {"ok": True, "skipped": True,
-                "detail": {"note": "配音先行失败，回退剧本估算时长（不阻断）",
-                           "error": tts_out.get("error")}}
+                "detail": {"note": "剧本无角色与镜头，跳过参考音色生成"}}
 
-    # 读 manifest，按 shot_id 聚合每镜配音音频实测总时长
-    mpath = dub_manifest_path(ctx)
-    per_shot: dict = {}
+    A = _A()
     try:
-        with open(mpath, "r", encoding="utf-8") as f:
-            mf = json.load(f) or {}
-        for ln in (mf.get("lines") or []):
-            if not isinstance(ln, dict) or not ln.get("ok"):
-                continue
-            sid = ln.get("shot_id")
-            if sid is None:
-                continue
-            d = 0.0
-            try:
-                d = float(ln.get("duration") or 0)
-            except (TypeError, ValueError):
-                d = 0.0
-            if d > 0:
-                per_shot[sid] = per_shot.get(sid, 0.0) + d
-    except Exception as e:  # noqa: BLE001
-        logger.warning("第%s集 配音 manifest 读取失败，跳过时长回填：%s",
+        # 项目全量角色（角色资产索引的键即角色名）→ 交给既有实现逐角色补参考音色。
+        # 传 common=[] 是因为「已确认的公共池」与本步无关：本步要覆盖**全部**角色。
+        char_idx = A._build_asset_index(script.get("characters") or [],
+                                        ctx["project_name"], "character")
+        A._ensure_voice_bank_refs([], ctx["project_name"], all_characters=char_idx)
+        _dub_dir = A._dub_project_dir(ctx["project_name"])
+        _rows = A.tts_client.list_voice_bank(_dub_dir) or []
+        _names = [str(r.get("character")) for r in _rows
+                  if isinstance(r, dict) and r.get("character")]
+        return {"ok": True, "skipped": False,
+                "detail": {"note": f"配音先行：{len(_names)} 个角色参考音色就绪",
+                           "characters": _names},
+                "artifact": _dub_dir if os.path.isdir(_dub_dir) else ""}
+    except Exception as e:  # noqa: BLE001  纯增强环节：绝不因 TTS/磁盘问题拖垮整集
+        logger.warning("第%s集 配音先行（参考音色）失败，已跳过（不阻断）：%s",
                        ctx["episode_no"], e)
         return {"ok": True, "skipped": True,
-                "detail": {"note": "配音 manifest 不可读，跳过时长回填"}}
-
-    if not per_shot:
-        return {"ok": True, "skipped": True,
-                "detail": {"note": "该集无有效配音台词，跳过时长回填"}}
-
-    # 回填：只拉长不缩短。shot_id 可能是 int 或 str，统一用 str 比对。
-    changed = 0
-    for s in (script.get("shots") or []):
-        sid = s.get("shot_id")
-        key_hits = [k for k in per_shot if str(k) == str(sid)]
-        if not key_hits:
-            continue
-        dub_dur = max(per_shot[k] for k in key_hits)
-        try:
-            cur = float(s.get("duration") or 0)
-        except (TypeError, ValueError):
-            cur = 0.0
-        # 画面至少要有配音那么长；同时留一点余量（首尾起落），避免台词顶格卡满
-        floor = dub_dur + 0.5
-        if floor > cur:
-            s["duration"] = round(floor, 2)
-            changed += 1
-
-    if changed:
-        # 回写剧本：让后续 storyboard / video（从磁盘重读剧本）也拿到回填后的 duration
-        sp = _script_path(ctx)
-        try:
-            atomic_write_json(sp, script)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("第%s集 回填时长后的剧本写回失败（视频仍用 ctx 内回填值）：%s",
-                           ctx["episode_no"], e)
-    ctx["script"] = script
-    return {"ok": True, "skipped": False,
-            "detail": {"note": f"配音先行：{changed} 镜画面时长已按配音音频实测时长回填",
-                       "per_shot_sec": {str(k): round(v, 2) for k, v in per_shot.items()}},
-            "artifact": mpath}
+                "detail": {"note": f"配音先行失败，已跳过（不阻断）：{e}"}}
 
 
 def step_assets(ctx) -> dict:
@@ -1089,10 +1045,14 @@ def step_final(ctx) -> dict:
     # 采用为成片，否则会误报「该集没有可拼接的镜头视频」而整集卡死。
     mode = (ctx["config"].get("video_mode") or "per_shot")
     if mode == "episode":
-        src = vd.get("file") or ""
+        # 优先采用**超分产物**（upscale 步在 video 之后、final 之前）：超分成功则成片
+        # 即超分版；超分被跳过 / fail-open 落空时回退整集原片，行为与改动前一致。
+        src = upscale_path(ctx)
+        if not _playable(src):
+            src = vd.get("file") or ""
         if not _nonempty(src):
             raise PipelineError("整集模式未找到整集视频文件，无法合成成片")
-        ctx["progress"]("整集模式：采用整集视频作为成片", 70, phase="final")
+        ctx["progress"]("整集模式：采用整集视频作为成片", 94, phase="final")
         files = [src]
         tmp = out + ".episode.mp4"
         if os.path.exists(tmp):
@@ -1100,6 +1060,7 @@ def step_final(ctx) -> dict:
         shutil.copy2(src, tmp)
     else:
         # 按剧本镜头顺序（而非文件名字典序）拼接，保证叙事顺序正确
+        # ⚠️ 逐镜模式**不**消费超分产物：超分对象是单条**集级**视频，与逐镜拼接语义不符。
         files = []
         for i, s in enumerate(shots):
             seq = A._shot_seq(s.get("shot_id", i + 1), i + 1)
@@ -1109,7 +1070,7 @@ def step_final(ctx) -> dict:
         if not files:
             raise PipelineError("该集没有可拼接的镜头视频")
 
-        ctx["progress"](f"合成成片（{len(files)} 段）", 70, phase="final")
+        ctx["progress"](f"合成成片（{len(files)} 段）", 94, phase="final")
         tmp = out + ".concat.mp4"
         if os.path.exists(tmp):
             os.remove(tmp)
@@ -1117,13 +1078,26 @@ def step_final(ctx) -> dict:
     if not _nonempty(tmp):
         raise PipelineError("片段拼接失败（未产出有效文件）")
 
-    # 字幕：默认**关闭**（项目 config.subtitle_enabled，默认 false）。
-    # 2026-09-24 用户明确要求「视频不要生成字幕」：成片这里不再无条件烧硬字幕，
-    # 只有项目显式开启才走 add_subtitles。关掉时直接沿用拼接产物 tmp。
+    # 字幕：分成两种文字、两个开关（2026-10-02）——
+    #   · 台词字幕（人物开口的转录）→ subtitle_enabled，默认 false（2026-09-24 用户要求）；
+    #   · 字幕/转场 caption（时空落点/回溯/集尾悬念）→ caption_burn_enabled，默认 true，
+    #     它是**剧情装置**：不烧观众就会看到无过渡的跳切（参考稿靠「春秋蝉，逆转时光。」交代）。
+    # 两者都不开时直接沿用拼接产物 tmp，行为与改动前一致。
     subbed = ""
-    if A._project_subtitle_enabled(ctx["project_name"]):
+    if (A._project_subtitle_enabled(ctx["project_name"])
+            or A._project_caption_burn_enabled(ctx["project_name"])):
         try:
             from dialogue_utils import dialogue_text
+            _want_dlg = A._project_subtitle_enabled(ctx["project_name"])
+            _want_cap = A._project_caption_burn_enabled(ctx["project_name"])
+
+            def _cap_text(_s):
+                """镜头字幕文本：兼容 {text,kind} / 旧字符串 / 扁平 caption_text 三种形状。"""
+                _c = _s.get("caption")
+                if isinstance(_c, dict):
+                    _c = _c.get("text")
+                return str(_c or _s.get("caption_text") or "").strip()
+
             subs, cur = [], 0.0
             # B-07 P1-5：时间轴基准用 ffprobe 实测各段时长累加（而非剧本 duration），
             # 与成片实际时长一致，避免字幕整体漂移。
@@ -1135,9 +1109,14 @@ def step_final(ctx) -> dict:
                     _script_total = sum(float(x.get("duration") or 5) for x in shots) or 1.0
                     if _ep_total > 0:
                         dur = dur / _script_total * _ep_total
-                    text = dialogue_text(s.get("dialogue"))
-                    if text:
-                        subs.append({"start": cur, "end": cur + dur, "text": text})
+                    if _want_dlg:
+                        text = dialogue_text(s.get("dialogue"))
+                        if text:
+                            subs.append({"start": cur, "end": cur + dur, "text": text})
+                    if _want_cap:
+                        _ct = _cap_text(s)
+                        if _ct:
+                            subs.append({"start": cur, "end": cur + dur, "text": _ct})
                     cur += dur
             else:
                 # 逐镜模式：各段 ffprobe 实测时长累加
@@ -1161,9 +1140,14 @@ def step_final(ctx) -> dict:
                     dur = seg_durs[i] if i < len(seg_durs) else float(s.get("duration") or 5)
                     if dur <= 0:
                         dur = float(s.get("duration") or 5)
-                    text = dialogue_text(s.get("dialogue"))
-                    if text:
-                        subs.append({"start": cur, "end": cur + dur, "text": text})
+                    if _want_dlg:
+                        text = dialogue_text(s.get("dialogue"))
+                        if text:
+                            subs.append({"start": cur, "end": cur + dur, "text": text})
+                    if _want_cap:
+                        _ct = _cap_text(s)
+                        if _ct:
+                            subs.append({"start": cur, "end": cur + dur, "text": _ct})
                     cur += dur
             if subs:
                 subbed = A.video_processor.add_subtitles(tmp, subs, out)
@@ -1282,7 +1266,7 @@ def step_mix(ctx) -> dict:
 
 
 def step_upscale(ctx) -> dict:
-    """超分（FlashVSR）：对混音成片做超分，并归档到确定性路径
+    """超分（FlashVSR）：对**集级原片**做超分，并归档到确定性路径
 
     设计要点（重要）
     ----------------
@@ -1298,8 +1282,15 @@ def step_upscale(ctx) -> dict:
     if pd.get("done"):
         return {"ok": True, "skipped": True, "detail": {"probe": pd}, "artifact": pd["file"]}
 
-    # 优先超分混音成品（带配音）；没有则退回无配音成片
-    src = mix_output_path(ctx)
+    # 超分作用对象＝**集级原片**（video 步产出的整集视频）。旧顺序里超分在混音之后，
+    # 此处保留 mix/final 两个回退分支，便于「老工程续跑」时仍能命中既有产物。
+    src = ""
+    try:
+        src = (probe_video(ctx).get("file") or "")
+    except Exception:  # noqa: BLE001  探测失败按「无源片」处理，走下方回退
+        src = ""
+    if not _nonempty(src):
+        src = mix_output_path(ctx)
     if not _nonempty(src):
         src = final_path(ctx)
     if not _nonempty(src):
@@ -1333,7 +1324,7 @@ def step_upscale(ctx) -> dict:
     scale = int(ctx["config"].get("upscale_scale") or 2)
     if scale not in (2, 3, 4):      # 兜底：配置未经 normalize_config 直连时
         scale = 2
-    ctx["progress"](f"超分（FlashVSR {scale}x）…", 96, phase="upscale")
+    ctx["progress"](f"超分（FlashVSR {scale}x）…", 84, phase="upscale")
     try:
         # 审计 P1-3：托管超分同样过闸门；并把闸门 id 同步给 upscaler 的
         # current_task_id —— /free 守卫（has_other_running_gpu_tasks）据此排除自身，
@@ -1344,11 +1335,11 @@ def step_upscale(ctx) -> dict:
         with gpu_task_gate.run_gpu_task(_up_tid, "托管·超分"):
             res = _upscaler.upscale(
                 src, project_name=ctx["project_name"], scale=scale,
-                # ⚠️ 成片是带 TTS 配音的，而 TE-Speed 链路默认 attach_audio=False ——
+                # ⚠️ 源片自带 H3 原生音轨，而 TE-Speed 链路默认 attach_audio=False ——
                 # 不显式开启会把音轨丢掉，超分产物变成无声视频。
                 attach_audio=True,
                 progress_cb=lambda msg, pct=None: ctx["progress"](
-                    f"超分：{msg}", 96, phase="upscale"),
+                    f"超分：{msg}", 84, phase="upscale"),
             )
     except Exception as e:  # noqa: BLE001  超分失败不阻断出片
         logger.warning("第%s集超分失败（已跳过，不影响成片交付）：%s",
@@ -1390,10 +1381,12 @@ STEP_RUNNERS = {
     "storyboard": step_storyboard,
     "keyframe": step_keyframe,
     "video": step_video,
+    "upscale": step_upscale,
     "final": step_final,
+    # tts / mix 已不在 STEP_SEQUENCE（10→8 步），但函数体保留：手工端点与「老工程续跑」
+    # 路径不废，回滚只需把它俩加回 STEP_SEQUENCE 即可。
     "tts": step_tts,
     "mix": step_mix,
-    "upscale": step_upscale,
 }
 
 
@@ -1403,7 +1396,9 @@ def step_enabled(step: str, ctx) -> bool:
     if step == "script":
         return True
     if step == "tts_pre":
-        return bool(cfg.get("enable_tts_pre")) and bool(cfg.get("enable_tts"))
+        # 只受 enable_tts_pre 控制：原先还要求 enable_tts，会让「关掉 TTS」连带
+        # 静默关掉整步（含参考音色）。enable_tts 改为在 step_tts_pre 内部生效。
+        return bool(cfg.get("enable_tts_pre"))
     if step == "assets":
         return bool(cfg.get("enable_assets"))
     if step == "storyboard":
@@ -1476,8 +1471,8 @@ def _load_script_into_ctx(ctx) -> dict:
 
 
 def _deliverable_of(ctx, steps: dict) -> str:
-    """该集的最终交付物：优先超分成品，其次混音成品，最后成片"""
-    for key in ("upscale", "mix", "final"):
+    """该集的最终交付物：优先超分成品，其次成片"""
+    for key in ("upscale", "final"):
         art = (steps.get(key) or {}).get("artifact") or ""
         if _nonempty(art):
             return art
@@ -1696,8 +1691,7 @@ def run_episode(config: dict, project_name: str, episode_no: int, novel_meta: di
 
 #: 步骤在整体进度里的百分比锚点
 _STEP_PCT = {"script": 2, "tts_pre": 10, "assets": 18, "storyboard": 32,
-             "keyframe": 44, "video": 48, "final": 70, "tts": 80, "mix": 90,
-             "upscale": 96}
+             "keyframe": 44, "video": 48, "upscale": 82, "final": 92}
 
 
 def result_pct(result: dict, step: str) -> int:

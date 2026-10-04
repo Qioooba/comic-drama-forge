@@ -74,7 +74,85 @@ _STATE = {
 }
 
 #: 每个项目连续失败计数（项目名 → {集号: 次数}）
+#:
+#: ⭐ 2026-10-02：**必须落盘**（原为纯内存 → 重启即清零）。
+#: 为什么（实测教训）：`max_episode_attempts=2` 的判据在 `_pick_next`，
+#: 它读的就是这里。曾经出现「分镜 worker 报成功但文件缺失 → probe 复核判失败 →
+#: 每轮全量重跑 6 镜」的循环，指望 2 次后挂起；但守护进程一重启（改代码/手动重启）
+#: 计数就归零，于是**死循环白烧 GPU（实测 12:59→13:36 烧 4 轮约 40 分钟）**。
+#: 落盘后该机制才真正具备「跨重启」语义。
+#: 读写仍以内存为准（热路径不加 IO），只在**变更时**落盘、**启动时**按需载入。
 _ATTEMPTS: dict = {}
+
+
+def _attempts_path(project: str) -> str:
+    return os.path.join(_autopilot_dir(project), "attempts.json")
+
+
+def _save_attempts(project: str) -> None:
+    """把某项目的失败计数落盘（失败只告警，绝不阻断生产主流程）。"""
+    try:
+        data = dict(_ATTEMPTS.get(project) or {})
+        atomic_write_json(_attempts_path(project), data)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("保存 attempts 失败（%s）：%s", project, e)
+
+
+def _load_attempts(project: str) -> dict:
+    """从磁盘载入某项目的失败计数；没有就返回空。
+
+    注意：**键统一转为 int**（JSON 的键会全部变成字符串，不转会与
+    `_ATTEMPTS.setdefault(project, {})[no]` 的 int 键对不上 → 计数永远读不到 0 以外）。
+    """
+    try:
+        path = _attempts_path(project)
+        if not os.path.isfile(path):
+            return {}
+        data = read_json_strict(path, {})
+        if not isinstance(data, dict):
+            return {}
+        out = {}
+        for k, v in data.items():
+            try:
+                out[int(k)] = int(v)
+            except (TypeError, ValueError):
+                continue
+        return out
+    except Exception as e:  # noqa: BLE001  读不到就当没有，绝不阻断
+        logger.warning("读取 attempts 失败（%s）：%s", project, e)
+        return {}
+
+
+def _attempts_get(project: str, episode_no: int) -> int:
+    """读失败计数；内存没有该项目时**先从盘载入**（重启后仍能读到历史计数）。
+
+    ⭐ 懒加载是关键：若只在进程启动时全量载入，项目是运行时新建/发现的话仍会漏。
+    判据「内存里根本没有这个 project 的键」= 尚未接触过 → 载一次。
+    """
+    with _LOCK:
+        d = _ATTEMPTS.get(project)
+    if d is None:
+        loaded = _load_attempts(project)
+        with _LOCK:
+            d = _ATTEMPTS.setdefault(project, loaded)
+    return int(d.get(episode_no, 0))
+
+
+def _bump_attempt(project: str, episode_no: int, delta: int = 1) -> int:
+    """失败计数 +delta 并落盘，返回新值。"""
+    with _LOCK:
+        d = _ATTEMPTS.setdefault(project, {})
+        d[episode_no] = int(d.get(episode_no, 0)) + int(delta)
+        val = d[episode_no]
+    _save_attempts(project)
+    return val
+
+
+def _reset_attempt(project: str, episode_no: int) -> None:
+    """成功（或超限挂起后）清零并落盘。"""
+    with _LOCK:
+        _ATTEMPTS.setdefault(project, {})[episode_no] = 0
+    _save_attempts(project)
 
 #: 上一轮实际生产的 (项目, 集号)，以及同一集连续被生产的次数
 #: 用于兜住「状态判定异常导致无限重跑同一集」这类问题（实测出现过 1 秒 121 次），
@@ -108,7 +186,12 @@ PLAN_DEFAULTS = {
     "enable_video": True,
     "enable_final": True,
     "enable_tts": True,
-    "enable_mix": True,
+    # 「每角色参考音色」生成开关（tts_pre 步）：True = 剧本后为每个角色补一段参考音色，
+    # 供 H3 以 audioMode=generate 锁定角色音色并自生成对白。
+    "enable_tts_pre": True,
+    # 混音默认关闭（2026-10-04，10→8 步）：H3 原生音轨生效后混音会与之冲突，且 `mix`
+    # 已不在 STEP_SEQUENCE。必须列进 PLAN_DEFAULTS 才能经接口关闭（见下方 enable_upscale 注释）。
+    "enable_mix": False,
     # 超分（FlashVSR）：默认开启。必须列进 PLAN_DEFAULTS ——
     # api_autopilot_plan_set 会按 `k in PLAN_DEFAULTS` 过滤入参，
     # 不在此处的字段无法通过接口关闭，等于没有关掉的入口。
@@ -426,7 +509,14 @@ def episode_units(chapters: list, plan: dict = None, text: str = "",
     for ch in chapters:
         idx = int(ch.get("index") or 0)
         try:
-            segs = nts.split_chapter_for_episodes(ch, text or "", fixed_parts=fixed_parts)
+            # 2026-10-03 用户决策：改回「一章 = 一集」（不再按内容体量拆分）。
+            # 传超大 max_sec 顶掉分集上限判据，estimate_episode_parts 恒为 1；
+            # 如需恢复按内容拆分，设 env MJSCXT_EPISODE_SPLIT=1。
+            _no_split = str(os.environ.get("MJSCXT_EPISODE_SPLIT") or "").strip().lower() \
+                not in ("1", "true", "yes", "on")
+            segs = nts.split_chapter_for_episodes(
+                ch, text or "", fixed_parts=fixed_parts,
+                max_sec=(10 ** 9) if _no_split else None)
         except Exception as e:  # noqa: BLE001
             logger.warning("第%s章拆章失败（按不拆处理）：%s", idx, e)
             segs = [{"part": 1, "parts": 1, "start": ch.get("start") or 0,
@@ -742,7 +832,7 @@ PHASE_LABELS_ZH = {
     "shots": "拆分镜头",
     "coverage": "原文覆盖率校验",
     "script": "剧本生成",
-    "tts_pre": "配音先行（锁定画面时长）",
+    "tts_pre": "配音先行（角色参考音色）",
     "assets": "生成资产（角色/物品/场景）",
     "storyboard": "生成分镜图",
     "keyframe": "生成尾帧",
@@ -965,7 +1055,7 @@ def _auto_revive(project: str, plan: dict) -> int:
             ep = int(d.get("episode_no"))
             pipeline.resolve_dead_letter(project, ep, note=f"自动复活（挂起已超过 {hours:g} 小时）")
             # 复活后要把尝试计数清零，否则下一次失败又会立刻被挂起
-            _ATTEMPTS.setdefault(project, {})[ep] = 0
+            _reset_attempt(project, ep)
             revived += 1
             logger.info("%s 第%s集自动复活（挂起于 %s，已超过 %g 小时）",
                         project, ep, marked, hours)
@@ -1015,11 +1105,11 @@ def _pick_episode(project: str, plan: dict):
         if not chapter:
             continue
         # 连续失败超限 → 挂起等人工
-        tries = _ATTEMPTS.get(project, {}).get(no, 0)
+        tries = _attempts_get(project, no)
         if tries >= int(plan.get("max_episode_attempts") or 2):
             _mark_dead(project, no,
                        f"连续 {tries} 次生产失败，已挂起等人工处理")
-            _ATTEMPTS.setdefault(project, {})[no] = 0
+            _reset_attempt(project, no)
             continue
         # 防紧凑空转：同一集刚跑过就等一个间隔（打回重做也一样，不必贴着重跑）
         if not _rerun_allowed(project, no):
@@ -1174,7 +1264,7 @@ def _produce(project: str, plan: dict, pick: dict) -> None:
                 logger.warning("自动验收失败：%s", e)
         with _LOCK:
             _STATE["totals"]["episodes_done"] = int(_STATE["totals"].get("episodes_done") or 0) + 1
-        _ATTEMPTS.setdefault(project, {})[episode_no] = 0
+        _reset_attempt(project, episode_no)
         logger.info("第%s集生产完成：%s", episode_no, result.get("deliverable"))
     elif result.get("status") == "cancelled":
         logger.info("第%s集因托管暂停中止（已完成步骤已保留，可续跑）", episode_no)
@@ -1187,10 +1277,9 @@ def _produce(project: str, plan: dict, pick: dict) -> None:
             _mark_dead(project, episode_no, result.get("error") or "需人工介入",
                        {"status": result.get("status")})
         else:
-            _ATTEMPTS.setdefault(project, {})[episode_no] = \
-                _ATTEMPTS.get(project, {}).get(episode_no, 0) + 1
+            _n = _bump_attempt(project, episode_no)
             logger.warning("第%s集生产失败（第 %d 次）：%s", episode_no,
-                           _ATTEMPTS[project][episode_no], result.get("error"))
+                           _n, result.get("error"))
 
     # 2026-09-30：托管路径同样登记 last_run（成功/失败都记），与 run-once 口径一致。
     try:
@@ -1252,6 +1341,14 @@ def purge_project(project_name: str) -> dict:
             os.remove(_lp)
     except Exception as e:  # noqa: BLE001
         logger.warning("清理 last_run 失败（%s）：%s", project_name, e)
+    # ⭐ attempts 同样要落盘清理（2026-10-02 落盘后新增）：否则同名重建会带着
+    # 上个项目的失败计数起步 → 一失败就立刻被「连续 N 次失败」挂起。
+    try:
+        _ap = _attempts_path(project_name)
+        if os.path.isfile(_ap):
+            os.remove(_ap)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("清理 attempts 失败（%s）：%s", project_name, e)
     wake()
     return {"project": project_name, "dead_letters_cleared": True}
 

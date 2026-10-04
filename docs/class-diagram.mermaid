@@ -1,0 +1,43 @@
+classDiagram
+    class H3CommonRefs {
+        <<pure functions>>
+        +LIMIT_REFERENCE_IMAGES=9
+        +asset_key(asset) tuple
+        +plan_common_refs(seg_assets, max_common, limit) list
+        -_normalize_char_path(path) str
+    }
+    class H3DirectorBuilder {
+        +MAX_REFERENCE_IMAGES=9
+        +MAX_REFERENCE_AUDIOS=3
+        +build(segments, refs, seg_refs, seg_audios, common_ref_audios, common_prompt, common_enabled, audio_mode, ...) (wf, layout)
+        +_build_timeline(..., common_ref_audios, common_prompt, seg_ref_start)
+        +_ref_items(names, start) list
+        +_ref_audio_items(names, start) list
+        +check_ref_layout(timeline) list
+        +_guard_global_prompt(timeline, common_prompt)
+    }
+    class ComfyUIClient {
+        +generate_h3_sequence_sequential(segments, common_refs, common_ref_audios, common_prompt, seg_audios)
+        +generate_h3_sequence(build_only)
+        +_upload_h3_director_ref / _upload_h3_director_audio
+        -_derive_audio_mode(common_audio_names, seg_audio_names, emit_audio) str
+    }
+    class AppAssembly {
+        +_h3_plan_common_refs(shots, ...) (common, comps_map)
+        +_h3_shot_ref_components(shot, ..., outfit_map) list
+        +_ensure_voice_bank_refs(common, project, all_characters)
+        +_h3_common_ref_audios(common, project) list
+        +_h3_common_subject_lock(common, common_ref_audios, style, worldview, aspect) str
+        +_shot_segment(shot, seq, qc_cfg, common, common_keys) (segs, sb_local)
+    }
+    class VoiceBank {
+        +find_voice_bank_ref(dub_dir, character) (path, text)
+        +save_voice_bank_ref(dub_dir, character, path, ref_text)
+        +voice_bank_dir(dub_dir, character)
+    }
+
+    AppAssembly --> H3CommonRefs : 交集判据
+    AppAssembly --> VoiceBank : 公共音色来源
+    AppAssembly --> ComfyUIClient : 提交(common_*)
+    ComfyUIClient --> H3DirectorBuilder : build()
+    H3DirectorBuilder ..> H3DirectorTimeline : global.refs/refAudios/prompt

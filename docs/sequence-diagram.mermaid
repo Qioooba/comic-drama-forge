@@ -1,0 +1,20 @@
+sequenceDiagram
+    participant EP as app.py (episode worker)
+    participant CR as h3_common_refs
+    participant VB as voice_bank
+    participant CL as comfyui_client
+    participant BD as h3_director_builder
+    participant H3 as ComfyUI H3 Director
+
+    EP->>CR: plan_common_refs(逐镜组件交集)
+    CR-->>EP: common[K] (角色/场景/物品)
+    EP->>VB: _ensure_voice_bank_refs(公共角色) + _h3_common_ref_audios
+    VB-->>EP: common_audios[M] (本地路径)
+    EP->>EP: _h3_common_subject_lock(common, common_audios) -> common_prompt
+    EP->>CL: segments + common_refs=K路径 + common_ref_audios=common_audios + common_prompt
+    CL->>CL: 上传公共图/音 -> common_names[K] / common_audio_names[M]
+    CL->>CL: audio_mode 推导 (M>0 -> generate)
+    CL->>BD: build(common_ref_audios=M名, common_prompt, seg_audios=清空)
+    BD->>BD: global.refs=0..K-1, global.refAudios=0..M-1, 段级从 K/M 起(段音频清空)
+    BD->>H3: timeline JSON (global.prompt 拼接边界)
+    H3-->>EP: 整集 mp4 (音色统一, 无逐段配音)

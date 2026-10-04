@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import time
 import uuid
 from datetime import datetime
@@ -397,7 +398,182 @@ def split_chapters(text: str, fallback_chars: int = FALLBACK_CHAPTER_CHARS,
             "end": end,
             "char_count": end - pos,
         })
-    return chapters
+    # 折叠「卷/部」标题壳（第[数字][卷] 与 第[数字][节] 同正则，卷标题无正文）
+    return collapse_shell_chapters(chapters, text)
+
+
+# 「卷/部/篇」这类结构标题与「章/节」共用同一条正则（第[数字][章回节卷篇集部]），
+# 于是「第一卷：魔性不改」会被切成一个独立章节 —— 而它下面一个字正文都没有。
+# 下游按 index 取章 → 取到空壳 → 模型只拿到 11 个字的标题，把整集剧本凭空编出来
+#（2026-10-02 实测：《蛊真人》第 1 集 = 「第一卷：魔性不改」11 字，产出 8 个镜头全是
+# 「魔性不改 / 大道无情 / 唯我独尊 / 为了长生 / 手段尽可尽」这类模型自造的四字口号，
+# 原文台词一句没用，且整半章（春秋蝉逆转重生 · 青茅山古月山寨）彻底丢失，
+# 而覆盖率检查仍报 100% —— 因为根本没有正文单元可核对）。
+# 这类「只有标题行、正文近空」的壳章必须并入其后的真实章节，不能单独成章。
+SHELL_CHAPTER_BODY_CHARS = 60
+
+
+def chapter_body_chars(text: str, ch: dict) -> int:
+    """章节正文（去掉标题行与全部空白后）的字符数。
+
+    标题行不计入 —— 壳章的特征正是「去掉标题行后什么都不剩」。
+    """
+    try:
+        seg = text[int(ch.get("start") or 0):int(ch.get("end") or 0)]
+    except (TypeError, ValueError):
+        return 0
+    nl = seg.find("\n")
+    body = seg[nl + 1:] if nl >= 0 else ""
+    return len(re.sub(r"\s", "", body))
+
+
+def collapse_shell_chapters(chapters: list, text: str,
+                            min_body: int = SHELL_CHAPTER_BODY_CHARS) -> list:
+    """把「只有标题、正文近空」的壳章并入下一章，并重排 index（1..N）。
+
+    - 只折叠 **后面还有章节** 的短条目；末章若也是壳章则丢弃（它不是正文）。
+    - 被折叠的标题（如卷名）记入下一章的 volume 字段，信息不丢。
+    - 真正写得短的章节（短篇/测试文本）只要正文不空就不受影响；
+      若折叠后一章不剩，原样返回 —— 绝不产出空章节表。
+    """
+    if not chapters:
+        return []
+    out = []
+    pending = []
+    for i, ch in enumerate(chapters):
+        if not isinstance(ch, dict):
+            continue
+        body = chapter_body_chars(text, ch)
+        is_last = (i + 1 >= len(chapters))
+        if body < min_body:
+            if is_last:
+                continue
+            pending.append(str(ch.get("title") or "").strip())
+            continue
+        item = dict(ch)
+        if pending:
+            vols = [x for x in pending if x]
+            if vols:
+                item["volume"] = " / ".join(vols)
+            pending = []
+        item["index"] = len(out) + 1
+        out.append(item)
+    if not out:
+        keep = [dict(c) for c in chapters if isinstance(c, dict)]
+        for n, c in enumerate(keep, 1):
+            c["index"] = n
+        return keep
+    return out
+
+
+def apply_chapter_structure(chapters: list, verdict: dict, text: str) -> list:
+    """按 LLM 判决剔除「结构标题」条目，并重排 index。
+
+    **LLM 只提供判断，删条必须通过规则复核**：只有同时满足
+    「LLM 判为结构标题」+「去掉标题行后正文近空」两个条件才剔除，
+    绝不因为模型一句话就删掉可能有正文的章节（误删正文不可逆）。
+    被剔除的标题记入下一章的 volume 字段。
+    """
+    if not chapters or not isinstance(verdict, dict):
+        return chapters
+    raw = verdict.get("volume_indices") or []
+    vols = set()
+    for v in raw:
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            continue
+        if n > 0:
+            vols.add(n)
+    if not vols:
+        return chapters
+    out, pending = [], []
+    for ch in chapters:
+        if not isinstance(ch, dict):
+            continue
+        try:
+            idx = int(ch.get("index") or 0)
+        except (TypeError, ValueError):
+            idx = 0
+        body = chapter_body_chars(text, ch)
+        if idx in vols and body < SHELL_CHAPTER_BODY_CHARS:
+            pending.append(str(ch.get("title") or "").strip())
+            continue
+        item = dict(ch)
+        if pending:
+            existing = str(item.get("volume") or "").strip()
+            have = [x.strip() for x in existing.split("/") if x.strip()]
+            # 规则折叠可能已经把同一个卷名写进 volume，这里去重，避免
+            # 「第一卷：魔性不改 / 第一卷：魔性不改」这种重复
+            extra = [x for x in (y.strip() for y in pending) if x and x not in have]
+            if extra:
+                joined = " / ".join(extra)
+                item["volume"] = (existing + " / " + joined) if existing else joined
+            pending = []
+        item["index"] = len(out) + 1
+        out.append(item)
+    return out if out else chapters
+
+
+def ensure_chapter_structure(novels_dir: str, novel_id: str, llm_client=None,
+                             force: bool = False) -> dict:
+    """生成剧本前的「章节目录结构体检」：让 LLM 判断哪些条目只是结构标题。
+
+    在**生成剧本之前**调用（用户要求：先像人一样读目录判断真章节，再写剧本）。
+
+    - 结果缓存进 meta（chapter_structure / chapter_structure_audited_at），
+      同一本书只跑一次 LLM，后续调用零成本（force=True 可重跑）；
+    - LLM 未配置 / 调用失败 / 结论不可采信 → 直接返回原 meta，
+      沿用 collapse_shell_chapters 的规则折叠结果，绝不阻断生产；
+    - 应用判决时走 apply_chapter_structure 的规则复核（不盲信模型）。
+    """
+    meta = get_novel(novels_dir, novel_id)
+    if not isinstance(meta, dict):
+        return meta or {}
+    if meta.get("chapter_structure") and not force:
+        return meta
+    if llm_client is None:
+        return meta
+    chapters = meta.get("chapters") or []
+    if not chapters:
+        return meta
+    text = read_novel_text(novels_dir, novel_id) or ""
+    if not text:
+        return meta
+    try:
+        import chapter_llm
+        verdict = chapter_llm.analyze_chapter_structure(
+            llm_client, chapters, text, meta.get("name") or meta.get("title") or "")
+    except Exception as e:  # noqa: BLE001  体检失败不阻断生产
+        logger.warning("章节目录结构体检失败（沿用规则折叠）：%s %s", novel_id, e)
+        return meta
+    if not verdict:
+        return meta
+    try:
+        before = len(chapters)
+        new_chapters = apply_chapter_structure(chapters, verdict, text)
+        meta["chapter_structure"] = verdict
+        meta["chapter_structure_audited_at"] = datetime.now().isoformat(timespec="seconds")
+        if len(new_chapters) != before:
+            meta["chapters"] = new_chapters
+            meta["chapter_count"] = len(new_chapters)
+            meta["chapter_structure_note"] = (
+                "LLM 目录体检再剔除 %d 个结构标题条目" % (before - len(new_chapters)))
+            logger.info("章节目录体检：%s %d → %d 章", novel_id, before, len(new_chapters))
+        with open(os.path.join(novels_dir, "%s.json" % novel_id), "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+        index = _load_index(novels_dir)
+        hit = False
+        for m in index:
+            if m.get("novel_id") == novel_id:
+                m["chapter_count"] = meta.get("chapter_count")
+                m["chapter_structure"] = verdict.get("structure") or ""
+                hit = True
+        if hit:
+            _save_index(novels_dir, index)
+    except OSError as e:  # noqa: BLE001
+        logger.warning("目录体检结果回写失败（内存内已生效）：%s %s", novel_id, e)
+    return meta
 
 
 def guess_title(text: str, fallback: str) -> str:
@@ -502,6 +678,7 @@ def ingest_novel(raw_path: str, filename: str, novels_dir: str,
         "line_count": text.count("\n") + 1,
         "chapter_count": len(chapters),
         "chapter_source": "llm" if extra_patterns else "regex",
+        "chapters_collapsed": True,
         "chapters": chapters[:MAX_CHAPTERS_KEPT],
         "text_file": text_name,
         "uploaded_at": datetime.now().isoformat(timespec="seconds"),
@@ -556,12 +733,112 @@ def list_novels(novels_dir: str) -> list:
     return alive
 
 
+def _migrate_shell_chapters(novels_dir: str, novel_id: str, meta: dict) -> dict:
+    """老库惰性迁移：把已存 meta 里的「卷标题壳章」折叠掉并回写（一次性）。
+
+    只在 meta 无 chapters_collapsed 标记时执行；正文读不到就只打标记，
+    迁移失败一律不阻断读取（返回原 meta）。
+    """
+    text_file = meta.get("text_file") or f"{novel_id}.txt"
+    text_path = os.path.join(novels_dir, text_file)
+    text = ""
+    if os.path.isfile(text_path):
+        try:
+            with open(text_path, "r", encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except OSError:
+            text = ""
+    old = meta.get("chapters") or []
+    if text and old:
+        chapters = collapse_shell_chapters(old, text)
+        meta["chapters"] = chapters
+        meta["chapter_count"] = len(chapters)
+        if len(chapters) != len(old):
+            meta["chapter_collapse_note"] = (
+                f"已折叠 {len(old) - len(chapters)} 个空壳章节标题（卷/部标题无正文）")
+            logger.info("章节壳章折叠：%s %d → %d 章", novel_id, len(old), len(chapters))
+    meta["chapters_collapsed"] = True
+    try:
+        with open(os.path.join(novels_dir, f"{novel_id}.json"), "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+        index = _load_index(novels_dir)
+        hit = False
+        for m in index:
+            if m.get("novel_id") == novel_id:
+                m["chapter_count"] = meta.get("chapter_count")
+                m["chapters_collapsed"] = True
+                hit = True
+        if hit:
+            _save_index(novels_dir, index)
+    except OSError as e:  # noqa: BLE001
+        logger.warning("章节折叠结果回写失败（内存内已生效）：%s %s", novel_id, e)
+    return meta
+
+
 def get_novel(novels_dir: str, novel_id: str) -> dict:
     path = os.path.join(novels_dir, f"{novel_id}.json")
     if not os.path.isfile(path):
         raise NovelParseError(f"小说不存在：{novel_id}")
     with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+        meta = json.load(f)
+    # 惰性迁移：老库（2026-10-02 之前入库）的 chapters 里可能混着「卷标题壳章」，
+    # 第一次读到就折叠并回写；之后靠 chapters_collapsed 标记跳过，不再读正文。
+    if isinstance(meta, dict) and meta.get("chapters") and not meta.get("chapters_collapsed"):
+        try:
+            meta = _migrate_shell_chapters(novels_dir, novel_id, meta)
+        except Exception as e:  # noqa: BLE001  迁移失败绝不影响读取
+            logger.warning("章节壳章折叠迁移失败（沿用原章节表）：%s %s", novel_id, e)
+    return meta
+
+
+def remove_novel(novels_dir: str, novel_id: str, trash_dir: str = None) -> dict:
+    """删除小说（软删：把 <id>.json + <id>.txt 移入回收站，并从 index.json 摘除，可手工还原）。
+
+    与项目删除同一风格——**不物理删除**。`trash_dir` 缺省为 ``<novels_dir>/_trash``，
+    实际落 ``<trash_dir>/<时间戳>_<novel_id>/``。已不存在的条目返回 success=False。
+    返回 {success, moved:[{kind,from,to}], skipped:[...], recoverable, trash_dir}。
+    """
+    novel_id = str(novel_id or "").strip()
+    if not novel_id:
+        return {"success": False, "error": "novel_id 为空"}
+    # 实体文件是否存在（json 在才算真登记过）
+    meta_path = os.path.join(novels_dir, f"{novel_id}.json")
+    if not os.path.isfile(meta_path):
+        return {"success": False, "error": f"小说不存在：{novel_id}"}
+
+    trash_root = trash_dir or os.path.join(novels_dir, "_trash")
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    dst_root = os.path.join(trash_root, f"{stamp}_{novel_id}")
+    os.makedirs(dst_root, exist_ok=True)
+
+    moved, skipped = [], []
+    files = [meta_path, os.path.join(novels_dir, f"{novel_id}.txt")]
+    # 若 meta 里登记了自定义 text_file（老数据），一并收走
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            tf = (json.load(f) or {}).get("text_file")
+        if tf:
+            files.append(os.path.join(novels_dir, tf))
+    except Exception:  # noqa: BLE001
+        pass
+    for src in files:
+        if not src or not os.path.isfile(src):
+            continue
+        dst = os.path.join(dst_root, os.path.basename(src))
+        try:
+            shutil.move(src, dst)
+            moved.append({"kind": "novel", "from": src, "to": dst})
+        except (OSError, shutil.Error) as e:  # noqa: BLE001
+            skipped.append({"path": src, "error": str(e)})
+
+    # 从 index.json 摘除（软删：数据在回收站可还原）
+    index = _load_index(novels_dir)
+    new_index = [m for m in index if (m.get("novel_id") or m.get("id")) != novel_id]
+    if len(new_index) != len(index):
+        _save_index(novels_dir, new_index)
+
+    return {"success": True, "moved": moved, "skipped": skipped,
+            "recoverable": True, "trash_dir": dst_root}
 
 
 def read_novel_text(novels_dir: str, novel_id: str, max_chars: int = None) -> str:

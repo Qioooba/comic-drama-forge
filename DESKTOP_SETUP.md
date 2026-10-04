@@ -6,7 +6,7 @@
 ```bash
 cd "C:\Users\liujianghua\WorkBuddy\2026-09-09-16-55-22\漫剧生成系统"
 python app/serve.py
-# 访问 http://127.0.0.1:5000
+# 访问 http://127.0.0.1:5210  （默认端口；可用环境变量 APP_PORT 覆盖）
 ```
 
 ### 方法二：双击启动
