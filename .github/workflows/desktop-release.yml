@@ -162,26 +162,37 @@ jobs:
         run: |
           find dist -maxdepth 1 -type f -printf '%f  %s bytes\n'
 
-      # 自愈：若该 tag 已存在旧 Release（含被 GitHub 篡改过名的旧资产），先整个删掉，
-      # 避免 softprops update 时新旧资产并存。本机无 PAT、匿名 API 删 Release 是 403，
-      # 故借 CI 的 GITHUB_TOKEN（contents:write 已授权）完成；删不掉不阻塞（|| true）。
-      - name: Delete existing release (self-heal)
+      # 自愈：清除该 tag 下「不属于期望 3 件套」的残留资产（如被 GitHub 吞掉中文名的
+      # -Portable-x.y.z.exe）。整机删 release 语义脆弱（实测删不掉/软 props 又重建），
+      # 故按资产名精确删，幂等可重复。本机无 PAT，匿名删资产 403，借 CI 的 GITHUB_TOKEN。
+      - name: Prune stale release assets (self-heal)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="v${{ needs.build-win.outputs.version }}"
+          V="${{ needs.build-win.outputs.version }}"
+          TAG="v$V"
           REPO="${{ github.repository }}"
           RID=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
             "https://api.github.com/repos/$REPO/releases/tags/$TAG" \
             | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('id') or '')" || true)
-          if [ -n "$RID" ]; then
-            echo "existing release $TAG -> id $RID, deleting (removes stale renamed assets)..."
-            curl -s -X DELETE -H "Authorization: token $GITHUB_TOKEN" \
-              "https://api.github.com/repos/$REPO/releases/$RID" > /dev/null || true
-            echo "old release removed."
-          else
-            echo "no existing release for $TAG; nothing to delete."
+          if [ -z "$RID" ]; then
+            echo "no existing release for $TAG; nothing to prune."
+            exit 0
           fi
+          # 逐个列出当前资产，删掉「不属于期望 3 件套」的（用 jq，ubuntu-latest 内置）
+          curl -s -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/repos/$REPO/releases/$RID/assets?per_page=100" \
+            | jq -r --arg a "comic-drama-forge-Portable-$V.exe" \
+                     --arg b "resources-$V.zip" \
+                     --arg c "SHA256SUMS.txt" \
+                     'select(.name != $a and .name != $b and .name != $c) | "\(.id) \(.name)"' \
+            | while IFS=' ' read -r aid aname; do
+                echo "pruning stale asset: $aname (id $aid)"
+                curl -s -X DELETE -H "Authorization: token $GITHUB_TOKEN" \
+                  "https://api.github.com/repos/$REPO/releases/assets/$aid" > /dev/null \
+                  || echo "  -> delete failed (non-fatal)"
+              done
+          echo "self-heal prune done."
         shell: bash
 
       - name: Create GitHub Release
