@@ -83,11 +83,18 @@ jobs:
           New-Item -ItemType Directory -Path $dst | Out-Null;
           Expand-Archive $zip -DestinationPath $dst -Force;
           # 放开 site-packages（embeddable 默认禁用 import site）
-          $pth = Get-ChildItem $dst -Filter "*.pth" | Select-Object -First 1;
+          # ⚠️ 官方包里的文件名是 `python313._pth`，**不以 `.pth` 结尾**：
+          #    -Filter "*.pth" 匹配不到它 → $pth 为 $null → `$pth.FullName` 抛
+          #    "cannot call a method on a null-valued expression" → 整步失败
+          #    （2026-10-04 实测：run 37179716898 就是死在这里）。必须用 "python*._pth"。
+          $pth = Get-ChildItem $dst -Filter "python*._pth" | Select-Object -First 1;
+          if (-not $pth) { throw "未找到 Python embeddable 的 ._pth（$dst）—— 官方包版式可能已变更" }
           $content = Get-Content $pth.FullName;
-          $content = $content -replace '#import site','import site';
+          # 3.13.12 实际写作 "#import site"（无空格）；用宽松正则兼容 "# import site"
+          $content = $content -replace '^\s*#\s*import site\s*$','import site';
           Set-Content $pth.FullName ($content -join "`n");
           Add-Content $pth.FullName "Lib\site-packages";
+          "--- 处理后 $($pth.Name) ---"; Get-Content $pth.FullName;
           # get-pip
           Invoke-WebRequest "https://bootstrap.pypa.io/get-pip.py" -OutFile "get-pip.py";
           & $dst\python.exe get-pip.py --no-warn-script-location;
