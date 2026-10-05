@@ -1287,6 +1287,8 @@ def api_project_assets(pid):
                 "file": full,
                 "size": os.path.getsize(full),
                 "url": f"/api/storyboards/file/{os.path.basename(d)}/{fn}",
+                # 2026-10-05：mtime 版本令牌（前端拼 ?v= 击穿缓存，避免重生成后仍显示旧图）
+                "mtime": int(os.path.getmtime(full)),
                 "project_dir": os.path.basename(d),
             })
     # 视频 / 成片 / 超分 / 配音 产物（按项目隔离后的实际目录）
@@ -1297,8 +1299,9 @@ def api_project_assets(pid):
                 if fn.lower().endswith(exts):
                     full = os.path.join(d, fn)
                     out.append({"name": fn, "file": full, "size": os.path.getsize(full),
+                                # 2026-10-05：mtime 版本令牌（前端拼 ?v= 击穿缓存，避免重生成后仍显示旧图）
+                                "mtime": int(os.path.getmtime(full)),
                                 "project_dir": os.path.basename(d)})
-        return out
     p = project_store.paths(key)
     return jsonify({"success": True, "project": key, "project_id": rec["id"],
                     "gallery": gallery,
@@ -9190,8 +9193,18 @@ def api_generate_final():
 
 @app.route('/api/assets/<path:filename>')
 def api_asset_file(filename):
-    """提供资产文件访问"""
-    return _serve_safe(os.path.join(PROJECT_OUTPUT_DIR, "assets"), filename)
+    """提供资产文件访问
+
+    ⭐ 2026-10-05 资产自动刷新：资产图会被**原地覆盖重生成**（路径不变），必须让浏览器
+    每次回源校验，否则轮询拿到新 JSON 后 <img> 仍显示旧缓存图，用户以为「必须手动刷新」。
+    与前端 ?v=<mtime> 双重保险：前端换 URL 触发重挂（主），本处 no-cache 兜底回源。
+    """
+    resp = _serve_safe(os.path.join(PROJECT_OUTPUT_DIR, "assets"), filename)
+    try:
+        resp.headers["Cache-Control"] = "no-cache, must-revalidate"
+    except Exception:  # noqa: BLE001  abort 响应(403/404) 无 headers，忽略
+        pass
+    return resp
 
 
 @app.route('/api/videos/<path:filename>')
@@ -14932,19 +14945,28 @@ def api_tts_voice_bank_preview():
     if not ref:
         return jsonify({"success": False,
                         "error": f"角色「{character}」未绑定参考音频，请先上传"}), 400
-    voice = normalize_voice({
-        "mode": "clone", "ref_audio": ref, "ref_text": ref_text,
-        "speaker": "Ryan", "seed": 0,
-    })
-    preview_dir = os.path.join(dub_dir, "preview")
-    os.makedirs(preview_dir, exist_ok=True)
-    out_path = os.path.join(preview_dir,
-                            f"clone_{int(time.time())}_{tts_client.safe_name(character, 12)}.wav")
+    # ⭐ 2026-10-05 修复「试听 500」：
+    # ① voice 带上 character —— synthesize_one 的批项此前恒为 character=None，
+    #    教训库 / 台词清洗全部丢了角色维度；
+    # ② 整段包一层兜底 try：此前 normalize_voice / safe_name / makedirs 里任何
+    #    未预期异常都会直接变 Flask 500（界面只剩「Internal Server Error」一句，
+    #    用户完全不知道发生了什么）。现在统一返回可读的 502/500 JSON。
     try:
+        voice = normalize_voice({
+            "mode": "clone", "ref_audio": ref, "ref_text": ref_text,
+            "speaker": "Ryan", "seed": 0, "character": character,
+        })
+        preview_dir = os.path.join(dub_dir, "preview")
+        os.makedirs(preview_dir, exist_ok=True)
+        out_path = os.path.join(preview_dir,
+                                f"clone_{int(time.time())}_{tts_client.safe_name(character, 12)}.wav")
         client = QwenTTSClient(out_root=DUB_DIR, params=TTS_DEFAULT_PARAMS)
         rec = client.synthesize_one(text, voice, out_path)
     except TTSError as e:
         return jsonify({"success": False, "error": str(e)}), 502
+    except Exception as e:  # noqa: BLE001 兜底：绝不让试听变裸 500
+        app.logger.exception("参考音色试听失败")
+        return jsonify({"success": False, "error": f"试听失败：{e}"}), 500
     if not rec.get("ok"):
         return jsonify({"success": False, "error": rec.get("error") or "合成失败",
                         "clone_fallback": rec.get("clone_fallback")}), 502
@@ -15000,15 +15022,22 @@ def api_tts_preview():
         voice = normalize_voice(data.get('voice'), base)
     except TTSError as e:
         return jsonify({"success": False, "error": str(e)}), 400
-
-    preview_dir = os.path.join(out_dir, "preview")
-    os.makedirs(preview_dir, exist_ok=True)
-    out_path = os.path.join(preview_dir, f"preview_{int(time.time())}_"
-                                         f"{tts_client.safe_name(char_name or 'line', 12)}.wav")
+    # 2026-10-05：voice 补上 character 维度（教训库记账）+ 整段兜底，不再裸 500
+    voice = dict(voice)
+    if char_name:
+        voice["character"] = char_name
     try:
+        preview_dir = os.path.join(out_dir, "preview")
+        os.makedirs(preview_dir, exist_ok=True)
+        out_path = os.path.join(preview_dir, f"preview_{int(time.time())}_"
+                                          f"{tts_client.safe_name(char_name or 'line', 12)}.wav")
         client = QwenTTSClient(out_root=DUB_DIR, params=TTS_DEFAULT_PARAMS)
         rec = client.synthesize_one(text, voice, out_path)
     except TTSError as e:
+        return jsonify({"success": False, "error": str(e)}), 502
+    except Exception as e:  # noqa: BLE001 兜底：绝不让试听变裸 500
+        app.logger.exception("单句试听失败")
+        return jsonify({"success": False, "error": f"试听失败：{e}"}), 500
         return jsonify({"success": False, "error": str(e)}), 502
     if not rec.get("ok"):
         return jsonify({"success": False, "error": rec.get("error") or "合成失败", "result": rec}), 502

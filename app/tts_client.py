@@ -506,7 +506,7 @@ def normalize_voice(raw: Optional[dict], fallback: Optional[dict] = None) -> Dic
     return voice
 
 
-def clean_line_text(text: str, character: str = "") -> str:
+def clean_line_text(text, character="") -> str:
     """清洗台词：去除引号/说话人前缀/舞台提示括号，保留可朗读文本"""
     s = str(text or "").strip()
     for q in ("“", "”", "\"", "「", "」", "『", "』"):
@@ -1200,6 +1200,6 @@ class QwenTTSClient:
         res = self.synthesize_batch([{
             "text": text, "voice": voice, "out_path": out_path,
             "store_prefix": store_prefix or f"dub/preview/{tag}",
-            "line_id": tag, "shot_id": None, "character": None,
+            "line_id": tag, "shot_id": None, "character": str((voice or {}).get("character") or "") or None,
         }], timeout=timeout)
         return res[0] if res else {"ok": False, "error": "合成未返回结果"}

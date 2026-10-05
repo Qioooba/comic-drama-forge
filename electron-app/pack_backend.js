@@ -94,6 +94,28 @@ function main() {
     console.warn('[跳过] main.py 源缺失');
   }
 
+  // ⭐ 前端构建产物（2026-10-04）：Flask 提供的前端 UI 来自 app/static（vite 构建输出），
+  // 资源增量/整包更新包都要带上最新前端 —— 但 pack_backend 此前**不会构建前端**，
+  // 更新包里的 static/ 是上次构建期残留，导致「手动更新后前端仍是旧的」。
+  // 现在：若本地有前端源码，就先跑一遍 vite build，让上面的目录收集自然带上最新产物。
+  // 构建失败仅警告（沿用 app/static 旧产物），不阻塞后端资源收集。
+  const FE_SRC = path.join(ROOT, 'frontend');
+  const FE_STATIC = path.join(ROOT, 'app', 'static');
+  if (fs.existsSync(path.join(FE_SRC, 'package.json'))) {
+    try {
+      const { execSync } = require('node:child_process');
+      const t0 = Date.now();
+      execSync('npm run build', { cwd: FE_SRC, stdio: 'pipe', timeout: 600000 });
+      const distOk = fs.existsSync(FE_STATIC);
+      console.log(`[前端] vite 构建完成（${Math.round((Date.now() - t0) / 1000)}s），static/ ${distOk ? '已更新' : '未生成（请检查 frontend 构建）'}`);
+    } catch (e) {
+      const msg = (e && e.message ? String(e.message) : String(e)).split('\n').slice(0, 6).join(' | ');
+      console.warn('[前端] vite 构建失败（沿用 app/static 旧产物，不阻塞打包）：' + msg);
+    }
+  } else {
+    console.warn('[前端] 未找到 frontend/package.json，跳过前端构建（沿用既有 app/static）');
+  }
+
   // 3. 校验 Python 运行时
   const hasPy = fs.existsSync(path.join(PYDIR, 'python.exe')) ||
                 fs.existsSync(path.join(PYDIR, 'python3'));

@@ -31,6 +31,15 @@ logger = logging.getLogger(__name__)
 #   必然「日志文件不存在」。打包版的本进程日志改写到 exe 同级的 logs/ 目录
 #   （见 main.py 的 _redirect_stdouts），故 frozen 时优先定位 exe 同级 logs/。
 def _resolve_log_dir() -> str:
+    # ⭐ Electron 桌面版（2026-10-04）：后端以源码镜像（resource-mirror）方式运行时
+    #   sys.frozen 为 False，旧逻辑会按 __file__ 定位 .workbuddy/test/_out —— 指向镜像
+    #   内从未创建过的无效路径，日志页报「日志文件不存在」。桌面版 spawn 环境必带
+    #   MJSCXT_DATA_DIR（见 electron-app/main.js），且 main.py 的 _redirect_frozen_logs
+    #   同样把本进程 stdout 落到 <MJSCXT_DATA_DIR>/logs/serve_stdout.log。
+    #   **读（log_viewer）与写（main.py）必须指向同一目录** —— 环境变量存在时优先。
+    _data_dir = os.environ.get("MJSCXT_DATA_DIR", "").strip()
+    if _data_dir:
+        return os.path.join(_data_dir, "logs")
     if getattr(sys, "frozen", False):
         # 单文件 exe：同级目录放 logs/
         return os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "logs")

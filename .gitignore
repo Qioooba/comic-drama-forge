@@ -169,3 +169,11 @@ electron-app/dist/
 # 工具运行态缓存（2026-10-02 上线审计）：会话 hook 状态 / 运行历史 / 发现台账，
 # 全是本机会话级临时数据，因机而异、无协作价值，不入库。
 .mimosa/
+
+# ===================== 本机构建/排查残留（2026-10-05） =====================
+# 早期排查 electron-builder 目录结构时用脚本导出的中间清单（几十 MB 文本）、
+# 以及 harness 的本地状态目录 —— 均为本机临时产物，无协作价值，不入库。
+electron_dirs.json
+electron_dist_files.txt
+electron_root_dirs.json
+.local/

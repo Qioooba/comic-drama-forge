@@ -221,6 +221,66 @@ def _install_shutdown_hooks() -> None:
     logger.info("已注册 atexit 优雅停机兜底")
 
 
+
+# =======================================================================
+# 进程日志落盘（2026-10-05）—— 修复桌面版「日志文件不存在」的真正根因
+# =======================================================================
+# 背景：桌面版（Electron）spawn 的是**本文件**（python.exe app/serve.py，cwd=资源镜像），
+#   而 main.py 的 _redirect_frozen_logs() 在打包布局下**根本不会被调用** ——
+#   main.py 在 resources/ 根、serve.py 在资源镜像里，spawn 的是后者。
+#   后果：本进程 stdout/stderr 没有任何落盘，而前端「日志」页按
+#   log_viewer._resolve_log_dir() 去读 <MJSCXT_DATA_DIR>/logs/serve_stdout.log
+#   → 永远「日志文件不存在」。
+# 现在：入口处直接把 stdout/stderr 镜像到日志文件，与读取侧严格对齐。
+#   非桌面/非打包场景（MJSCXT_DATA_DIR 未设置且非 frozen）保持原样，不落这份日志。
+# 两个必须遵守的坑（main.py 同款，实测踩过）：
+#   1. 不要用 os.dup2：后台方式启动时控制台句柄失效 → 退出写日志 OSError(9)
+#      → CPython 'lost sys.stderr' abort。只换 sys.stdout/sys.stderr 对象。
+#   2. 日志文件句柄必须模块级持有：被 GC 回收会连带关掉正在写的流。
+_LOG_FH = None
+
+
+def _redirect_process_logs() -> None:
+    """把本进程 stdout/stderr 追加写到日志文件（与 log_viewer 读侧同路径）"""
+    global _LOG_FH
+    try:
+        _data_dir = (os.environ.get('MJSCXT_DATA_DIR') or '').strip()
+        if _data_dir:
+            log_dir = os.path.join(_data_dir, 'logs')
+        elif getattr(sys, 'frozen', False):
+            log_dir = os.path.join(os.path.dirname(os.path.abspath(sys.executable)), 'logs')
+        else:
+            return  # 源码/计划任务模式由 run_serve.bat 重定向，保持原行为
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, 'serve_stdout.log')
+        _orig = (sys.stdout, sys.stderr)
+        fh = open(log_path, 'a', encoding='utf-8', errors='replace', buffering=1)
+        try:
+            fh.reconfigure(encoding='utf-8', errors='replace', line_buffering=True)
+        except Exception:  # noqa: BLE001 某些流不支持 reconfigure
+            pass
+        sys.stdout = fh
+        sys.stderr = fh
+        _LOG_FH = fh
+
+        def _restore():
+            try:
+                if _LOG_FH is not None:
+                    try:
+                        _LOG_FH.flush()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    sys.stdout, sys.stderr = _orig
+                    _LOG_FH.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+        atexit.register(_restore)
+        sys.stdout.write(f'[serve] log redirected to: {log_path}\n')
+        sys.stdout.flush()
+    except Exception as _e:  # noqa: BLE001 重定向失败绝不阻塞启动
+        print(f'[serve] log redirect failed (ignored): {_e}')
+
 def main() -> int:
     restart_count = 0
 
@@ -260,6 +320,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    _redirect_process_logs()
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     raise SystemExit(main())

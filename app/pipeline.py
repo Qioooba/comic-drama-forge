@@ -798,6 +798,16 @@ def step_tts_pre(ctx) -> dict:
         # 传 common=[] 是因为「已确认的公共池」与本步无关：本步要覆盖**全部**角色。
         char_idx = A._build_asset_index(script.get("characters") or [],
                                         ctx["project_name"], "character")
+        # 2026-10-05：TTS 环境自检 —— 不可用时直接返回精确跳过原因，
+        # 不再静默跑一遍全部合成失败（用户会以为「配音完成了」其实什么都没有）。
+        try:
+            _tts_env = A.tts_env_check()
+        except AttributeError:
+            _tts_env = {"available": True, "reasons": []}
+        if not _tts_env.get("available"):
+            return {"ok": True, "skipped": True,
+                    "detail": {"note": "TTS 环境不可用，跳过参考音色生成：" + "；".join(_tts_env.get("reasons") or []),
+                               "env_available": False}}
         A._ensure_voice_bank_refs([], ctx["project_name"], all_characters=char_idx)
         _dub_dir = A._dub_project_dir(ctx["project_name"])
         _rows = A.tts_client.list_voice_bank(_dub_dir) or []

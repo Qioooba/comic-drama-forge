@@ -50,9 +50,19 @@ def _redirect_frozen_logs():
     """
     import sys
     global _FROZEN_LOG_FH, _FROZEN_ORIG_STDIO
-    if not getattr(sys, "frozen", False):
+    # ⭐ Electron 桌面版（2026-10-04）：后端是 resource-mirror 里的源码（sys.frozen=False），
+    #   旧逻辑「非 frozen 直接 return」导致本进程 stdout 不落盘，而前端日志页却按
+    #   log_viewer._resolve_log_dir() 去读 <MJSCXT_DATA_DIR>/logs/serve_stdout.log
+    #   （桌面版该环境变量必存在）→ 永远「日志文件不存在」。
+    #   现在：只要 MJSCXT_DATA_DIR 被设置（桌面版/启动器场景），无论 frozen 与否，
+    #   都把 stdout/stderr 镜像到 <MJSCXT_DATA_DIR>/logs/，与读取侧路径严格对齐。
+    _data_dir = os.environ.get("MJSCXT_DATA_DIR", "").strip()
+    if not _data_dir and not getattr(sys, "frozen", False):
         return
-    log_dir = Path(os.path.dirname(os.path.abspath(sys.executable))) / "logs"
+    if _data_dir:
+        log_dir = Path(_data_dir) / "logs"
+    else:
+        log_dir = Path(os.path.dirname(os.path.abspath(sys.executable))) / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / "serve_stdout.log"
     try:

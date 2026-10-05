@@ -32,6 +32,8 @@ interface AssetItem {
   url?: string;
   file?: string;
   size?: number;
+  /** 文件 mtime（后端下发的版本令牌）：拼进图片 URL 做缓存击穿，保证重生成后前端必刷新 */
+  mtime?: number;
   [key: string]: any;
 }
 
@@ -70,6 +72,34 @@ export function ProjectWorkbenchPage({ projectKey }: ProjectWorkbenchPageProps) 
       /* 资产刷新失败不阻塞页面 */
     }
   }, [projectKey]);
+
+  // ⭐ 资产自动刷新（2026-10-04 首版 / 2026-10-05 增强）：此前资产只随页面挂载拉一次
+  //    （缺陷 D3 只解决了「生产启动后能手动重拉」，用户仍要点「刷新」才看到新资产）。
+  //    现在三重保障：
+  //      ① 可见时每 12s 静默重拉（页面隐藏时跳过，不浪费请求）；
+  //      ② 窗口重新获得焦点 / 切回本标签页 **立刻**重拉一次（用户切走又回来无需等）；
+  //      ③ 图片 URL 带 ?v=<mtime>（见 assetSrc）—— 这是关键：轮询虽会换回新 JSON，
+  //         但旧代码 <img src> 恒定、浏览器命中旧缓存，用户看到的还是旧图。
+  //    失败静默（reloadAssets 内部已 catch），不弹提示 —— 这是后台轮询。
+  useEffect(() => {
+    if (!projectKey) return;
+    let alive = true;
+    const tick = () => {
+      if (!alive) return;
+      if (typeof document !== 'undefined' && document.hidden) return; // 隐藏页不轮询
+      void reloadAssets();
+    };
+    const timer = setInterval(tick, 12000);
+    const onFocus = () => tick();
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onFocus);
+    return () => {
+      alive = false;
+      clearInterval(timer);
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onFocus);
+    };
+  }, [projectKey, reloadAssets]);
 
   // Load project data
   useEffect(() => {
@@ -243,11 +273,21 @@ export function ProjectWorkbenchPage({ projectKey }: ProjectWorkbenchPageProps) 
 
 // ========== 资源地址解析 ==========
 // 后端 /api/projects/<pid>/assets 返回的 url 已带 "/api" 前缀，不能重复拼接
-function assetSrc(url?: string | null): string | null {
+function assetSrc(url?: string | null, version?: number | string | null): string | null {
   if (!url) return null;
-  if (url.startsWith('http://') || url.startsWith('https://')) return url;
-  if (url.startsWith('/')) return url;
-  return `/api/${url}`;
+  let out = url;
+  if (!(out.startsWith('http://') || out.startsWith('https://'))) {
+    out = out.startsWith('/') ? out : `/api/${out}`;
+  }
+  // ⭐ 2026-10-05 资产自动刷新：带上版本令牌（后端 asset_gallery 下发的 mtime）。
+  //   背景：资产重新生成后 URL 是不变的（/api/assets/<key>/<name>/base.png），
+  //   轮询虽然换回了新 JSON，但 <img src> 字符串没变 —— React 不会重挂节点、
+  //   浏览器还会命中旧缓存，用户看到的仍是旧图，误以为「必须手动刷新页面」。
+  //   加上 ?v=<mtime> 后：图变了 URL 就变，React 必然重挂 <img>，浏览器必然重新取图。
+  if (version !== undefined && version !== null && `${version}` !== '') {
+    out += (out.includes('?') ? '&' : '?') + 'v=' + encodeURIComponent(String(version));
+  }
+  return out;
 }
 
 // ========== 错误脱敏（缺陷 D5） ==========
@@ -1630,7 +1670,8 @@ function AssetCard({
   onClick?: () => void;
 }) {
   const { t } = useApp();
-  const imageUrl = assetSrc(item.thumb?.url || item.views?.[0]?.url);
+  const _v = item.thumb || item.views?.[0];
+  const imageUrl = assetSrc(_v?.url, _v?.mtime ?? _v?.size);
   const [broken, setBroken] = useState(false);
   const FallbackIcon = type === 'character' ? User : type === 'item' ? Box : Mountain;
   // 缩略图容器比例必须跟随资产实际画幅（后端 style_kit.ASSET_BASE_RATIO 写死）：
@@ -1908,11 +1949,11 @@ function AssetPreviewModal({
   }, [preview, projectKey]);
 
   const gallery = React.useMemo(() => {
-    if (!preview) return [] as { url: string; view?: string; size?: number }[];
+    if (!preview) return [] as { url: string; view?: string; size?: number; mtime?: number }[];
     return [
       preview.item.thumb,
       ...(preview.item.views || []),
-    ].filter(Boolean) as { url: string; view?: string; size?: number }[];
+    ].filter(Boolean) as { url: string; view?: string; size?: number; mtime?: number }[];
   }, [preview]);
 
   // ← / → 在多个视角之间切换（图片浏览器的最低预期）
@@ -1929,7 +1970,7 @@ function AssetPreviewModal({
   // 共享 Modal 已处理 isOpen=false 时不渲染，这里只需容忍 preview 为空时的取值
   const item = preview?.item;
   const current = gallery[active];
-  const src = assetSrc(current?.url);
+  const src = assetSrc(current?.url, current?.mtime ?? current?.size);
 
   const downloadCurrent = () => {
     if (!src) return;
@@ -2019,7 +2060,7 @@ function AssetPreviewModal({
           {gallery.length > 1 && (
             <div className="flex flex-wrap gap-2" role="tablist" aria-label={t('wb.viewSwitch')}>
               {gallery.map((g, i) => {
-                const thumb = assetSrc(g.url);
+                const thumb = assetSrc(g.url, g.mtime ?? g.size);
                 return (
                   <button
                     key={i}

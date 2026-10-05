@@ -279,23 +279,65 @@ function resourceMirrorDir() {
 
 // 首次运行：把安装区 resourcesPath/{app,workflows,locales} 播种到可写镜像。
 // 已存在且非空则跳过（增量更新会另行覆盖）。不播种 python（python 归整包管理，运行时用安装区）。
+// 镜像版本标记文件：记录「当前镜像里的资源是哪一版」。
+// ⭐ 2026-10-05 修复关键缺陷：旧实现只在镜像**不存在**时播种。于是整包更新（Portable
+//   替换安装区）后，安装区已是新代码，但 userData 里的旧镜像仍然存在 → useMirror 命中
+//   旧镜像 → 后端继续跑**更新前的老代码**。用户表现为「明明更新了却什么都没变」，
+//   而且没有任何报错，极难定位。
+// 现在：把版本写进标记文件，启动时比对「安装区版本 vs 镜像版本」，不一致就重新播种
+// （安装区更新了说明换过整包，以安装区为准；资源增量则会把标记同步成资源版本）。
+const MIRROR_VERSION_FILE = '.mirror-version';
+
+function readMirrorVersion(mirror) {
+  try {
+    return String(fs.readFileSync(path.join(mirror, MIRROR_VERSION_FILE), 'utf8') || '').trim();
+  } catch {
+    return '';
+  }
+}
+
+function writeMirrorVersion(mirror, ver) {
+  try {
+    fs.writeFileSync(path.join(mirror, MIRROR_VERSION_FILE), String(ver || ''), 'utf8');
+  } catch (e) {
+    console.warn('[更新] 写入镜像版本标记失败（忽略）：', e && e.message);
+  }
+}
+
 function seedResourceMirror() {
   if (!app.isPackaged) return null; // 开发态直接用项目根，无镜像
   const res = process.resourcesPath;
   const mirror = resourceMirrorDir();
+  const installed = updateConfig.currentVersion();
+  const mirrorVer = readMirrorVersion(mirror);
+  const mirrorExists = fs.existsSync(path.join(mirror, 'app'));
+  // 需要（重新）播种的两种情况：镜像还没有；或安装区版本与镜像版本不一致
+  // （整包更新替换了安装区 → 安装区为准，必须覆盖旧镜像）。
+  const needSeed = !mirrorExists || mirrorVer !== installed;
   // 安装区目录名 → 镜像目录名：后端源码在安装区叫 backend，镜像内仍叫 app
   // （后端代码里的相对引用不变，只有安装区这层名字避让 .asar / app 冲突）。
   const subs = [['backend', 'app'], ['workflows', 'workflows'], ['locales', 'locales']];
+  if (needSeed) {
+    console.log(`[更新] 资源镜像需(重新)播种：镜像版本=${mirrorVer || '(无)'} 安装区版本=${installed}`);
+  }
   for (const [srcName, dstName] of subs) {
     const src = path.join(res, srcName);
     const dst = path.join(mirror, dstName);
     if (!fs.existsSync(src)) continue;
-    if (!fs.existsSync(dst)) {
-      fs.mkdirSync(path.dirname(dst), { recursive: true });
-      fs.cpSync(src, dst, { recursive: true });
-      console.log(`[更新] 播种资源镜像 ${srcName} -> ${dst}`);
+    if (!fs.existsSync(dst) || needSeed) {
+      try {
+        // 重新播种前清掉旧目录：cpSync 是覆盖式合并，若不先删，**已被上游删除的文件**
+        // 会残留在镜像里继续被后端读到（旧代码复活）。
+        if (needSeed && fs.existsSync(dst)) fs.rmSync(dst, { recursive: true, force: true });
+        fs.mkdirSync(path.dirname(dst), { recursive: true });
+        fs.cpSync(src, dst, { recursive: true });
+        console.log(`[更新] 播种资源镜像 ${srcName} -> ${dst}`);
+      } catch (e) {
+        console.error(`[更新] 播种资源镜像失败 ${srcName}: `, e && e.message);
+      }
     }
   }
+  if (needSeed) writeMirrorVersion(mirror, installed);
   return mirror;
 }
 
@@ -354,7 +396,11 @@ async function runResourceUpdate(info, manual) {
   try {
     await updater.downloadAndUnpackResources(info.latest, info.assets, shaSums, destDir, mirror,
       (f) => { if (manual) console.log(`资源增量下载 ${(f * 100).toFixed(0)}%`); });
-    console.log('[更新] 资源增量已覆盖镜像，重启后端生效');
+    // ⭐ 2026-10-05：把镜像版本标记成**资源版本**。否则下次启动时
+    //   seedResourceMirror 会发现「安装区版本(旧) != 镜像版本」并重新播种安装区旧代码，
+    //   把刚更新好的资源增量**回滚掉**（用户表现为「更新成功但一重启就回到老样子」）。
+    writeMirrorVersion(mirror, info.latest);
+    console.log('[更新] 资源增量已覆盖镜像（版本标记 ' + info.latest + '），重启后端生效');
     const status = await stopBackend().then(startBackend).then(() => backendStatus());
     await dialog.showMessageBox(undefined, {
       type: 'info', title: '更新完成',
@@ -670,18 +716,21 @@ function registerIpc() {
       return { ok: false, error: String(e.message || e) };
     }
   });
+  // ⭐ 桌面版手动更新（2026-10-04）：manual=true —— 主进程内的进度日志打到 ring buffer，
+  // 资源增量完成后重启后端，前端再整页重载拉新资源（UpdateChecker 已处理）。
   ipcMain.handle('updater:applyResource', async () => {
     const current = updateConfig.currentVersion();
     const info = await updater.checkForUpdates(current);
     if (!info.update) return { ok: false, error: '已是最新版本' };
-    const r = await runResourceUpdate(info, false);
+    const r = await runResourceUpdate(info, true);
     return { ok: true, ...r };
   });
   ipcMain.handle('updater:applyFull', async () => {
     const current = updateConfig.currentVersion();
     const info = await updater.checkForUpdates(current);
     if (!info.update) return { ok: false, error: '已是最新版本' };
-    const r = await runFullUpdate(info, false);
+    const r = await runFullUpdate(info, true);
+    // 整包「稍后」分支：runFullUpdate 返回 deferred=true，前端据此恢复选择态
     return { ok: true, ...r };
   });
   ipcMain.handle('config:get', () => ({ ...config, configPath: configPath() }));

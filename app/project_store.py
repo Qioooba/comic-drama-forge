@@ -892,6 +892,11 @@ def _views_of(dir_path: str) -> list:
             "view": os.path.splitext(fn)[0],
             "file": full,
             "size": os.path.getsize(full),
+            # ⭐ 2026-10-05 资产自动刷新：mtime 作为「版本令牌」下发 —— 前端拼成
+            #   ?v=<mtime> 加到图片 URL 上。重生成后 URL 变化 → React 必重挂 <img>、
+            #   浏览器必不命中旧缓存（此前 URL 恒定，轮询虽换回新 JSON，但 <img src>
+            #   没变，用户看到的仍是旧图，误以为「必须手动刷新」）。
+            "mtime": int(os.path.getmtime(full)),
             "url": "/api/assets/" + os.path.relpath(full, ASSETS_DIR).replace(os.sep, "/"),
         })
     return views

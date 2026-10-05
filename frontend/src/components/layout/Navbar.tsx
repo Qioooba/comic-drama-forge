@@ -1,6 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import { useApp } from '@/context/AppContext';
 import { useTheme, type ThemeMode } from '@/context/ThemeContext';
+import { hasDesktopUpdater } from '@/desktop/updater';
+import { UpdateChecker } from '@/components/desktop/UpdateChecker';
 
 /** 键盘焦点环：与 ui/index.tsx 的 FOCUS_RING 保持一致 */
 const FOCUS_RING =
@@ -190,6 +192,9 @@ export function Navbar() {
             </div>
           )}
         </div>
+
+        {/* 桌面版更新入口：仅 Electron 壳渲染（见 UpdateChecker 注释） */}
+        {hasDesktopUpdater() && <UpdateChecker />}
 
         {/* User avatar */}
         <button

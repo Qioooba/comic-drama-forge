@@ -476,8 +476,8 @@ npm run build:win
 ```bash
 # 1. 完成上述两种打包
 # 2. 创建 tag 并推送
-git tag v2.6.2
-git push origin v2.6.2
+git tag v1.2.0
+git push origin v1.2.0
 
 # 3. GitHub Actions 自动运行 .github/workflows/desktop-release.yml
 #    - 烘焙 Python + 收集后端资源
@@ -491,4 +491,4 @@ git push origin v2.6.2
 ---
 
 
-**版本**: 2.6.2 | **日期**: 2026-10-04
+**版本**: 1.2.0（桌面版） | **日期**: 2026-10-05
