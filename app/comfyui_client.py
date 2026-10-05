@@ -46,6 +46,7 @@ from config import (
     CONFLICT_NEGATIVE_TOKENS,
     ENABLE_BLOCKING_ANNOTATION,
     H3_ENABLE_REFINE,
+    H3_COMMON_NOTE_MODE,
     COMFYUI_INPUT_DIR,
     # 景别唯一权威表（分镜构图规范 / 解析顺序都必须由它派生，见 SHOT_CAMERA_SPECS 上方注释）
     SHOT_TYPES,
@@ -576,13 +577,22 @@ def scene_view_prompt_suffix(view_key: str) -> str:
          ``.workbuddy/test/_out/probe_scene_views.py``。
     """
     key = str(view_key or "").strip()
-    if not key or key not in SCENE_VIEW_KEYS:
+    # ⭐ 2026-10-05 场景九宫格：机位句/标签查表支持 4 档（旧逐档）与 9 档（九宫格）两套口径，
+    #   单一来源都在 config（SCENE_VIEW_* 与 SCENE_GRID_*）。
+    #   ⚠️ SCENE_GRID_* 在 config 里**晚于**本文件 import 的 SCENE_VIEW_* 定义，故这里**函数内**
+    #   延迟 import（避免 import 顺序依赖 / 循环），只取三张表。
+    try:
+        from config import SCENE_GRID_VIEW_KEYS, SCENE_GRID_ANGLE_ZH, SCENE_GRID_LABELS
+    except ImportError:
+        SCENE_GRID_VIEW_KEYS, SCENE_GRID_ANGLE_ZH, SCENE_GRID_LABELS = (), {}, {}
+    valid_keys = tuple(SCENE_VIEW_KEYS) + tuple(SCENE_GRID_VIEW_KEYS)
+    if not key or key not in valid_keys:
         return ""
-    angle = SCENE_VIEW_ANGLE_ZH.get(key)
+    angle = SCENE_VIEW_ANGLE_ZH.get(key) or SCENE_GRID_ANGLE_ZH.get(key)
     if not angle:
         return ""
-    label = SCENE_VIEW_LABELS.get(key) or key
-    # 与 base 同空间、只换机位：显式声明「同一场地」是防止模型把四个档理解成四个场地
+    label = SCENE_VIEW_LABELS.get(key) or SCENE_GRID_LABELS.get(key) or key
+    # 与 base 同空间、只换机位：显式声明「同一场地」是防止模型把多档理解成多个场地
     # （一旦理解错，分镜换机位就等于换场景，比没有机位档更糟）。
     # ⚠️ 2026-10-03（B 方案）：旧句尾「建筑形制、空间关系、陈设与光照方向保持不变」里的
     #   「**空间关系**…保持不变」是**反向指令** —— 等于叫模型别动构图，正是 left45/right45
@@ -2554,8 +2564,14 @@ class ComfyUIClient:
 
     @staticmethod
     def build_shot_grid_keyframes_prompt(shot: dict, ref_labels: List[str] = None,
-                                         style: str = "") -> str:
+                                         style: str = "", has_characters: bool = True) -> str:
         """分镜图「**单镜九宫格 · 9 关键帧**」提示词（2026-10-02 用户指定）。
+
+        :param has_characters: 本镜画面内是否有出场角色（默认 True = 旧行为逐字不变）。
+            为 False 时（道具特写/空镜/纯画外音）转发给 :meth:`build_storyboard_prompt`
+            并**改写**九宫格追加段里的「CHARACTER CONSISTENCY」句 —— 否则
+            「the characters … must be IDENTICAL in every one of the nine panels」
+            会暗示画面里有角色，与无人物镜自相矛盾（2026-10-05）。
 
         ⚠️⚠️ **粒度（用户明确纠正，勿再回退）**：「一个 5 秒的分镜就是用的 9 宫格」
           —— 九宫格的 9 个格是**这一个镜头（shot）内随时间推进的 9 个关键帧**：
@@ -2579,7 +2595,8 @@ class ComfyUIClient:
         ⚠️ 分辨率：3x3 后每格仅整图 1/9 面积 → **必须放大整图边长**（调用方负责 size）。
         """
         prompt = ComfyUIClient.build_storyboard_prompt(
-            shot, ref_labels, has_blocking_image=False)
+            shot, ref_labels, has_blocking_image=False,
+            has_characters=has_characters)
         prompt = prompt.replace(
             "TASK: Generate a single storyboard frame.",
             "TASK: Generate ONE image laid out as a 3x3 storyboard sheet (a nine-panel "
@@ -2589,6 +2606,21 @@ class ComfyUIClient:
         # 镜头级的景别/机位/动作摘要（提示词里已含 FRAMING / SCENE AND ACTION，
         # 这里只补「9 关键帧的时间语义」，让模型知道这是时间切片而非空间变体）。
         shot_desc = str(shot.get("description") or "").strip()
+        # 一致性句随 has_characters 切换（2026-10-05）：无角色镜头若照抄「the characters …
+        # must be IDENTICAL in every panel」会暗示画里有角色 → 与 no-humans 禁令矛盾。
+        _consistency = (
+            "CHARACTER CONSISTENCY (critical): the characters, their facial "
+            "identity, hairstyle, costume and props, together with the scene, "
+            "lighting direction and colour grading, must be IDENTICAL in every one "
+            "of the nine panels — only the progression of the action and framing "
+            "changes.\n"
+            if has_characters else
+            "SUBJECT CONSISTENCY (critical): this shot has NO on-screen characters, "
+            "so NO human figure may appear in ANY of the nine panels. The scene, the "
+            "props and their placement, the lighting direction and colour grading "
+            "must be IDENTICAL in every one of the nine panels — only the "
+            "progression of the action and framing changes.\n"
+        )
         prompt += (
             "\n\nGRID LAYOUT (single-shot keyframes): exactly 3 rows by 3 columns, "
             "nine panels in total, reading order left-to-right then top-to-bottom.\n"
@@ -2604,12 +2636,8 @@ class ComfyUIClient:
             "gradually with the camera movement described for this shot, but every "
             "panel still belongs to this one continuous take.\n"
             + (f"Shot content to advance through: {shot_desc}\n" if shot_desc else "")
-            + "CHARACTER CONSISTENCY (critical): the characters, their facial "
-            "identity, hairstyle, costume and props, together with the scene, "
-            "lighting direction and colour grading, must be IDENTICAL in every one "
-            "of the nine panels — only the progression of the action and framing "
-            "changes.\n"
-            "TEXT RULE (important, two different things):\n"
+            + _consistency
+            + "TEXT RULE (important, two different things):\n"
             "- NO content text anywhere in the artwork: no dialogue, no subtitles, "
             "no captions, no signage, no watermark.\n"
             "- DO print a small plain Arabic numeral (1 to 9) in the BOTTOM-LEFT "
@@ -2636,7 +2664,8 @@ class ComfyUIClient:
 
     @staticmethod
     def build_storyboard_prompt(shot: dict, ref_labels: List[str] = None,
-                                has_blocking_image: bool = False) -> str:
+                                has_blocking_image: bool = False,
+                                has_characters: bool = True) -> str:
         """按镜头剧情描述构建分镜图（Qwen-Image-2.1 多参考图编辑）提示词。
 
         :param has_blocking_image: 本次参考图里**已含** 3D 导演台构图基准图
@@ -2644,7 +2673,13 @@ class ComfyUIClient:
             「Blocking — …」空间锚点行：构图已由基准图逐像素给定，再叠一条文字版
             只会在「文字说左、图说右」时制造矛盾（文字是软约束，模型可能二选一）。
             基准图缺失/渲染失败时该参数为 False，行为与旧版完全一致。
-
+        :param has_characters: 本镜**画面内是否有出场角色**（默认 True = 旧行为逐字不变）。
+            为 False（道具特写/空镜/纯画外音）时：① 在 SCENE AND ACTION 段追加一条
+            「NO HUMANS IN FRAME」硬禁令；② 把台词行从「角色在说话（口型）」改写为
+            「画外音/旁白，说话人不在画面里」—— 否则这两处会诱导模型为了让「说话」可见
+            而凭空画一个人，与本镜「无人物」相矛盾。仅对无人物镜生效（2026-10-05）。
+            ⚠️ **不要**复用/耦合 ``has_blocking_image``：基准图缺失时它也为 False，
+            但缺失 ≠ 无人物镜，混用会把有角色镜误当无人物镜加错禁令。
 
         ## 为什么改成官方 <imageN> 协议（2026-09-25）
 
@@ -2860,13 +2895,36 @@ class ComfyUIClient:
                 "pan / track / follow / tilt — from movement within the frame — "
                 f"character or object action): {_mo}.")
         if _dlg_text(shot.get("dialogue")):
-            # 只给说话状态与口型提示，严禁把台词文本写进提示词（模型会把台词当画面字幕画出来）
-            content_lines.append(
-                f"Speaking state: {_dlg_speaker(shot.get('dialogue')) or 'the character'} "
-                f"is quietly saying one short line, shown only as natural lip movement "
-                f"and subtle expression changes.")
+            if has_characters:
+                # 只给说话状态与口型提示，严禁把台词文本写进提示词（模型会把台词当画面字幕画出来）
+                content_lines.append(
+                    f"Speaking state: {_dlg_speaker(shot.get('dialogue')) or 'the character'} "
+                    f"is quietly saying one short line, shown only as natural lip movement "
+                    f"and subtle expression changes.")
+            else:
+                # 2026-10-05：本镜画面内无角色 → 该台词只可能是画外音/旁白。若照抄
+                # 「角色在说话 / 口型」，模型会为了让「说话」可见而凭空画一个人 ——
+                # 正是「无角色镜被人偶污染」的成因之一。改写为「只出声、不画人」。
+                content_lines.append(
+                    "Audio only: this shot carries a line of off-screen voice-over / "
+                    "narration; the speaker is NOT visible in the frame. Represent it as "
+                    "sound only — do NOT draw any person, face, body or lip movement to "
+                    "stand in for the speaker.")
         if shot.get("emotion"):
             content_lines.append(f"Emotion and mood: {shot['emotion']}.")
+        # ---------- 无人物镜头：显式禁人（2026-10-05）----------
+        # 动机：道具特写/空镜（characters_in_shot=[]）历史上会因「台词兜底」被塞进一张 3D
+        # 人偶基准图、或被「角色在说话」措辞误导 → 画面凭空出现人物。此处对这一类镜头显式
+        # 声明画面内不得出现任何人形。⚠️ **仅 has_characters=False 时追加**；有角色镜头
+        # 提示词逐字不变（防回归）。落点在本段（SCENE AND ACTION）内，**不新增协议节**，
+        # 节序契约 TASK→VISUAL BASE→PRIMARY CANVAS→(COMPOSITION BASELINE)→IDENTITY→
+        # REFERENCE ROLES→SCENE/ACTION→LIGHTING→STYLE→PRESERVE 保持不变。
+        if not has_characters:
+            content_lines.append(
+                "NO HUMANS IN FRAME (strict — this shot has no on-screen characters): "
+                "the frame must contain NO human figures, NO faces, NO bodies, NO human "
+                "silhouettes, and NO people reflected or partially entering the frame — "
+                "show only the environment, objects and props described above.")
         # ---------- 程序化站位（TE MAN 3D导演台，软约束）----------
         # 把 shot 的角色站位/机位/景别结构化翻译成一条空间锚点行（Blocking — …），
         # 增强分镜图构图稳定性。这是**软约束**：不新增协议段、不改变 TASK/PRESERVE
@@ -4271,16 +4329,32 @@ class ComfyUIClient:
             name = str(ref.get("name") or "").strip() or f"公共资产{_i + 1}"
             kind = str(ref.get("kind") or "").strip()
             label = _next_label()
+            # ⭐ 2026-10-05 公共参数「相关说明」（H3_COMMON_NOTE_MODE）：把本集专属的
+            #    appearance 设定文案并入说明（此前只进 subjects、公共区看不到）；场景
+            #    说明改九宫格多视角口径。开关关闭时回落旧固定模板（零回归）。
+            _note = H3_COMMON_NOTE_MODE
+            _ap = _appearance(ref)
             if kind == "scene":
-                picture_defs.append((
-                    label, f"{name} 的环境参考，定义场景结构、材质氛围与光照基调"))
+                if _note:
+                    _sc_txt = (f"{name} 的环境参考（9 机位九宫格总览：同一场地的各观察角度"
+                               f"都在这张图里，含空间结构、材质氛围与光照基调）")
+                else:
+                    _sc_txt = f"{name} 的环境参考，定义场景结构、材质氛围与光照基调"
+                if _note and _ap:
+                    _sc_txt += f"；设定：{_ap}"
+                picture_defs.append((label, _sc_txt))
                 continue
             if kind == "item":
-                picture_defs.append((
-                    label, f"物品「{name}」的设定图，定义其形状、材质与配色"))
+                _it_txt = f"物品「{name}」的设定图，定义其形状、材质与配色"
+                if _note and _ap:
+                    _it_txt += f"；设定：{_ap}"
+                picture_defs.append((label, _it_txt))
             else:
                 # character（kind 缺省也走这里：公共池主体就是角色锚点）
-                picture_defs.append((label, _char_desc(name)))
+                _ch_txt = _char_desc(name)
+                if _note and _ap:
+                    _ch_txt += f"；本集设定：{_ap}"
+                picture_defs.append((label, _ch_txt))
             subjects.append({"name": name, "appearance": _appearance(ref),
                              "picture": label})
 

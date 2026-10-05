@@ -1037,6 +1037,80 @@ SCENE_VIEW_MAX_RETRIES = max(0, _env_int("SCENE_VIEW_MAX_RETRIES", 1))
 #:   （如「对峙空地 right45」≈99.2 这类近重复），80~95 一律放行。
 SCENE_VIEW_DUP_PHASH_MAX = 95.0
 
+# ===================== 场景九宫格多视角（2026-10-05 用户指定） =====================
+# 用户要求把场景多视角从「逐档独立出 4 张高清图（front/left45/right45/top）」改为
+# 「一张 3×3 九宫格总图（9 个机位）作为场景资产本体，下游整图直接用」。
+#
+# 技术前提（务必先读，它决定了下面的出图方式）：场景出图是**纯 T2I**
+# （``comfyui_client.generate_scene_base`` 跑 scene_gen 工作流，无参考图槽位）。
+# 单张 prompt 让模型「一张图画 9 个机位」不可靠（``scene_grid.py`` 调研已证伪：
+# 「qwenmultiangle/ComfyUI 官方均无可靠的单 prompt 九宫格，可靠做法是 9 次独立生成 +
+# 拼接」）。故九宫格只能由 **9 次独立出图（逐机位）→ PIL 拼接成一张** 产出
+# （拼接复用 ``scene_grid.stitch_grid``）。
+#
+# ⚠️⚠️ 代价（用户 2026-10-05 三轮确认知悉并选择「彻底关机位对档·纯整图」）：
+#   · 下游（分镜/H3）拿到的场景参考图从「多张独立高清图」变成「一张九宫格总图」，
+#     单格清晰度下降；
+#   · **关闭** ``_pick_scene_view`` 的按机位对档（``RULES_A §A7`` 的核心价值）——
+#     网格模式下所有镜头机位都喂整张九宫格，不再俯拍拿俯视图。
+#   为可回滚，全部改动挂在 ``SCENE_GRID_MODE`` 开关下（**默认 True = 走九宫格**）；
+#   关掉即回落到上面 4 档逐档独立出图 + 按机位选档的旧行为（旧常量 SCENE_VIEW_* 保留）。
+SCENE_GRID_MODE = _env_bool("MJSCXT_SCENE_GRID", True)
+
+#: 九宫格 9 机位的键序（**即九宫格格序**，与 ``scene_grid.stitch_grid`` 的 3×3 排布一致：
+#: 1 行 front/left45/right45，2 行 top/wide/low，3 行 detail/depth/back）。
+#: 单一来源：机位句与标签都从这里取（见 SCENE_GRID_ANGLE_ZH / SCENE_GRID_LABELS），
+#: 出图循环与拼接循环共用同一序列，避免两份清单漂移。
+SCENE_GRID_VIEW_KEYS = ("front", "left45", "right45", "top",
+                        "wide", "low", "detail", "depth", "back")
+
+#: 九宫格各机位 → **出图**机位句（追加进正向 T2I 提示词，决定这张格画哪个机位）。
+#: 前 4 档（front/left45/right45/top）直接**复用** SCENE_VIEW_ANGLE_ZH 的口径
+#: （front/top 是实证有效措辞、left45/right45 是 2026-10-03 B 方案强措辞，逐字不动）；
+#: 后 5 档（wide/low/detail/depth/back）取自 ``scene_grid.SCENE_GRID_ANGLES`` 的同款句，
+#: 保证与手动九宫格预览的机位语义一致。
+#: ⚠️ 每条句**不得出现** ``CHARACTER_WORDS``/``CHARACTER_QTY_RE`` 能命中的词
+#: （人物/人影/人群/士兵…），否则被 ``sanitize_scene_prompt`` 整句丢弃、机位静默失效
+#: （与 SCENE_VIEW_ANGLE_ZH 同约束，改措辞前先跑 probe_scene_views.py）。
+SCENE_GRID_ANGLE_ZH = {
+    "front": SCENE_VIEW_ANGLE_ZH["front"],
+    "left45": SCENE_VIEW_ANGLE_ZH["left45"],
+    "right45": SCENE_VIEW_ANGLE_ZH["right45"],
+    "top": SCENE_VIEW_ANGLE_ZH["top"],
+    "wide": "拉远到大远景机位，整个场景居于画面中央，四周留出大片周围环境",
+    "low": "相机贴近地面向上仰拍，前景物件因透视被放大，天空或顶部结构入画",
+    "detail": "近距离特写场景中最有辨识度的陈设细节，背景浅景深虚化",
+    "depth": "沿场景主轴纵深拍摄，两侧陈设向画面深处汇聚，强调空间透视",
+    "back": "从场景背后向入口方向反打拍摄，呈现与正面相反的空间关系",
+}
+
+#: 九宫格各机位 → 中文标签（供日志/UI/机位句前缀用）。
+SCENE_GRID_LABELS = {
+    "front": "正面全景", "left45": "左前 45°", "right45": "右前 45°",
+    "top": "顶部鸟瞰", "wide": "大远景", "low": "低角度仰拍",
+    "detail": "细节特写", "depth": "纵深透视", "back": "背面反打",
+}
+
+#: 九宫格主图的文件名（落 ``<场景目录>/grid.png``；作为 SCENE_GRID_MODE 下的场景主图，
+#: 资产索引 ``_build_asset_index`` 与下游 ``_pick_scene_view`` 都认它）。
+SCENE_GRID_FILENAME = "grid.png"
+
+#: 九宫格主图 meta 的 derive_mode 标注（``_write_artifact_meta`` 的 extra），
+#: 表明它是「逐机位独立出图 + PIL 拼接」而来（区别于 base.png 的单张 T2I）。
+SCENE_GRID_DERIVE_MODE = "grid_stitch"
+
+# ===================== H3 公共参数「相关说明」提示词（2026-10-05） =====================
+# H3 Director 公共区（global.refs + global.refAudios + commonEnabled）此前只登记参考图/
+# 音频，提示词说明是**写死的通用模板**（"环境参考…/三视图设定图…"），本集专属的
+# `appearance` 设定没并进去、公共音色音频也没有一句用途说明、场景说明还是旧"正面档"
+# 口径（与场景九宫格 SCENE_GRID_MODE 脱节）。本开关打开后，comfyui_client._h3_picture_defs
+# 的公共块做三处增强：① 公共角色/物品/场景说明并入该资产的 `appearance` 设定文案；
+# ② 公共场景说明改九宫格多视角口径（"9 机位总览，同一场地的各观察角度都在这张图里"）；
+# ③ 公共音色参考音频补一句 `<Audio N>` 用途说明（驱动该角色声音）。
+# ⭐ 只改说明文本、不动 <Picture N>/<Audio N> 编号与槽位顺序（零错位风险）；关掉回落到
+# 旧的固定模板说明（回滚点 = 置 False）。
+H3_COMMON_NOTE_MODE = _env_bool("MJSCXT_H3_COMMON_NOTE", True)
+
 # ===================== 正负提示词冲突清理（P0：风格冲突修复） =====================
 # 物品生成.json / 分镜生成.json 的负向词表含「3D渲染、二次元动漫」，场景生成.json 含「3D」，
 # 而正向提示词要求「国漫3D渲染风格」——正负自相矛盾会把 3D 风格压掉（画面风格撕裂）。

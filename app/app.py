@@ -37,13 +37,17 @@ from config import (
     SCENE_VIEW_KEYS, SCENE_VIEW_LABELS, SCENE_VIEW_ANGLE_ZH,
     SCENE_ANGLE_TO_VIEW, SCENE_VIEWS_ENABLED, SCENE_VIEW_MAX_RETRIES,
     SCENE_VIEW_DUP_PHASH_MAX,
+    # 场景九宫格多视角（2026-10-05）：开关 + 9 机位键序 + 机位句/标签 + 主图文件名/derive_mode
+    SCENE_GRID_MODE, SCENE_GRID_VIEW_KEYS, SCENE_GRID_ANGLE_ZH, SCENE_GRID_LABELS,
+    SCENE_GRID_FILENAME, SCENE_GRID_DERIVE_MODE,
     H3_COMMON_REFS, H3_COMMON_REFS_MAX,
     PROJECT_DEFAULT_CONFIG,
     PROMPT_ENHANCE_CONFIG_PATH, save_prompt_enhance_config, _prompt_enhance_file_flags,
 )
 from script_generator import ScriptGenerator
 from comfyui_client import (ComfyUIClient, camera_spec as _camera_spec,
-                            camera_key as _camera_key, camera_angle as _camera_angle)
+                            camera_key as _camera_key, camera_angle as _camera_angle,
+                            BLOCKING_REF_MARK as _BLOCKING_REF_MARK)
 import comfyui_job_store  # 崩溃免重渲检查点（2026-09-29）：种子沿用判据 + 台账查询
 import preview_gate  # 两级生产（2026-09-29）：预演不可交付 + 预演批准
 import novel_screenplay  # 文学剧本层（2026-10-03 两段式生产：文学剧本→改写为分镜表）
@@ -2814,7 +2818,8 @@ def _storyboard_retry_shot_impl():
     _rs_size = style_kit.aspect_size(
         style_kit.aspect_ratio(_rs_style) or style_kit.DEFAULT_RATIO,
         style_kit.storyboard_megapixels())
-    prompt = comfyui_client.build_storyboard_prompt(shot, labels)
+    prompt = comfyui_client.build_storyboard_prompt(
+        shot, labels, has_characters=_shot_has_on_screen(shot))
     refs = _unify_ref_canvas(refs, _rs_size, project)
     # ---- 提示词预检（生成前质检）：先判 → 确定性自愈 → 再出图 ----
     # 目的：把 GPU 花在有问题的提示词上是纯浪费，且出图后质检才发现就已经晚了。
@@ -3968,6 +3973,14 @@ def _generate_asset_task(task_id: str, assets: list, asset_type: str, project_na
                     # 成本口径：正面档**复用刚过质检的 base.png**（不重复烧 GPU），
                     #   只多出 left45 / right45 / top 三档；三档都是**加值**而非必需，
                     #   不达标就丢弃并由下游回落正面档，绝不把资产判 failed。
+                    # ⭐ 2026-10-05 场景九宫格（SCENE_GRID_MODE）：机位档从 4 档扩到 9 档，
+                    #   逐档独立出图后额外用 scene_grid.stitch_grid 拼成一张 3×3 总图
+                    #   grid.png（= 场景资产本体，下游 _pick_scene_view 整图直接用）。
+                    #   关闭时下面全部回落到 4 档旧行为（SCENE_VIEW_*），零回归。
+                    _grid = bool(SCENE_GRID_MODE)
+                    _grid_keys = SCENE_GRID_VIEW_KEYS if _grid else SCENE_VIEW_KEYS
+                    _grid_labels = SCENE_GRID_LABELS if _grid else SCENE_VIEW_LABELS
+                    _grid_angles = SCENE_GRID_ANGLE_ZH if _grid else SCENE_VIEW_ANGLE_ZH
                     view_paths["front"] = base_dst
                     view_gate["front"] = {
                         "accept": True, "blocked": False, "skipped": True,
@@ -3976,11 +3989,11 @@ def _generate_asset_task(task_id: str, assets: list, asset_type: str, project_na
                         "critical_issues": [],
                     }
                     saved_views.append("front")
-                    for vk in SCENE_VIEW_KEYS:
+                    for vk in _grid_keys:
                         if vk == "front":
                             continue
-                        _v_label = SCENE_VIEW_LABELS.get(vk) or vk
-                        _v_angle = SCENE_VIEW_ANGLE_ZH.get(vk) or _v_label
+                        _v_label = _grid_labels.get(vk) or vk
+                        _v_angle = _grid_angles.get(vk) or _v_label
                         _v_dst = os.path.join(asset_dir, f"{vk}.png")
                         _v_gate = None
                         _v_verdict = None       # 最近一次质检原始判据（丢档排障用）
@@ -4116,10 +4129,54 @@ def _generate_asset_task(task_id: str, assets: list, asset_type: str, project_na
                                                      drop_reason="质检判定不达标")
                     # 清掉本档集合内**本轮不再产出**的陈旧机位图（含上一轮/旧实现遗留），
                     # 避免 UI 与资产索引把陈旧机位当成有效档展示。
+                    # ⭐ 2026-10-05 九宫格：known 集合随模式扩展（网格含 9 档 + grid 主图），
+                    #    否则宽机位档（wide/low/detail/depth/back）会被 prune 当陈旧档清掉。
+                    _known_stems = (tuple(ASSET_VIEW_STEMS)
+                                    + (_grid_keys if _grid else tuple(SCENE_VIEW_KEYS)))
+                    if _grid:
+                        _grid_cell_paths = [os.path.join(asset_dir, f"{k}.png")
+                                            for k in _grid_keys
+                                            if os.path.isfile(os.path.join(asset_dir, f"{k}.png"))]
+                        _grid_dst = os.path.join(asset_dir, SCENE_GRID_FILENAME)
+                        if len(_grid_cell_paths) >= 2:
+                            try:
+                                _stitched = scene_grid.stitch_grid(_grid_cell_paths, _grid_dst)
+                                if _stitched and os.path.isfile(_stitched):
+                                    view_paths[SCENE_GRID_FILENAME] = _stitched
+                                    view_gate[SCENE_GRID_FILENAME] = {
+                                        "accept": True, "blocked": False, "skipped": True,
+                                        "label": "九宫格拼接（本地派生）",
+                                        "reason": "9 机位独立出图后本地拼 3×3 总图，继承各档质检",
+                                        "critical_issues": [],
+                                    }
+                                    saved_views.append(SCENE_GRID_FILENAME)
+                                    _write_artifact_meta(
+                                        _stitched, kind="asset_grid", project_name=project_name,
+                                        seed=seed, prompt=orig_asset_prompt,
+                                        workflow_key="scene_gen_grid",
+                                        qc={"accept": True, "skipped": True,
+                                             "label": "拼接总图（继承 9 档质检）"},
+                                        asset_name=name,
+                                        extra={"asset_type": asset_type,
+                                               "derive_mode": SCENE_GRID_DERIVE_MODE,
+                                               "cells": list(_grid_keys),
+                                               "n_cells": len(_grid_cell_paths),
+                                               "style": gen_style or None})
+                                    app.logger.info(
+                                        "[场景九宫格] shot 场景「%s」9 机位独立出图已拼成 3×3 总图 "
+                                        "（%d 格）：%s", name, len(_grid_cell_paths), _stitched)
+                            except Exception as _ge:  # noqa: BLE001
+                                app.logger.warning(
+                                    "场景「%s」九宫格拼接失败（保留各机位档，不阻断入库）：%s",
+                                    name, _ge)
+                        else:
+                            app.logger.warning(
+                                "场景「%s」九宫格可用的机位档不足 2（实得 %d），跳过拼接，"
+                                "下游回落 base.png", name, len(_grid_cell_paths))
                     try:
                         sheet_split.prune_stale_views(
                             asset_dir, keep=tuple(view_paths.keys()),
-                            known=tuple(ASSET_VIEW_STEMS) + tuple(SCENE_VIEW_KEYS),
+                            known=_known_stems,
                             logger=app.logger)
                     except Exception as _pe:  # noqa: BLE001
                         app.logger.warning("清理陈旧视角文件失败（不影响入库）：%s", _pe)
@@ -5426,6 +5483,21 @@ def _build_asset_index(assets: list, project_name: str, kind: str) -> dict:
             )
             if _p:
                 entry[_stem] = _p
+        # ⭐ 2026-10-05 场景九宫格：把 9 机位独立档（wide/low/detail/depth/back 等）
+        #    与拼接总图 grid.png 一并挂进 entry，供 `_pick_scene_view` 的九宫格分支
+        #    按 SCENE_GRID_FILENAME 直接取整图。键只在**文件真实存在**时写入（同上方
+        #    逐档口径），避免给「没这个档」写空串。
+        if kind == "scene":
+            for _stem in tuple(SCENE_GRID_VIEW_KEYS) + (SCENE_GRID_FILENAME,):
+                if _stem in entry:
+                    continue
+                _p = _first_existing(
+                    comfyui_client.resolve_local_path(payload.get(_stem) or ""),
+                    os.path.join(asset_dir_for_name, f"{_stem}.png"),
+                    os.path.join(asset_dir_for_name, f"{_stem}.jpg"),
+                )
+                if _p:
+                    entry[_stem] = _p
         # 场景把**正面档别名到 base.png**：场景不单独产出 front.png（base 本身就是正面
         # 机位出图，见资产 worker 的 scene 分支），但下游 `_pick_scene_view` 的回退链
         # 要按档位名逐级取，别名能省掉「每个调用点各自特判 scene」的分支。
@@ -5606,6 +5678,65 @@ def _match_shot_chars(shot: dict, char_idx: dict) -> list:
         _note_ref_warning(shot, _msg)
         app.logger.warning("[角色参考图] %s", _msg)
     return resolved
+
+
+def _on_screen_characters(shot: dict) -> list:
+    """「本镜画面内可见角色」的**权威口径**（单一来源，2026-10-05）。
+
+    直接委托 :func:`te_3d_director.on_screen_characters` —— 它同时是 3D 导演台
+    ``_parse_characters`` 的实现（``render_blocking → build_render_plan →
+    _parse_characters``）。因此「分镜该不该注入 3D 基准图」的判据与「3D 导演台渲不渲得出
+    人偶」的判据**是同一个函数**，天然同源，不会再出现「A 处说没人、B 处说有人」的分叉。
+
+    ⚠️ 只认剧本的 ``characters_in_shot``；**台词 speaker 可能是画外音，不算出场角色**。
+
+    te_3d_director 不可导入时返回 ``[]``：此时 ``render_blocking`` 同样不可用（本镜本就不会
+    注入基准图），判为「无出场角色」是安全的保守值，不会误注入人偶。
+    """
+    if not isinstance(shot, dict):
+        return []
+    try:
+        import te_3d_director  # noqa: PLC0415
+        return list(te_3d_director.on_screen_characters(shot))
+    except Exception as e:  # noqa: BLE001 - 导演台不可用时保守判为「无出场角色」
+        app.logger.warning("[3D导演台] 解析出场角色失败（按无出场角色处理）：%s", e)
+        return []
+
+
+def _shot_has_on_screen(shot) -> bool:
+    """本镜是否有**画面内出场角色**（读 :func:`_on_screen_characters` 的权威口径）。
+
+    正常路径下 ``_allocate_storyboard_refs`` 已把该口径以 ``shot['_on_screen_chars']``
+    挂回；字段**缺失**时保守返回 ``True``（沿用旧行为）—— 避免某条没走分配器的调用路径被
+    误判成无人物镜、丢掉构图基准图或加错提示词（宁可少禁、不可误禁）。
+    """
+    if not isinstance(shot, dict):
+        return True
+    return bool(shot.get("_on_screen_chars", True))
+
+
+def _shot_has_char_ref(shot) -> bool:
+    """本镜是否有**已命中资产的角色身份参考图**（读 ``_allocate_storyboard_refs`` 挂回的
+    ``shot['_char_ref_names']`` = :func:`_match_shot_chars` 的 ``chars_in``）。
+
+    ## 为什么渲染 3D 人偶基准图还要再过这一关（2026-10-05）
+
+    ``COMPOSITION_BASELINE_SECTION``（comfyui_client.py）要求模型「用其他参考图里的角色
+    **完全覆盖**人偶」。若本镜声明了角色、但角色**资产缺失**（``_match_shot_chars`` 返回
+    ``[]``、``_no_reference=True``），refs 里就只有场景图、**没有角色图可覆盖** → 模型只能
+    照抄人偶，症状与「画外音兜底」逐字相同。故渲染门槛在 ``_shot_has_on_screen``（declared）
+    之外，**还须** ``_shot_has_char_ref``（declared ∩ matched）。
+
+    ⚠️ 本判据是 ``_shot_has_on_screen`` 的**子集**，行为只会更保守（不插 ref、少调一次
+    ``render_blocking``），**不会与渲染器产生矛盾输出**，因此不构成「第三个会分叉的口径」。
+
+    字段**缺失**时保守返回 ``True``：与 :func:`_shot_has_on_screen` 同风格 —— 避免某条未走
+    ``_allocate_storyboard_refs`` 的调用路径被误判成「无角色图」而丢掉基准图（宁可多渲、
+    不可误禁）。注意：真走到渲染前的正常路径**一定**已挂该字段。
+    """
+    if not isinstance(shot, dict):
+        return True
+    return bool(shot.get("_char_ref_names", True))
 
 
 #: 取「半身档」角色参考图的景别集合（近景类）。
@@ -5794,8 +5925,23 @@ def _pick_scene_view(scene_payload: dict, shot) -> str:
     `_build_asset_index` 与历史生产者都填它，但**不一定**同时给 `front`/`base`/`_dir`。
     少了这一档，任何「只填 image」的场景索引都会静默丢场景锚点 —— 这不是假想：
     改完当场被 ``probe_scene_match.py`` 的端到端用例抓出（fixture 就是只填 image 的形态）。
+
+    ⭐ 2026-10-05 场景九宫格（SCENE_GRID_MODE）：**彻底关机位对档、纯整图直接用**。
+       网格模式下场景资产本体是 9 机位拼成的 ``grid.png``，下游**所有镜头机位**都喂
+       这张整图（不再按机位选档）——这是用户 2026-10-05 三轮确认的选择。故函数体
+       第一步就先查 ``grid``；查不到（老项目 / 关网格）才走下面原有的按机位逐级回退。
     """
     payload = scene_payload or {}
+    # ⭐ 九宫格模式：优先整图（grid.png），不再按镜头机位选档（关机位对档）。
+    #    用既有回退链工具保证「网格图缺失时平滑回落旧行为」，绝不返回空。
+    if SCENE_GRID_MODE:
+        _g = comfyui_client.resolve_local_path(payload.get(SCENE_GRID_FILENAME) or "")
+        _gd = payload.get("_dir")
+        _g2 = os.path.join(_gd, SCENE_GRID_FILENAME) if (_gd and os.path.isdir(_gd)) else ""
+        _grid_pick = _first_existing(_g, _g2)
+        if _grid_pick:
+            return _grid_pick
+        # 网格主图缺失（老项目未重跑 / 拼接失败）→ 继续走下方按机位回退，绝不静默丢图。
     target = _scene_view_for_shot(shot)
     order = []
     for k in (target, "front", "base"):
@@ -6104,12 +6250,19 @@ def _ensure_voice_bank_refs(common: list, project_name: str, all_characters=None
 
 
 def _h3_common_ref_audios(common: list, project_name: str) -> list:
-    """从公共池角色收集 voice_bank 参考音色本地路径（2026-10-02 公共参考音色）。
+    """从公共池角色收集 voice_bank 参考音色（2026-10-02 公共参考音色）。
 
     只对 ``kind == character`` 的公共项，取其在 voice_bank 里已登记的参考音频
     （``find_voice_bank_ref``，缺则跳过＝该角色无绑定音色，绝不误挂别的声音）。
-    返回**有序**本地绝对路径列表，供 ComfyUI 侧写进 ``global.refAudios``（index 0..M-1）。
+    返回**有序**的 ``(角色名, 本地绝对路径)`` 列表，供 ComfyUI 侧写进
+    ``global.refAudios``（index 0..M-1）**并**在公共提示词里做**逐行角色归属**
+    （``<Audio N> = 角色名``）。
     无公共角色 / 无音色库 / 全部缺音色 → 返回 ``[]``（零行为变更，走原 generate 无参考）。
+
+    ⭐ 2026-10-05：从「纯路径列表」改为 ``(角色名, 路径)`` 有序对 —— 因为本函数会
+    **跳过无音色的角色**，下游靠公共池顺序反推「哪个 <Audio> 属于谁」会错位；
+    携带角色名才能逐行准确归属。下游两处消费（build 侧取 [1]、subject_lock 侧取 [0]）
+    需同步。
     """
     _char_names = [str(c.get("name") or "").strip()
                    for c in (common or [])
@@ -6135,10 +6288,10 @@ def _h3_common_ref_audios(common: list, project_name: str) -> list:
         if _key in _seen:
             continue
         _seen.add(_key)
-        _out.append(_ref)
+        _out.append((_cn, _ref))
     if _out:
         app.logger.info("[H3公共参考音色] 公共角色音色 %d 支 → global.refAudios：%s",
-                        len(_out), "、".join(os.path.basename(x) for x in _out))
+                        len(_out), "、".join(n for n, _p in _out))
     return _out
 
 
@@ -6180,11 +6333,23 @@ def _h3_common_subject_lock(common: list, common_ref_audios: list,
         _parts.append(" ".join(_lock))
     _M = len(common_ref_audios or [])
     if _M:
-        _a = " ".join(f"<Audio {_i + 1}>" for _i in range(_M))
+        # ⭐ 2026-10-05：音色参考音频**每个单独一行、更显眼、带角色名归属**。
+        # common_ref_audios 现为 ``[(角色名, 路径)]`` 有序对（见 _h3_common_ref_audios）；
+        # index 0..M-1 → <Audio 1..M>，逐行写「<Audio N> = 角色名」，模型不再猜哪支音色是谁。
+        _voice_lines = []
+        for _i, _item in enumerate(common_ref_audios or []):
+            # 兼容：正常是 (名, 路径) 元组；万一上游仍传纯路径字符串，取不到名字就用「角色_{i+1}」。
+            if isinstance(_item, (list, tuple)) and len(_item) >= 1:
+                _vn = str(_item[0] or "").strip() or f"角色{_i + 1}"
+            else:
+                _vn = f"角色{_i + 1}"
+            _voice_lines.append(f"<Audio {_i + 1}> = {_vn}")
         _parts.append(
-            f"Reference voice timbre (shared across every shot): {_a}. "
-            "Match each character's spoken lines to their reference voice; keep the "
-            "timbre consistent.")
+            "VOICE TIMBRE REFERENCE — 本集角色参考音色（贯穿全片共用，逐行对应）:\n"
+            + "\n".join(_voice_lines)
+            + ". Each reference voice drives that character's spoken lines across every "
+              "shot; keep the timbre of each character consistent with its reference "
+              "audio (do not switch between voices for the same character).")
     
     # ---- 公共提示词补全：世界观 + 全局 STYLE（2026-10-03）----
     # 按「推荐放公共参数的内容」表：公共提示词 = 角色定义(上面 subject lock) +
@@ -6238,13 +6403,32 @@ def _allocate_storyboard_refs(shot: dict, char_idx: dict, item_idx: dict, scene_
     （见 generate_storyboard 的 slot_cleared），不会塞重复图。
     """
     chars_in = _match_shot_chars(shot, char_idx)
+    # ⭐ 2026-10-05：把「本镜画面内可见角色」以**单一权威口径**挂回 shot，供调用点的
+    #    3D 构图基准图注入判据复用（见工作线程里 `_shot_has_on_screen(shot)`）。
+    #    ⚠️ 取的是**剧本声明**（characters_in_shot），不是 chars_in（= 声明 ∩ 资产索引命中）：
+    #    `has_characters` **提示词参数**要的正是这个「本镜该不该有人」的剧本意图。
+    shot["_on_screen_chars"] = _on_screen_characters(shot)
+    # ⭐ 2026-10-05：另行挂回**已命中资产的角色名**（= chars_in），专供「渲不渲 3D 基准图」的
+    #    门槛用（见 `_shot_has_char_ref`）。为什么渲染门槛要比提示词门槛更严：人偶基准图必须
+    #    被「其他参考图里的角色」完全覆盖才有意义；角色资产缺失时没有可覆盖的角色图，渲了只会
+    #    被照抄（与本次缺陷同症状）。该判据是 `_on_screen_chars` 的子集，只更保守、不会分叉。
+    shot["_char_ref_names"] = list(chars_in)
     # 2026-09-29：物品与角色/场景同口径——走统一匹配器（原先 `if n in item_idx`
     # 让名字稍有差异的物品**静默不带参考图**，且不打日志）。
     items_in = _resolve_item_names(shot, item_idx, "分镜参考图")
 
     refs = []
-    if not chars_in:
-        # S6：禁止静默 take-first —— 镜头一个角色都匹配不到时，标记 no_reference，
+    # ⭐ 2026-10-05：区分两种「一个角色都没匹配到」——
+    #   (a) characters_in_shot **本就为空** → **合法的无人物镜头**（道具特写/空镜/纯画外音），
+    #       **不得**置 _no_reference、不写 _ref_error（否则会产出误导文案
+    #       「角色 [] 在资产索引中均无匹配」，并让该镜走 S6 报错路径）；
+    #   (b) 声明了角色但 resolve 后一个都没命中 → 保持 S6 行为（置 _no_reference + _ref_error
+    #       + 日志），由调用方决定 400 / 跳过。
+    # ⚠️ 消费方 `if not refs:` 分支（工作线程内）只在前者为「(b) 且无任何其他参考图」时
+    #    才触发；`(a)` 或「有场景图但无角色」的镜头 refs 非空 → 该分支不触发（这正是 shot#1
+    #    以前被「静默放行」的原因）。
+    if not chars_in and (shot.get("_on_screen_chars") or []):
+        # S6：禁止静默 take-first —— 镜头声明了角色却一个都匹配不到时，标记 no_reference，
         # 由调用方决定 400（单镜）/ 跳过 + 警告日志（批量）。
         shot["_no_reference"] = True
         shot["_ref_error"] = (
@@ -6702,6 +6886,12 @@ def _storyboard_worker(task_id: str, project_name: str, shots: list,
                 refs = _unify_ref_canvas(refs, _sb_size, project_name)
                 if not refs:
                     # S6：区分"无参考图"与"角色匹配失败"（_no_reference）
+                    # ⚠️ 2026-10-05：本分支**只**在 refs 完全为空时进入。对「有场景/道具图但
+                    #    无角色」的镜头 refs 非空 → 走 else 分支、**不会**进入这里 —— 这正是
+                    #    shot#1（道具特写 + 场景图，characters_in_shot=[]）以前能「静默通过」
+                    #    并被人偶污染的原因。故这里只处理「(b) 声明了角色却匹配不到 且 无其他
+                    #    任何参考图」的情形；「(a) 本就无人物」的镜头由 _allocate_storyboard_refs
+                    #    决定**不**置 _no_reference（见那里的注释）。
                     if shot.get("_no_reference"):
                         item["no_reference"] = True
                         item["ref_error"] = shot.get("_ref_error") or ""
@@ -6717,9 +6907,19 @@ def _storyboard_worker(task_id: str, project_name: str, shots: list,
                     # ---- TE 3D 导演台：渲染 3D 站位/机位构图基准图（2026-09-30）----
                     # 每镜先渲一张无面人偶站位图 → 作 <image1> 构图基准 → 提示词追加
                     # COMPOSITION BASELINE 段。渲染失败静默降级为纯文字站位锚点（fail-open）。
+                    # ⭐ 2026-10-05（修复「无角色镜头被人偶污染」）：渲人偶基准图需**同时**
+                    #    满足两条（口径见 _shot_has_on_screen / _shot_has_char_ref）：
+                    #      ① 画面内确有出场角色（declared，characters_in_shot 非空）；
+                    #      ② 本镜确有**已命中资产的角色身份参考图**（chars_in 非空）。
+                    #    缺②时（声明了角色但资产缺失，_no_reference=True）refs 里只有场景图、
+                    #    没有角色图可覆盖人偶 → COMPOSITION BASELINE 要求「用其他角色图完全覆盖
+                    #    人偶」无法满足 → 模型照样照抄人偶，症状与本次缺陷一致。故一并挡住。
+                    #    注意：② 是 ① 的**子集**，只更保守（不插 ref / 少调一次渲染），不会分叉。
+                    #    ⚠️ `has_characters` 提示词参数仍只取 ①（declared）—— 见下方与 L2817。
                     from config import ENABLE_3D_BLOCKING_IMAGE
+                    _has_on_screen = _shot_has_on_screen(shot)
                     _blocking_ref_path = ""
-                    if ENABLE_3D_BLOCKING_IMAGE:
+                    if ENABLE_3D_BLOCKING_IMAGE and _has_on_screen and _shot_has_char_ref(shot):
                         try:
                             import te_3d_render
                             if te_3d_render.available():
@@ -6740,7 +6940,12 @@ def _storyboard_worker(task_id: str, project_name: str, shots: list,
                                                      shot_id, os.path.basename(_blocking_ref_path))
                                     item["_blocking_ref"] = _blocking_ref_path
                                     # 插入为第一张参考图（<image1>），后续参考图序号后移
-                                    refs.insert(0, (_blocking_ref_path, "3D构图基准", _blocking_ref_path))
+                                    # ⭐ 标签必须引用常量 _BLOCKING_REF_MARK（= comfyui_client.BLOCKING_REF_MARK，
+                                    #    值 "3D导演台构图基准"），**禁止再写裸字面量**：comfyui_client.build_storyboard_prompt
+                                    #    靠 `BLOCKING_REF_MARK in label` 识别基准图并生成 COMPOSITION BASELINE 段，
+                                    #    字面量与常量一旦漂移（如旧 "3D构图基准" ≠ "3D导演台构图基准"）该段静默缺失、
+                                    #    且人偶被误当 identity anchor（2026-10-05 定位的既有缺陷）。
+                                    refs.insert(0, (_blocking_ref_path, _BLOCKING_REF_MARK, _blocking_ref_path))
                                     # ⭐ 基准图在 _unify_ref_canvas **之后**插入，躲过了归一
                                     #    （2026-10-02）：它是 <image1> 画布定义者，尺寸必须与
                                     #    _sb_size 逐像素一致，否则整个分镜画幅被它带偏。
@@ -6752,11 +6957,13 @@ def _storyboard_worker(task_id: str, project_name: str, shots: list,
                                                shot_id, _3d_e)
                             _blocking_ref_path = ""
                     prompt = (comfyui_client.build_shot_grid_keyframes_prompt(
-                        shot, labels, style=(shot.get("style") or _sb_style))
+                        shot, labels, style=(shot.get("style") or _sb_style),
+                        has_characters=_has_on_screen)
                         if _sb_grid_mode
                         else comfyui_client.build_storyboard_prompt(
                             shot, labels,
-                            has_blocking_image=bool(_blocking_ref_path)))
+                            has_blocking_image=bool(_blocking_ref_path),
+                            has_characters=_has_on_screen))
                     item["prompt"] = prompt
                     orig_prompt = prompt      # 教训库的稳定键：改写后的提示词不参与指纹
                     item["refs"] = {r[0]: os.path.basename(os.path.dirname(r[2])) for r in refs}
@@ -8164,7 +8371,10 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
             # ⭐ 公共参考音色 + 公共提示词 subject lock（2026-10-02）：统一派生，
             #    预演/正式两个调用点共用同一份，避免两处口径漂移。
             _ensure_voice_bank_refs(_common, project_name, all_characters=char_idx)
+            # ⭐ 2026-10-05：_h3_common_ref_audios 现返回 [(角色名, 路径)] 有序对。
+            # subject_lock 用完整对（逐行「<Audio N> = 角色名」归属）；build 侧要纯路径列表。
             _common_audios = _h3_common_ref_audios(_common, project_name)
+            _common_audio_paths = [p for (_n, p) in _common_audios]
             # ⭐ 公共提示词补全（2026-10-03）：世界观 + 全局 STYLE 也进公共段（与角色锁定一致
             #    拼在每段提示词前）。世界观优先取 AI 设定面板的 era_world，缺则取项目 brief。
             _cw_style = str(_style_res.get("style") or style or "").strip()
@@ -8418,7 +8628,7 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
                             qc_style=eff_style,
                             max_retries=0,      # 预演不重试：要改就重出一版预演
                             common_refs=[c["path"] for c in _common if c.get("path")],
-                            common_ref_audios=_common_audios,
+                            common_ref_audios=_common_audio_paths,
                             common_prompt=_common_prompt,
                         )
                     except Exception as _pv_err:                       # noqa: BLE001
@@ -8529,7 +8739,7 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
                                              f"{episode_tag or 'episode'}_s{_sn:02d}"),
                             timeout_per_segment=timeout_per_segment, size=_size,
                             common_refs=[c["path"] for c in _common if c.get("path")],
-                            common_ref_audios=_common_audios,
+                            common_ref_audios=_common_audio_paths,
                             common_prompt=_common_prompt,
                             build_only=True, save_build_to=_sp)
                         _wfo = (_r or {}).get("workflow")
@@ -8587,7 +8797,7 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
                         qc_style=eff_style, max_retries=max_retries,
                         qc_stop_cb=(_ep_qc_stop_cb if qc_on else None),
                         common_refs=[c["path"] for c in _common if c.get("path")],
-                        common_ref_audios=_common_audios,
+                        common_ref_audios=_common_audio_paths,
                         common_prompt=_common_prompt)
                     _sf = (_sres or {}).get("files") or []
                     if not _sf or not os.path.isfile(_sf[0]):
@@ -8689,7 +8899,7 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
                 common_refs=[c["path"] for c in _common if c.get("path")],
                 # ⭐ 公共参考音色（2026-10-02 取代逐段配音）：公共角色的 voice_bank 参考音
                 #   → global.refAudios（index 0..M-1）；无公共角色/无音色 → 空（零行为变更）。
-                common_ref_audios=_common_audios,
+                common_ref_audios=_common_audio_paths,
                 # ⭐ 公共提示词 subject lock（2026-10-02）：角色/物品/场景锁定 + 公共音色
                 #   指代，编号与 global.refs/refAudios 逐位对齐（<Picture 1..K>/<Audio 1..M>）。
                 common_prompt=_common_prompt,
@@ -11448,9 +11658,12 @@ def _qc_ref_images(shot: dict, char_idx: dict, item_idx: dict, scene_idx: dict,
     if not out:
         # 兜底：本镜没登记角色/物品时，用生成侧实际用的那几张（至少保住场景锚点）
         # ⚠️ 2026-10-02 修复：必须**跳过构图基准图**。生成侧 refs 的第 1 项可能是
-        #    `("3D构图基准", ...)`（见下方 refs.insert(0, (..., "3D构图基准", ...))）——
+        #    `(_blocking_ref_path, _BLOCKING_REF_MARK, ...)`（见上方 refs.insert(0, ...)，
+        #    标签现为常量 _BLOCKING_REF_MARK = "3D导演台构图基准"）——
         #    那是**无面人偶预演图**，实测把它当设定图送检会严重污染判定
         #    （同图 score 88 → 35，且诱发臆造缺陷，见 qc_client.check_image 的定论）。
+        #    ⭐ 下方过滤判据 `"构图基准" in _kind/_label` 对新旧标签（"3D构图基准"/
+        #    "3D导演台构图基准"）都命中，无需随标签改动。
         #    原先兜底无差别收下 refs，等于从「质检输入」这个后门把基准图放了回去。
         for r in (fallback_refs or []):
             if not (isinstance(r, (list, tuple)) and len(r) >= 3):

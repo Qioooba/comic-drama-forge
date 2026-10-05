@@ -213,26 +213,52 @@ def _entity_id(prefix: str, idx: int) -> str:
     return f"{prefix}_{idx}"
 
 
-def _parse_characters(shot: dict) -> List[str]:
-    """从 shot 取出场角色名单（characters_in_shot 优先，回落 dialogue speaker）。"""
+def on_screen_characters(shot: dict) -> List[str]:
+    """「本镜画面内可见角色」的**唯一权威解析**（= 剧本 ``characters_in_shot``）。
+
+    ## 口径（2026-10-05 统一，勿再分叉）
+
+    ``characters_in_shot`` 是剧本对**画面内可见角色**的权威声明。
+    **台词 speaker 不是**出场角色 —— 画外音 / 旁白 / 电话另一头的声音都可以有
+    speaker，但画面里一个人都没有。把 speaker 当成出场角色，会让「本该无人的道具
+    特写镜」凭空多出一个（无面）人物，正是「本镜不该有人却有人」的根因。
+
+    本函数是唯一来源：``te_3d_director`` 内部（``build_scene_json`` /
+    ``build_composition_prompt`` / ``build_render_plan`` / ``block_annotation`` /
+    ``blocking_spec_text``）与 ``app.py`` 的 3D 基准图注入判据**都调用它**，
+    一处定义 → 多处同源。
+
+    :param shot: 剧本镜头对象。
+    :return: 归一化后的出场角色名列表（切分 → 去重保序 → 上限 6）。
+    """
     chars = shot.get("characters_in_shot") or []
     if isinstance(chars, str):
         chars = [c.strip() for c in re.split(r"[，,、/]", chars) if c.strip()]
     chars = [c for c in chars if c]
-    if not chars:
-        # 回落：从台词里取 speaker（去重、保序）
-        seen: List[str] = []
-        for d in (shot.get("dialogue") or []):
-            sp = str((d or {}).get("speaker") or "").strip()
-            if sp and sp not in seen and sp not in ("旁白", "众人"):
-                seen.append(sp)
-        chars = seen
     # 去重保序 + 上限（导演台一般摆 1-3 人）
     uniq: List[str] = []
     for c in chars:
         if c not in uniq:
             uniq.append(c)
     return uniq[:6]
+
+
+def _parse_characters(shot: dict) -> List[str]:
+    """从 shot 取出场角色名单（**只认 characters_in_shot**，与 on_screen_characters 同源）。
+
+    ⚠️ 2026-10-05（修复「无角色镜头被 3D 人偶基准图污染」）：**删除了「characters_in_shot
+    为空时回落台词 speaker」的兜底**。原兜底使本函数与 ``app.py`` 的 ``_match_shot_chars``
+    （只读 characters_in_shot）口径不一致：道具特写镜（characters_in_shot=[]，仅画外音
+    台词）被 3D 导演台判为「有角色」→ 渲出一张无面人偶基准图 → 作 ``<image1>`` 注入分镜
+    提示词，而 ``COMPOSITION BASELINE`` 段要求「用其他参考图里的角色完全覆盖人偶」——
+    本镜根本没有角色参考图可覆盖 → 模型只能照抄人偶。
+
+    🔁 **回滚点**：若某日确实需要恢复「按台词 speaker 当出场角色」的旧行为，**不要**在本
+    函数里加回兜底（那会让两处口径再次分叉、重现同一缺陷）；正确做法是让剧本侧**先**把
+    画外音说话人写进 ``characters_in_shot``（或另立显式「出场角色」字段），再让本函数与
+    ``app.py`` **同时**消费该字段。恢复前提：确认该 speaker 确实**在画面内**说话（非画外音）。
+    """
+    return on_screen_characters(shot)
 
 
 def _position_for_index(idx: int, total: int,
