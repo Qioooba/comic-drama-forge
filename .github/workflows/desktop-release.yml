@@ -205,7 +205,6 @@ jobs:
           draft: false
           prerelease: false
           generate_release_notes: false
-          delete: true
           files: |
             dist/comic-drama-forge-Portable-${{ needs.build-win.outputs.version }}.exe
             dist/resources-${{ needs.build-win.outputs.version }}.zip
