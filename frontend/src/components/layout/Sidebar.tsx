@@ -103,7 +103,7 @@ export function Sidebar({
       <div className="border-t border-line p-4">
         {!collapsed && (
           <p className="hidden text-center text-xs text-ink-3 md:block">
-            v1.0.0 • AI Powered
+            {`v${__APP_VERSION__}`} • AI Powered
           </p>
         )}
       </div>

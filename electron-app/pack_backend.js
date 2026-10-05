@@ -76,6 +76,29 @@ function main() {
   if (fs.existsSync(mainPyDst)) fs.rmSync(mainPyDst, { force: true });
   fs.mkdirSync(OUT, { recursive: true });
 
+  // ⭐ 前端构建产物（2026-10-04，顺序修正 2026-10-05）：Flask 提供的前端 UI 来自
+  //   app/static（vite 构建输出）。**必须放在下方「收集源码」之前** ——
+  //   否则 copyDirRec 会把「上一版」的 app/static 收进 _backend（若 app/static 刚被
+  //   清空，甚至收进一个空目录），导致打包出的前端永远是旧的/缺失。
+  //   症状：明明重新打包了却「什么都没变」，且全程无任何报错，极难定位。
+  //   构建失败仅警告（沿用 app/static 旧产物），不阻塞后端资源收集。
+  const FE_SRC = path.join(ROOT, 'frontend');
+  const FE_STATIC = path.join(ROOT, 'app', 'static');
+  if (fs.existsSync(path.join(FE_SRC, 'package.json'))) {
+    try {
+      const { execSync } = require('node:child_process');
+      const t0 = Date.now();
+      execSync('npm run build', { cwd: FE_SRC, stdio: 'pipe', timeout: 600000 });
+      const distOk = fs.existsSync(FE_STATIC);
+      console.log(`[前端] vite 构建完成（${Math.round((Date.now() - t0) / 1000)}s），static/ ${distOk ? '已更新' : '未生成（请检查 frontend 构建）'}`);
+    } catch (e) {
+      const msg = (e && e.message ? String(e.message) : String(e)).split('\n').slice(0, 6).join(' | ');
+      console.warn('[前端] vite 构建失败（沿用 app/static 旧产物，不阻塞打包）：' + msg);
+    }
+  } else {
+    console.warn('[前端] 未找到 frontend/package.json，跳过前端构建（沿用既有 app/static）');
+  }
+
   // 2. 收集源码
   for (const name of dirItems) {
     const src = path.join(ROOT, name);
@@ -94,26 +117,47 @@ function main() {
     console.warn('[跳过] main.py 源缺失');
   }
 
-  // ⭐ 前端构建产物（2026-10-04）：Flask 提供的前端 UI 来自 app/static（vite 构建输出），
-  // 资源增量/整包更新包都要带上最新前端 —— 但 pack_backend 此前**不会构建前端**，
-  // 更新包里的 static/ 是上次构建期残留，导致「手动更新后前端仍是旧的」。
-  // 现在：若本地有前端源码，就先跑一遍 vite build，让上面的目录收集自然带上最新产物。
-  // 构建失败仅警告（沿用 app/static 旧产物），不阻塞后端资源收集。
-  const FE_SRC = path.join(ROOT, 'frontend');
-  const FE_STATIC = path.join(ROOT, 'app', 'static');
-  if (fs.existsSync(path.join(FE_SRC, 'package.json'))) {
-    try {
-      const { execSync } = require('node:child_process');
-      const t0 = Date.now();
-      execSync('npm run build', { cwd: FE_SRC, stdio: 'pipe', timeout: 600000 });
-      const distOk = fs.existsSync(FE_STATIC);
-      console.log(`[前端] vite 构建完成（${Math.round((Date.now() - t0) / 1000)}s），static/ ${distOk ? '已更新' : '未生成（请检查 frontend 构建）'}`);
-    } catch (e) {
-      const msg = (e && e.message ? String(e.message) : String(e)).split('\n').slice(0, 6).join(' | ');
-      console.warn('[前端] vite 构建失败（沿用 app/static 旧产物，不阻塞打包）：' + msg);
+  // ⭐ 安全子集 .env（2026-10-05）：桌面版一直**不带任何 .env** 出厂，
+  //   而后端靠 .env 拿 COMFYUI_ROOT / MODELS_DIR 等**路径类**配置。
+  //   后果（实测）：桌面版 COMFYUI_ROOT 为空 → MODELS_DIR 为空 → 前端「超分」
+  //   报「FlashVSR 模型缺失」、TTS 报「模型根目录不存在（已尝试 ..\ComfyUI\...）」，
+  //   而实际上 ComfyUI 与模型都完全正常 —— 纯误报。
+  //   这里把项目根 .env 里**路径/URL 类**的键过滤出来单独下发；密钥一律剔除。
+  //   ⚠️ 绝不可整份下发：本机 .env 含 MJSCXT_SECRET_KEY（密钥库主密钥）。
+  //   落点 _backend/.env → electron-builder extraResources 拷到 resources/.env
+  //   → main.js 的 seedResourceMirror 播种到资源镜像根 → env_loader._resolve_env_path
+  //   的「源根兜底」正好命中 <镜像根>/.env。
+  const envSrc = path.join(ROOT, '.env');
+  const envDst = path.join(OUT, '.env');
+  const ENV_DENY = /(SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|APIKEY|API_KEY|_KEY$|KEY_)/i;
+  function isSafeEnvKey(k) {
+    if (!/^[A-Z][A-Z0-9_]*$/.test(k)) return false;
+    if (ENV_DENY.test(k)) return false;
+    return /^(COMFYUI_|MODELS_|MJSCXT_)/.test(k) || k === 'DEPLOY_PROFILE';
+  }
+  const kept = [];
+  const dropped = [];
+  {
+    const lines = ['# 由 pack_backend.js 从项目根 .env 过滤生成（仅路径/URL 类，密钥已剔除）'];
+    if (fs.existsSync(envSrc)) {
+      for (const raw of fs.readFileSync(envSrc, 'utf8').split(/\r?\n/)) {
+        const line = raw.trim();
+        if (!line || line.startsWith('#')) continue;
+        const eq = line.indexOf('=');
+        if (eq < 0) continue;
+        const key = line.slice(0, eq).trim();
+        if (isSafeEnvKey(key)) {
+          lines.push(line);
+          kept.push(key);
+        } else {
+          dropped.push(key);
+        }
+      }
+    } else {
+      lines.push('# （项目根未找到 .env，本文件为空；桌面版将使用内置默认值）');
     }
-  } else {
-    console.warn('[前端] 未找到 frontend/package.json，跳过前端构建（沿用既有 app/static）');
+    fs.writeFileSync(envDst, lines.join('\n') + '\n', 'utf8');
+    console.log(`[收集] .env 安全子集：保留 [${kept.join(', ') || '无'}]，剔除 [${dropped.join(', ') || '无'}]`);
   }
 
   // 3. 校验 Python 运行时

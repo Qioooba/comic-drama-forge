@@ -1108,6 +1108,15 @@ def ensure_dirs():
               ITEMS_DIR, SCENES_DIR, STORYBOARDS_DIR, VIDEOS_DIR, FINAL_DIR, NOVELS_DIR, QC_DIR,
               AI_CHAT_DIR, UPSCALE_DIR, DUB_DIR, DUB_MIX_DIR, PROJECTS_DIR, PROJECT_TRASH_DIR,
               CONTINUITY_DIR]:
-        os.makedirs(d, exist_ok=True)
-
+        try:
+            os.makedirs(d, exist_ok=True)
+        except PermissionError as e:
+            # ⭐ 2026-10-05：桌面版嵌入式 Python 运行时 PROJECT_DATA_DIR 可能是
+            #   尚未创建的深层路径（%APPDATA%\mjscxt-desktop\mjscxt-data），
+            #   旧代码直接 makedirs 抛 PermissionError → 模块导入失败 → 进程崩溃。
+            #   现在捕获并降级（记录警告，不阻断启动），后续代码若因目录缺失出错，
+            #   各路径已在模块顶部定义，不会二次崩溃。
+            import logging
+            logging.getLogger(__name__).warning(
+                "无法创建数据目录 %s（权限不足），该目录相关功能将不可用：%s", d, e)
 ensure_dirs()

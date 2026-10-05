@@ -1,5 +1,26 @@
 # 漫剧工坊 - 桌面应用部署指南
 
+## ⚠️ 重要：桌面版 EXE 不要放在 WorkBuddy 工作区目录里运行
+
+**实测结论（2026-10-05 对照实验）**：Electron 打包产物只要位于
+`C:\Users\liujianghua\WorkBuddy\...` 之内，启动就会**瞬间静默死亡**——
+无窗口、无提示、`desktop.log` 一行都不写（死点在 JS 执行之前）。
+
+崩溃指纹（想自己确认时按这个找）：
+- 退出码 `-2147483645`（= `0x80000003` STATUS_BREAKPOINT）
+- stderr 出现 `Received fatal exception EXCEPTION_BREAKPOINT`，栈内含 `IsSandboxedProcess`
+- 加 `--no-sandbox` 不再崩，但接着报 `process_singleton_win.cc(465) Lock file can not be created! Error code: 5`
+- `%APPDATA%\mjscxt-desktop\desktop.log` **零新增**（关键判别特征）
+
+**正确做法**：把打包产物复制到工作区之外的普通目录再运行，例如
+`C:\Users\liujianghua\mjscxt_desktop\desktop-app\`（本机已验证可出窗口）。
+同一份字节换个目录就能跑 —— 与路径长度、中文路径均无关。
+
+**另一个假故障**：`comic-drama-forge-Portable-*.exe` 首次启动要**约 65 秒**静默
+自解压约 280MB 到 `%TEMP%`，期间"任务管理器里有进程、但没有任何界面"。
+这段时间**不要重复双击**（第二次会因单实例锁直接静默退出）。想避免等待，
+请用 Setup 安装版，或直接运行解压好的目录版。
+
 ## 快速开始
 
 ### 方法一：Web模式（推荐）

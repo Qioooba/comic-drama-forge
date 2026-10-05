@@ -316,7 +316,10 @@ function seedResourceMirror() {
   const needSeed = !mirrorExists || mirrorVer !== installed;
   // 安装区目录名 → 镜像目录名：后端源码在安装区叫 backend，镜像内仍叫 app
   // （后端代码里的相对引用不变，只有安装区这层名字避让 .asar / app 冲突）。
-  const subs = [['backend', 'app'], ['workflows', 'workflows'], ['locales', 'locales']];
+  // ⚠️ '.env' 是**文件**（安全子集配置，见 pack_backend.js）：播种时要区分文件/目录，
+  //    否则 rmSync/cpSync 的 recursive 语义会按目录处理而抛错。
+  const subs = [['backend', 'app'], ['workflows', 'workflows'], ['locales', 'locales'],
+                ['.env', '.env']];
   if (needSeed) {
     console.log(`[更新] 资源镜像需(重新)播种：镜像版本=${mirrorVer || '(无)'} 安装区版本=${installed}`);
   }
@@ -326,11 +329,15 @@ function seedResourceMirror() {
     if (!fs.existsSync(src)) continue;
     if (!fs.existsSync(dst) || needSeed) {
       try {
-        // 重新播种前清掉旧目录：cpSync 是覆盖式合并，若不先删，**已被上游删除的文件**
+        // 重新播种前清掉旧目标：cpSync 是覆盖式合并，若不先删，**已被上游删除的文件**
         // 会残留在镜像里继续被后端读到（旧代码复活）。
-        if (needSeed && fs.existsSync(dst)) fs.rmSync(dst, { recursive: true, force: true });
+        if (needSeed && fs.existsSync(dst)) {
+          if (fs.statSync(dst).isDirectory()) fs.rmSync(dst, { recursive: true, force: true });
+          else fs.rmSync(dst, { force: true });
+        }
         fs.mkdirSync(path.dirname(dst), { recursive: true });
-        fs.cpSync(src, dst, { recursive: true });
+        if (fs.statSync(src).isDirectory()) fs.cpSync(src, dst, { recursive: true });
+        else fs.copyFileSync(src, dst);
         console.log(`[更新] 播种资源镜像 ${srcName} -> ${dst}`);
       } catch (e) {
         console.error(`[更新] 播种资源镜像失败 ${srcName}: `, e && e.message);

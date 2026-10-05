@@ -106,6 +106,158 @@ def _load_flask_app():
     return flask_app
 
 
+# =======================================================================
+# 进程日志落盘（2026-10-05，二次修正：提前到 exec app.py 之前）
+# =======================================================================
+# 背景：桌面版（Electron）spawn 的是**本文件**（python.exe app/serve.py，cwd=资源镜像），
+#   而 main.py 的 _redirect_frozen_logs() 在打包布局下**根本不会被调用** ——
+#   main.py 在 resources/ 根、serve.py 在资源镜像里，spawn 的是后者。
+#   读取侧 log_viewer._resolve_log_dir() 读的是
+#   <MJSCXT_DATA_DIR>/logs/serve_stdout.log，故写入侧必须落到同一路径。
+#
+# ⚠️ 为什么必须**在顶层、且在 `app = _load_flask_app()` 之前**执行：
+#   1) `app = _load_flask_app()` 会 exec 整份 app.py，import 期就会打出一批关键日志
+#      （AI 前置自检不通过、密钥库初始化、script_generator 缺 key 等）。
+#      若重定向发生在其后，这批日志只会进 Electron 管道，**永远不进文件**，
+#      而前端「运行日志」页只读文件 → 用户看到的仍是空白页。
+#   2) 放在第三方 import 之前，logging 的 handler 尚不存在，之后任何模块
+#      basicConfig 时拿到的就是本文件流 —— 无需事后修补（下面的 re-point 仅作保险）。
+#   本模块没有任何其他模块 import 它（serve.py 是入口），顶层副作用可控。
+#   非桌面/非打包场景（MJSCXT_DATA_DIR 未设置且非 frozen）直接 return，行为不变。
+#
+# 两个必须遵守的坑（main.py 同款，实测踩过）：
+#   1. 不要用 os.dup2：后台方式启动时控制台句柄失效 → 退出写日志 OSError(9)
+#      → CPython 'lost sys.stderr' abort。只换 sys.stdout/sys.stderr 对象。
+#   2. 日志文件句柄必须模块级持有：被 GC 回收会连带关掉正在写的流。
+_LOG_FH = None
+
+
+class _Tee:
+    """把写入同时送给「原始流」和「日志文件」。
+
+    为什么要 tee 而不是直接替换：
+      · 日志文件侧是给前端「运行日志」页读的（log_viewer 按同一路径读）；
+      · 原始流侧是 Electron 主进程的管道（main.js 的环形缓冲，菜单「后端 → 查看日志」用）。
+    直接 ``sys.stdout = fh`` 会让其中一侧彻底失声（2026-10-05 用户反馈：
+    桌面版日志页只有一行 '[serve] log redirected to: ...'，因为 logging 的
+    StreamHandler 早在模块导入期就绑定了旧管道，替换 sys.stdout 改不到它）。
+
+    实现约束（沿用 main.py 踩过的坑）：
+      · 不用 os.dup2（后台启动时控制台句柄失效 → 退出期 OSError(9) → abort）；
+      · 只做 Python 层的对象替换，写文件失败绝不抛（日志系统不能反过来搞挂服务）。
+    """
+
+    def __init__(self, primary, mirror):
+        self._primary = primary
+        self._mirror = mirror
+
+    def write(self, data):
+        n = 0
+        for stream in (self._primary, self._mirror):
+            if stream is None:
+                continue
+            try:
+                n = stream.write(data)
+            except Exception:  # noqa: BLE001 任一目标失败都不影响另一侧
+                pass
+        return n
+
+    def writelines(self, lines):
+        for line in lines:
+            self.write(line)
+
+    def flush(self):
+        for stream in (self._primary, self._mirror):
+            if stream is None:
+                continue
+            try:
+                stream.flush()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def isatty(self):
+        return False
+
+    def fileno(self):
+        # 让需要真实 fd 的调用方拿到文件句柄（不是管道）
+        try:
+            return self._mirror.fileno()
+        except Exception:  # noqa: BLE001
+            raise OSError('no fileno')
+
+
+def _redirect_process_logs() -> None:
+    """把本进程 stdout/stderr 追加写到日志文件（与 log_viewer 读侧同路径）"""
+    global _LOG_FH
+    # 幂等：本函数在模块导入期已先调用过一次（赶在 exec app.py 之前）。
+    # __main__ 里那次调用保留作保险，故这里必须幂等，否则会开出第二个文件句柄。
+    if _LOG_FH is not None:
+        return
+    try:
+        _data_dir = (os.environ.get('MJSCXT_DATA_DIR') or '').strip()
+        if _data_dir:
+            log_dir = os.path.join(_data_dir, 'logs')
+        elif getattr(sys, 'frozen', False):
+            log_dir = os.path.join(os.path.dirname(os.path.abspath(sys.executable)), 'logs')
+        else:
+            return  # 源码/计划任务模式由 run_serve.bat 重定向，保持原行为
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, 'serve_stdout.log')
+        _orig = (sys.stdout, sys.stderr)
+        fh = open(log_path, 'a', encoding='utf-8', errors='replace', buffering=1)
+        try:
+            fh.reconfigure(encoding='utf-8', errors='replace', line_buffering=True)
+        except Exception:  # noqa: BLE001 某些流不支持 reconfigure
+            pass
+        _LOG_FH = fh
+        tee_out = _Tee(_orig[0], fh)
+        tee_err = _Tee(_orig[1], fh)
+        sys.stdout = tee_out
+        sys.stderr = tee_err
+
+        # ⭐ 关键一步：logging 的 StreamHandler 在本模块 import 期（被别的模块
+        #   basicConfig 触发）就已经绑定了**旧的** sys.stderr（管道）。只替换
+        #   sys.stdout/sys.stderr 不会改到已存在的 handler —— 那些日志会继续走管道，
+        #   日志文件里一条不落（这正是「日志页只有 redirect 横幅」的真正原因）。
+        #   这里把「指向旧流的 handler」改指到新的 tee 上，读/写两侧才真正对齐。
+        try:
+            _loggers = [logging.root]
+            for _name in list(logging.root.manager.loggerDict.keys()):
+                _loggers.append(logging.getLogger(_name))
+            for _lg in _loggers:
+                for _h in list(getattr(_lg, 'handlers', []) or []):
+                    if not isinstance(_h, logging.StreamHandler):
+                        continue
+                    _stream = getattr(_h, 'stream', None)
+                    if _stream is _orig[0]:
+                        _h.setStream(tee_out)
+                    elif _stream is _orig[1]:
+                        _h.setStream(tee_err)
+        except Exception as _e:  # noqa: BLE001 handler 重定向失败不影响服务启动
+            sys.stderr.write(f'[serve] logging handler re-point failed (ignored): {_e}\n')
+
+        def _restore():
+            try:
+                if _LOG_FH is not None:
+                    try:
+                        _LOG_FH.flush()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    sys.stdout, sys.stderr = _orig
+                    _LOG_FH.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+        atexit.register(_restore)
+        sys.stdout.write(f'[serve] log redirected to: {log_path}\n')
+        sys.stdout.flush()
+    except Exception as _e:  # noqa: BLE001 重定向失败绝不阻塞启动
+        print(f'[serve] log redirect failed (ignored): {_e}')
+
+# 导入期立即生效：必须在 `app = _load_flask_app()` 之前（见上方说明）。
+_redirect_process_logs()
+
+
 app = _load_flask_app()
 
 logger = logging.getLogger("serve")
@@ -220,66 +372,6 @@ def _install_shutdown_hooks() -> None:
     atexit.register(_atexit_stop)
     logger.info("已注册 atexit 优雅停机兜底")
 
-
-
-# =======================================================================
-# 进程日志落盘（2026-10-05）—— 修复桌面版「日志文件不存在」的真正根因
-# =======================================================================
-# 背景：桌面版（Electron）spawn 的是**本文件**（python.exe app/serve.py，cwd=资源镜像），
-#   而 main.py 的 _redirect_frozen_logs() 在打包布局下**根本不会被调用** ——
-#   main.py 在 resources/ 根、serve.py 在资源镜像里，spawn 的是后者。
-#   后果：本进程 stdout/stderr 没有任何落盘，而前端「日志」页按
-#   log_viewer._resolve_log_dir() 去读 <MJSCXT_DATA_DIR>/logs/serve_stdout.log
-#   → 永远「日志文件不存在」。
-# 现在：入口处直接把 stdout/stderr 镜像到日志文件，与读取侧严格对齐。
-#   非桌面/非打包场景（MJSCXT_DATA_DIR 未设置且非 frozen）保持原样，不落这份日志。
-# 两个必须遵守的坑（main.py 同款，实测踩过）：
-#   1. 不要用 os.dup2：后台方式启动时控制台句柄失效 → 退出写日志 OSError(9)
-#      → CPython 'lost sys.stderr' abort。只换 sys.stdout/sys.stderr 对象。
-#   2. 日志文件句柄必须模块级持有：被 GC 回收会连带关掉正在写的流。
-_LOG_FH = None
-
-
-def _redirect_process_logs() -> None:
-    """把本进程 stdout/stderr 追加写到日志文件（与 log_viewer 读侧同路径）"""
-    global _LOG_FH
-    try:
-        _data_dir = (os.environ.get('MJSCXT_DATA_DIR') or '').strip()
-        if _data_dir:
-            log_dir = os.path.join(_data_dir, 'logs')
-        elif getattr(sys, 'frozen', False):
-            log_dir = os.path.join(os.path.dirname(os.path.abspath(sys.executable)), 'logs')
-        else:
-            return  # 源码/计划任务模式由 run_serve.bat 重定向，保持原行为
-        os.makedirs(log_dir, exist_ok=True)
-        log_path = os.path.join(log_dir, 'serve_stdout.log')
-        _orig = (sys.stdout, sys.stderr)
-        fh = open(log_path, 'a', encoding='utf-8', errors='replace', buffering=1)
-        try:
-            fh.reconfigure(encoding='utf-8', errors='replace', line_buffering=True)
-        except Exception:  # noqa: BLE001 某些流不支持 reconfigure
-            pass
-        sys.stdout = fh
-        sys.stderr = fh
-        _LOG_FH = fh
-
-        def _restore():
-            try:
-                if _LOG_FH is not None:
-                    try:
-                        _LOG_FH.flush()
-                    except Exception:  # noqa: BLE001
-                        pass
-                    sys.stdout, sys.stderr = _orig
-                    _LOG_FH.close()
-            except Exception:  # noqa: BLE001
-                pass
-
-        atexit.register(_restore)
-        sys.stdout.write(f'[serve] log redirected to: {log_path}\n')
-        sys.stdout.flush()
-    except Exception as _e:  # noqa: BLE001 重定向失败绝不阻塞启动
-        print(f'[serve] log redirect failed (ignored): {_e}')
 
 def main() -> int:
     restart_count = 0
