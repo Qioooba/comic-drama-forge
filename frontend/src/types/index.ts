@@ -724,6 +724,44 @@ export interface ComfyUIModelsResponse {
   error?: string;
 }
 
+export interface TrtEngineInfo {
+  key: string;
+  name: string;
+  path: string;
+  exists: boolean;
+  size: number;
+  ok: boolean;
+}
+
+export interface TrtEngineCheckResponse {
+  success: boolean;
+  status: '可用' | '不兼容' | '未测试';
+  status_label?: string;
+  reason?: string;
+  static?: {
+    engines: TrtEngineInfo[];
+    ok: boolean;
+    reason?: string;
+  };
+  runtime?: {
+    status: string;
+    reason?: string;
+    probed?: boolean;
+    prompt_id?: string;
+  };
+  environment?: {
+    name?: string;
+    driver?: string;
+    compute_cap?: string;
+    trt_version?: string;
+    comfyui_url?: string;
+  };
+  checked_at?: string;
+  probe_requested?: boolean;
+  cached?: boolean;
+  error?: string;
+}
+
 // --- 后台服务日志（只读查看） ---
 
 export interface LogSource {

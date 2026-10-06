@@ -16,6 +16,7 @@ import type {
   MixEnv, MixPlanResponse, MixTask, MixStatusResponse,
   QCConfig, QCResponse,
   Episode, EpisodeListResponse, NovelSplitPlanResponse, ComfyUIModelsResponse,
+  TrtEngineCheckResponse,
   LogSource, LogsResponse,
   AutopilotStatus, AutopilotProgress,
   Deliverable, DeliverablesResponse,
@@ -988,6 +989,12 @@ export const novelsSplitPlanApi = {
 };
 
 // --- ComfyUI 模型 / 插件扫描（全局，与具体项目无关） ---
+export const trtEngineApi = {
+  /** P0-3：默认只做静态检查；probe=true 会提交 Encode→Decode 最小加载探针。 */
+  check: (probe = false) =>
+    request<TrtEngineCheckResponse>(`/trt-engine/check${probe ? '?probe=1' : ''}`),
+};
+
 export const comfyuiModelsApi = {
   /** 扫描 ComfyUI 实际可用的模型槽位候选与已装自定义节点包。
    *  refresh=true 会绕过后端 object_info 缓存重新拉取（「重新扫描」按钮）。 */

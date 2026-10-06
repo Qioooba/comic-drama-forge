@@ -2,8 +2,12 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { useApp } from '@/context/AppContext';
 import { Badge, Button, Card, Select } from '@/components/ui';
 import { AlertTriangle, RefreshCw } from '@/components/ui/icons';
-import { comfyuiModelsApi } from '@/api/client';
-import type { ComfyUIModelSlot, ComfyUIModelsResponse } from '@/types';
+import { comfyuiModelsApi, trtEngineApi } from '@/api/client';
+import type {
+  ComfyUIModelSlot,
+  ComfyUIModelsResponse,
+  TrtEngineCheckResponse,
+} from '@/types';
 
 /**
  * ComfyUI 生成模型（全局设置）
@@ -23,6 +27,23 @@ export function ComfyUIPage() {
   const [savingKey, setSavingKey] = useState<string | null>(null);
   const [flash, setFlash] = useState<{ key: string; ok: boolean; msg: string } | null>(null);
   const [showPlugins, setShowPlugins] = useState(false);
+  const [trt, setTrt] = useState<TrtEngineCheckResponse | null>(null);
+  const [trtProbing, setTrtProbing] = useState(false);
+
+  const checkTrt = useCallback(async (probe: boolean) => {
+    if (probe) setTrtProbing(true);
+    try {
+      setTrt(await trtEngineApi.check(probe));
+    } catch (e) {
+      setTrt({
+        success: false,
+        status: '未测试',
+        reason: e instanceof Error ? e.message : String(e),
+      });
+    } finally {
+      if (probe) setTrtProbing(false);
+    }
+  }, []);
 
   const scan = useCallback(async (refresh: boolean) => {
     setLoading(true);
@@ -38,7 +59,8 @@ export function ComfyUIPage() {
 
   useEffect(() => {
     void scan(false);
-  }, [scan]);
+    void checkTrt(false);
+  }, [scan, checkTrt]);
 
   const handleChange = async (slot: ComfyUIModelSlot, value: string) => {
     setSavingKey(slot.key);
@@ -128,6 +150,61 @@ export function ComfyUIPage() {
           </div>
         </div>
       )}
+
+      {/* ===== TRT engine status (P0-3) ===== */}
+      <Card bodyClassName="p-5">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h3 className="text-base font-semibold text-ink-1">{t('wb.cm.trtTitle')}</h3>
+            <p className="mt-1 text-xs text-ink-3">{t('wb.cm.trtHint')}</p>
+          </div>
+          <div className="flex items-center gap-2">
+            {trt && (
+              <Badge variant={
+                trt.status === '可用' ? 'success'
+                  : trt.status === '不兼容' ? 'danger' : 'warning'
+              }>
+                {trt.status}
+              </Badge>
+            )}
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={trtProbing}
+              onClick={() => void checkTrt(true)}
+            >
+              <RefreshCw className={`mr-2 h-4 w-4 ${trtProbing ? 'animate-spin' : ''}`} />
+              {trtProbing ? t('wb.cm.trtTesting') : t('wb.cm.trtTest')}
+            </Button>
+          </div>
+        </div>
+        {trt?.reason && (
+          <p className="mt-3 rounded border border-amber-500/30 bg-amber-500/10 p-2 text-xs text-amber-700 dark:text-amber-300">
+            {trt.reason}
+          </p>
+        )}
+        <div className="mt-3 grid gap-2 sm:grid-cols-2">
+          {(trt?.static?.engines || []).map(engine => (
+            <div key={engine.key} className="rounded border border-border px-3 py-2 text-xs">
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-mono text-ink-2">{engine.key}</span>
+                <Badge variant={engine.ok ? 'success' : 'danger'}>
+                  {engine.ok ? t('wb.cm.trtFileOk') : t('wb.cm.trtFileMissing')}
+                </Badge>
+              </div>
+              <p className="mt-1 truncate font-mono text-[11px] text-ink-3">{engine.path}</p>
+              <p className="text-[11px] text-ink-3">{(engine.size / 1024 / 1024).toFixed(1)} MB</p>
+            </div>
+          ))}
+        </div>
+        {trt?.environment && (
+          <p className="mt-3 text-[11px] text-ink-3">
+            {trt.environment.name} · {t('wb.cm.trtDriver')} {trt.environment.driver || '-'} ·
+            {' '}{t('wb.cm.trtCompute')} {trt.environment.compute_cap || '-'}
+            {trt.checked_at ? ` · ${t('wb.cm.trtCheckedAt')} ${trt.checked_at}` : ''}
+          </p>
+        )}
+      </Card>
 
       {/* ===== Model slots ===== */}
       <div className="space-y-4">

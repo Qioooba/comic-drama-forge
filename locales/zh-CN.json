@@ -852,7 +852,16 @@
     "screenplayRewriteDone": "已生成结构化分镜剧本，可在工作台查看",
     "screenplayRewriteFailed": "改写分镜剧本失败",
     "screenplayRewriteTimeout": "改写分镜剧本超时，请稍后在工作台查看进度",
-    "screenplayHumanTag": "此为人审稿；下方为改写后的分镜剧本"
+    "screenplayHumanTag": "此为人审稿；下方为改写后的分镜剧本",
+    "cm.trtTitle": "TRT VAE Engine",
+    "cm.trtHint": "启动前只做静态检查；点击“测试可用性”会提交最小 Encode→Decode 探针，真正加载两个 engine。",
+    "cm.trtTest": "测试可用性",
+    "cm.trtTesting": "正在测试…",
+    "cm.trtFileOk": "文件就绪",
+    "cm.trtFileMissing": "文件缺失",
+    "cm.trtDriver": "驱动",
+    "cm.trtCompute": "算力",
+    "cm.trtCheckedAt": "检查于"
   },
   "settings": {
     "title": "设置",

@@ -852,7 +852,16 @@
     "screenplayRewriteDone": "Structured storyboard script generated — view it in the workbench",
     "screenplayRewriteFailed": "Failed to rewrite into storyboard script",
     "screenplayRewriteTimeout": "Storyboard screenplay rewrite timed out; check the workbench later",
-    "screenplayHumanTag": "Human review draft; the storyboard script below is the rewritten version"
+    "screenplayHumanTag": "Human review draft; the storyboard script below is the rewritten version",
+    "cm.trtTitle": "TRT VAE Engine",
+    "cm.trtHint": "Startup performs a static check. Run the probe to execute a minimal Encode→Decode flow and truly load both engines.",
+    "cm.trtTest": "Test availability",
+    "cm.trtTesting": "Testing…",
+    "cm.trtFileOk": "File ready",
+    "cm.trtFileMissing": "File missing",
+    "cm.trtDriver": "Driver",
+    "cm.trtCompute": "Compute",
+    "cm.trtCheckedAt": "Checked at"
   },
   "settings": {
     "title": "Settings",

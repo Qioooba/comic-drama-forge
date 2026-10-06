@@ -89,6 +89,7 @@ import audio_qc
 import plugin_registry
 import deps_check
 import workflow_integrity
+import trt_engine_check
 import project_store
 import shot_key
 from fs_atomic import atomic_write_json, read_json_strict
@@ -312,6 +313,20 @@ except Exception as _e:  # noqa: BLE001  完整性核对失败不得阻断启动
 script_gen = ScriptGenerator()
 comfyui_client = ComfyUIClient()
 video_processor = VideoPostProcessor()
+
+# ⭐ P0-3：启动先做 TRT engine 静态自检（不抢 GPU、不提交任务）。
+# 真实加载探针只在用户点击“测试可用性”或显式 ?probe=1 时执行。
+try:
+    TRT_ENGINE_CHECK_BOOT = trt_engine_check.check()
+    if TRT_ENGINE_CHECK_BOOT.get("status") == "不兼容":
+        app.logger.warning("TRT VAE engine 自检：%s",
+                           TRT_ENGINE_CHECK_BOOT.get("reason") or "文件缺失/为空")
+    else:
+        app.logger.info("TRT VAE engine 自检：%s（真实加载探针未执行）",
+                        TRT_ENGINE_CHECK_BOOT.get("status"))
+except Exception as _e:  # noqa: BLE001  自检失败不得阻断启动
+    TRT_ENGINE_CHECK_BOOT = {"success": False, "status": "未测试", "reason": str(_e)}
+    app.logger.warning(f"TRT VAE engine 自检失败（不影响启动）：{_e}")
 
 # 无人值守托管：若存在已启用的托管计划，服务启动后自动接着生产（断点续跑）
 # 用一个短延时线程延后启动，避免拖慢 Flask 首次响应；失败不影响服务可用性。
@@ -9835,6 +9850,22 @@ def api_workflow_integrity():
     except Exception as e:  # noqa: BLE001  状态接口也不应打挂
         return jsonify({"success": False, "ok": False,
                         "warnings": [f"核对异常：{e}"]}), 200
+
+
+@app.route('/api/trt-engine/check', methods=['GET'])
+def api_trt_engine_check():
+    """P0-3：TRT engine 三态自检；?probe=1 提交最小 Encode→Decode 加载探针。"""
+    probe = str(request.args.get('probe', '')).strip().lower() in ('1', 'true', 'yes')
+    try:
+        timeout = float(request.args.get('timeout') or 90)
+    except (TypeError, ValueError):
+        timeout = 90.0
+    try:
+        return jsonify(trt_engine_check.check(
+            client=comfyui_client, probe=probe, timeout=max(5.0, min(timeout, 300.0))))
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"success": False, "status": "未测试",
+                        "reason": f"自检异常：{e}"}), 200
 
 
 @app.route('/api/upscale/sources', methods=['GET'])
