@@ -80,11 +80,14 @@ def _page_src() -> str:
             return _c
     return _PAGE_SRC_CANDIDATES[0]
 
-#: 本机 ComfyUI 的 TE MAN 插件 web 目录（按顺序探测，第一个存在的胜出）
+#: 历史硬编码的 TE MAN web 目录（仅作最后兜底）。
+#: ⚠️ 2026-10-06：原先第三项是 ``os.path.join(os.environ.get("COMFYUI_DIR", ""), ...)``，
+#: 而 COMFYUI_DIR 未设置时它会拼出**相对路径** ``custom_nodes\TE_MAN\web\js`` ——
+#: 既探不到东西，还会混进告警的「已尝试」列表误导排查。
+#: 该来源已由 `_te_man_js_candidates()` 在 env 非空时显式处理，这里只留写死的绝对路径。
 _TE_MAN_JS_CANDIDATES = (
     r"D:\ComfyUI_portable_TE_v260619\ComfyUI\ComfyUI\custom_nodes\TE_MAN\web\js",
     r"D:\ComfyUI_portable_TE_v260619\ComfyUI\custom_nodes\TE_MAN\web\js",
-    os.path.join(os.environ.get("COMFYUI_DIR", ""), "custom_nodes", "TE_MAN", "web", "js"),
 )
 
 #: 无头浏览器候选（Edge 是 Windows 预置的，优先用它可以省掉 Playwright 下载）
