@@ -88,6 +88,7 @@ import pipeline
 import audio_qc
 import plugin_registry
 import deps_check
+import workflow_integrity
 import project_store
 import shot_key
 from fs_atomic import atomic_write_json, read_json_strict
@@ -289,6 +290,23 @@ try:
 except Exception as _e:  # noqa: BLE001  自检失败不得阻断启动
     AI_SELFCHECK_BOOT = {}
     app.logger.warning(f"AI 前置自检执行失败（不影响启动）：{_e}")
+
+# ⭐ P0-4：启动即核对 workflows/ 多副本 hash。只告警、不阻断启动；状态 API
+# 供前端/排障复用，必须同时显示“实际读取路径”和各副本 hash。
+try:
+    WORKFLOW_INTEGRITY_BOOT = workflow_integrity.check()
+    for _warning in WORKFLOW_INTEGRITY_BOOT.get("warnings") or []:
+        app.logger.warning(_warning)
+    if WORKFLOW_INTEGRITY_BOOT.get("ok"):
+        app.logger.info(
+            "工作流副本核对通过：实际读取=%s，canonical=%s，共 %d 个文件",
+            WORKFLOW_INTEGRITY_BOOT.get("actual_root") or "(未找到)",
+            WORKFLOW_INTEGRITY_BOOT.get("canonical_root") or "(未配置)",
+            len(WORKFLOW_INTEGRITY_BOOT.get("files") or []),
+        )
+except Exception as _e:  # noqa: BLE001  完整性核对失败不得阻断启动
+    WORKFLOW_INTEGRITY_BOOT = {"success": False, "ok": False, "warnings": [str(_e)]}
+    app.logger.warning(f"工作流副本核对失败（不影响启动）：{_e}")
 
 # 初始化组件
 script_gen = ScriptGenerator()
@@ -9807,6 +9825,16 @@ def api_deps_check():
                         "summary": {"all_ok": False, "blockers": [f"检测异常：{e}"]}})
     result["docs"] = "docs/依赖清单.md"
     return jsonify(result)
+
+
+@app.route('/api/workflows/integrity', methods=['GET'])
+def api_workflow_integrity():
+    """P0-4：核对 workflows/ 多副本 hash，返回实际读取路径与漂移告警。"""
+    try:
+        return jsonify(workflow_integrity.check())
+    except Exception as e:  # noqa: BLE001  状态接口也不应打挂
+        return jsonify({"success": False, "ok": False,
+                        "warnings": [f"核对异常：{e}"]}), 200
 
 
 @app.route('/api/upscale/sources', methods=['GET'])

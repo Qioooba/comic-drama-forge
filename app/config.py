@@ -85,6 +85,10 @@ H3_DISABLE_DLSS = _env("H3_DISABLE_DLSS", "1").strip().lower() not in ("0", "fal
 #    直接不可用**（每个模板都找不到文件），而且换机 / 重装 ComfyUI 就会集体失效。
 #    现在把项目引用的全部模板随项目一起分发，默认从项目内解析。
 PROJECT_WORKFLOWS_DIR = _norm_path(os.path.join(PROJECT_ROOT_DIR, "workflows"))
+# P0-4：完整性核对的 canonical source。开发态默认源码仓库；桌面版 Electron
+# 启动后端时会传入安装区路径，镜像/ComfyUI 副本只参与比对，不改变解析优先级。
+WORKFLOW_CANONICAL_DIR = _norm_path(_env(
+    "MJSCXT_WORKFLOW_CANONICAL_DIR", PROJECT_WORKFLOWS_DIR))
 
 # 解析优先级：
 #   1) MJSCXT_WORKFLOWS_DIR 显式指定目录（最高，换机/调试用）

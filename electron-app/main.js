@@ -544,6 +544,18 @@ async function startBackend() {
       fs.mkdirSync(layout.dataDir, { recursive: true });
       childEnv.MJSCXT_DATA_DIR = layout.dataDir;
     }
+
+    // P0-4：把只读安装区/可写镜像路径交给后端做 workflows hash 对账。
+    // 开发态 canonical 仍是源码仓库；打包态安装区是发布基线，镜像是实际读取副本。
+    const workflowInstallDir = path.join(
+      app.isPackaged ? process.resourcesPath : config.projectRoot,
+      'workflows',
+    );
+    childEnv.MJSCXT_WORKFLOW_INSTALL_DIR = workflowInstallDir;
+    childEnv.MJSCXT_WORKFLOW_CANONICAL_DIR = workflowInstallDir;
+    if (app.isPackaged) {
+      childEnv.MJSCXT_WORKFLOW_MIRROR_DIR = path.join(resourceMirrorDir(), 'workflows');
+    }
     backend.child = spawn(python, [layout.servePy], {
       cwd: layout.cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
