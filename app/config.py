@@ -136,8 +136,38 @@ def resolve_workflow_path(workflow_file: str) -> str:
 
 # 模型路径
 MODELS_DIR = _norm_path(_env("MODELS_DIR", _DERIVED["models"]))
-QWEN_IMAGE_MODEL = os.path.join(MODELS_DIR, "diffusion_models", "qwen-image-2512",
-                                "qwen_image_2512_fp8_e4m3fn.safetensors") if MODELS_DIR else ""
+
+# P0-1：模型搜索根**列表**（MODELS_DIR 只是主根）。
+# ⚠️ 为什么不能只扫 MODELS_DIR：本机常见「多套 ComfyUI 并存」——第二套实例用
+#    `--base-directory .../ComfyUI-2nd` 起，TRT engine 等放在**它自己的** models/ 下，
+#    而 MODELS_DIR 指向另一套主树。只扫单根 → 真实存在的模型被依赖检测判成「缺失」。
+#    ComfyUI 自己的 /object_info 也是多根同时可见（同一文件可同时出现
+#    `MiniMax-H3\x` 与 `minimax-h3\x` 两种 combo 值），单根扫描与事实不符。
+def models_search_dirs() -> list:
+    """按优先级返回全部可能的模型根目录（只含真实存在者，去重）。"""
+    out, seen = [], set()
+
+    def _add(p):
+        p = _norm_path(p) if p else ""
+        if p and p not in seen and os.path.isdir(p):
+            seen.add(p)
+            out.append(p)
+
+    _add(MODELS_DIR)           # 主根（显式配置，最高优先）
+    _add(_DERIVED["models"])   # COMFYUI_ROOT 推导根（被 MODELS_DIR 覆盖时也保留）
+    if COMFYUI_ROOT:
+        for base in (COMFYUI_ROOT,
+                     os.path.join(COMFYUI_ROOT, "ComfyUI"),
+                     os.path.join(COMFYUI_ROOT, "ComfyUI", "ComfyUI")):
+            _add(os.path.join(base, "models"))
+    return out
+
+
+# P1-10：Qwen 2512 UNET **已下线**（2026-09-23 起现役图片链路全部切 Qwen-Image 2.1 INT8，
+# 见 WORKFLOW_TEMPLATE 的 *_Qwen21.json）。原名 QWEN_IMAGE_MODEL 会让状态页/依赖检测/
+# 新代码误以为 2512 仍在役，故改名为 LEGACY_ 前缀；若确认全仓无引用可直接删除。
+LEGACY_QWEN_IMAGE_MODEL = os.path.join(MODELS_DIR, "diffusion_models", "qwen-image-2512",
+                                       "qwen_image_2512_fp8_e4m3fn.safetensors") if MODELS_DIR else ""
 H3_MODEL = os.path.join(MODELS_DIR, "diffusion_models", "minimax-h3",
                         "minimax_h3_ref2va_pruned_int8_convrot.safetensors") if MODELS_DIR else ""
 FLASHVSR_MODEL = os.path.join(MODELS_DIR, "FlashVSR-v1.1",
