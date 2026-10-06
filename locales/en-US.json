@@ -879,7 +879,15 @@
     "cm.actualDlssBypass": "Bypassed (24fps)",
     "cm.actualDlssOn": "Not bypassed",
     "cm.actualDlssAbsent": "Not in template",
-    "cm.actualWorkflowHash": "Workflow SHA256"
+    "cm.actualWorkflowHash": "Workflow SHA256",
+    "cm.actualTemplate": "Template",
+    "cm.actualSwitch": "Runtime switch",
+    "cm.actualResult": "Actual result",
+    "cm.switchOn": "On",
+    "cm.switchOff": "Off",
+    "cm.actualRefineSelectedOff": "Template selected but disabled; not executed",
+    "cm.actualDlssTemplateOn": "Included by refine template",
+    "cm.actualDlssTemplateOff": "Not in active single-pass template"
   },
   "settings": {
     "title": "Settings",

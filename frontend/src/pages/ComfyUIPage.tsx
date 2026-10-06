@@ -250,20 +250,43 @@ export function ComfyUIPage() {
             </div>
             <div className="grid gap-2 text-xs sm:grid-cols-2">
               <div className="rounded border border-border px-3 py-2">
-                <span className="text-ink-3">{t('wb.cm.actualRefine')}：</span>
-                <span className={actual.refine_present ? 'text-success-strong' : 'text-ink-2'}>
-                  {actual.refine_present ? t('wb.cm.actualRefineOn') : t('wb.cm.actualRefineOff')}
-                </span>
+                <p className="font-medium text-ink-2">{t('wb.cm.actualRefine')}</p>
+                <p className="mt-1 text-ink-3">
+                  {t('wb.cm.actualTemplate')}: {actual.workflow_file || '-'}
+                </p>
+                <p className="text-ink-3">
+                  {t('wb.cm.actualSwitch')}:
+                  {' '}{actual.refine_expected ? t('wb.cm.switchOn') : t('wb.cm.switchOff')}
+                </p>
+                <p className={actual.refine_present ? 'text-success-strong' : 'text-ink-2'}>
+                  {t('wb.cm.actualResult')}:
+                  {' '}{actual.refine_present
+                    ? t('wb.cm.actualRefineOn')
+                    : actual.workflow_file === 'minimax_h3_director_二采_加速.json'
+                      ? t('wb.cm.actualRefineSelectedOff')
+                      : t('wb.cm.actualRefineOff')}
+                </p>
               </div>
               <div className="rounded border border-border px-3 py-2">
-                <span className="text-ink-3">{t('wb.cm.actualDlss')}：</span>
-                <span className={actual.dlss_bypassed ? 'text-warning-strong' : 'text-ink-2'}>
-                  {actual.dlss_bypassed
-                    ? t('wb.cm.actualDlssBypass')
-                    : actual.dlss_present
-                      ? t('wb.cm.actualDlssOn')
+                <p className="font-medium text-ink-2">{t('wb.cm.actualDlss')}</p>
+                <p className="mt-1 text-ink-3">
+                  {t('wb.cm.actualTemplate')}:
+                  {' '}{actual.workflow_file === 'minimax_h3_director_二采_加速.json'
+                    ? t('wb.cm.actualDlssTemplateOn')
+                    : t('wb.cm.actualDlssTemplateOff')}
+                </p>
+                <p className="text-ink-3">
+                  {t('wb.cm.actualSwitch')}:
+                  {' '}{actual.dlss_bypassed ? t('wb.cm.actualDlssBypass') : t('wb.cm.switchOn')}
+                </p>
+                <p className={actual.dlss_bypassed ? 'text-warning-strong' : 'text-ink-2'}>
+                  {t('wb.cm.actualResult')}:
+                  {' '}{actual.dlss_present
+                    ? t('wb.cm.actualDlssOn')
+                    : actual.dlss_bypassed
+                      ? t('wb.cm.actualDlssBypass')
                       : t('wb.cm.actualDlssAbsent')}
-                </span>
+                </p>
               </div>
             </div>
             <div className="rounded border border-border px-3 py-2 text-[11px]">

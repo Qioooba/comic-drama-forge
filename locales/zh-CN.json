@@ -879,7 +879,15 @@
     "cm.actualDlssBypass": "已旁路（24fps）",
     "cm.actualDlssOn": "未旁路",
     "cm.actualDlssAbsent": "模板未包含",
-    "cm.actualWorkflowHash": "工作流 SHA256"
+    "cm.actualWorkflowHash": "工作流 SHA256",
+    "cm.actualTemplate": "模板",
+    "cm.actualSwitch": "运行时开关",
+    "cm.actualResult": "实际执行",
+    "cm.switchOn": "开",
+    "cm.switchOff": "关",
+    "cm.actualRefineSelectedOff": "已选模板但关闭，未执行",
+    "cm.actualDlssTemplateOn": "二采模板包含",
+    "cm.actualDlssTemplateOff": "现役单采模板不包含"
   },
   "settings": {
     "title": "设置",
