@@ -34,7 +34,7 @@ class ScriptGenerator:
 
         if provider == "anthropic":
             if not api_key:
-                logger.warning("ANTHROPIC_API_KEY 未设置，剧本生成将在调用时报错")
+                logger.warning("ANTHROPIC_API_KEY 未设置：仅旧 Anthropic CLI 直连路径不可用；Web 主流程将使用 AI 设置中的文本模型")
             else:
                 import anthropic  # 延迟导入
                 self.client = anthropic.Anthropic(api_key=api_key)
