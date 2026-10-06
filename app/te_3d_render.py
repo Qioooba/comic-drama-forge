@@ -749,14 +749,39 @@ def render_blocking_grid(shot, out_dir, target_size=None,
     顺序拼成一张**与目标九宫格一一对应**的 3x3 基准网格，供生成端作 `<image1>`
     构图基准 —— 模型「照着这张 3D 网格的机位/站位/动作来摆九宫格」。
 
-    失败降级（fail-open）：
-      * 任一格渲染失败 → 该格用空白占位（生成端仍会看到其余格的 3D 基准）；
-      * 全部失败 / 无浏览器 / Pillow 缺失 → 返回 `None`，调用方回退旧行为（纯文字站位锚点）。
+    失败降级（fail-closed）：
+      * **任一格缺失 → 整张不出，返回 `None`**，调用方回退旧行为（纯文字站位锚点）。
+      * 全部缺失 / 无浏览器 / Pillow 缺失 → 同样返回 `None`。
     绝不抛异常、绝不阻断九宫格主链路。
+
+    ⚠️ 2026-10-06 实测修正：原先是「任一格失败就用空白占位、其余格照出」，是 **fail-open**，
+    会产出**大片黑格**的联系表，而 `comfyui_client` 的提示词却写着「9 格与输出九宫格一一对应，
+    每一格都要照搬基准格的机位/站位/角度」—— 模型被要求去照搬黑框，等于给了错信息。
+    根因不是渲染失败，而是 `build_render_plan` 的 `fits` 闸门本就按**景别横向容量**拒出图：
+
+        人数    可出图格数
+          1 人      9/9
+          2 人      3/9   （特写/近景/中近景/大特写 容量都只有 1）
+          3 人      1/9
+          4+ 人     0/9
+
+    九宫格这套「同一场景 × 9 种候选构图」的前提就是**单主体**：特写里塞两张脸既数不清人数、
+    也画不出构图基准（`te_3d_director` 的 `fits` 判据 ③ 正是为此）。所以多人镜**从一开始就不该
+    出九宫格**，应当整张放弃、让调用方回退文字锚点 —— 这与该模块「硬凑出来的图比没有更坏」
+    的既有原则一致。多人的单镜基准图仍可走 :func:`render_blocking`（按本镜**实际声明**的
+    景别出图；该景别装不下几个人时 `fits` 同样会拒出，同样安全回退）。
     """
     cells = render_blocking_grid_cells(
         shot, out_dir, target_size=target_size, root_dir=root_dir, timeout=timeout)
     if not cells or not any(cells):
+        return None
+    missing = [i + 1 for i, c in enumerate(cells) if not c]
+    if missing:
+        logger.info(
+            "[3D站位图] 九宫格基准网格放弃（%d/%d 格缺失：%s）—— 宁可不注入基准图，"
+            "也不让模型照搬黑格；本镜回退纯文字站位锚点。"
+            "多人镜属预期行为（景别横向容量装不下多张脸，见 build_render_plan 的 fits 判据 ③）。",
+            len(missing), len(cells), missing)
         return None
     # 拼 3x3 联系表（格序即九宫格格序）。
     try:
