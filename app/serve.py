@@ -200,7 +200,11 @@ def _redirect_process_logs() -> None:
         elif getattr(sys, 'frozen', False):
             log_dir = os.path.join(os.path.dirname(os.path.abspath(sys.executable)), 'logs')
         else:
-            return  # 源码/计划任务模式由 run_serve.bat 重定向，保持原行为
+            # 源码/开发态：log_viewer 默认读 <project>/.workbuddy/test/_out，
+            # 而 run_serve.bat / Electron dev 并不总是额外重定向 stdout。
+            # 这里补齐同一路径，避免前端报「日志文件不存在」。
+            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            log_dir = os.path.join(project_root, '.workbuddy', 'test', '_out')
         os.makedirs(log_dir, exist_ok=True)
         log_path = os.path.join(log_dir, 'serve_stdout.log')
         _orig = (sys.stdout, sys.stderr)
