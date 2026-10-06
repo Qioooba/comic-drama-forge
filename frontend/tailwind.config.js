@@ -54,11 +54,14 @@ module.exports = {
   theme: {
     extend: {
       fontFamily: {
-        sans: ['PingFang SC', 'Microsoft YaHei', 'system-ui', 'sans-serif'],
+        // 唯一真源在 index.css 的 :root（--font-sans / --font-serif / --font-mono）。
+        // 上一版在这里复制字体字面量，sans 还少了 -apple-system / BlinkMacSystemFont
+        // 等回退项 —— 与 CSS 令牌悄然漂移。改为引用 var() 后改字体只改一处。
+        sans: ['var(--font-sans)'],
         // 编辑性标题（项目名 / 集名）：与正文分族，给「作品」一点编辑感
-        serif: ['Georgia', 'Songti SC', 'SimSun', 'serif'],
+        serif: ['var(--font-serif)'],
         // 数值与技术值：seed / 时长 / 哈希 / 路径。等宽让数字等宽可逐位核对
-        mono: ['Cascadia Code', 'SFMono-Regular', 'Consolas', 'monospace'],
+        mono: ['var(--font-mono)'],
       },
       colors: {
         canvas: token('bg-canvas'),

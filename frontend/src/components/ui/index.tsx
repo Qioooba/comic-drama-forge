@@ -29,8 +29,8 @@ const FIELD_BASE =
 /** 行内单行控件高度：36px（= --control-h-compact）。改尺寸只改这一个令牌。 */
 const FIELD_H = 'h-control-compact';
 
-const FIELD_OK = 'border-line hover:border-line-strong focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/25';
-const FIELD_ERR = 'border-danger focus:border-danger focus:outline-none focus:ring-2 focus:ring-danger/25';
+const FIELD_OK = 'border-line hover:border-line-strong focus:border-brand focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/25';
+const FIELD_ERR = 'border-danger focus:border-danger focus:outline-none focus-visible:ring-2 focus-visible:ring-danger/25';
 
 function FieldLabel({ label, children }: { label?: string; children: React.ReactNode }) {
   if (!label) return <>{children}</>;
@@ -42,9 +42,21 @@ function FieldLabel({ label, children }: { label?: string; children: React.React
   );
 }
 
-function FieldError({ error }: { error?: string }) {
+function FieldError({ error, id }: { error?: string; id?: string }) {
   if (!error) return null;
-  return <p className="mt-1 text-xs text-danger-strong">{error}</p>;
+  return <p id={id} className="mt-1 text-xs text-danger-strong">{error}</p>;
+}
+
+/** 字段级 spinner：aria-busy 时贴右显示。
+ *  ⚠️ 必须是真实节点 —— index.css 的 ::after 伪元素对 input/select/textarea
+ *  这类替换元素不渲染，基线层造 spinner 对原生字段是死代码（见 MASTER §4.4）。 */
+function FieldSpinner({ className = 'right-2.5 top-1/2 -translate-y-1/2' }: { className?: string }) {
+  return (
+    <span
+      className={`pointer-events-none absolute h-4 w-4 animate-spin rounded-full border-2 border-brand/30 border-t-brand ${className}`}
+      aria-hidden="true"
+    />
+  );
 }
 
 // ===================== 基础反馈 =====================
@@ -207,6 +219,68 @@ export function StateBadge({
   return <span className={`${base} ${STATUS_STYLE[status]} ${className}`}>{body}</span>;
 }
 
+export type DecisionKind = 'selected' | 'approved';
+
+/**
+ * 决策徽标（ADR-0002 / ADR-0013）——「采用」与「批准」两档**独立**表达。
+ *
+ * 三重律（MASTER §4.2 / §4.5）在此固化为组件契约：色 + 文本 + 图标三者同时
+ * 出现，默认文案走语言包；调用方无法只给颜色，也无法不给状态词。
+ * ⚠️ 不变量：selected 永不显示为 approved；两档不得共用图标或文案。
+ *
+ * 默认文案走 t('state.selected') / t('state.approved')；调用方传 label 时可覆盖。
+ */
+const DECISION_STYLE: Record<DecisionKind, string> = {
+  selected: 'bg-selected-subtle text-selected-strong',
+  approved: 'bg-approved-subtle text-approved-strong',
+};
+
+export function DecisionBadge({
+  decision,
+  label,
+  onClick,
+  className = '',
+}: {
+  decision: DecisionKind;
+  /** 可选覆盖；缺省时回落 state.selected / state.approved */
+  label?: string;
+  /** 仅用于跳转决策记录；不得用它把两档做成同一个按钮 */
+  onClick?: () => void;
+  className?: string;
+}) {
+  const base = 'inline-flex h-[22px] items-center gap-1.5 rounded-full px-2 text-xs font-medium';
+  const body = (
+    <>
+      {decision === 'selected' ? (
+        // selected：单勾 —— 创作决定（这版被采用）
+        <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2.4} aria-hidden="true">
+          <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.5 9.5 17.5 19.5 6.5" />
+        </svg>
+      ) : (
+        // approved：印章勾 —— 放行决定（人工批准）。与 selected 图标刻意不同形
+        <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} aria-hidden="true">
+          <path strokeLinecap="round" strokeLinejoin="round" d="M12 2.75 14.6 5.4l3.65-.3.9 3.57 3.05 2-1.73.2 1.7 3.2-3.05 2-.9 3.57-3.65-.3L12 21.25 9.4 18.6l-3.65.3-.9-3.57-3.05-2 1.7-3.2-1.7-3.2 3.05-2 .9-3.57 3.65.3L12 2.75Z" />
+          <path strokeLinecap="round" strokeLinejoin="round" d="m8.75 12.25 2.1 2.1 4.4-4.4" />
+        </svg>
+      )}
+      {label ?? t(decision === 'selected' ? 'state.selected' : 'state.approved')}
+    </>
+  );
+  if (onClick) {
+    return (
+      <button
+        type="button"
+        onClick={onClick}
+        className={`${base} ${DECISION_STYLE[decision]} transition-opacity hover:opacity-80 ${FOCUS_RING} ${className}`}
+      >
+        {body}
+      </button>
+    );
+  }
+  return <span className={`${base} ${DECISION_STYLE[decision]} ${className}`}>{body}</span>;
+}
+
+
 export function Card({
   children,
   className = '',
@@ -327,6 +401,7 @@ export function Input({
   autoFocus,
   error,
   suffix,
+  busy = false,
 }: {
   value: string;
   onChange: (v: string) => void;
@@ -341,7 +416,11 @@ export function Input({
   error?: string;
   /** 尾部插槽（如「显示/隐藏密钥」按钮）：输入框自动让出右侧内边距，插槽绝对定位贴右 */
   suffix?: React.ReactNode;
+  /** 提交中：aria-busy + 右侧 spinner（spinner 是真实节点，见 FieldSpinner） */
+  busy?: boolean;
 }) {
+  const errorId = React.useId();
+  const hasSuffix = Boolean(suffix);
   const input = (
     <input
       type={type}
@@ -351,14 +430,19 @@ export function Input({
       disabled={disabled}
       autoFocus={autoFocus}
       aria-invalid={error ? true : undefined}
+      aria-describedby={error ? errorId : undefined}
+      aria-busy={busy || undefined}
       onKeyDown={onEnter ? (e) => { if (e.key === 'Enter') onEnter(); } : undefined}
-      className={`${FIELD_BASE} ${FIELD_H} ${suffix ? 'pr-10' : ''} ${error ? FIELD_ERR : FIELD_OK} ${className}`}
+      className={`${FIELD_BASE} ${FIELD_H} ${hasSuffix || busy ? 'pr-10' : ''} ${error ? FIELD_ERR : FIELD_OK} ${className}`}
     />
   );
-  const field = suffix ? (
+  const field = hasSuffix || busy ? (
     <div className="relative">
       {input}
-      <div className="absolute inset-y-0 right-0 flex items-center pr-1.5">{suffix}</div>
+      {hasSuffix && (
+        <div className="absolute inset-y-0 right-0 flex items-center pr-1.5">{suffix}</div>
+      )}
+      {!hasSuffix && busy && <FieldSpinner />}
     </div>
   ) : (
     input
@@ -367,12 +451,11 @@ export function Input({
     <FieldLabel label={label}>
       <>
         {field}
-        <FieldError error={error} />
+        <FieldError error={error} id={errorId} />
       </>
     </FieldLabel>
   );
 }
-
 export function Textarea({
   value,
   onChange,
@@ -383,6 +466,8 @@ export function Textarea({
   mono = false,
   error,
   resize = true,
+  busy = false,
+  disabled = false,
 }: {
   value: string;
   onChange: (v: string) => void;
@@ -395,27 +480,41 @@ export function Textarea({
   /** ⚠️ 必须走 prop 而不是 className 覆盖：resize-y 与 resize-none 同属性，
       谁生效取决于 Tailwind 产出顺序，靠 className 压不住 */
   resize?: boolean;
+  /** 提交中：aria-busy + 右上 spinner（多行内容不居中遮挡） */
+  busy?: boolean;
+  disabled?: boolean;
 }) {
+  const errorId = React.useId();
   const area = (
     <textarea
       value={value}
       onChange={(e) => onChange(e.target.value)}
       rows={rows}
       placeholder={placeholder}
+      disabled={disabled}
       aria-invalid={error ? true : undefined}
-      className={`${FIELD_BASE} ${resize ? 'resize-y' : 'resize-none'} py-2 ${error ? FIELD_ERR : FIELD_OK} ${mono ? 'font-mono text-sm' : ''} ${className}`}
+      aria-describedby={error ? errorId : undefined}
+      aria-busy={busy || undefined}
+      className={`${FIELD_BASE} ${resize ? 'resize-y' : 'resize-none'} py-2 ${busy ? 'pr-10' : ''} ${error ? FIELD_ERR : FIELD_OK} ${mono ? 'font-mono text-sm' : ''} ${className}`}
     />
+  );
+  const field = busy ? (
+    <div className="relative">
+      {area}
+      <FieldSpinner className="right-2.5 top-2" />
+    </div>
+  ) : (
+    area
   );
   return (
     <FieldLabel label={label}>
       <>
-        {area}
-        <FieldError error={error} />
+        {field}
+        <FieldError error={error} id={errorId} />
       </>
     </FieldLabel>
   );
 }
-
 /** 原生 <select> 此前 6 处各自手写样式，这里统一出口 */
 export function Select({
   value,
@@ -424,6 +523,8 @@ export function Select({
   className = '',
   disabled = false,
   label,
+  error,
+  busy = false,
 }: {
   value: string;
   onChange: (v: string) => void;
@@ -431,20 +532,43 @@ export function Select({
   className?: string;
   disabled?: boolean;
   label?: string;
+  /** 错误态：与 Input/Textarea 同款 aria-invalid + 红边 + 原因文案（2026-10-07 补齐） */
+  error?: string;
+  /** 提交中：aria-busy + 右侧 spinner */
+  busy?: boolean;
 }) {
+  const errorId = React.useId();
   const select = (
     <select
       value={value}
       onChange={(e) => onChange(e.target.value)}
       disabled={disabled}
-      className={`${FIELD_BASE} ${FIELD_H} cursor-pointer ${FIELD_OK} ${className}`}
+      aria-invalid={error ? true : undefined}
+      aria-describedby={error ? errorId : undefined}
+      aria-busy={busy || undefined}
+      className={`${FIELD_BASE} ${FIELD_H} cursor-pointer ${busy ? 'pr-10' : ''} ${error ? FIELD_ERR : FIELD_OK} ${className}`}
     >
       {options.map((o) => (
         <option key={o.value} value={o.value}>{o.label}</option>
       ))}
     </select>
   );
-  return <FieldLabel label={label}>{select}</FieldLabel>;
+  const field = busy ? (
+    <div className="relative">
+      {select}
+      <FieldSpinner />
+    </div>
+  ) : (
+    select
+  );
+  return (
+    <FieldLabel label={label}>
+      <>
+        {field}
+        <FieldError error={error} id={errorId} />
+      </>
+    </FieldLabel>
+  );
 }
 
 // ===================== 弹窗 =====================

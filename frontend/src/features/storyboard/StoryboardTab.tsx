@@ -311,7 +311,7 @@ function StoryboardHubTab({ projectKey, novelId }: { projectKey: string; novelId
         />
       )}
 
-      {sub === 'storyboard' && <StoryboardTab projectKey={projectKey} episodeNo={selectedEpisode} />}
+      {sub === 'storyboard' && <StoryboardTab projectKey={projectKey} episodeNo={selectedEpisode} novelId={novelId} />}
       {sub === 'studio' && (
         <ShotStudioTab projectKey={projectKey} novelId={novelId} episodeNo={selectedEpisode} />
       )}
@@ -495,7 +495,7 @@ const PROJECT_VIDEO_MODE_OPTIONS: { value: VideoMode; labelKey: string }[] = [
 // 批量重生成单次上限：与后端 /api/video/retry-shots-batch 的硬上限（≤12）一致
 const BATCH_RETRY_LIMIT = 12;
 
-function StoryboardTab({ projectKey, episodeNo }: { projectKey: string; episodeNo?: number | null }) {
+function StoryboardTab({ projectKey, episodeNo, novelId }: { projectKey: string; episodeNo?: number | null; novelId?: string }) {
   const { t } = useApp();
   const toast = useToast();
   // cards / summary / loading / error 已随 ADR-0010 收敛为 query（见下方 canvasQ），
@@ -510,6 +510,11 @@ function StoryboardTab({ projectKey, episodeNo }: { projectKey: string; episodeN
   const [shotError, setShotError] = useState('');
   /** 整集一次提交（mode=episode）：触发中标记 + 返回的 task_id */
   const [episodeGenerating, setEpisodeGenerating] = useState(false);
+  // 手动首跑：一次性提交本集全部镜头；与单镜重跑/批量重生成并存。
+  const [generateAllBusy, setGenerateAllBusy] = useState(false);
+  const [generateAllNotice, setGenerateAllNotice] = useState('');
+  const generateAllAliveRef = useRef(true);
+  useEffect(() => () => { generateAllAliveRef.current = false; }, []);
   const [episodeTaskId, setEpisodeTaskId] = useState<string | null>(null);
   /** 项目级视频生成方式（新建项目时选的 video_mode）：本页「生成视频」按它执行。
    *  ⚠️ 不要与上面每镜的 videoMode（reference/keyframe 单镜重做）混用，两者不是一个东西。 */
@@ -670,9 +675,69 @@ function StoryboardTab({ projectKey, episodeNo }: { projectKey: string; episodeN
     }
   };
 
+  /** 首跑整集分镜：优先用小说剧本的完整 shots/characters/items/scenes；无 novelId 时
+   *  退化为画布当前卡片，仍可触发后端断点续跑。任务异步，轮询终态后刷新画布。 */
+  const handleGenerateAllStoryboards = async () => {
+    if (!projectKey || episodeNo == null || generateAllBusy || loading || isCanvasStale) return;
+    setGenerateAllBusy(true);
+    setGenerateAllNotice('');
+    setShotError('');
+    try {
+      let payload: any = {
+        project_name: projectKey,
+        episode_no: episodeNo,
+        shots: cards,
+        overwrite: false,
+      };
+      if (novelId) {
+        const detail = await episodesApi.get(novelId, episodeNo);
+        const script = ((detail as any)?.script || {}) as Record<string, any>;
+        if (Array.isArray(script.shots) && script.shots.length > 0) {
+          payload = {
+            ...payload,
+            shots: script.shots,
+            characters: script.characters || [],
+            items: script.items || [],
+            scenes: script.scenes || [],
+          };
+        }
+      }
+      const r = await storyboardApi.generateEpisode(payload);
+      setGenerateAllNotice(t('sb.generateAllStarted', { total: r.total || payload.shots.length }));
+      if (r.task_id) {
+        const deadline = Date.now() + 15 * 60 * 1000;
+        for (;;) {
+          await new Promise((resolve) => setTimeout(resolve, 3000));
+          if (!generateAllAliveRef.current) return;
+          const d: any = await generationApi.status(String(r.task_id));
+          const task = (d?.task ?? d) || {};
+          if (task.status === 'completed') {
+            const results = Array.isArray(task.results) ? task.results : [];
+            const failed = results.filter((x: any) => x && x.success === false);
+            if (failed.length) {
+              throw new Error(t('sb.generateAllPartial', { ok: results.length - failed.length, total: results.length }));
+            }
+            break;
+          }
+          if (task.status === 'failed' || task.status === 'cancelled') {
+            throw new Error(task.error || t('sb.generateAllFailed'));
+          }
+          if (Date.now() > deadline) throw new Error(t('sb.generateAllTimeout'));
+        }
+        setGenerateAllNotice(t('sb.generateAllDone', { total: r.total || payload.shots.length }));
+        await fetchCanvas();
+      }
+    } catch (e) {
+      if (generateAllAliveRef.current) setShotError(e instanceof Error ? e.message : t('sb.generateAllFailed'));
+    } finally {
+      if (generateAllAliveRef.current) setGenerateAllBusy(false);
+    }
+  };
+
   // 生成该集视频：方式取**项目级设定**（episode 整集一次出连续片 / per_shot 逐镜 /
   // keyframe 首尾帧插值）。旧实现把 mode 写死成 episode，用户在新建设置里选什么都无效。
   const handleGenerateEpisode = async () => {
+    if (episodeNo == null) return;
     if (!projectKey) return;
     setEpisodeGenerating(true);
     setShotError('');
@@ -827,6 +892,19 @@ function StoryboardTab({ projectKey, episodeNo }: { projectKey: string; episodeN
       <div className="flex justify-between items-center">
         <h3 className="text-lg font-semibold">{t('wb.storyboardHub')}</h3>
         <div className="flex items-center gap-2">
+          <Button
+            size="sm"
+            variant="brand"
+            onClick={handleGenerateAllStoryboards}
+            disabled={generateAllBusy || loading || isCanvasStale || episodeNo == null}
+            title={
+              generateAllBusy ? t('sb.generateAllBusy')
+              : episodeNo == null ? t('sb.generateAllNoEpisode')
+              : t('sb.generateAllHint')
+            }
+          >
+            {generateAllBusy ? t('common.generating') : t('sb.generateAll')}
+          </Button>
           {/* 视频生成方式（项目级）：默认取「新建项目」时选的值，这里可改并即刻落盘 */}
           <Select
             value={projectVideoMode}
@@ -838,8 +916,8 @@ function StoryboardTab({ projectKey, episodeNo }: { projectKey: string; episodeN
           <Button
             size="sm"
             onClick={handleGenerateEpisode}
-            disabled={loading || episodeGenerating || isCanvasStale}
-            title={isCanvasStale ? '正在切换到本集数据，暂不能生成' : undefined}
+            disabled={loading || episodeGenerating || isCanvasStale || episodeNo == null}
+            title={episodeNo == null ? t('sb.generateVideoNoEpisode') : isCanvasStale ? '正在切换到本集数据，暂不能生成' : undefined}
             className="bg-brand hover:bg-brand-strong"
           >
             {episodeGenerating ? t('common.generating') : t('sb.generateVideo')}
@@ -896,6 +974,11 @@ function StoryboardTab({ projectKey, episodeNo }: { projectKey: string; episodeN
         </div>
       )}
 
+      {generateAllNotice && (
+        <div className="p-3 bg-info-subtle border border-info/30 rounded-lg text-info-strong text-sm">
+          {generateAllNotice}
+        </div>
+      )}
       {notice && (
         <div className="p-3 bg-success-subtle border border-success/30 rounded-lg text-success-strong text-sm">
           {notice}

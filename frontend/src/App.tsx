@@ -7,6 +7,7 @@ import { Navbar } from '@/components/layout/Navbar';
 import { Sidebar } from '@/components/layout/Sidebar';
 import { ErrorBoundary } from '@/components/ErrorBoundary';
 import { ServiceMonitor } from '@/components/ServiceMonitor';
+import { ApiCompatibilityGate } from '@/components/ApiCompatibilityGate';
 import { AppRouteTable, AppRouterProvider } from '@/router';
 
 // 全局（与具体项目无关）的功能放这里；单个项目的功能一律进 /projects/:key/:tab。
@@ -77,7 +78,9 @@ export default function App() {
             {/* Router 提供者包在 AppShellContent 之外 —— 壳层自身就要用
                 useLocation（侧边栏高亮）与 useNavigate（侧边栏点击） */}
             <AppRouterProvider>
-              <AppShellContent />
+              <ApiCompatibilityGate>
+                <AppShellContent />
+              </ApiCompatibilityGate>
               <ServiceMonitor />
             </AppRouterProvider>
           </AppProvider>

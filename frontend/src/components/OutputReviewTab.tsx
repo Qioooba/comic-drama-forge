@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { useApp } from '@/context/AppContext';
-import { exportApi, autopilotApi, qualityApi, projectsApi, type QualityEpisodeRow } from '@/api/client';
+import { exportApi, autopilotApi, qualityApi, projectsApi, videoApi, type QualityEpisodeRow } from '@/api/client';
+import { deliveryApi } from '@/api/generated';
 import { Button, Textarea, Skeleton, EmptyState, ErrorState } from '@/components/ui';
 import { ChevronDown, ChevronRight, ClipboardCheck, FileText, Film, FolderOpen } from '@/components/ui/icons';
 import { EpisodeReviewPanel, STATUS_DOT } from '@/components/EpisodeReviewPanel';
@@ -35,6 +36,19 @@ export function OutputReviewTab({ projectKey, assets }: OutputReviewTabProps) {
   const [playing, setPlaying] = useState<string | null>(null);
   // 审片：每集四层状态（行内画 A/B/C/D 状态点，并决定该集是否有可复核内容）
   const [quality, setQuality] = useState<QualityEpisodeRow[]>([]);
+  // 项目剧本清单：手动合成成片必须把 episode_no 映射到项目 output 内的 script_path。
+  const [scriptRows, setScriptRows] = useState<Array<Record<string, any>>>([]);
+  // Script-list failures must stay visible; do not collapse them into "no script".
+  const [scriptListError, setScriptListError] = useState('');
+  // 手动成片合成：同步端点可能触发本地合成，期间防重复提交。
+  const [finalVideoBusy, setFinalVideoBusy] = useState<number | null>(null);
+  const [finalVideoNotice, setFinalVideoNotice] = useState('');
+  // 交付包：导出文件先登记 SHA-256 清单，再做机器校验与人工批准；下载门禁读取这里的状态。
+  const [deliveryPackages, setDeliveryPackages] = useState<any[]>([]);
+  const [deliveryBusy, setDeliveryBusy] = useState<string | null>(null);
+  const [deliveryNotice, setDeliveryNotice] = useState('');
+  const [presetId, setPresetId] = useState('landscape_16x9');
+  const [approver, setApprover] = useState('');
   // 当前展开了「四层状态 · 逐镜复核」的集号（一次只展开一集，避免整页被撑得过长）
   const [expanded, setExpanded] = useState<number | null>(null);
   // ---- 成片字幕开关（2026-10-07 补前端入口）----
@@ -98,12 +112,21 @@ export function OutputReviewTab({ projectKey, assets }: OutputReviewTabProps) {
     if (!projectKey) return;
     setLoading(true);
     try {
-      const [exportRes, deliverRes] = await Promise.all([
+      const [exportRes, deliverRes, scriptRes, deliveryRes] = await Promise.all([
         exportApi.listFiles(projectKey),
         autopilotApi.deliverables(projectKey),
+        projectsApi.scripts(projectKey)
+          .then((d) => { setScriptListError(''); return d; })
+          .catch((e) => {
+            setScriptListError(e instanceof Error ? e.message : t('common.loadFailed'));
+            return { success: false, project: projectKey, total: 0, scripts: [] };
+          }),
+        deliveryApi.listDeliveryPackages(projectKey).catch(() => ({ success: false, count: 0, packages: [] })),
       ]);
       setExportFiles(exportRes?.files || []);
       setDeliverables(deliverRes?.items || []);
+      setScriptRows(scriptRes?.scripts || []);
+      setDeliveryPackages((deliveryRes as any)?.packages || []);
       setPending(deliverRes?.pending || 0);
       // 审片数据是「增补」：取不到时成片验收照常可用，不把整页打成硬错误态
       try {
@@ -139,6 +162,88 @@ export function OutputReviewTab({ projectKey, assets }: OutputReviewTabProps) {
       setError(e instanceof Error ? e.message : t('deliver.exportFailed'));
     } finally {
       setGenerating(false);
+    }
+  };
+
+  const scriptPathForEpisode = (episodeNo: number) => {
+    const hit = scriptRows.find((row) => Number(row.episode_no) === Number(episodeNo));
+    return typeof hit?.path === 'string' ? hit.path : '';
+  };
+
+  const handleCreateDeliveryPackage = async () => {
+    if (deliveryBusy) return;
+    setDeliveryBusy('create');
+    setDeliveryNotice('');
+    setError('');
+    try {
+      const d = await deliveryApi.createDeliveryPackage({
+        project_name: projectKey,
+        preset_id: presetId,
+      });
+      setDeliveryNotice(t('deliver.packageCreated', { id: d.package?.package_id || '' }));
+      await loadAll();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : t('deliver.packageCreateFailed'));
+    } finally {
+      setDeliveryBusy(null);
+    }
+  };
+
+  const handleDeliveryRelease = async (packageId: string) => {
+    if (!approver.trim() || deliveryBusy) {
+      if (!approver.trim()) setError(t('deliver.approverRequired'));
+      return;
+    }
+    setDeliveryBusy(packageId);
+    setDeliveryNotice('');
+    setError('');
+    try {
+      const verified = await deliveryApi.verifyDeliveryPackage(packageId);
+      if (!verified.success) {
+        setError(t('deliver.packageVerifyFailed'));
+        return;
+      }
+      await deliveryApi.approveDeliveryPackage(packageId, { approver: approver.trim() });
+      const release = await deliveryApi.releaseCheckDeliveryPackage(packageId, {});
+      if (!release.success) {
+        const blockers = (release.release as any)?.blockers || [];
+        setError(`${t('deliver.packageReleaseBlocked')}${blockers.length ? `：${blockers.join('、')}` : ''}`);
+        return;
+      }
+      setDeliveryNotice(t('deliver.packageReleased', { id: packageId }));
+      await loadAll();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : t('deliver.packageActionFailed'));
+    } finally {
+      setDeliveryBusy(null);
+    }
+  };
+
+  /** 手动「生成/重新合成成片」：按项目剧本清单定位 script_path，调用 /api/final/video。 */
+  const handleFinalVideo = async (episodeNo: number) => {
+    const scriptPath = scriptPathForEpisode(episodeNo);
+    if (!projectKey || !scriptPath || finalVideoBusy !== null) return;
+    setFinalVideoBusy(episodeNo);
+    setError('');
+    setFinalVideoNotice('');
+    try {
+      const d = await videoApi.finalVideo({
+        project_name: projectKey,
+        script_path: scriptPath,
+        episode_no: episodeNo,
+      });
+      const registered = d.deliverable?.registered;
+      if (registered === false) {
+        setFinalVideoNotice('');
+        setError(`${t('deliver.finalVideoRegisteredFailed')}${d.deliverable?.reason ? `：${d.deliverable.reason}` : ''}`);
+      } else {
+        setFinalVideoNotice(t('deliver.finalVideoDone', { n: d.episode_no || episodeNo }));
+      }
+      await loadAll();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : t('deliver.finalVideoFailed'));
+    } finally {
+      setFinalVideoBusy(null);
     }
   };
 
@@ -245,6 +350,11 @@ export function OutputReviewTab({ projectKey, assets }: OutputReviewTabProps) {
           {error}
         </div>
       )}
+      {finalVideoNotice && (
+        <div className="p-3 bg-success-subtle border border-success/30 rounded-lg text-sm text-success-strong">
+          {finalVideoNotice}
+        </div>
+      )}
       {/* 区域 1: 导出配置 */}
       <div className="bg-surface rounded-lg border border-line p-4">
         <h4 className="font-semibold text-ink-1 mb-3 flex items-center gap-2">
@@ -262,6 +372,64 @@ export function OutputReviewTab({ projectKey, assets }: OutputReviewTabProps) {
             {notice}
           </div>
         )}
+
+        {/* 交付包：先登记 SHA-256 清单，再机器校验 + 人工批准；下载门禁读取该状态。 */}
+        <div className="mb-4 border-t border-line pt-4">
+          <h5 className="text-sm font-medium text-ink-1 mb-2 flex items-center gap-1.5">
+            <ClipboardCheck className="h-4 w-4" /> {t('deliver.packageTitle')}
+          </h5>
+          <p className="text-xs text-ink-2 mb-2">{t('deliver.packageHint')}</p>
+          <div className="flex flex-wrap items-end gap-2">
+            <label className="text-xs text-ink-2">
+              {t('deliver.packagePreset')}
+              <select
+                value={presetId}
+                onChange={(e) => setPresetId(e.target.value)}
+                disabled={deliveryBusy !== null}
+                className="ml-2 rounded border border-line bg-surface px-2 py-1 text-sm text-ink-1"
+              >
+                <option value="landscape_16x9">16:9</option>
+                <option value="portrait_9x16">9:16</option>
+                <option value="portrait_3x4">3:4</option>
+              </select>
+            </label>
+            <Button size="sm" variant="secondary" onClick={handleCreateDeliveryPackage} disabled={deliveryBusy !== null}>
+              {deliveryBusy === 'create' ? t('common.generating') : t('deliver.packageCreate')}
+            </Button>
+            <label className="text-xs text-ink-2">
+              {t('deliver.approver')}
+              <input
+                value={approver}
+                onChange={(e) => setApprover(e.target.value)}
+                placeholder={t('deliver.approverPlaceholder')}
+                disabled={deliveryBusy !== null}
+                className="ml-2 w-36 rounded border border-line bg-surface px-2 py-1 text-sm text-ink-1"
+              />
+            </label>
+            {deliveryPackages[0] && (
+              <Button
+                size="sm"
+                onClick={() => handleDeliveryRelease(deliveryPackages[0].package_id)}
+                disabled={deliveryBusy !== null || !approver.trim()}
+                title={!approver.trim() ? t('deliver.approverRequired') : t('deliver.packageReleaseHint')}
+              >
+                {deliveryBusy === deliveryPackages[0].package_id ? t('common.generating') : t('deliver.packageRelease')}
+              </Button>
+            )}
+          </div>
+          {deliveryNotice && (
+            <p className="mt-2 text-xs text-success-strong">{deliveryNotice}</p>
+          )}
+          {deliveryPackages.length > 0 && (
+            <ul className="mt-2 space-y-1 text-xs text-ink-2">
+              {deliveryPackages.map((pkg) => (
+                <li key={pkg.package_id} className="truncate">
+                  {pkg.package_id} · {pkg.status || 'built'} · {pkg.file_count || 0} files
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
 
         {/* 成片字幕（2026-10-07 新增：后端一直支持，界面此前无入口） */}
         <div className="mb-4">
@@ -500,6 +668,27 @@ export function OutputReviewTab({ projectKey, assets }: OutputReviewTabProps) {
                           </a>
                         </>
                       )}
+                      <Button
+                        size="sm"
+                        variant="brand"
+                        onClick={() => handleFinalVideo(episode_no)}
+                        disabled={finalVideoBusy !== null || !scriptPathForEpisode(episode_no)}
+                        aria-describedby={`final-video-reason-${episode_no}`}
+                        title={
+                          finalVideoBusy !== null ? t('deliver.finalVideoBusy')
+                          : scriptListError ? t('deliver.finalVideoScriptsUnavailable')
+                          : !scriptPathForEpisode(episode_no) ? t('deliver.finalVideoNoScript')
+                          : t('deliver.finalVideoHint')
+                        }
+                      >
+                        {finalVideoBusy === episode_no ? t('common.generating') : t('deliver.finalVideo')}
+                      </Button>
+                      <span id={`final-video-reason-${episode_no}`} className="sr-only">
+                        {finalVideoBusy !== null ? t('deliver.finalVideoBusy')
+                        : scriptListError ? t('deliver.finalVideoScriptsUnavailable')
+                        : !scriptPathForEpisode(episode_no) ? t('deliver.finalVideoNoScript')
+                        : t('deliver.finalVideoHint')}
+                      </span>
                       {d && (
                         <>
                           <Button

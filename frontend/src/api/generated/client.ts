@@ -69,9 +69,12 @@ import type {
   PreflightReport,
   PreflightResponse,
   RegisterMediaRequest,
+  ReleaseCheckRequest,
+  ReleaseCheckResponse,
   RenderManifest,
   RenderManifestResponse,
   RenderRequest,
+  RenderVersionListResponse,
   RenderVersionResponse,
   ReuseHintResponse,
   RevokeApprovalRequest,
@@ -89,6 +92,7 @@ import type {
   UpdateJobRequest,
   VerifyDeliveryResponse,
   VerifyRenderRequest,
+  VerifyRenderResponse,
   VerifyResult,
 } from './types';
 
@@ -154,7 +158,7 @@ function qs(params: Record<string, string | number | boolean | undefined | null>
 
 
 /**
- * contracts —— 契约版本 2026-10-07.1（spec 87b4e26a18ac…）
+ * contracts —— 契约版本 2026-10-07.2（spec 4c0774a9aeeb…）
  */
 export const contractsApi = {
   /**
@@ -181,7 +185,7 @@ export const contractsApi = {
 };
 
 /**
- * delivery —— 契约版本 2026-10-07.1（spec 87b4e26a18ac…）
+ * delivery —— 契约版本 2026-10-07.2（spec 4c0774a9aeeb…）
  */
 export const deliveryApi = {
   /**
@@ -220,6 +224,13 @@ export const deliveryApi = {
   getDeliveryManifest: (package_id: string) =>
     request<DeliveryManifestResponse>(`/api/delivery/packages/${encodeURIComponent(String(package_id))}/manifest`, { method: 'GET' }),
   /**
+   * 交付发布总门禁（授权+校验+人工批准+磁盘）
+   *
+   * `POST /api/delivery/packages/{package_id}/release-check`
+   */
+  releaseCheckDeliveryPackage: (package_id: string, body?: ReleaseCheckRequest) =>
+    request<ReleaseCheckResponse>(`/api/delivery/packages/${encodeURIComponent(String(package_id))}/release-check`, { method: 'POST', body: JSON.stringify(body) }),
+  /**
    * 撤销人工批准
    *
    * `POST /api/delivery/packages/{package_id}/revoke`
@@ -243,7 +254,7 @@ export const deliveryApi = {
 };
 
 /**
- * jobs —— 契约版本 2026-10-07.1（spec 87b4e26a18ac…）
+ * jobs —— 契约版本 2026-10-07.2（spec 4c0774a9aeeb…）
  */
 export const jobsApi = {
   /**
@@ -293,7 +304,7 @@ export const jobsApi = {
    *
    * `POST /api/jobs/{job_id}/attempts`
    */
-  createJobAttempt: (job_id: string, body: CreateAttemptRequest) =>
+  createJobAttempt: (job_id: string, body?: CreateAttemptRequest) =>
     request<AttemptResponse>(`/api/jobs/${encodeURIComponent(String(job_id))}/attempts`, { method: 'POST', body: JSON.stringify(body) }),
   /**
    * 待处理单元（断点续跑判据之一）
@@ -319,7 +330,7 @@ export const jobsApi = {
 };
 
 /**
- * licensing —— 契约版本 2026-10-07.1（spec 87b4e26a18ac…）
+ * licensing —— 契约版本 2026-10-07.2（spec 4c0774a9aeeb…）
  */
 export const licensingApi = {
   /**
@@ -334,7 +345,7 @@ export const licensingApi = {
    *
    * `POST /api/licensing/gate`
    */
-  evaluateLicensingGate: (body: LicenseRequirement) =>
+  evaluateLicensingGate: (body?: LicenseRequirement) =>
     request<LicensingGateResponse>(`/api/licensing/gate`, { method: 'POST', body: JSON.stringify(body) }),
   /**
    * 音乐库授权列表（CC BY 署名可直接复制）
@@ -353,7 +364,7 @@ export const licensingApi = {
 };
 
 /**
- * production_facts —— 契约版本 2026-10-07.1（spec 87b4e26a18ac…）
+ * production_facts —— 契约版本 2026-10-07.2（spec 4c0774a9aeeb…）
  */
 export const productionfactsApi = {
   /**
@@ -457,7 +468,7 @@ export const productionfactsApi = {
 };
 
 /**
- * styles —— 契约版本 2026-10-07.1（spec 87b4e26a18ac…）
+ * styles —— 契约版本 2026-10-07.2（spec 4c0774a9aeeb…）
  */
 export const stylesApi = {
   /**
@@ -484,7 +495,7 @@ export const stylesApi = {
 };
 
 /**
- * timeline —— 契约版本 2026-10-07.1（spec 87b4e26a18ac…）
+ * timeline —— 契约版本 2026-10-07.2（spec 4c0774a9aeeb…）
  */
 export const timelineApi = {
   /**
@@ -494,6 +505,20 @@ export const timelineApi = {
    */
   getTimelineByFingerprint: (fingerprint: string) =>
     request<TimelineRevisionResponse>(`/api/timeline/fingerprints/${encodeURIComponent(String(fingerprint))}`, { method: 'GET' }),
+  /**
+   * 按剪辑指纹反查成片登记
+   *
+   * `GET /api/timeline/renders/by-fingerprint/{compose_fingerprint}`
+   */
+  findTimelineRenderVersions: (compose_fingerprint: string) =>
+    request<RenderVersionListResponse>(`/api/timeline/renders/by-fingerprint/${encodeURIComponent(String(compose_fingerprint))}`, { method: 'GET' }),
+  /**
+   * 读取成片登记（含指纹与 sha256）
+   *
+   * `GET /api/timeline/renders/{render_id}`
+   */
+  getTimelineRenderVersion: (render_id: string) =>
+    request<RenderVersionResponse>(`/api/timeline/renders/${encodeURIComponent(String(render_id))}`, { method: 'GET' }),
   /**
    * 时间线 revision 列表（不可变）
    *
@@ -548,13 +573,20 @@ export const timelineApi = {
    *
    * `POST /api/timeline/revisions/{revision_id}/render`
    */
-  renderTimelineRevision: (revision_id: string, body: RenderRequest) =>
+  renderTimelineRevision: (revision_id: string, body?: RenderRequest) =>
     request<RenderVersionResponse>(`/api/timeline/revisions/${encodeURIComponent(String(revision_id))}/render`, { method: 'POST', body: JSON.stringify(body) }),
   /**
-   * 登记 EpisodeRenderVersion（绑 compose_fingerprint）
+   * 列出该 revision 的成片登记
+   *
+   * `GET /api/timeline/revisions/{revision_id}/renders`
+   */
+  listTimelineRenderVersions: (revision_id: string) =>
+    request<RenderVersionListResponse>(`/api/timeline/revisions/${encodeURIComponent(String(revision_id))}/renders`, { method: 'GET' }),
+  /**
+   * 核验渲染结果与时长（不登记 EpisodeRenderVersion）
    *
    * `POST /api/timeline/revisions/{revision_id}/verify-render`
    */
   verifyTimelineRender: (revision_id: string, body: VerifyRenderRequest) =>
-    request<RenderVersionResponse>(`/api/timeline/revisions/${encodeURIComponent(String(revision_id))}/verify-render`, { method: 'POST', body: JSON.stringify(body) }),
+    request<VerifyRenderResponse>(`/api/timeline/revisions/${encodeURIComponent(String(revision_id))}/verify-render`, { method: 'POST', body: JSON.stringify(body) }),
 };

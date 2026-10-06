@@ -2907,6 +2907,10 @@ def convert_novel_to_script(client, novel_meta: dict, novel_text: str, style: st
             logger.warning(f"第 {chunk['index']} 块分镜失败，已兜底 {len(fb)} 镜：{e}")
 
     shots = _norm_shots(all_shots, bible, episodes)
+    if len(shots) > MAX_SHOTS_PER_EPISODE:
+        raise LLMError(
+            f"整本转换生成 {len(shots)} 镜，超过单集硬上限 {MAX_SHOTS_PER_EPISODE} 镜；"
+            f"为避免静默截断尾部情节，整本路径已 fail-closed。请改用按章分集接口。")
     if not shots:
         raise LLMError("模型未返回有效分镜：" + ("；".join(warnings) or "未知错误"))
 
@@ -3638,15 +3642,10 @@ def convert_chapter_to_script(client, novel_meta: dict, novel_text: str, chapter
     # 截断会丢失尾部情节 → 必须响亮记录（写进 metadata.warnings + error 日志），
     # 并明确指引「拆成 2 集重新生成」，不能静默吞掉。
     if len(shots) > MAX_SHOTS_PER_EPISODE:
-        _dropped = len(shots) - MAX_SHOTS_PER_EPISODE
-        shots = shots[:MAX_SHOTS_PER_EPISODE]
-        warnings.append(
-            f"⚠ 本集生成 {len(shots) + _dropped} 镜，超过单集硬上限 {MAX_SHOTS_PER_EPISODE} 镜，"
-            f"已截断末尾 {_dropped} 镜（**尾部情节会缺失**）。请把本章拆成 2 集重新生成，"
-            f"以完整覆盖原文。")
-        logger.error("第%s集：镜头数 %d 超上限 %d，已硬截断 %d 镜（%s）—— 建议拆章分集",
-                     episode_no, len(shots) + _dropped, MAX_SHOTS_PER_EPISODE, _dropped,
-                     chapter_title)
+        raise LLMError(
+            f"第{episode_no}集（{chapter_title}）生成 {len(shots)} 镜，超过单集硬上限 "
+            f"{MAX_SHOTS_PER_EPISODE} 镜；为避免静默截断尾部情节，本次转换已中止。"
+            f"请把该章拆成多集重新生成，或人工压缩分镜后重试。")
 
     for sh in shots:
         sh["episode"] = int(episode_no)

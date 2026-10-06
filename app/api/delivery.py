@@ -163,6 +163,27 @@ def get_delivery_package(package_id):
     return jsonify({"success": True, "package": pkg})
 
 
+@bp.post("/api/delivery/packages/<package_id>/release-check")
+def release_check_delivery_package(package_id):
+    """发布总门禁（机器校验 + 人工批准 + 授权 + 磁盘现状）。
+
+    请求体不接受任何授权结论：服务端按包内 requirement + project 重新评估。
+    客户端传入的 ``licensing_gate`` 一律忽略，防止伪造 ``{"ok": true}`` 放行。
+    """
+    pkg = delivery_repo.get_package(package_id)
+    if not pkg:
+        return _fail(delivery_domain.DELIVERY_ERROR_CODES[delivery_domain.DLV_UNKNOWN_PACKAGE],
+                     delivery_domain.DLV_UNKNOWN_PACKAGE, status=404)
+    gate = licensing_repo.evaluate_delivery_gate(
+        pkg.get("requirement") or {}, project=pkg.get("project") or "", audit=True)
+    approval = delivery_repo.get_approval(package_id)
+    result = delivery_domain.release_ready(pkg, approval, licensing_gate=gate)
+    pkg["approval"] = delivery_domain.evaluate_approval(pkg, approval)
+    pkg["status"] = delivery_domain.derive_status(pkg, approval)
+    pkg["release_ready"] = result
+    return jsonify({"success": bool(result.get("ok")), "release": result, "package": pkg})
+
+
 @bp.get("/api/delivery/packages/<package_id>/manifest")
 def get_delivery_manifest(package_id):
     """交付清单：逐文件 SHA-256 + 包摘要 + 授权/批准状态（可直接归档留痕）。"""

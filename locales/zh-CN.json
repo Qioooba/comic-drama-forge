@@ -537,7 +537,30 @@
     "approve": "通过",
     "rejectReasonLabel": "打回原因",
     "rejectReasonInput": "请输入打回原因...",
-    "confirmReject": "确认打回"
+    "confirmReject": "确认打回",
+    "finalVideo": "生成成片",
+    "finalVideoHint": "按该集剧本合成最终成片并登记交付清单",
+    "finalVideoBusy": "已有成片合成任务，请等待完成",
+    "finalVideoNoScript": "未找到该集项目剧本，无法合成成片",
+    "finalVideoDone": "第 {n} 集成片已合成并刷新交付清单",
+    "finalVideoFailed": "生成/重新合成成片失败",
+    "packageTitle": "交付包与发布",
+    "packageHint": "先导出工程文件，再登记 SHA-256 清单；机器校验通过并由人工批准后才能下载。",
+    "packagePreset": "规格",
+    "packageCreate": "登记交付包",
+    "packageCreated": "已登记交付包 {id}",
+    "packageCreateFailed": "登记交付包失败",
+    "approver": "批准人",
+    "approverPlaceholder": "请输入人工批准人",
+    "approverRequired": "请输入人工批准人",
+    "packageRelease": "校验并批准",
+    "packageReleaseHint": "先机器校验，再人工批准并执行发布总门禁",
+    "packageReleased": "交付包 {id} 已通过发布门禁",
+    "packageReleaseBlocked": "交付包发布门禁未通过",
+    "packageVerifyFailed": "交付包机器校验失败",
+    "packageActionFailed": "交付包操作失败",
+    "finalVideoRegisteredFailed": "视频已生成，但交付登记未完成",
+    "finalVideoScriptsUnavailable": "剧本清单接口暂不可用，无法定位成片剧本"
   },
   "upscale": {
     "title": "超分（FlashVSR）",
@@ -1188,7 +1211,15 @@
     "moreLines": "还有 {n} 条台词...",
     "generate": "生成配音",
     "generateStarted": "配音生成任务已启动",
-    "activeTasks": "活跃任务"
+    "activeTasks": "活跃任务",
+    "batchAssetsGenerate": "一键生成资产",
+    "batchAssetsBusy": "资产任务正在顺序生成，请稍候",
+    "batchAssetsNoScript": "暂无剧集数据，无法读取角色/物品/场景设定",
+    "batchAssetsHint": "遍历项目全部剧集生成角色、物品、场景；已有资产会自动跳过",
+    "batchAssetsDone": "资产批量任务已启动并完成轮询，已刷新资产列表",
+    "batchAssetsNothing": "当前剧本没有可生成的角色/物品/场景资产",
+    "batchAssetsFailed": "资产批量生成失败",
+    "batchAssetsTimeout": "资产批量任务轮询超时"
   },
   "mix": {
     "title": "音画混音",
@@ -1419,6 +1450,10 @@
     "repaired": "已自愈：{items}",
     "suggestion": "建议：{hint}",
     "promptQcAllPassed": "台词预检全部通过",
+    "workflowNoticeTitle": "声音链路说明",
+    "workflowNoticeFormal": "正式托管链路：H3 原生音轨 + tts_pre 角色参考音色，成片直接使用原生音轨。",
+    "workflowNoticeManual": "旧逐句 TTS + 混音：仅作为手工回滚/返工路径，不是默认成片链路。",
+    "workflowNoticeHint": "若只是修复个别台词，请在确认正式链路状态后使用下方手工工具。",
     "workflowTitle": "工作流程说明",
     "workflowStep1": "先生成 TTS 配音（每集台词合成音频）",
     "workflowStep2": "再进行音画混音（将配音与视频片段合成）",
@@ -1460,7 +1495,15 @@
     "done": "已完成",
     "failed": "失败",
     "skipped": "已跳过",
-    "attention": "需人工"
+    "attention": "需人工",
+    "selected": "已采用",
+    "approved": "已批准"
+  },
+  "contract": {
+    "checking": "正在校验 API 契约…",
+    "mismatchTitle": "API 契约不兼容",
+    "mismatchBody": "前端生成客户端与后端运行时契约不一致。请重新生成客户端并刷新页面，未完成校验前已停止写操作。",
+    "unavailable": "API 契约服务暂不可用：{message}"
   },
   "vault": {
     "title": "AI 配置中心",
@@ -1613,6 +1656,7 @@
     "chapterN": "第 {n} 章",
     "episodeGenerate": "整集生成视频",
     "episodeGenerateStarted": "整集视频生成已启动（{total} 镜）",
+    "generateVideoNoEpisode": "请先选择要生成视频的集次",
     "episodeGenerateFailed": "整集视频生成启动失败",
     "generateVideo": "生成视频",
     "videoModeSaved": "视频生成方式已保存",
@@ -1634,7 +1678,16 @@
       "imageAlt": "镜头 {seq} 的 3x3 候选构图网格图"
     },
     "zoomTitle": "分镜图预览",
-    "zoomHint": "点击任意处或按 ESC 关闭"
+    "zoomHint": "点击任意处或按 ESC 关闭",
+    "generateAll": "生成本集全部分镜",
+    "generateAllHint": "首跑整集分镜图；单镜重跑与批量重生成仍保留",
+    "generateAllBusy": "分镜首跑任务正在生成，请稍候",
+    "generateAllNoEpisode": "请先选择要生成分镜的集次",
+    "generateAllStarted": "本集分镜首跑任务已启动（{total} 镜）",
+    "generateAllDone": "本集分镜首跑已完成（{total} 镜）",
+    "generateAllFailed": "本集分镜首跑失败",
+    "generateAllTimeout": "本集分镜首跑轮询超时",
+    "generateAllPartial": "本集分镜首跑完成但有失败镜头（成功 {ok}/{total}）"
   },
   "video": {
     "batchRetry": {

@@ -135,44 +135,17 @@ def api_novel_preview(novel_id):
 
 @bp.route('/api/novels/<novel_id>/convert', methods=['POST'])
 def api_novel_convert(novel_id):
-    """用自定义 API 把已上传小说转成 A 版剧本（后台任务）"""
-    try:
-        # 生成剧本前先做章节目录体检（LLM 判断真章节，结果缓存；失败退回规则折叠）
-        novel_meta = ensure_chapter_structure(NOVELS_DIR, novel_id, _optional_llm_client())
-    except NovelParseError as e:
-        return jsonify({"success": False, "error": str(e)}), 404
+    """整本转换已弃用：不再产生无法纳入主链路的孤儿剧本。
 
-    client = _current_llm_client()
-    if not client.configured:
-        return _ai_guide_response("尚未配置自定义 AI 接口，无法把小说转成剧本")
-
-    data = request.json or {}
-    style = (data.get('style') or '3D动漫渲染').strip()
-    episodes = max(1, min(int(data.get('episodes') or 1), 12))
-    target_shots = max(4, min(int(data.get('target_shots') or NOVEL_DEFAULT_SHOTS), 40))
-    # A：小说 → 独立项目（未指定则自动建立该项目，数据落在项目自己的目录）
-    proj = _resolve_novel_project(data, novel_meta)
-    style = _apply_project_settings(style, data.get('project_name') or novel_id)
-
-    task_id = f"novel2script_{novel_id}_{int(time.time())}"
-    with lock:
-        generation_state[task_id] = {
-            "status": "running", "progress": 0, "phase": "prepare",
-            "message": "正在准备分块…", "novel_id": novel_id,
-            "project_id": proj["id"], "project_key": proj["dir_key"],
-            "chunk_chars": NOVEL_CHUNK_CHARS, "max_chunks": NOVEL_MAX_CHUNKS,
-        }
-    threading.Thread(target=_novel_convert_worker,
-                     args=(task_id, novel_meta, style, episodes, target_shots,
-                           proj["dir_key"]),
-                     daemon=True).start()
-    return jsonify({"success": True, "task_id": task_id, "status": "started",
-                    "novel_id": novel_id, "style": style, "episodes": episodes,
-                    "target_shots": target_shots,
-                    "project_id": proj["id"], "project_key": proj["dir_key"],
-                    "project_name": proj["name"],
-                    "char_count": novel_meta.get("char_count"),
-                    "chapter_count": novel_meta.get("chapter_count")})
+    新口径：一章一集，使用 /api/novels/<id>/episodes/generate 按章分集，
+    以便后续资产、分镜、视频、交付全部落在同一项目目录。
+    """
+    return jsonify({
+        "success": False,
+        "error": "整本小说转剧本已弃用；请改用按章分集接口 /api/novels/<id>/episodes/generate",
+        "error_code": "whole_novel_convert_deprecated",
+        "guide": "/api/novels/<id>/episodes/generate",
+    }), 410
 
 
 @bp.route('/api/novels/<novel_id>/chapters', methods=['GET'])

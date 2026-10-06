@@ -13,4 +13,4 @@
  * 真要搬的话，同一时刻只能有一个人改这两个路径 —— 两处 import 同时改到一半
  * 会让中间态编译不过，比「晚一点搬」更糟。
  */
-export { AudioTab } from '@/components/AudioTab';
+export { AudioTab } from './AudioTab';

@@ -445,7 +445,7 @@ PROJECT_DEFAULT_CONFIG = {
     # 与托管生产都按它执行（取值见 VIDEO_MODES / norm_video_mode）。
     "video_mode": "episode",
     "voice_map": {},                    # 角色→音色映射（按项目隔离）
-    "qc_enabled": False,                # 质检开关（按项目隔离）
+    "qc_enabled": True,                 # 质检开关（按项目隔离；与前端默认一致）
     # 成片硬字幕开关（按项目隔离）：默认关闭。
     # 2026-09-24：H3 提示词已不再往画面里引导字幕（旧版「严禁出现字幕」反而诱导模型自绘），
     # 但成片合成阶段仍会额外烧一层字幕（pipeline.step_final / video_postprocess.finalize_episode）。

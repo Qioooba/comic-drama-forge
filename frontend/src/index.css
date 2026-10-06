@@ -433,7 +433,7 @@ body {
    改造前 Input/Select/Textarea 没有这一层，导致「提交中」和「校验失败」在
    每个页面各写一遍，且往往漏掉。这里在 base 层统一：
 
-     [aria-busy="true"]   提交中：自带 spinner，光标转忙
+     [aria-busy="true"]   提交中：光标转忙（spinner 由组件层自带真实节点，见下）
      [aria-invalid="true"] 校验失败：红边 + 红字说明
      [readonly]           只读：虚线边框（区别于 disabled 的灰化）
 
@@ -442,23 +442,18 @@ body {
    （见 design-system/comicdrama/MASTER.md 的 Interaction invariants）。
    ========================================================================== */
 @layer components {
+  /* 2026-10-07 复核修正：原先这里用 ::after 伪元素给所有 [aria-busy] 造
+     spinner，并设 color:transparent。三处实错：
+     ① input / select / textarea 是替换元素，::after **不会渲染** —— 对原生
+        字段这条规则是死代码；
+     ② Button 自带 React spinner，伪元素会叠成双 spinner；
+     ③ color:transparent 会被组件层 text-ink-* 工具类覆盖（utilities 层优先），
+        从来没隐藏过文字，只是在文字上叠了一圈转圈。
+     修正：base 层只保留「忙」的光标语义；spinner 收归组件层真实节点
+     （Button / Input / Select / Textarea 的 FieldSpinner），reduced-motion
+     的放慢策略移到 .animate-spin（见文件尾）。 */
   [aria-busy='true'] {
     cursor: progress;
-    position: relative;
-    color: transparent;
-  }
-
-  [aria-busy='true']::after {
-    content: '';
-    position: absolute;
-    inset: 50% auto auto 50%;
-    width: 1em;
-    height: 1em;
-    margin: -0.5em 0 0 -0.5em;
-    border: 2px solid rgb(var(--brand) / 0.3);
-    border-top-color: rgb(var(--brand));
-    border-radius: 50%;
-    animation: token-spin 0.7s linear infinite;
   }
 
   [aria-invalid='true'] {
@@ -472,18 +467,6 @@ body {
   [readonly]:not([aria-invalid='true']) {
     border-style: dashed;
     border-color: rgb(var(--border-strong));
-  }
-}
-
-@keyframes token-spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  [aria-busy='true']::after {
-    animation-duration: 2.4s;
   }
 }
 
@@ -607,6 +590,13 @@ body {
   .animate-pulse-dot,
   .animate-skeleton {
     animation: none;
+  }
+
+  /* 转圈类不「停止」而是放慢到 2.4s：完全停转会丢掉「正在处理」的信号，
+     前庭敏感用户要的是降低频闪，不是信息消失。Button / 字段 spinner 共用
+     .animate-spin，一处覆盖全站生效。 */
+  .animate-spin {
+    animation-duration: 2.4s;
   }
 }
 

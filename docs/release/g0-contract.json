@@ -4,12 +4,12 @@
     "此前没有门禁文件，验收靠 HANDOFF_P0_20261006.md 这类 49KB 的人工叙述；",
     "把门禁数据化之后，CI 能自动判断「这次改动有没有破坏契约」。",
     "",
-    "⚠ **本文件当前只包含 W3（契约 / 交付 / 授权）拥有的字段。**",
+    "⚠ 历史说明：本文件最初只包含 W3（契约 / 交付 / 授权）拥有的字段；后续 W8/W2 已追加顶层门禁与决策索引。当前以顶层结构为准，`w3_contract_and_delivery` 仍是 W3 权威子块。",
     "文件所有权属 W8（ADR + 决策可追溯）；W8 落地其余字段时请**追加**，",
     "不要删除或覆盖下面 `w3_contract_and_delivery` 之下的内容 —— 那是被",
     "`scripts/check_generated_client.py` 与交付门禁按名字引用的。"
   ],
-  "contract_version": "2026-10-07.1",
+  "contract_version": "2026-10-07.2",
   "openapi_version": "3.1.0",
   "w3_contract_and_delivery": {
     "$owner": "W3",
@@ -59,6 +59,26 @@
         "path": "config/model-licensing.json",
         "role": "模型 / 素材 / 品牌授权的唯一登记处",
         "required": true
+      },
+      {
+        "path": "app/infrastructure/timeline_repo.py",
+        "role": "TimelineRevision + EpisodeRenderVersion 持久化（facts.db，schema v2）",
+        "required": true
+      },
+      {
+        "path": "app/application/timeline_service.py",
+        "role": "冻结计划 → 成片登记落库；render 版本跨请求可读",
+        "required": true
+      },
+      {
+        "path": "app/api/timeline.py",
+        "role": "时间线与成片登记端点（含 render 版本查询）",
+        "required": true
+      },
+      {
+        "path": "app/application/production.py",
+        "role": "GenerationIntent 引用 CapabilityProfileVersion 时强制登记校验",
+        "required": true
       }
     ],
     "generated_artifacts": [
@@ -87,13 +107,13 @@
         "path": "frontend/src/api/generated/manifest.json",
         "produced_by": "scripts/generate_client.py",
         "hand_editable": false,
-        "note": "含 contract_version 与 spec_hash，前端启动闸门据此判断客户端是否过期"
+        "note": "含 contract_version 与 spec_hash，ApiCompatibilityGate 在前端启动时消费并阻断不兼容写操作"
       }
     ],
     "required_schema_versions": {
       "delivery": 1,
       "model_licensing": 1,
-      "openapi_contract": "2026-10-07.1"
+      "openapi_contract": "2026-10-07.2"
     },
     "quality_gates": [
       {
@@ -131,7 +151,8 @@
         "DLV-APPROVER-NOT-HUMAN": "批准者不是人工主体（机器账号/自动化身份一律 403）—— 2026-10-07 审核 P0-3 新增",
         "DLV-ALREADY-APPROVED": "",
         "DLV-UNKNOWN-PACKAGE": "",
-        "DLV-NOT-BUILT": ""
+        "DLV-NOT-BUILT": "",
+        "DLV-NOT-RELEASE-READY": "交付包尚未达到发布条件（授权门禁、机器校验或人工批准未同时成立）"
       },
       "licensing": {
         "LIC-REGISTRY-MISSING": "授权登记表缺失或格式非法，已按最严口径阻断交付",
@@ -144,7 +165,11 @@
         "LIC-BRAND-UNRESOLVED": "品牌与水印版本不存在或未启用，不得进入交付",
         "LIC-GATE-BLOCKED": "授权门禁未通过"
       }
-    }
+    },
+    "notes": [
+      "2026-10-07：EpisodeRenderVersion 已接入 TimelineRepo（schema v2），dry_run 不伪造登记；release_ready 为发布总门禁。",
+      "契约版本已升至 2026-10-07.2；本轮已运行 generate_client.py 重新生成 timeline render-version、delivery release-check、verify-render 类型/路径，生成物与规格摘要已同步；真实服务启动与硬件门禁仍待复核。"
+    ]
   },
   "spec_version": "2026-10-07",
   "spec_note": "本节由 W8 追加。与 contract_version 的区别：contract_version 随 W3 的契约/交付/授权变更，spec_version 随本文件自身的字段集变更。",
@@ -368,7 +393,7 @@
       "path": "frontend/src/api/generated/manifest.json",
       "produced_by": "scripts/generate_client.py",
       "hand_editable": false,
-      "note": "含 contract_version 与 spec_hash，前端启动闸门据此判断客户端是否过期"
+      "note": "含 contract_version 与 spec_hash，ApiCompatibilityGate 在前端启动时消费并阻断不兼容写操作"
     },
     {
       "path": "_route_snapshot_before.json",
@@ -382,12 +407,12 @@
   "generated_artifacts_note": "与 w3_contract_and_delivery.generated_artifacts 为同一份清单的两种视角：W3 块是契约/交付/授权侧的权威记录，本节是「全部生成物」的视角（含路由快照基线）。两处不一致时以 w3 块为准，并由 check_generated_client.py 兜底。",
   "required_schema_versions": {
     "facts_repo": 1,
-    "timeline_repo": 1,
+    "timeline_repo": 2,
     "jobs_repo": 1,
     "style_catalog": 1,
     "delivery": 1,
     "model_licensing": 1,
-    "openapi_contract": "2026-10-07.1",
+    "openapi_contract": "2026-10-07.2",
     "$note": "前三个是 SQLite 库内 schema_version 表登记的 module 版本；style_catalog 读自 app/style_catalog.json；delivery / model_licensing 见 w3_contract_and_delivery.required_schema_versions（常量式，非库内登记表）。"
   },
   "migration_heads": {
@@ -395,7 +420,7 @@
     "expected_heads": {
       "output/facts.db": {
         "facts_repo": 1,
-        "timeline_repo": 1
+        "timeline_repo": 2
       },
       "output/jobs.db": {
         "jobs_repo": 1
@@ -515,9 +540,9 @@
       "readonly-diagnose"
     ]
   },
-  "adr_directory": "docs/decisions/ADR-00{01..12}.*.md",
+  "adr_directory": "docs/decisions/ADR-00{01..13}.*.md",
   "$filled_by_w8": {
-    "$note": "W8 已追加的顶层键（回应下方 $reserved_for_w8 的交接清单）。w3_contract_and_delivery 块及其 $reserved_for_w8 原文**未被修改**，仅在其后追加。",
+    "$note": "历史交接记录：W8 曾追加顶层键。当前顶层 required_components / generated_artifacts / quality_gates 等已存在；w3_contract_and_delivery 仍保留，后续补修只在其 notes/residual 中更新，不删除 W3 权威字段。",
     "keys_added": [
       "spec_version",
       "required_components",
@@ -604,7 +629,7 @@
         "id": "generated-client-duplicate-export",
         "owner": "W3",
         "adr": "ADR-0004",
-        "detail": "frontend/src/api/generated/index.ts:14-30 有 15 处 Duplicate identifier（contractsApi x3 / deliveryApi x8 / licensingApi x4）。根因：scripts/generate_client.py 按每个 operation 追加导出名，未去重。修法：生成时 sorted(set(...))。注意 check_generated_client.py **PASS**（生成物与规格一致），只有 frontend-types 能抓到 —— 故两道门禁不冗余。",
+        "detail": "首轮记录：frontend/src/api/generated/index.ts 曾有 15 处 Duplicate identifier。当前 scripts/generate_client.py 已加入 sorted(set(...)) 去重，当前生成物未见重复导出；本轮未重跑 frontend-types / generated-fresh，故状态应标为「源码已修，门禁待复核」。",
         "gate": "generated-fresh（已加 --require-ts）",
         "state": "fixed（2026-10-07 已修，见 ADR-0011/0004）",
         "followup": "g0-contract 的 generated-fresh 命令需追加 --require-ts"
@@ -653,7 +678,7 @@
         "residual": [
           "旧渲染路径仍是默认分支 —— render_from_plan() 需显式开启（POST /api/timeline/revisions/<id>/render），生产流程尚未切过去",
           "compose_plan_to_ffmpeg_args() **从未被真实 ffmpeg 执行过一次**：xfade / acrossfade / concat / atrim 的 offset 与长度递推、concat 前显式 aformat 规范化，全部只有参数串断言与图反推的算术验证（本轮禁跑 FFmpeg 与 GPU）。首次启用必须渲一段短样片逐帧核对时长、转场边界与音画同步",
-          "EpisodeRenderVersion 只随端点响应返回，**连内存里都不持有**（不是「无落库表」那么弱）：请求结束即丢，进程重启更丢，跨请求查不回",
+          "已关闭（2026-10-07）：EpisodeRenderVersion 已落库到 episode_render_versions（timeline_repo schema v2），并提供 /api/timeline/renders/* 查询；dry_run 不伪造登记。",
           "字幕仍与后期混在同一条路径，compose_plan 未把字幕作为独立图层解耦（subtitle_revision 只是挂在计划上的引用）",
           "compose_fingerprint 与 render_from_plan() 的绑定尚未接入 workflow_hash 免重渲判据 —— 即冻结计划变了，旧计划渲出的成片仍会被判为「无需重渲」",
           "指纹值已变更两次：第一轮把 total_duration_sec 与 compose_fingerprint 纳入 plan_fingerprint 载荷，第二轮把 silence_declarations 纳入。该路径为 opt-in 新端点、从未有生产渲染走过，故无历史指纹需迁移，但任何已按旧指纹做过比对的人工记录都需重算",
@@ -684,7 +709,7 @@
     "contract_gate_note": "generated-fresh 门禁原先只注册 3 个蓝图而 MANUAL_BLUEPRINTS 声称 7 个，属空转通过；2026-10-07 已改为注册全部 7 域并豁免 3 个 /health 运维探针。"
   },
   "$reserved_for_w8": {
-    "$note": "以下顶层键属 W8（ADR + 决策可追溯）与 W2（领域仓储迁移），本轮 W3 未创建，留空由该 owner 追加：",
+    "$note": "历史交接清单：以下键最初由 W3 保留给 W8/W2；当前顶层已存在这些键。此段保留用于说明来源，不应再被解读为「当前缺失」。",
     "keys": [
       "required_components",
       "generated_artifacts",

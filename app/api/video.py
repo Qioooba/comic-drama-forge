@@ -293,28 +293,59 @@ def api_generate_final():
     project_name, err = _project_or_400((data.get('project_name') or '').strip())
     if err is not None:
         return err
-    script_path = data.get('script_path', '')
+    script_path = str(data.get('script_path') or '')
+    episode_no = data.get('episode_no')
+    wanted = None
+    if episode_no not in (None, "", 0, "0"):
+        try:
+            wanted = int(episode_no)
+        except (TypeError, ValueError):
+            return jsonify({"error": f"episode_no 非法：{episode_no!r}"}), 400
+    allowed_scripts = {os.path.normcase(os.path.realpath(p))
+                       for p in project_store.project_scripts(project_name)}
+    if not script_path:
+        if wanted is None:
+            return jsonify({"error": "缺少 script_path 或 episode_no，无法定位成片剧本"}), 400
+        for cand in project_store.project_scripts(project_name):
+            try:
+                with open(cand, "r", encoding="utf-8") as f:
+                    _tmp = json.load(f) or {}
+                _ep = _tmp.get("episode_no") or (_tmp.get("metadata") or {}).get("episode_no")
+                if int(_ep or 0) == wanted:
+                    script_path = cand
+                    break
+            except Exception:
+                continue
+        if not script_path:
+            return jsonify({"error": f"未找到第 {wanted} 集剧本"}), 404
 
     # P0-4：剧本路径必须先落在项目输出目录内（与 project_store.bind_script 同口径），
-    # 越界（如 C:/Windows/... 或项目外路径）直接拒读，避免被 index.json 里被污染的
-    # 绝对路径拖出目录读走任意文件。
-    if not script_path or not project_store.is_path_inside_output(script_path):
-        return jsonify({"error": "剧本路径必须在项目输出目录内（output/），越界路径已拒读"}), 400
+    # 且必须属于当前请求项目，不能拿项目 B 的剧本给项目 A 合成并登记交付。
+    if not project_store.is_path_inside_output(script_path):
+        return jsonify({"error": "剧本路径必须在项目 output/ 内，越界路径已拒读"}), 400
+    real_script = os.path.normcase(os.path.realpath(script_path))
+    if real_script not in allowed_scripts:
+        return jsonify({"error": "剧本路径不属于当前项目，已拒绝合成"}), 400
     if not os.path.exists(script_path):
         return jsonify({"error": "剧本文件不存在"}), 400
 
     try:
         # 集号与剧本一起解析：合成必须知道是第几集（审计 S4 —— 旧代码合成完才读集号，
         # 而合成函数压根没有集号入参，于是第 2 集及以后合成的是第 1 集的片段）
-        ep_no = 0
         try:
             with open(script_path, "r", encoding="utf-8") as f:
                 _sc = json.load(f) or {}
             ep_no = int(_sc.get('episode_no')
                         or (_sc.get('metadata') or {}).get('episode_no') or 0)
-        except Exception:  # noqa: BLE001 - 剧本读不到就退回第 1 集
-            ep_no = 0
-        output = video_processor.generate_final_video(script_path, project_name, ep_no or 1)
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": f"剧本集号无法解析：{exc}"}), 400
+        if ep_no <= 0:
+            return jsonify({"error": "剧本缺少有效 episode_no，拒绝按第 1 集兜底合成"}), 400
+        if wanted is not None and ep_no != wanted:
+            return jsonify({"error": f"请求集号 {wanted} 与剧本集号 {ep_no} 不一致"}), 400
+        output = video_processor.generate_final_video(script_path, project_name, ep_no)
+        if output and not project_store.is_path_inside_output(output):
+            return jsonify({"error": "成片输出路径不在项目 output/ 内，已拒绝登记交付"}), 500
         if not output:
             return jsonify({"error": f"没有可合并的视频片段（第 {ep_no or 1} 集），"
                                      "请先完成步骤5的视频生成"}), 400

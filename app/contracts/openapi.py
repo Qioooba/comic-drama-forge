@@ -61,7 +61,7 @@ __all__ = [
 OPENAPI_VERSION = "3.1.0"
 
 #: 契约版本。前端启动时的兼容性闸门（W5）拿它做比对。
-CONTRACT_VERSION = "2026-10-07.1"
+CONTRACT_VERSION = "2026-10-07.2"
 
 _RULE_ARG = re.compile(r"<(?:(?P<conv>[a-zA-Z_]+):)?(?P<name>[a-zA-Z_][a-zA-Z0-9_]*)>")
 
@@ -640,14 +640,21 @@ SCHEMAS.update({
     },
     "CreateIntentRequest": {
         "type": "object",
-        "required": ["project", "prompt"],
+        "required": ["project", "episode", "shot_key", "prompt"],
         "properties": {
             "project": {"type": "string"},
+            "episode": {"type": ["string", "integer"]},
+            "shot_key": {"type": "string"},
             "prompt": {"type": "string"},
+            "kind": {"type": "string"},
+            "negative_prompt": {"type": "string"},
             "ref_slots": {"type": "array", "items": _FREEFORM},
             "seed": {"type": "integer"},
-            "profile": {"type": "string"},
+            "profile_id": {"type": "string"},
+            "profile_version": {"type": ["string", "integer"]},
             "workflow_version": {"type": "string"},
+            "workflow_hash": {"type": "string"},
+            "created_by": {"type": "string"},
             "derived_from": {"type": "string"},
         },
     },
@@ -836,6 +843,33 @@ SCHEMAS.update({
             "preflight": {"$ref": "PreflightReport"},
         },
     },
+    "ReleaseCheckRequest": {
+        "type": "object",
+        "description": "发布检查不接受客户端授权结论；服务端按 requirement 重新评估。",
+        "properties": {},
+    },
+    "ReleaseCheckResponse": {
+        "type": "object",
+        "required": ["success", "release"],
+        "properties": {
+            "success": {"type": "boolean"},
+            "release": {
+                "type": "object",
+                "required": ["ok", "blockers"],
+                "properties": {
+                    "ok": {"type": "boolean"},
+                    "code": {"type": "string"},
+                    "message": {"type": "string"},
+                    "blockers": {"type": "array", "items": {"type": "string"}},
+                    "approval_state": {"type": "string"},
+                    "licensing_ok": {"type": "boolean"},
+                    "verified_ok": {"type": "boolean"},
+                    "disk_ok": {"type": "boolean"},
+                },
+            },
+            "package": {"type": "object"},
+        },
+    },
     "RenderManifest": {
         "type": "object",
         "description": "渲染清单。合法静音在此**前置声明**，而不是渲染后才发现。",
@@ -858,22 +892,56 @@ SCHEMAS.update({
     },
     "VerifyRenderRequest": {
         "type": "object",
-        "required": ["compose_fingerprint", "path"],
+        "required": ["probed"],
+        "description": "渲完结果核验：传 ffprobe 结果，不登记 EpisodeRenderVersion。",
         "properties": {
+            "probed": {"type": "object", "additionalProperties": True},
+            "tolerance_sec": {"type": "number", "minimum": 0},
+        },
+    },
+    "VerifyRenderResponse": {
+        "type": "object",
+        "required": ["success", "ok", "reason", "compose_fingerprint", "planned_duration_sec"],
+        "properties": {
+            "success": {"type": "boolean", "const": True},
+            "ok": {"type": "boolean"},
+            "reason": {"type": "string"},
             "compose_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-            "path": {"type": "string"},
-            "authorized_by": {"type": "string"},
+            "planned_duration_sec": {"type": "number"},
         },
     },
     "EpisodeRenderVersion": {
         "type": "object",
-        "required": ["render_version_id", "compose_fingerprint"],
+        "required": ["render_id", "revision_id", "compose_fingerprint", "plan_fingerprint"],
         "properties": {
-            "render_version_id": {"type": "string"},
+            "render_id": {"type": "string"},
+            "revision_id": {"type": "string"},
+            "project": {"type": "string"},
+            "episode": {"type": "string"},
+            "revision_no": {"type": "integer"},
             "compose_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-            "path": {"type": "string"},
-            "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "plan_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "output_path": {"type": "string"},
+            "output_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "output_bytes": {"type": "integer"},
+            "output_duration_sec": {"type": "number"},
+            "subtitle_revision": {"type": "string"},
+            "entry_media_version_ids": {"type": "array", "items": {"type": "string"}},
+            "declared_silences": {"type": "integer"},
+            "authorized_by": {"type": "string"},
+            "authorization_ref": {"type": "string"},
             "created_at": {"type": "string"},
+            "note": {"type": "string"},
+            "bind_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        },
+    },
+    "RenderVersionListResponse": {
+        "type": "object",
+        "required": ["success", "renders", "count"],
+        "properties": {
+            "success": {"type": "boolean", "const": True},
+            "renders": {"type": "array", "items": _ref("EpisodeRenderVersion")},
+            "count": {"type": "integer"},
         },
     },
     "RenderVersionResponse": {
@@ -886,13 +954,22 @@ SCHEMAS.update({
     },
     "RenderRequest": {
         "type": "object",
+        "required": ["authorized_by"],
         "description": "按冻结计划发起渲染。``authorized_by`` 必须是人工主体。",
         "properties": {
             "authorized_by": {"type": "string",
                               "description": "机器账号一律 403（复用 require_human_authorization）"},
+            "authorization_ref": {"type": "string"},
             "output_path": {"type": "string"},
             "dry_run": {"type": "boolean",
                         "description": "只做预检不真渲染；用于接上游合成计划的安全接入"},
+            "preview": {"type": "boolean"},
+            "renderer": {"type": "string"},
+            "preset": {"type": "string"},
+            "note": {"type": "string"},
+            "target_w": {"type": "integer"},
+            "target_h": {"type": "integer"},
+            "target_fps": {"type": "integer"},
         },
     },
 
@@ -1123,6 +1200,13 @@ def _build_manual_paths() -> Dict[str, Dict[str, Any]]:
                        ok_schema=_ref("DeliveryPackageResponse"),
                        errors=[(404, "交付包不存在")]),
         },
+        "/api/delivery/packages/{package_id}/release-check": {
+            "post": _op("releaseCheckDeliveryPackage", "交付发布总门禁（授权+校验+人工批准+磁盘）",
+                        d, params=[_path_param("package_id", {"type": "string"}, "交付包 id")],
+                        request_body=_json_body(_ref("ReleaseCheckRequest"), required=False),
+                        ok_schema=_ref("ReleaseCheckResponse"),
+                        errors=[(404, "交付包不存在")]),
+        },
         "/api/delivery/packages/{package_id}/manifest": {
             "get": _op("getDeliveryManifest", "交付清单（逐文件 SHA-256 + 包摘要）", d,
                        params=[_PACKAGE_PARAM],
@@ -1305,11 +1389,28 @@ def _build_manual_paths() -> Dict[str, Dict[str, Any]]:
                        errors=[(404, "revision 不存在")]),
         },
         "/api/timeline/revisions/{revision_id}/verify-render": {
-            "post": _op("verifyTimelineRender", "登记 EpisodeRenderVersion（绑 compose_fingerprint）",
+            "post": _op("verifyTimelineRender", "核验渲染结果与时长（不登记 EpisodeRenderVersion）",
                         tl, params=[_revision_id],
                         request_body=_json_body(_ref("VerifyRenderRequest")),
-                        ok_schema=_ref("RenderVersionResponse"),
-                        errors=[(409, "compose_fingerprint 不匹配")]),
+                        ok_schema=_ref("VerifyRenderResponse"),
+                        errors=[(404, "revision 不存在")]),
+        },
+        "/api/timeline/revisions/{revision_id}/renders": {
+            "get": _op("listTimelineRenderVersions", "列出该 revision 的成片登记", tl,
+                       params=[_revision_id],
+                       ok_schema=_ref("RenderVersionListResponse"),
+                       errors=[(404, "revision 不存在")]),
+        },
+        "/api/timeline/renders/{render_id}": {
+            "get": _op("getTimelineRenderVersion", "读取成片登记（含指纹与 sha256）", tl,
+                       params=[_path_param("render_id", {"type": "string"}, "渲染登记 id")],
+                       ok_schema=_ref("RenderVersionResponse"),
+                       errors=[(404, "成片登记不存在")]),
+        },
+        "/api/timeline/renders/by-fingerprint/{compose_fingerprint}": {
+            "get": _op("findTimelineRenderVersions", "按剪辑指纹反查成片登记", tl,
+                       params=[_path_param("compose_fingerprint", {"type": "string"}, "剪辑指纹")],
+                       ok_schema=_ref("RenderVersionListResponse")),
         },
         "/api/timeline/revisions/{revision_id}/render": {
             "post": _op("renderTimelineRevision",

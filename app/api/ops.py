@@ -135,6 +135,135 @@ def api_analytics_reset():
 # P2-1 / P2-2  NLE 导出（剪映草稿 / FCPXML / SRT / 帧序列）
 # ==========================================================================
 
+def _quality_artifact_for(project_name: str, episode_no) -> str:
+    """发布门禁绑定真实交付物：优先最终成片，缺回退到整集视频。"""
+    try:
+        ep = int(episode_no)
+    except (TypeError, ValueError):
+        return _quality_find_full(project_name, episode_no)
+    try:
+        for item in pipeline.list_deliverables(project_name) or []:
+            try:
+                if int(item.get("episode_no") or 0) != ep:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            path = str(item.get("path") or "")
+            if path and os.path.isfile(path):
+                return path
+    except Exception:
+        pass
+    return _quality_find_full(project_name, ep)
+
+
+def _delivery_release_gate_for(project_name: str, filename: str = ""):
+    """下载/取回导出文件前统一交付包门禁。
+
+    质量门禁只说明“可以导出”；真正取回文件还必须有非空交付包、授权门禁、
+    机器校验、人工批准与磁盘哈希同时成立。没有交付包时 fail-closed。
+    """
+    try:
+        from domain import delivery as delivery_domain
+        from infrastructure import delivery_repo, licensing_repo
+    except ImportError:  # pragma: no cover - 脚本方式导入兜底
+        from app.domain import delivery as delivery_domain
+        from app.infrastructure import delivery_repo, licensing_repo
+    blockers = []
+    pkg_project = project_name
+    try:
+        rec = project_store.get_project(project_name)
+        if rec:
+            pkg_project = rec.get("dir_key") or project_name
+    except Exception:
+        pass
+    try:
+        packages = delivery_repo.list_packages(pkg_project)
+    except Exception as exc:  # noqa: BLE001
+        return [f"交付包清单读取失败：{exc}"]
+    if not packages:
+        return ["未登记交付包，无法下载发布文件"]
+    target = str(filename or "").replace("\\", "/").lstrip("/")
+    target_base = os.path.basename(target)
+    candidates = []
+    for pkg in packages:
+        files = pkg.get("files") or []
+        if target and any(
+            str(f.get("rel_path") or "").replace("\\", "/") == target
+            or os.path.basename(str(f.get("rel_path") or "")) == target_base
+            for f in files
+        ):
+            candidates.append(pkg)
+    if not candidates:
+        candidates = packages
+    passed = False
+    for pkg in candidates:
+        try:
+            gate = licensing_repo.evaluate_delivery_gate(
+                pkg.get("requirement") or {}, project=pkg.get("project") or pkg_project, audit=True)
+            approval = delivery_repo.get_approval(pkg.get("package_id") or "")
+            result = delivery_domain.release_ready(pkg, approval, licensing_gate=gate)
+            if result.get("ok"):
+                passed = True
+                break
+            blockers.extend([f"交付包 {pkg.get('package_id')}：{b}"
+                             for b in (result.get("blockers") or [])])
+        except Exception as exc:  # noqa: BLE001
+            blockers.append(f"交付包 {pkg.get('package_id')} 门禁异常：{exc}")
+    if not passed:
+        return blockers or ["交付包发布门禁未通过"]
+    return []
+
+
+def _release_gate_for(project_name: str, episode_no=None):
+    """导出前统一发布门禁：D 层批准 + 产物哈希绑定未失效。"""
+    blockers = []
+    eps = []
+    if episode_no not in (None, "", 0, "0"):
+        try:
+            eps = [int(episode_no)]
+        except (TypeError, ValueError):
+            blockers.append(f"episode_no 非法：{episode_no!r}")
+    else:
+        try:
+            for path in project_store.project_scripts(project_name):
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        data = json.load(f) or {}
+                    ep = data.get("episode_no") or (data.get("metadata") or {}).get("episode_no")
+                    if ep is not None:
+                        eps.append(int(ep))
+                except Exception:
+                    continue
+            eps = sorted(set(eps))
+        except Exception:
+            eps = []
+    if not eps:
+        blockers.append("未找到可发布剧集，导出已阻止")
+        return blockers
+    for ep in eps:
+        state = quality_stage.load_state(project_name, ep)
+        ready, reasons = quality_stage.release_ready(state)
+        if not ready:
+            blockers.extend([f"第{ep}集：{r}" for r in reasons if not str(r).startswith("提示：")])
+        full = _quality_artifact_for(project_name, ep)
+        for stage in ("C", "D"):
+            entry = (state.get("stages") or {}).get(stage) or {}
+            if entry.get("status") != "passed":
+                continue
+            binding = entry.get("binding")
+            if not isinstance(binding, dict) or not binding:
+                blockers.append(f"第{ep}集：{stage} 层已通过但缺少产物哈希绑定")
+                continue
+            if not str(binding.get("artifact_sha256") or "").strip():
+                blockers.append(f"第{ep}集：{stage} 层绑定缺少 artifact_sha256")
+                continue
+            status, reason = quality_stage.check_stage_binding(state, stage, full)
+            if status != "valid":
+                blockers.append(f"第{ep}集：{stage} 层批准无效（{reason}）")
+    return blockers
+
+
+
 @bp.route('/api/export/run', methods=['POST'])
 def api_export_run():
     """一键导出：剪映草稿 + FCPXML + SRT + 帧序列清单
@@ -146,6 +275,10 @@ def api_export_run():
     project, err = _project_or_400(data.get('project_name') or '')
     if err is not None:
         return err
+    blockers = _release_gate_for(project, data.get('episode_no'))
+    if blockers:
+        return jsonify({"success": False, "error": "导出发布门禁未通过",
+                        "blockers": blockers}), 409
     script = _load_script_for(project, data.get('episode_no'))
     if not script:
         return jsonify({"success": False, "error": "剧本不存在"}), 404
@@ -222,7 +355,27 @@ def api_export_list():
 
 @bp.route('/api/export/download/<path:filename>')
 def api_export_download(filename):
-    """导出产物下载（限导出根目录内）"""
+    """导出产物下载（限导出根目录内；下载前同样走发布门禁）"""
+    parts = [x for x in str(filename or "").replace("\\", "/").split("/") if x and x != "."]
+    project = str(request.args.get("project") or "").strip()
+    if not project and len(parts) > 1:
+        project = parts[0]
+    if not project:
+        base = os.path.basename(parts[-1]) if parts else ""
+        for rec in project_store.list_projects(with_stats=False):
+            for key in (rec.get("dir_key"), rec.get("id"), rec.get("name")):
+                key = str(key or "")
+                if key and (base == key or base.startswith(key + "_")):
+                    project = rec.get("dir_key") or key
+                    break
+            if project:
+                break
+    blockers = _release_gate_for(project) if project else ["无法识别导出文件所属项目，下载已阻止"]
+    if project:
+        blockers.extend(_delivery_release_gate_for(project, filename))
+    if blockers:
+        return jsonify({"success": False, "error": "导出发布门禁未通过",
+                        "blockers": blockers}), 409
     return _serve_attachment(nle_export.EXPORT_DIR, filename)
 
 
@@ -1033,6 +1186,10 @@ def api_export_project(project_name):
     project_name, err = _project_or_400(project_name, field_name="project_name")
     if err is not None:
         return err
+    blockers = _release_gate_for(project_name, data.get('episode_no'))
+    if blockers:
+        return jsonify({"success": False, "error": "导出发布门禁未通过",
+                        "blockers": blockers}), 409
     # 前端不传 timeline（工作台 ExportTab 就只传 formats）。此处必须自己从剧本
     # 构建时间轴，否则会导出成空的占位文件。
     timeline = _timeline_for_export(project_name, data.get('episode_no'),
@@ -1040,6 +1197,19 @@ def api_export_project(project_name):
 
     em = ExportManager(project_name, PROJECT_OUTPUT_DIR)
     exports = em.export_all(timeline)
+    # 交付包扫描的是 nle_export.EXPORT_DIR（output/export/<project>/），
+    # 而 ExportManager 历史上写 output/exports/<project>/。把本轮产物同步一份到
+    # 交付扫描根目录，避免“导出成功但交付包永远看不到这些文件”。
+    try:
+        delivery_root = os.path.join(nle_export.EXPORT_DIR, project_name)
+        os.makedirs(delivery_root, exist_ok=True)
+        for src in exports.values():
+            dst = os.path.join(delivery_root, os.path.basename(src))
+            if os.path.abspath(src) != os.path.abspath(dst):
+                shutil.copy2(src, dst)
+    except Exception as exc:  # noqa: BLE001
+        app.logger.warning("导出产物同步到交付目录失败（不阻断导出）：%s", exc)
+
 
     # 转换为前端期望的格式
     result_files = []
@@ -1071,6 +1241,10 @@ def api_get_export_file(project_name, format):
     project_name, err = _project_or_400(project_name, field_name="project_name")
     if err is not None:
         return err
+    blockers = _release_gate_for(project_name)
+    if blockers:
+        return jsonify({"success": False, "error": "导出发布门禁未通过",
+                        "blockers": blockers}), 409
     export_dir = os.path.join(PROJECT_OUTPUT_DIR, "exports", project_name)
     if format == 'fcpml':
         filename = f"{project_name}_fcpml.xml"
@@ -1081,6 +1255,10 @@ def api_get_export_file(project_name, format):
     else:
         return jsonify({"success": False, "error": "不支持的格式"}), 400
 
+    blockers.extend(_delivery_release_gate_for(project_name, filename))
+    if blockers:
+        return jsonify({"success": False, "error": "导出发布门禁未通过",
+                        "blockers": blockers}), 409
     filepath = os.path.join(export_dir, filename)
     if not os.path.exists(filepath):
         return jsonify({"success": False, "error": "文件不存在"}), 404
@@ -1100,6 +1278,10 @@ def api_export_current():
     project_name, err = _project_or_400(project_name, field_name="project_name")
     if err is not None:
         return err
+    blockers = _release_gate_for(project_name, data.get('episode_no'))
+    if blockers:
+        return jsonify({"success": False, "error": "导出发布门禁未通过",
+                        "blockers": blockers}), 409
 
     export_dir = os.path.join(PROJECT_OUTPUT_DIR, "exports", project_name)
     os.makedirs(export_dir, exist_ok=True)
