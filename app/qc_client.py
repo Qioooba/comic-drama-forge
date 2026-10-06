@@ -18,6 +18,7 @@ AI 质检模块（图片 / 视频）—— 可开关、可配置、不达标自�
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
 import logging
@@ -798,6 +799,8 @@ CONFIG_KEYS = (
     "image_pixel_std_min", "video_max_drift",
     # 提示词预检（生成前质检，见 prompt_qc.py）。⚠️ 它不依赖质检接口，默认开启
     "prompt_enabled", "prompt_mode",
+    # P1-9：视觉能力强制自检结果（untested/ok/failed/uncertain）
+    "vision_status", "vision_checked_at", "vision_error", "vision_endpoint_key",
 )
 
 
@@ -870,6 +873,12 @@ def _empty_config() -> dict:
         "prompt_enabled": True,
         # warn=只记录 / repair=确定性自愈后放行（默认）/ block=有问题就拦
         "prompt_mode": "repair",
+        # P1-9：图片/视频质检启用前必须确认模型真的支持图像输入。
+        # uncertain 也按“未生效”处理，绝不能当成通过。
+        "vision_status": "untested",
+        "vision_checked_at": None,
+        "vision_error": "",
+        "vision_endpoint_key": "",
         "updated_at": None,
     }
 
@@ -1018,6 +1027,82 @@ def _sync_credentials_db(cfg: dict = None, api_key: str = None, source: str = "q
     return ""
 
 
+def _vision_requested(cfg: dict) -> bool:
+    return bool(_as_bool(cfg.get("enabled"), False)
+                and (_as_bool(cfg.get("image_enabled"), True)
+                     or _as_bool(cfg.get("video_enabled"), True)))
+
+
+def _vision_endpoint_key(ep: dict) -> str:
+    """端点身份指纹；密钥只进哈希，不落明文。"""
+    raw = "\0".join([
+        str(ep.get("base_url") or "").strip().lower(),
+        str(ep.get("model") or "").strip(),
+        hashlib.sha256(str(ep.get("api_key") or "").encode("utf-8")).hexdigest(),
+    ])
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+
+def _persist_vision_status(config_path: str, cfg: dict) -> dict:
+    # 调用方已持 _QC_WRITE_LOCK；这里只做一次原子覆盖，不能再次加锁。
+    _atomic_write_json(config_path, cfg)
+    return load_config(config_path)
+
+
+def _refresh_vision_status(config_path: str, before: dict, cfg: dict,
+                           force: bool = False) -> dict:
+    """按需执行视觉自检，并把三态结果持久化。调用方必须已持写锁。"""
+    if not _vision_requested(cfg):
+        cfg["vision_status"] = "untested"
+        cfg["vision_error"] = ""
+        cfg["vision_endpoint_key"] = _vision_endpoint_key(resolve_endpoint(cfg))
+        return _persist_vision_status(config_path, cfg)
+
+    ep = resolve_endpoint(cfg)
+    key = _vision_endpoint_key(ep)
+    if not (ep.get("base_url") and ep.get("api_key") and ep.get("model")):
+        cfg["vision_status"] = "untested"
+        cfg["vision_error"] = "质检接口未配置完整，无法执行视觉自检"
+        cfg["vision_endpoint_key"] = key
+        return _persist_vision_status(config_path, cfg)
+
+    was_requested = _vision_requested(before)
+    before_key = _vision_endpoint_key(resolve_endpoint(before)) if was_requested else ""
+    status = str(cfg.get("vision_status") or "untested")
+    needs = (force
+             or not was_requested
+             or before_key != key
+             or str(before.get("vision_endpoint_key") or "") != key
+             or status not in ("ok", "failed", "uncertain"))
+    if not needs:
+        return cfg
+
+    result = test_vision(ep, timeout=60)
+    vision = result.get("vision")
+    cfg["vision_checked_at"] = datetime.now().isoformat(timespec="seconds")
+    cfg["vision_endpoint_key"] = key
+    if vision is True:
+        cfg["vision_status"] = "ok"
+        cfg["vision_error"] = ""
+    elif vision is None:
+        cfg["vision_status"] = "uncertain"
+        cfg["vision_error"] = str(result.get("hint") or result.get("error")
+                                  or "视觉能力未确认")
+    else:
+        cfg["vision_status"] = "failed"
+        cfg["vision_error"] = str(result.get("error") or "模型不支持图像输入")
+    logger.warning("质检视觉自检结果：%s（%s）",
+                   cfg["vision_status"], cfg["vision_error"] or "OK")
+    return _persist_vision_status(config_path, cfg)
+
+
+def refresh_vision_status(config_path: str, force: bool = True) -> dict:
+    """公开入口：强制重测质检模型视觉能力（P1-9）。"""
+    with _QC_WRITE_LOCK:
+        cfg = load_config(config_path)
+        return _refresh_vision_status(config_path, cfg, dict(cfg), force=force)
+
+
 def save_config(config_path: str, patch: dict, keep_key_if_blank: bool = True) -> dict:
     # P2-T3：整段「读 load_config → 改 → 原子写」持锁串行化，
     # 防两个线程同时 save 时读改写互相丢更新（唯一临时名只防文件截断，不防逻辑丢更新）。
@@ -1027,6 +1112,8 @@ def save_config(config_path: str, patch: dict, keep_key_if_blank: bool = True) -
 
 def _save_config_impl(config_path: str, patch: dict, keep_key_if_blank: bool = True) -> dict:
     cfg = load_config(config_path)
+    before_cfg = dict(cfg)
+    force_vision = bool((patch or {}).get("_probe_vision"))
     # A2（2026-09-23）：记录本次是否写入了**新**密钥。None = 未改密钥，
     # 同步 DB 时保持库内原值（与 /api/ai/config 的 keep 语义一致）。
     new_key = None
@@ -1105,6 +1192,10 @@ def _save_config_impl(config_path: str, patch: dict, keep_key_if_blank: bool = T
     # 这里按**生效端点**同步（resolve_endpoint 会从加密库补齐密钥）；
     # api_key=None → 库内原密钥不动；失败只响亮降级，绝不阻断已完成的保存。
     _sync_credentials_db(final, api_key=new_key)
+    # P1-9：只要打开图片/视频质检，就先确认模型支持图像输入；
+    # uncertain/failed 均保持 image/video inactive，避免“以为在质检、实际跳过”。
+    final = _refresh_vision_status(config_path, before_cfg, final,
+                                   force=force_vision)
     return final
 
 
@@ -1180,6 +1271,13 @@ def _normalize(cfg: dict) -> dict:
     cfg["image_qc_recheck"] = _as_bool(cfg.get("image_qc_recheck"), True)
     _pmode = str(cfg.get("prompt_mode") or "repair").strip().lower()
     cfg["prompt_mode"] = _pmode if _pmode in ("warn", "repair", "block") else "repair"
+    _vstatus = str(cfg.get("vision_status") or "untested").strip().lower()
+    cfg["vision_status"] = (_vstatus if _vstatus in
+                            ("untested", "ok", "failed", "uncertain")
+                            else "untested")
+    cfg["vision_checked_at"] = str(cfg.get("vision_checked_at") or "") or None
+    cfg["vision_error"] = str(cfg.get("vision_error") or "")
+    cfg["vision_endpoint_key"] = str(cfg.get("vision_endpoint_key") or "")
     cfg["endpoint_override"] = _normalize_override(cfg.get("endpoint_override"))
     # G9/O1 图片客观层阈值：纯色/黑图 stddev 下限（float，默认 8.0，上限 50.0）
     try:
@@ -1327,8 +1425,16 @@ def public_view(cfg: dict) -> dict:
         "endpoint_source": ep["source"],
         "endpoint_auto_synced": ep.get("auto_synced", False),
         "ready": ready,
-        "image_qc_active": bool(cfg.get("enabled") and cfg.get("image_enabled") and ep["base_url"] and ep["api_key"] and ep["model"]),
-        "video_qc_active": bool(cfg.get("enabled") and cfg.get("video_enabled") and ep["base_url"] and ep["api_key"] and ep["model"]),
+        "vision_status": str(cfg.get("vision_status") or "untested"),
+        "vision_ok": str(cfg.get("vision_status") or "") == "ok",
+        "vision_checked_at": cfg.get("vision_checked_at"),
+        "vision_error": str(cfg.get("vision_error") or ""),
+        "image_qc_active": bool(cfg.get("enabled") and cfg.get("image_enabled")
+                                and ep["base_url"] and ep["api_key"] and ep["model"]
+                                and cfg.get("vision_status") == "ok"),
+        "video_qc_active": bool(cfg.get("enabled") and cfg.get("video_enabled")
+                                and ep["base_url"] and ep["api_key"] and ep["model"]
+                                and cfg.get("vision_status") == "ok"),
         # 音频分两档：客观层只要开关打开就能跑（零模型依赖），AI 层还要接口就绪。
         # 分开暴露是为了让前端能如实告诉用户「客观层在跑但 AI 层没配置」，
         # 而不是笼统显示一个「未启用」让人误以为整条音频质检都没生效。
@@ -1362,13 +1468,16 @@ def clear_config(config_path: str) -> dict:
 # ===================== 开关判定（生成流程调用） =====================
 
 def image_qc_ready(cfg: dict, override: dict = None) -> bool:
+    # P1-9 第四要素：端点通 ≠ 支持视觉；vision 必须明确为 ok。
     return bool(cfg.get("enabled") and cfg.get("image_enabled")
-                and qc_endpoint_ready(cfg, override))
+                and qc_endpoint_ready(cfg, override)
+                and cfg.get("vision_status") == "ok")
 
 
 def video_qc_ready(cfg: dict, override: dict = None) -> bool:
     return bool(cfg.get("enabled") and cfg.get("video_enabled")
-                and qc_endpoint_ready(cfg, override))
+                and qc_endpoint_ready(cfg, override)
+                and cfg.get("vision_status") == "ok")
 
 
 def audio_qc_ready(cfg: dict, override: dict = None) -> bool:

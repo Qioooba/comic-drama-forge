@@ -959,20 +959,28 @@ export function AIVaultPage() {
               {result && (() => {
                 // success=true 但没拿到正文（额度被思考占用）既不是「配置错」也不是「就绪」，
                 // 用琥珀色单独区分，避免用户看到红叉/绿勾后被误导。
-                const partial = result.success && result.verdict !== 'ok';
+                const visionBlocked = result.vision === false;
+                const visionUncertain = result.vision === null && result.uncertain;
+                const partial = result.success && (result.verdict !== 'ok' || visionUncertain);
                 const ms = result.latency_ms ?? result.response_time_ms;
-                const box = partial
-                  ? 'bg-warning-subtle text-warning-strong'
-                  : result.success
-                    ? 'bg-success-subtle text-success-strong'
-                    : 'bg-danger-subtle text-danger-strong';
-                    const ResultIcon = partial ? AlertTriangle : result.success ? CheckCircle2 : X;
+                const box = visionBlocked
+                  ? 'bg-danger-subtle text-danger-strong'
+                  : partial
+                    ? 'bg-warning-subtle text-warning-strong'
+                    : result.success
+                      ? 'bg-success-subtle text-success-strong'
+                      : 'bg-danger-subtle text-danger-strong';
+                const ResultIcon = visionBlocked ? X : partial ? AlertTriangle : result.success ? CheckCircle2 : X;
                 return (
                   <div className={`p-3 rounded-lg text-sm ${box}`}>
                     <div className="flex items-center gap-2 flex-wrap">
                       <ResultIcon className="h-4 w-4 shrink-0" />
                       <span className="font-medium">
-                        {partial ? t('vault.verdictReachableNoContent') : result.success ? t('vault.testSuccess') : t('vault.testFailed')}
+                        {visionBlocked
+                          ? t('vault.visionBlocked')
+                          : partial
+                            ? t('vault.verdictReachableNoContent')
+                            : result.success ? t('vault.testSuccess') : t('vault.testFailed')}
                       </span>
                       {typeof ms === 'number' && (
                         <span className="text-xs opacity-75">({ms}ms)</span>
@@ -983,9 +991,11 @@ export function AIVaultPage() {
                       {result.disable_thinking === false && (
                         <span className="text-xs opacity-75">{t('vault.thinkingOn')}</span>
                       )}
-                      {result.vision === false && <span className="text-xs opacity-75">{t('vault.noVision')}</span>}
-                      {result.vision === null && result.uncertain && (
-                        <span className="text-xs opacity-75">{t('vault.visionUnconfirmed')}</span>
+                      {visionBlocked && (
+                        <span className="text-xs font-semibold">{t('vault.noVision')}</span>
+                      )}
+                      {visionUncertain && (
+                        <span className="text-xs font-semibold">{t('vault.visionUnconfirmed')}</span>
                       )}
                     </div>
                     {result.reply ? (

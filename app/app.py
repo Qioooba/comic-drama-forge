@@ -11980,15 +11980,42 @@ def api_qc_config_save():
     data.pop("reuse_llm", None)   # 旧字段：质检不再复用文本分析 LLM，直接忽略
     cfg = qc_client.save_config(QC_CONFIG_PATH, data)
     view = qc_client.public_view(cfg)
+    visual_requested = bool(view.get("enabled") and
+                            (view.get("image_enabled") or view.get("video_enabled")))
+    vision_bad = visual_requested and view.get("vision_status") != "ok"
     if view["enabled"] and not view["ready"]:
         return jsonify({"success": True, "config": view,
                         "config_path": os.path.abspath(QC_CONFIG_PATH),
                         "warning": "质检开关已开启，但质检接口信息不完整（base_url / api_key / model），"
                                    "生成流程将跳过质检且不会报错。",
                         "message": "配置已保存（接口未就绪）"})
+    if vision_bad:
+        status = view.get("vision_status") or "untested"
+        reason = {"failed": "当前质检模型不支持或未通过视觉输入测试",
+                  "uncertain": "视觉能力未确认",
+                  }.get(status, "尚未完成视觉能力自检")
+        return jsonify({"success": True, "config": view,
+                        "config_path": os.path.abspath(QC_CONFIG_PATH),
+                        "vision_warning": f"{reason}；图片/视频 AI 质检未生效。",
+                        "message": "配置已保存（视觉自检未通过）"})
     return jsonify({"success": True, "config": view,
                     "config_path": os.path.abspath(QC_CONFIG_PATH),
                     "message": "质检配置已保存"})
+
+
+@app.route('/api/qc/config/vision', methods=['POST'])
+def api_qc_config_vision():
+    """P1-9：强制重测质检模型是否支持图像输入；uncertain 也按未生效处理。"""
+    try:
+        cfg = qc_client.refresh_vision_status(QC_CONFIG_PATH, force=True)
+        view = qc_client.public_view(cfg)
+        return jsonify({"success": True, "config": view,
+                        "vision_status": view.get("vision_status"),
+                        "vision_ok": view.get("vision_ok"),
+                        "vision_error": view.get("vision_error", ""),
+                        "message": "视觉能力已重测"})
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"success": False, "error": f"视觉自检失败：{e}"}), 500
 
 
 @app.route('/api/qc/config/clear', methods=['POST'])

@@ -581,6 +581,14 @@ export interface MixStatusResponse {
 // --- QC ---
 export interface QCConfig {
   enabled: boolean;
+  image_enabled?: boolean;
+  video_enabled?: boolean;
+  vision_status?: 'untested' | 'ok' | 'failed' | 'uncertain';
+  vision_ok?: boolean;
+  vision_checked_at?: string | null;
+  vision_error?: string;
+  image_qc_active?: boolean;
+  video_qc_active?: boolean;
   max_retries: number;
   /** best-of-N 分镜候选数：1=关闭（默认），>1 时每镜生成 N 张候选按质检分选最佳 */
   best_of?: number;

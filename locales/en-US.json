@@ -1243,7 +1243,16 @@
     "time": "Time",
     "actions": "Actions",
     "retesting": "Retesting…",
-    "retest": "Retest"
+    "retest": "Retest",
+    "visionBlocked": "Vision probe failed: model does not support images",
+    "visionUncertain": "Vision probe unconfirmed: QC must not be treated as active",
+    "visionUntested": "Vision probe incomplete",
+    "visionInactive": "Image/video AI QC is not active",
+    "visionRetest": "Retest vision",
+    "visionTesting": "Testing…",
+    "visionOk": "Vision probe passed; image/video QC is active",
+    "visionBad": "Vision probe failed",
+    "visionFailed": "Vision probe failed"
   },
   "episodes": {
     "title": "Episode Management",
@@ -1504,7 +1513,8 @@
     "fallbackTestOk": "Fallback \"{label}\" is reachable",
     "fallbackTestPartial": "Reachable, but no content returned (reasoning likely consumed the budget)",
     "fallbackTestFail": "Fallback connection failed",
-    "cancel": "Cancel"
+    "cancel": "Cancel",
+    "visionBlocked": "Vision input unsupported: image/video AI QC is not active"
   },
   "sb": {
     "fetchFailed": "Failed to fetch",

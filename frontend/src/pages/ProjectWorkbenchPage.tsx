@@ -2549,7 +2549,9 @@ function QcTab({ projectKey }: { projectKey: string }) {
       } as any);
       // 后端在「总开关开了、但接口信息不全」时会回 warning：此时生成流程会**静默跳过**
       // 质检，必须原样透出给用户，否则又是一个「以为在质检其实没检」。
-      setNotice(t('qc.cfgSaved') + (resp?.warning ? `；⚠️ ${resp.warning}` : ''));
+      setNotice(t('qc.cfgSaved')
+        + (resp?.warning ? `；⚠️ ${resp.warning}` : '')
+        + (resp?.vision_warning ? `；⚠️ ${resp.vision_warning}` : ''));
       toast.success(t('qc.cfgSaved'));
       await load(true);
     } catch (e) {
@@ -2558,6 +2560,29 @@ function QcTab({ projectKey }: { projectKey: string }) {
       toast.error(msg);
     } finally {
       setCfgSaving(false);
+    }
+  };
+
+  const doVisionTest = async () => {
+    setCfgBusy('vision');
+    setError('');
+    setNotice('');
+    try {
+      const r = await qcApi.retestVision();
+      if (r?.vision_ok) {
+        setNotice(t('qc.visionOk'));
+        toast.success(t('qc.visionOk'));
+      } else {
+        setNotice(`${t('qc.visionBad')}：${r?.vision_error || r?.vision_status || ''}`);
+        toast.error(t('qc.visionBad'));
+      }
+      await load(true);
+    } catch (e) {
+      const msg = sanitizeError(e, t('qc.visionFailed'));
+      setError(msg);
+      toast.error(msg);
+    } finally {
+      setCfgBusy('');
     }
   };
 
@@ -2711,6 +2736,25 @@ function QcTab({ projectKey }: { projectKey: string }) {
             <div className="text-ink-1">{cfg.has_api_key ? (cfg.api_key_masked || t('qc.configured')) : t('qc.notConfigured')}</div>
           </div>
         </div>
+        {cfg.enabled && (cfg.image_enabled || cfg.video_enabled)
+          && cfg.vision_status !== 'ok' && (
+          <div className="mt-3 flex flex-wrap items-center gap-2 rounded border border-red-500/40 bg-red-500/10 p-2 text-xs text-red-600 dark:text-red-400">
+            <span className="font-semibold">
+              {cfg.vision_status === 'failed' ? t('qc.visionBlocked')
+                : cfg.vision_status === 'uncertain' ? t('qc.visionUncertain')
+                : t('qc.visionUntested')}
+            </span>
+            <span>{cfg.vision_error || t('qc.visionInactive')}</span>
+            <button
+              type="button"
+              className="ml-auto rounded border border-red-500/40 px-2 py-1 hover:bg-red-500/10"
+              disabled={cfgBusy === 'vision'}
+              onClick={() => void doVisionTest()}
+            >
+              {cfgBusy === 'vision' ? t('qc.visionTesting') : t('qc.visionRetest')}
+            </button>
+          </div>
+        )}
         <div className="mt-3 flex flex-wrap gap-2 text-xs">
           {/* 这里显示的是**实际是否生效**（*_qc_active），不是「用户配了什么」——
               配置开关在下方「质检配置」里，两处刻意分工：

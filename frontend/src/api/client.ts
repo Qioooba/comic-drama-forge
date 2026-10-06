@@ -801,6 +801,10 @@ export const qcApi = {
   clearConfig: () => request<{ success: boolean }>('/qc/config/clear', { method: 'POST' }),
   resetEndpoint: () => request<{ success: boolean }>('/qc/config/reset-endpoint', { method: 'POST' }),
   syncFromAI: () => request<{ success: boolean }>('/qc/config/sync-from-ai', { method: 'POST' }),
+  /** P1-9：强制重测质检模型视觉能力；uncertain 也按未生效返回。 */
+  retestVision: () =>
+    request<{ success: boolean; vision_status?: string; vision_ok?: boolean;
+              vision_error?: string }>('/qc/config/vision', { method: 'POST' }),
   // 审计 P1-7（2026-09-29）：必须把 project_name 送到后端 —— api_qc_test 按
   // project_name（缺省回落共享命名空间 'project'）从分镜目录自动挑样张；
   // 旧实现恒发空包体，「重测」拿到的要么是连通性探测、要么是别的项目的样张结论。

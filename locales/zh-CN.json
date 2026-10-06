@@ -1243,7 +1243,16 @@
     "time": "时间",
     "actions": "操作",
     "retesting": "重测中…",
-    "retest": "重测"
+    "retest": "重测",
+    "visionBlocked": "视觉自检失败：当前模型不支持图像输入",
+    "visionUncertain": "视觉自检未确认：不能视为质检已生效",
+    "visionUntested": "视觉自检未完成",
+    "visionInactive": "图片/视频 AI 质检未生效",
+    "visionRetest": "重测视觉",
+    "visionTesting": "测试中…",
+    "visionOk": "视觉自检通过，图片/视频质检已生效",
+    "visionBad": "视觉自检未通过",
+    "visionFailed": "视觉自检失败"
   },
   "episodes": {
     "title": "剧集管理",
@@ -1504,7 +1513,8 @@
     "infoComfyui": "ComfyUI 地址由环境变量 COMFYUI_URL 决定，页面上只做只读展示",
     "infoApiKey": "API Key 加密存储，不会在界面明文显示",
     "infoTestFirst": "建议先点「测试连接」确认接口可用后再保存",
-    "cancel": "取消"
+    "cancel": "取消",
+    "visionBlocked": "视觉输入不支持：图片/视频 AI 质检未生效"
   },
   "sb": {
     "fetchFailed": "获取失败",
