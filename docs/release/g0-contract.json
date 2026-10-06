@@ -429,7 +429,9 @@
         "python scripts/snapshot_routes.py _route_snapshot_before.json --diff _route_snapshot_now.json"
       ],
       "expect_exit_code": 0,
-      "fails_when": "既有 URL 逐字变化（协调书 R1：前端 1508 行全靠字符串拼 URL，改一个字符就 404）",
+      "fails_when": "**既有** URL 丢失或改路径（协调书 R1：前端 1508 行全靠字符串拼 URL，改一个既有字符就 404）",
+      "does_not_fail_when": "新增端点。本轮设计性新增 56 条（生产事实 / 任务 / 契约 / 交付 / 授权 / 风格 / 时间线 / 音频 AI 质检），不违反 R1。要严判「本轮不该有任何新增」时加 `--fail-on-added`。",
+      "gate_fix_2026_10_07": "⚠️ 旧实现 `return len(lost) + len(added)` 让「新增一条」即退出码非 0，叠加本轮 56 条新增后这道门禁**永远不可能通过** —— 一道永远红的门禁只会训练人忽略退出码。已改为只对 `lost` 失败，`added` 打印但默认放过。同轮更正一处更严重的错误：它此前被记成「EXIT=0 全绿」，那是只读了输出文本、没看真实退出码。负向验证：删掉 `/api/styles` 后门禁确实 EXIT=1。",
       "compare": "只比对路径 + 方法；endpoint 名允许随蓝图改名而变（ADR-0001）",
       "baseline": "_route_snapshot_before.json（252 rules）",
       "safety": "MJSCXT_AUTOPILOT=0 必设，否则 import 会触发 autopilot 托管恢复、会真的续跑生产；不启动服务 / 不连 ComfyUI / 不碰 GPU"
@@ -619,32 +621,46 @@
         "id": "frontend-features-split-not-implemented",
         "owner": "W5",
         "adr": "ADR-0009/0010",
-        "detail": "frontend/src/features/ 下除 style 外无任何域目录（agent/audio/output/qc/shot-studio/storyboard 已确认为空并删除）；ProjectWorkbenchPage.tsx 仍 5,429 行/247KB。TanStack Query 已在 package.json 但前端零引用，工作台 15 处 setInterval 仍在。路由骨架与 301 退役层已落地。",
+        "detail": "已落地（2026-10-07）：ProjectWorkbenchPage.tsx 由 5,429 行降到 868 行；features/ 下 overview 2167 / storyboard 1248 / qc 598 / upscale 575 / shot-studio 9 文件 1297 行；layouts/ AppShell + EpisodeContextBar；工作台 setInterval 由 7 处真实取数轮询收敛到 1 处（AgentTrace 的 1s 重渲染节拍，不发请求）。",
         "gate": "frontend-types",
-        "state": "open（2026-10-07 收口审核确认未实施）"
+        "state": "fixed（2026-10-07）",
+        "residual": [
+          "工作台之外的 5 处轮询仍是手写：AutopilotPanel 5s、Navbar 30s /api/status、ServiceMonitor 30s /api/status、LogsPage、useComfyProgress 的链式 setTimeout —— 都在当时的前端可写清单之外，未收编",
+          "audio / output / relation 三域只做了 re-export 薄壳（16/6/6 行），组件实体仍留在 components/。判断依据：三者本已单文件单职责、与其他域无共享状态，搬动行为收益为零却会产生大 diff 并让旧导入路径在搬迁窗口静默失效",
+          "AppShell 的 inspector 原本挂载两次（aside + drawer），会重复 DirectorIntentEditor 的硬编码 DOM id；已用 matchMedia 收敛为单次挂载，视觉不变"
+        ]
       },
       {
         "id": "selected-not-approved-ui-gap",
         "owner": "W5",
         "adr": "ADR-0002",
-        "detail": "采用!=批准在 domain 层与 API 层均成立（select/approve 是两个独立端点；未采用 409 / 机器账号 403），但 frontend/src 对 production_facts / decision_state / selected_not_approved 零引用 —— 用户看不到「已采用未批准」这一状态。",
-        "gate": "manual",
-        "state": "open（2026-10-07 收口审核确认）"
+        "detail": "已接线（2026-10-07）：import 链已逐跳验证 —— router.tsx → routes/routeElements → pages/ProjectWorkbenchPage → features/storyboard/StoryboardTab（第 4 个子页「镜头工作台」）→ ShotStudioTab → features/shot-studio → DecisionStateBadge / DirectorTakeAdoption，另有 layouts/AppShell + EpisodeContextBar 同链可达，零孤立组件。路由：#/projects/<key>/storyboard。SEL001 提醒级已人工确认：映射表严格分区，selected 系只落青档、approved 系只落绿档，无分支把采用渲染成批准，未识别状态 fail-closed 降级为「已采用·未批准」。",
+        "gate": "frontend-types + token-audit(SEL001 人工确认)",
+        "state": "partial（2026-10-07）",
+        "residual": [
+          "⚠️ **阻断级**：后端 create_intent() / register_media() 除 HTTP 路由自身外**零调用方** —— 生成流程从不登记 intent 与 media version。因此真实项目上 CandidateCompareDialog 只会显示「这一轮还没有候选版本」，DirectorTakeAdoption 虽在 import 图中可达但**实际不会渲染**。DecisionStateBadge 会以 none/「未采用」兜底渲染（fail-closed，不会读成已批准）。这是后端缺口，未用假数据源掩盖。",
+          "导演意图编辑与分场本轮只读：camera_motion / emotion 存中文散文而编辑器下拉是英文枚举，回写会污染提示词输入；blocking 不在 episode PUT 的 _ALLOWED；derive 端点强制要求 reason 而编辑器无该字段。三处均以可见原因禁用，不是点了静默失败的按钮",
+          "队列 / GPU / 磁盘状态显示「未知」：接真值需要新增 /api/status query hook，本轮刻意不加以免多出一处轮询点"
+        ]
       },
       {
         "id": "timeline-not-consumed-by-render",
         "owner": "W2",
         "adr": "ADR-0012",
-        "detail": "TimelineRevision/preflight/compose_fingerprint 已实现，且渲染消费链已补上：domain/timeline.py 的 build_compose_plan() / build_episode_render_version()，application/timeline_service.py 的 compose_plan_to_ffmpeg_args()（纯函数），video_postprocess.py 新增的 render_from_plan() / validate_render_plan()，以及 POST /api/timeline/revisions/<id>/render（复用 require_human_authorization）。⚠️ 对 video_postprocess.py 的改动是「新增为主」而非严格「仅追加」：git diff --numstat = 242 added / 1 deleted，那 1 行删除是第 14 行 typing import（补 Any）；除此之外没有任何既有函数体被修改，故既有行为不变。",
+        "detail": "TimelineRevision/preflight/compose_fingerprint 已实现，且渲染消费链已补上：domain/timeline.py 的 build_compose_plan() / build_episode_render_version()，application/timeline_service.py 的 compose_plan_to_ffmpeg_args()（纯函数），video_postprocess.py 新增的 render_from_plan() / validate_render_plan()，以及 POST /api/timeline/revisions/<id>/render（复用 require_human_authorization）。⚠️ 对 video_postprocess.py 的改动是「新增为主」而非严格「仅追加」：两轮修复累计 git diff --numstat = 297 added / 1 deleted（基线为第一轮修复之前的提交），那 1 行删除仍是第 11 行 typing import（补 Any）；git diff 的两个 hunk 只有这一个 import 行与文件末尾的纯追加，没有任何既有函数体被修改，故既有行为不变。2026-10-07 第二轮修复 6 处审计缺陷 + 另查出一处输入下标错渲（见 state）。",
         "gate": "manual",
-        "state": "partial（2026-10-07 收口审核前由渲染消费 Agent 落地；同日审计查出 6 处缺陷已修；下列 residual 前 5 项仍未接上，第 6 项是指纹值变更说明）",
+        "state": "partial（2026-10-07：第一轮修复 6 处审计缺陷；第二轮再修 6 处 + 1 处自查发现。第二轮修的：① concat 分支原来只 apad 补静音、本镜音轨从未进入音频链（画面有声/声音静音，而渲后时长校验照样通过）；② 音轨递推与权威成片时长在 27900 组输入里的 18600 组上分歧（其中 9300 组是 preflight 放行的合法输入，现已零分歧，另 18600 组非法输入全部 fail-closed 被拒）；③ 预览渲染失败的返回体缺 preview/deliverable/output_kind 标记；④ 集号从自由文本抠整数必然有损（S01E02 与 S01E03 都得到集号 1；第一集与第2集也撞），撞名叠上 -y 即静默覆盖已渲成片，文件名现加「集身份原文的短哈希」片段；⑤ TimelineRevision.total_duration_sec() 原为朴素求和，同一计划预检报 40.0、渲染声明并校验 38.5，现统一转发到唯一权威口径；⑥ 路径守卫补 Windows 保留设备名与长度上限（原先超长路径由 os.makedirs 抛 OSError 变 500），TOCTOU 收窄，silence_declarations 纳入 plan_fingerprint。第二轮自查另发现（不在原 6 处内）：compose_plan_to_ffmpeg_args 的输入下标算成 len(inputs)//2，导致第 2 镜起每镜都去读**上一镜的文件**，渲出「顺序看着对、素材全是错的那一版」且时长校验通过——已改为按已收集输入个数取下标。下列 residual 仍然成立，且本轮验证全部只到「参数串 + 纯逻辑算术」层。",
         "residual": [
           "旧渲染路径仍是默认分支 —— render_from_plan() 需显式开启（POST /api/timeline/revisions/<id>/render），生产流程尚未切过去",
-          "compose_plan_to_ffmpeg_args() 的 xfade / acrossfade offset 递推、以及本轮修正的 atrim 累计值，只做了纯逻辑断言，**从未真正跑过 ffmpeg** —— 首次启用必须渲一段短样片逐帧核对（受 R3 禁 GPU 约束，本轮无法验证）",
+          "compose_plan_to_ffmpeg_args() **从未被真实 ffmpeg 执行过一次**：xfade / acrossfade / concat / atrim 的 offset 与长度递推、concat 前显式 aformat 规范化，全部只有参数串断言与图反推的算术验证（本轮禁跑 FFmpeg 与 GPU）。首次启用必须渲一段短样片逐帧核对时长、转场边界与音画同步",
           "EpisodeRenderVersion 只随端点响应返回，**连内存里都不持有**（不是「无落库表」那么弱）：请求结束即丢，进程重启更丢，跨请求查不回",
           "字幕仍与后期混在同一条路径，compose_plan 未把字幕作为独立图层解耦（subtitle_revision 只是挂在计划上的引用）",
           "compose_fingerprint 与 render_from_plan() 的绑定尚未接入 workflow_hash 免重渲判据 —— 即冻结计划变了，旧计划渲出的成片仍会被判为「无需重渲」",
-          "2026-10-07 修复轮把 total_duration_sec 与 compose_fingerprint 纳入 plan_fingerprint 载荷，**指纹值因此改变**；该路径为 opt-in 新端点、从未有生产渲染走过，故无历史指纹需迁移，但任何已按旧指纹做过比对的人工记录都需重算"
+          "指纹值已变更两次：第一轮把 total_duration_sec 与 compose_fingerprint 纳入 plan_fingerprint 载荷，第二轮把 silence_declarations 纳入。该路径为 opt-in 新端点、从未有生产渲染走过，故无历史指纹需迁移，但任何已按旧指纹做过比对的人工记录都需重算",
+          "每镜音轨短于计划时长时不会被补静音：atrim 只裁不补，若源文件音轨比该镜声明时长短，音轨会短尾而渲后时长校验（只测容器最长流）看不出来。preflight 目前只比对**容器**时长与计划时长，不看流级音轨长度",
+          "输出文件名靠哈希片段保证不同 episode 不撞名，但**没有注册表或落盘前存在性校验**：同一集、同一 revision 的重复渲染仍会 -y 覆盖上一次产物（会登记成新的 render_id，历史登记不保留旧文件）",
+          "路径逃逸窗口只收窄未关闭：落盘前的复查把窗口从「检查→起 ffmpeg 进程」缩到「复查→建目录→exec」，但复查与 os.makedirs / ffmpeg 自己 open 之间仍有缝隙，彻底关闭需要基于句柄的打开方式或禁止中间目录为链接",
+          "render_from_plan() 的 output_root 是**必填**（缺省即拒绝写盘）：不经 /api/timeline/revisions/<id>/render 直接调用它而不传 output_root 的调用方会拿到 ok=False。这是本轮**有意**的破坏性变更（全仓 grep 仅 api/timeline.py 一处调用），但它把「谁负责声明可写范围」从隐含变成了显式参数"
         ]
       },
       {

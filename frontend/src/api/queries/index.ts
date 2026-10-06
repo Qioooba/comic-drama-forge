@@ -16,7 +16,7 @@ export { sanitizeError } from './errors';
 
 export { useAutopilotStatus } from './autopilot';
 
-export { useEpisodes, useStoryboardCanvas, useKeyframePlan } from './storyboard';
+export { useEpisodes, useEpisodeScript, useStoryboardCanvas, useKeyframePlan } from './storyboard';
 
 export { useGenerationStatus } from './jobs';
 export type { GenerationTaskStatus } from './jobs';
@@ -28,6 +28,8 @@ export {
   useMediaDecision,
   useSelectMediaVersion,
   useApproveMediaVersion,
+  useShotIntents,
+  latestIntentOf,
   normalizeDecisionState,
   mediaVersionsOf,
 } from './productionFacts';

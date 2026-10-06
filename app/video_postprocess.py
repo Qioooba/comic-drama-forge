@@ -896,11 +896,14 @@ def _assert_output_under_root(output_path: str, output_root: str) -> str:
 
     ``output_root`` 为空 ⇒ **拒绝写**（fail-closed）：无法验证归属就不落盘。
     """
-    root = os.path.abspath(str(output_root or ""))
+    root = str(output_root or "").strip()
     if not root:
         raise PlanRenderError(
             "按冻结计划渲染必须显式给出 output_root（项目输出根）；"
             "没有根就无法在落盘前复查路径归属，拒绝写盘")
+    # ⚠️ 先判空再 abspath：``os.path.abspath("")`` 返回**当前工作目录**，
+    # 少了上面那一步，空 root 会静默变成「进程 cwd」—— 那不是 fail-closed。
+    root = os.path.abspath(root)
     target = os.path.realpath(os.path.abspath(str(output_path or "")))
     try:
         inside = os.path.commonpath([os.path.normcase(target),
@@ -985,6 +988,16 @@ def render_from_plan(plan: Any, output_path: str, *, caller: str = "",
         return report
 
     # ---- 计划 → ffmpeg（真渲）----
+    # 落盘前复查路径归属（TOCTOU 收窄，见 _assert_output_under_root）。放在 mode
+    # 分支**之前**：concat_copy 分支同样把 output_path 交给子进程写，
+    # 只在 filter 分支复查就等于给另一条路径留了同一个洞。
+    try:
+        _assert_output_under_root(output_path, output_root)
+    except PlanRenderError as e:
+        report["error"] = str(e)
+        logger.error("%s：%s", report["caller"], report["error"])
+        return report
+
     proc = VideoPostProcessor()
     if ffmpeg.get("mode") == "concat_copy":
         files = [e.video_path for e in obj.entries]
@@ -994,13 +1007,6 @@ def render_from_plan(plan: Any, output_path: str, *, caller: str = "",
             report["error"] = "按冻结计划拼接失败（详见 concat_videos 的 error 日志）"
             return report
     else:
-        # ---- 落盘前复查路径归属（TOCTOU 收窄，见 _assert_output_under_root）----
-        try:
-            _assert_output_under_root(output_path, output_root)
-        except PlanRenderError as e:
-            report["error"] = str(e)
-            logger.error("%s：%s", report["caller"], report["error"])
-            return report
         args = ["ffmpeg"] + list(ffmpeg.get("args") or []) + [output_path]
         try:
             os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".",

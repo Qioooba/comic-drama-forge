@@ -29,6 +29,26 @@ export function useEpisodes(novelId?: string) {
 }
 
 /**
+ * 单集剧本正文（Shot Studio 的站位来源）。
+ *
+ * ⚠️ 为什么分镜画布不夠用：canvas 卡片带 `characters_in_shot`（角色**名字**），
+ *    但**站位** `blocking: [{name, x, depth, facing}]` 只在剧本正文里
+ *    （`app/novel_to_script.py::_norm_blocking` 归一后才落到 row 上）。
+ *    少这一次请求，站位板就只能靠猜 —— 那正是它作为「生成前可核对事实」
+ *    最不该有的状态。
+ *
+ * 不轮询：剧本只在用户显式编辑时变，且那条路径已自行失效画布缓存。
+ */
+export function useEpisodeScript(novelId?: string, episodeNo?: number | null) {
+  return useQuery({
+    queryKey: queryKeys.episodeScript(novelId || '', episodeNo),
+    queryFn: () => episodesApi.get(novelId as string, episodeNo as number),
+    enabled: !!novelId && episodeNo != null,
+    staleTime: 30_000,
+  });
+}
+
+/**
  * 分镜画布（按集）。
  *
  * ⚠️ 调用方**必须**处理 `isPreviousData`：为真时表示屏幕上是上一集的分镜，

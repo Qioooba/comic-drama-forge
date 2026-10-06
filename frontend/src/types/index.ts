@@ -1252,3 +1252,26 @@ export interface ProductionMediaVersion {
   probe?: Record<string, unknown>;
   [key: string]: unknown;
 }
+
+/**
+ * 一条冻结的生成意图（`GET /api/production_facts/intents` 的行）。
+ *
+ * ⚠️ 形状取自 `app/domain/production_facts.py::GenerationIntent.to_dict()`：
+ * 只有**内容字段**参与 `intent_hash`，id / 时间戳不参与。这里只声明接线用得到的
+ * 字段，其余按需再补 —— 不把 `[k: string]: unknown` 当成「什么都可能」的借口去
+ * 猜后端行为。
+ */
+export interface ProductionIntent {
+  intent_id: string;
+  project?: string;
+  episode?: string;
+  /** 剧本里的镜号（后端按字符串存，`"1"` 与 `"01"` 是不同的键） */
+  shot_key?: string;
+  kind?: string;
+  prompt?: string;
+  intent_hash?: string;
+  /** 冻结意图恒为 true —— 改动必须派生新意图（ADR-0002 铁律 2） */
+  frozen?: boolean;
+  created_at?: string;
+  parent_intent_id?: string;
+}
