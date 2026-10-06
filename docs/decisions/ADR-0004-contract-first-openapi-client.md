@@ -1,6 +1,6 @@
 # ADR-0004：契约优先 —— OpenAPI 导出 + 生成客户端
 
-- 状态：**已采纳**（2026-10-07 实施）
+- 状态：**已采纳**（2026-10-07 实施；当前复核：OpenAPI/生成物与前端启动兼容闸门均已落地）
 - 决策者：项目维护者
 - 相关：`app/contracts/openapi.py`、`scripts/generate_client.py`、`scripts/check_generated_client.py`、`frontend/src/api/generated/**`
 
@@ -46,7 +46,7 @@
 
 理由很直白：手改生成物 = 造出第二份真源。两份真源必然分叉，而分叉方向永远是
 「人直接改的那个更省事」。`manifest.json` 里带 `contract_version` 与 `spec_hash`，
-前端启动闸门据此判断客户端是否过期。
+这些字段由 `ApiCompatibilityGate` 在前端启动时消费，用于判断客户端是否过期。
 
 `frontend/src/api/generated/**` 下 5 个文件全部 `hand_editable: false`。
 其中 `client.ts` 的错误脱敏逻辑（`readError`，源自旧 `client.ts:37-40`）随生成物
@@ -75,7 +75,7 @@ API 产品；给内部工具加一层文档站是净成本。导出 JSON 已足�
 **正面**
 
 - 契约从「文档」变成**可 diff 的数据**，CI 能判断「这次改动有没有破坏契约」；
-- 前端不再手拼 URL，后端改路径会被 `check_generated_client.py` 拦下；
+- 生成客户端已提供类型化 API，工作台主链仍主要使用手写 `api/client.ts`；后端改路径会被 `check_generated_client.py` 拦下，前端启动兼容闸门已接线；
 - 新增路由漏写 schema 会被 `contract-coverage` 门禁发现；
 - 安全边界清晰：生成器**不 import `app`**（绕开副作用，`app/app.py` 可能半小时
   才完成 import），**不启动服务 / 不连 ComfyUI / 不碰 GPU**。
@@ -102,14 +102,14 @@ python scripts/check_generated_client.py   # expect_exit_code 0
 而 `cd frontend && npx tsc --noEmit` **FAIL** —— `generated/index.ts:14-30` 有 15 处
 `Duplicate identifier`（`contractsApi` ×3、`deliveryApi` ×8、`licensingApi` ×4）。
 
-根因：`scripts/generate_client.py` 按**每个 operation** 追加导出名，没有去重。
+根因：`scripts/generate_client.py` 曾按**每个 operation** 追加导出名，没有去重；当前生成器已加入去重，但本轮未重跑类型/新鲜度门禁。
 
 这条要留在 ADR 里，因为它证明**两道门禁不冗余**：
 `check_generated_client.py` 校验的是「生成物 == 规格」，而一个**稳定产出非法 TS** 的
 生成器同样满足这个等式。只有类型门禁能抓住它。删掉任何一道都会漏。
 
-> 该缺陷属 W3 文件范围（`scripts/generate_client.py`），本 ADR 不代修；
-> 修法是生成时 `sorted(set(...))` 去重。已记入 `g0-contract.json` 的 `open_items`。
+> 该缺陷属 W3 文件范围（`scripts/generate_client.py`）；当前源码已加入
+> `sorted(set(...))` 去重，但本轮审核未重跑门禁，故只登记为「源码已修、验收待复核」。
 
 ## 关联决策
 

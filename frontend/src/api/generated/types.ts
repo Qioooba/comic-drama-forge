@@ -175,12 +175,19 @@ export interface CreateDeliveryPackageRequest {
  * @see components/schemas/CreateIntentRequest
  */
 export interface CreateIntentRequest {
+  created_by?: string;
   derived_from?: string;
-  profile?: string;
+  episode: string | number;
+  kind?: string;
+  negative_prompt?: string;
+  profile_id?: string;
+  profile_version?: string | number;
   project: string;
   prompt: string;
   ref_slots?: Record<string, unknown>[];
   seed?: number;
+  shot_key: string;
+  workflow_hash?: string;
   workflow_version?: string;
 }
 
@@ -356,11 +363,25 @@ export interface DeliveryPresetsResponse {
  * @see components/schemas/EpisodeRenderVersion
  */
 export interface EpisodeRenderVersion {
+  authorization_ref?: string;
+  authorized_by?: string;
+  bind_hash?: string;
   compose_fingerprint: string;
   created_at?: string;
-  path?: string;
-  render_version_id: string;
-  sha256?: string;
+  declared_silences?: number;
+  entry_media_version_ids?: string[];
+  episode?: string;
+  note?: string;
+  output_bytes?: number;
+  output_duration_sec?: number;
+  output_path?: string;
+  output_sha256?: string;
+  plan_fingerprint: string;
+  project?: string;
+  render_id: string;
+  revision_id: string;
+  revision_no?: number;
+  subtitle_revision?: string;
 }
 
 /**
@@ -684,6 +705,23 @@ export interface RegisterMediaRequest {
 }
 
 /**
+ * 发布检查不接受客户端授权结论；服务端按 requirement 重新评估。
+ * @see components/schemas/ReleaseCheckRequest
+ */
+export interface ReleaseCheckRequest {
+  [key: string]: unknown;
+}
+
+/**
+ * @see components/schemas/ReleaseCheckResponse
+ */
+export interface ReleaseCheckResponse {
+  package?: Record<string, unknown>;
+  release: Record<string, unknown>;
+  success: boolean;
+}
+
+/**
  * 渲染清单。合法静音在此**前置声明**，而不是渲染后才发现。
  * @see components/schemas/RenderManifest
  */
@@ -708,11 +746,28 @@ export interface RenderManifestResponse {
  * @see components/schemas/RenderRequest
  */
 export interface RenderRequest {
+  authorization_ref?: string;
   /** 机器账号一律 403（复用 require_human_authorization） */
-  authorized_by?: string;
+  authorized_by: string;
   /** 只做预检不真渲染；用于接上游合成计划的安全接入 */
   dry_run?: boolean;
+  note?: string;
   output_path?: string;
+  preset?: string;
+  preview?: boolean;
+  renderer?: string;
+  target_fps?: number;
+  target_h?: number;
+  target_w?: number;
+}
+
+/**
+ * @see components/schemas/RenderVersionListResponse
+ */
+export interface RenderVersionListResponse {
+  count: number;
+  renders: EpisodeRenderVersion[];
+  success: true;
 }
 
 /**
@@ -883,12 +938,23 @@ export interface VerifyDeliveryResponse {
 }
 
 /**
+ * 渲完结果核验：传 ffprobe 结果，不登记 EpisodeRenderVersion。
  * @see components/schemas/VerifyRenderRequest
  */
 export interface VerifyRenderRequest {
-  authorized_by?: string;
+  probed: Record<string, unknown>;
+  tolerance_sec?: number;
+}
+
+/**
+ * @see components/schemas/VerifyRenderResponse
+ */
+export interface VerifyRenderResponse {
   compose_fingerprint: string;
-  path: string;
+  ok: boolean;
+  planned_duration_sec: number;
+  reason: string;
+  success: true;
 }
 
 /**

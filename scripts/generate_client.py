@@ -262,7 +262,8 @@ def _render_operation(path: str, method: str, op: Dict[str, Any]) -> str:
     body = ((op.get("requestBody") or {}).get("content") or {}).get("application/json")
     if body:
         body_schema = body.get("schema") or {}
-        args.append("body: {}".format(ts_type(body_schema)))
+        body_required = bool((op.get("requestBody") or {}).get("required", True))
+        args.append("{}: {}".format("body" if body_required else "body?", ts_type(body_schema)))
         init.append("body: JSON.stringify(body)")
 
     ret = _ok_response_type(op)

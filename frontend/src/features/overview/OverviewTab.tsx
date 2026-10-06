@@ -7,7 +7,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useApp } from '@/context/AppContext';
 import { t } from '@/i18n';
-import { videoApi, autopilotApi, episodesApi, novelsSplitPlanApi, preflightApi, screenplayApi, characterOutfits, characterSheetUpload, assetPrecipitation, generationApi, type EpisodeScenesResponse, type ChapterPreflightResult, type AssetPrecipitationResponse, type PrecipitationStatus } from '@/api/client';
+import { videoApi, autopilotApi, episodesApi, novelsSplitPlanApi, preflightApi, screenplayApi, characterOutfits, characterSheetUpload, assetPrecipitation, generationApi, assetsApi, type EpisodeScenesResponse, type ChapterPreflightResult, type AssetPrecipitationResponse, type PrecipitationStatus } from '@/api/client';
 import { Button, Input, EmptyState, ErrorState, Loading, Skeleton, Modal, Select } from '@/components/ui';
 import { useToast } from '@/components/ui/toast';
 import { useComfyProgress } from '@/hooks/useComfyProgress';
@@ -167,6 +167,12 @@ function OverviewTab({
   const [preview, setPreview] = useState<{ item: AssetItem; type: 'character' | 'item' | 'scene' } | null>(null);
   // 上传形象图 → 三视图（零 GPU 本地切分）
   const [uploadOpen, setUploadOpen] = useState(false);
+  // 手动一条龙：一键批量生成角色/物品/场景资产。三类顺序提交并逐任务轮询，
+  // 避免同时把多个 ComfyUI 资产任务压满。
+  const [batchAssetsBusy, setBatchAssetsBusy] = useState(false);
+  const [batchAssetsNotice, setBatchAssetsNotice] = useState('');
+  const [batchAssetsNoticeKind, setBatchAssetsNoticeKind] = useState<'success' | 'error'>('success');
+  const batchAssetsReqRef = useRef(0);
   // 可上传的角色名：优先取已有角色资产（用户大概率是给已抽出的角色换图），
   // 没有资产时也给个空列表让用户手填 —— 支持「先上传形象图再跑剧本」的用法。
   const uploadCharacters = React.useMemo(
@@ -478,6 +484,66 @@ function OverviewTab({
     return () => { alive = false; };
   }, [scriptLoading, episodes, projectKey]);
 
+  /** 一键批量生成资产：遍历项目全部剧集读取剧本 characters/items/scenes，
+   *  三类顺序提交 /api/assets/generate 并等待任务终态；已有资产由后端断点续跑跳过。 */
+  const batchGenerateAssets = async () => {
+    if (batchAssetsBusy || scriptLoading || !novelId || episodes.length === 0) return;
+    const token = ++batchAssetsReqRef.current;
+    setBatchAssetsBusy(true);
+    setBatchAssetsNotice('');
+    try {
+      const byKey = {
+        characters: new Map<string, any>(),
+        items: new Map<string, any>(),
+        scenes: new Map<string, any>(),
+      };
+      for (const ep of episodes) {
+        const detail = await episodesApi.get(novelId, ep.episode_no);
+        if (token !== batchAssetsReqRef.current || !spAliveRef.current) return;
+        const script = ((detail as any)?.script || {}) as Record<string, any[]>;
+        (script.characters || []).forEach((x: any) => x?.name && byKey.characters.set(String(x.name), x));
+        (script.items || []).forEach((x: any) => x?.name && byKey.items.set(String(x.name), x));
+        (script.scenes || []).forEach((x: any) => x?.name && byKey.scenes.set(String(x.name), x));
+      }
+      const groups: { type: 'character' | 'item' | 'scene'; key: string }[] = [
+        { type: 'character', key: 'characters' },
+        { type: 'item', key: 'items' },
+        { type: 'scene', key: 'scenes' },
+      ];
+      let started = 0;
+      for (const g of groups) {
+        if (token !== batchAssetsReqRef.current || !spAliveRef.current) return;
+        const list = Array.from((byKey as any)[g.key].values());
+        if (list.length === 0) continue;
+        const r = await assetsApi.generate({
+          asset_type: g.type,
+          project_name: projectKey,
+          assets: list,
+          overwrite: false,
+        });
+        if (r?.task_id) {
+          await pollGenerationTask(
+            String(r.task_id),
+            () => token === batchAssetsReqRef.current && spAliveRef.current,
+            t('tts.batchAssetsFailed'),
+            t('tts.batchAssetsTimeout')
+          );
+        }
+        started += 1;
+      }
+      if (token !== batchAssetsReqRef.current || !spAliveRef.current) return;
+      setBatchAssetsNoticeKind('success');
+      setBatchAssetsNotice(started ? t('tts.batchAssetsDone') : t('tts.batchAssetsNothing'));
+    } catch (err) {
+      if (token === batchAssetsReqRef.current && spAliveRef.current) {
+        setBatchAssetsNoticeKind('error');
+        setBatchAssetsNotice(err instanceof Error ? err.message : t('tts.batchAssetsFailed'));
+      }
+    } finally {
+      if (token === batchAssetsReqRef.current && spAliveRef.current) setBatchAssetsBusy(false);
+    }
+  };
+
   // 加载单集详情
   // ⚠️ 后端 /api/episodes/<novel>/<ep> 的剧本正文嵌在 `script` 对象下（shots/characters/items/scenes），
   // 且列表行才带 status/completed_shots（_episode_progress 推导），详情接口本身不返回这两个字段。
@@ -696,11 +762,34 @@ function OverviewTab({
       {/* 资产展示 */}
       <div className="flex items-center justify-between mb-3">
         <h3 className="text-lg font-semibold text-ink-1">{t('wb.assetsTitle')}</h3>
-        <Button variant="secondary" onClick={() => setUploadOpen(true)}>
-          <Upload className="h-4 w-4 mr-1.5" />
-          {t('uploadSheet.entry')}
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button
+            variant="brand"
+            onClick={batchGenerateAssets}
+            disabled={batchAssetsBusy || scriptLoading || !novelId || episodes.length === 0}
+            aria-describedby="batch-assets-reason"
+            title={
+              batchAssetsBusy ? t('tts.batchAssetsBusy')
+              : !novelId || episodes.length === 0 ? t('tts.batchAssetsNoScript')
+              : t('tts.batchAssetsHint')
+            }
+          >
+            {batchAssetsBusy ? t('common.generating') : t('tts.batchAssetsGenerate')}
+          </Button>
+          <span id="batch-assets-reason" className="sr-only">
+            {batchAssetsBusy ? t('tts.batchAssetsBusy') : !novelId || episodes.length === 0 ? t('tts.batchAssetsNoScript') : t('tts.batchAssetsHint')}
+          </span>
+          <Button variant="secondary" onClick={() => setUploadOpen(true)}>
+            <Upload className="h-4 w-4 mr-1.5" />
+            {t('uploadSheet.entry')}
+          </Button>
+        </div>
       </div>
+      {batchAssetsNotice && (
+        <div className={`p-3 rounded-lg border text-sm ${batchAssetsNoticeKind === 'error' ? 'bg-danger-subtle border-danger/30 text-danger-strong' : 'bg-success-subtle border-success/30 text-success-strong'}`}>
+          {batchAssetsNotice}
+        </div>
+      )}
       {total > 0 && (
         <>
           {groups.map((g) => {

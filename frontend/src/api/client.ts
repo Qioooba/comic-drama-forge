@@ -117,6 +117,11 @@ export const projectsApi = {
   updateConfig: (id: string, patch: Record<string, any>) =>
     request<{ success: boolean; project: string; config: Record<string, any> }>(
       `/projects/${id}/config`, { method: 'POST', body: JSON.stringify(patch) }),
+  /** 项目已登记剧本清单：交付页据此把 episode_no 映射到后端允许读取的 script_path。 */
+  scripts: (id: string) =>
+    request<{ success: boolean; project: string; total: number; scripts: Array<Record<string, any>> }>(
+      `/projects/${encodeURIComponent(id)}/scripts`
+    ),
   coverUrl: (id: string) => `${API_BASE}/projects/${id}/cover`,
   generateCover: (id: string, seed?: number) =>
     request<{ success: boolean; cover_path: string; cover_url: string }>(`/projects/${id}/cover/generate`, {
@@ -571,6 +576,39 @@ export const storyboardApi = {
       method: 'POST',
       body: JSON.stringify({ project_name: projectName, episode_no: episodeNo, shot_id: shotId, cell }),
     }),
+  /**
+   * 首跑/整集分镜图：一次性提交当前集全部镜头。
+   * 与单镜 retryShot、镜头批量重生成保留并行：首跑走这条，返工仍可精确到镜。
+   * 任务异步返回 task_id；前端只负责启动与展示任务号，轮询仍由 generation/status 负责。
+   */
+  generateEpisode: (data: {
+    project_name: string;
+    episode_no?: number;
+    shots: any[];
+    characters?: any[];
+    items?: any[];
+    scenes?: any[];
+    overwrite?: boolean;
+  }) =>
+    request<{ success: boolean; task_id: string; status: string; total: number; reused?: boolean; episode_stats?: any }>(
+      '/storyboards/generate',
+      { method: 'POST', body: JSON.stringify(data) }
+    ),
+};
+
+// --- Assets（角色 / 物品 / 场景批量生成）---
+// 后端任务是异步的：这里只返回 task_id，避免前端误把“已提交”当成“已生成”。
+export const assetsApi = {
+  generate: (data: {
+    asset_type: 'character' | 'item' | 'scene';
+    project_name: string;
+    assets: any[];
+    overwrite?: boolean;
+  }) =>
+    request<{ task_id: string; status: string }>('/assets/generate', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
 };
 
 /** 视频生成方式（**项目级**设定，与后端 config.VIDEO_MODES 一致）
@@ -626,6 +664,25 @@ export const videoApi = {
    * ⚠️ 历史缺陷：这里曾**硬编码 mode='episode'**，用户在任何地方都改不了生成方式；
    * 现在不传 mode 时由后端读**项目配置**（新建项目时选择），传了则以本次为准。
    */
+  /**
+   * 成片合成：把某一集的分镜视频按时间线合成最终成片，并登记交付清单。
+   * 这是手动链路的最后一公里入口；托管链路的 final 步骤也共用后端同一合成逻辑。
+   */
+  finalVideo: (data: {
+    project_name: string;
+    script_path?: string;
+    episode_no?: number;
+  }) =>
+    request<{
+      success: boolean;
+      output_path: string;
+      episode_no: number;
+      filename: string;
+      url: string;
+      deliverable?: { registered: boolean; reason?: string; episode_no: number };
+      watermark?: any;
+    }>('/final/video', { method: 'POST', body: JSON.stringify(data) }),
+
   generateEpisode: (data: {
     project_name: string;
     episode_no?: number;
@@ -1688,4 +1745,3 @@ export const productionFactsApi = {
       `/production_facts/approvals/${encodeURIComponent(approvalId)}/revoke`,
       { method: 'POST', body: JSON.stringify(data) }),
 };
-

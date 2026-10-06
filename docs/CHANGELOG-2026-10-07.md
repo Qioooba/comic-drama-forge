@@ -93,15 +93,17 @@ reserved_for_w8               pending_components(6) + open_items(7)
 
 ## 5. 已知问题与未完成项
 
-门禁的诚实结论：**5 道里 2 道 FAIL，两处都在别人的文件范围内，未代修。**
+> **当前工作树收口复核**：以下表格保留首轮门禁记录；后续工作树已出现部分修复（路由/features、静态 bundle、生成客户端导出去重、交付 release-check），但本轮审核**没有重跑任何门禁命令**，因此不能把历史 PASS/FAIL 当作当前验收结论。
+
+门禁的首轮诚实结论：**5 道里 2 道 FAIL，两处当时未代修。**
 
 | id | 归属 | 内容 |
 |---|---|---|
-| `generated-client-duplicate-export` | W3 | `generated/index.ts:14-30` 15 处 `Duplicate identifier`。根因：`generate_client.py` 按 operation 追加导出名未去重 |
+| `generated-client-duplicate-export` | W3 | 首轮记录：`generated/index.ts` 15 处 `Duplicate identifier`；当前生成器已加入 `sorted(set(...))` 去重，生成物当前也未见重复导出，但未重跑 `frontend-types` / `generated-fresh` 复核 |
 | `token-audit-transition-all-stylegallery` | W4 | `StyleGallery.tsx:125` 长列表 `transition-all` |
 | `safe-suite-vs-hardware-split` | **无人认领** | §P2-8 第 3 件「安全集 / 真实硬件集分离」本轮**未实现** |
 | `workflow-hash-64` | — | `workflow_hash` 32 位截断与 `bound_hash` 64 位口径不一致，可构造碰撞 |
-| `shared-py-split` | — | `_shared.py` 仍 8,884 行（本轮明确不写测试，不具备动它的条件） |
+| `shared-py-split` | — | `_shared.py` 当前约 11,144 行（本轮明确不写测试，不具备动它的条件） |
 | `timeline-revision-retention` | — | `TimelineRevision` 无清理 / 归档策略 |
 | `style-label-migration` | — | `style_id` 与旧 label 路由两条路径并存 |
 
@@ -109,12 +111,12 @@ reserved_for_w8               pending_components(6) + open_items(7)
 **商业交付会被 `LIC-LICENSE-UNVERIFIED` 拦下**，直到有人核实其 LICENSE 并更新登记表。
 这是 ADR-0007 有意承担的摩擦，不是 bug。
 
-### 前端两块未落地（W5）
+### 前端两块（首轮记录 vs 当前工作树）
 
-`frontend/src/routes/` 与 `layouts/` **当前为空目录** —— ADR-0009（真路由 + 退役层）
-与 ADR-0010（TanStack Query）的**代码尚未落地**，两篇 ADR 记录的是决策本身。
-已列入 `reserved_for_w8.pending_components`，未在 `required_components` 里
-标 `required: true`，以免门禁对着不存在的文件报错。
+首轮记录中 `frontend/src/routes/` 与 `layouts/` 为空；当前工作树已存在
+`router.tsx`、`routes/legacyRedirect.tsx`、`routes/routeElements.tsx`、
+`layouts/AppShell.tsx`、`layouts/EpisodeContextBar.tsx`，并由 `App.tsx` 消费。
+ADR-0010 的 query 层也已存在。**但本轮未运行浏览器/类型门禁**，所以这里只确认源码接线，不宣称运行时验收。
 
 ---
 
@@ -125,3 +127,15 @@ reserved_for_w8               pending_components(6) + open_items(7)
 - 评估依据：`docs/改造评估_对标LocalDramaStudio.md`（§P0-3 / §P0-4 / §P1-5 / §P1-6 / §P2-8）
 - 门禁规格：`docs/release/g0-contract.json`
 - 设计规范：`design-system/comicdrama/MASTER.md` + `pages/*.md`
+
+---
+
+## 7. 当前收口复核（P0/P1 摘要）
+
+- **P0｜生产事实已接入托管主链（best-effort）**：`app/pipeline.py` 在分镜/视频产物完成后登记 `GenerationIntent` + `MediaVersion`；历史存量产物仍需回填。
+- **P1｜契约启动闸门已接线**：`ApiCompatibilityGate` 启动比对 `/api/contracts/version` 与生成物版本/摘要，不一致时阻断写操作。
+- **P1｜导出与交付包发布门禁已分两段统一**：生成导出走集级质检与 C/D 哈希绑定，下载/取回再走交付包授权、机器校验、人工批准与磁盘摘要；服务端重新评估授权，客户端不能伪造。
+- **P1｜Job/Attempt 已接入整集生产**：`run_episode` 创建 Job/Attempt 并登记步骤单元；`task_store` 继续负责细粒度断点续跑，状态映射仍需持续审计。
+- **P0/P1｜TimelineRevision 保持 opt-in**：冻结计划渲染与 `EpisodeRenderVersion` 落库/查询已实现；旧 `generate_final_video()` 仍是默认兼容路径，切换需真实样片验证。
+
+以上为静态审核与 Vite 打包收口；本轮未运行 tsc/pytest/FFmpeg/生产任务，未调用 GPU/ComfyUI。

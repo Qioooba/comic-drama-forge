@@ -248,6 +248,29 @@ def by_fingerprint(fingerprint: str):
     return _ok(revisions=revs, count=len(revs))
 
 
+@bp.get("/api/timeline/revisions/<revision_id>/renders")
+def list_render_versions(revision_id: str):
+    """列出某冻结 revision 的成片登记（跨请求可读，交付追溯）。"""
+    renders = service().list_render_versions(revision_id=revision_id)
+    return _ok(renders=renders, count=len(renders))
+
+
+@bp.get("/api/timeline/renders/<render_id>")
+def get_render_version(render_id: str):
+    """按 render_id 读取成片登记（含 compose/plan 指纹与产物 sha256）。"""
+    rv = service().get_render_version(render_id)
+    if not rv:
+        return _err("成片登记不存在：%s" % render_id, 404)
+    return _ok(render_version=rv)
+
+
+@bp.get("/api/timeline/renders/by-fingerprint/<compose_fingerprint>")
+def renders_by_fingerprint(compose_fingerprint: str):
+    """按 compose_fingerprint 反查历史成片（免重渲判据）。"""
+    renders = service().find_render_versions(compose_fingerprint)
+    return _ok(renders=renders, count=len(renders))
+
+
 # =====================================================================
 # 按冻结计划渲染（ADR-0012 决策第 3 点）
 # =====================================================================
@@ -368,6 +391,11 @@ def render_from_plan(revision_id: str):
                "require_approved": bool(require_approved)})
     if not rr.get("ok"):
         return _err("按冻结计划渲染失败：%s" % (rr.get("error") or "未知原因"), 409, render=rr)
+    if dry_run:
+        # dry_run 只校验计划、不产生产物；没有 output_sha256 时不能伪造一条
+        # EpisodeRenderVersion（否则会被误当成真实成片登记）。
+        return _ok(render=rr, preflight=pre, dry_run=True,
+                   persisted=False, deliverable=False)
 
     # ④ 登记（内容变了指纹就变）
     note = str(d.get("note") or "")

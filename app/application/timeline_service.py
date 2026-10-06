@@ -558,7 +558,26 @@ class TimelineService:
         if not authorized_by:
             raise TimelineServiceError("成片登记必须记录授权主体 authorized_by"
                                        "（机器检查通过不等于人工批准）")
+        # ADR-0012 residual 已关闭：登记**必须落库**，请求结束即丢的响应字段
+        # 不算事实。仓储层 append-only 且按 render_id 唯一，重复登记会冲突。
+        self.timeline_repo.save_render_version(rv)
         logger.info("已登记成片版本：%s（rev=%s compose_fp=%s plan_fp=%s）",
                     rv.render_id, rv.revision_id, rv.compose_fingerprint[:12],
                     rv.plan_fingerprint[:12])
         return rv.to_dict()
+
+    def get_render_version(self, render_id: str) -> Optional[Dict[str, Any]]:
+        """跨请求读取成片登记（渲染结果的持久化事实）。"""
+        rv = self.timeline_repo.get_render_version(render_id)
+        return rv.to_dict() if rv else None
+
+    def list_render_versions(self, *, revision_id: str = "", project: str = "",
+                             episode: str = "", limit: int = 100) -> List[Dict[str, Any]]:
+        """列出某 revision / 项目的成片登记（交付与追溯用）。"""
+        return [r.to_dict() for r in self.timeline_repo.list_render_versions(
+            revision_id=revision_id, project=project, episode=episode, limit=limit)]
+
+    def find_render_versions(self, compose_fingerprint: str) -> List[Dict[str, Any]]:
+        """按剪辑指纹反查历史成片登记（免重渲判据）。"""
+        return [r.to_dict() for r in self.timeline_repo.find_render_versions(
+            compose_fingerprint)]

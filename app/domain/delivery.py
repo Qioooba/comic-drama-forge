@@ -57,6 +57,8 @@ __all__ = [
     "DLV_ALREADY_APPROVED",
     "DLV_UNKNOWN_PACKAGE",
     "DLV_NOT_BUILT",
+    "DLV_NOT_RELEASE_READY",
+    "release_ready",
     "STATUS_BUILT",
     "STATUS_VERIFIED",
     "STATUS_APPROVED",
@@ -100,6 +102,7 @@ DLV_APPROVER_NOT_HUMAN = "DLV-APPROVER-NOT-HUMAN"
 DLV_ALREADY_APPROVED = "DLV-ALREADY-APPROVED"
 DLV_UNKNOWN_PACKAGE = "DLV-UNKNOWN-PACKAGE"
 DLV_NOT_BUILT = "DLV-NOT-BUILT"
+DLV_NOT_RELEASE_READY = "DLV-NOT-RELEASE-READY"
 
 #: 错误码 → 中文说明。**这些文案是对外契约，前端会直接展示给用户**，
 #: 与 ``app/failure_codes.py`` 的 ``F-*`` 同性质，改动前必须先改契约。
@@ -113,6 +116,7 @@ DELIVERY_ERROR_CODES: Dict[str, str] = {
     DLV_ALREADY_APPROVED: "该交付包已被批准",
     DLV_UNKNOWN_PACKAGE: "交付包不存在",
     DLV_NOT_BUILT: "交付包尚未生成",
+    DLV_NOT_RELEASE_READY: "交付包尚未达到发布条件（授权门禁、机器校验或人工批准未同时成立）",
 }
 
 # --------------------------------------------------------------------------
@@ -439,6 +443,45 @@ def derive_status(pkg: Dict[str, Any], approval: Optional[Dict[str, Any]]) -> st
     if (approval or {}).get("verified_ok") or (pkg or {}).get("verified_ok"):
         return STATUS_VERIFIED
     return STATUS_BUILT
+
+
+def release_ready(pkg: Dict[str, Any], approval: Optional[Dict[str, Any]] = None,
+                  *, licensing_gate: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """发布前总门禁：授权、机器校验、人工批准、磁盘现状必须**同时**成立。
+
+    这是交付 API 的统一收口，不允许调用方只看其中一个布尔值就导出。
+    ``licensing_gate`` 可传入最新一次授权门禁结果；不传时沿用包落库时的
+    ``licensing_ok``。任何未知状态都按未就绪处理（fail-closed）。
+    """
+    if not pkg:
+        return {"ok": False, "code": DLV_UNKNOWN_PACKAGE,
+                "message": DELIVERY_ERROR_CODES[DLV_UNKNOWN_PACKAGE],
+                "blockers": ["unknown_package"]}
+    blockers: List[str] = []
+    if not (pkg.get("files") or []):
+        blockers.append("empty_package")
+    if not pkg.get("package_hash"):
+        blockers.append("package_not_built")
+    licensing_ok = bool((licensing_gate or {}).get("ok", pkg.get("licensing_ok")))
+    if not licensing_ok:
+        blockers.append("licensing_gate")
+    if not pkg.get("verified_ok"):
+        blockers.append("machine_verify")
+    if not pkg.get("disk_ok") or not pkg.get("disk_matches_baseline"):
+        blockers.append("disk_state")
+    approval_view = evaluate_approval(pkg, approval)
+    if approval_view["state"] != "valid":
+        blockers.append("human_approval")
+    return {
+        "ok": not blockers,
+        "code": "" if not blockers else DLV_NOT_RELEASE_READY,
+        "message": "" if not blockers else DELIVERY_ERROR_CODES[DLV_NOT_RELEASE_READY],
+        "blockers": blockers,
+        "approval_state": approval_view["state"],
+        "licensing_ok": licensing_ok,
+        "verified_ok": bool(pkg.get("verified_ok")),
+        "disk_ok": bool(pkg.get("disk_ok") and pkg.get("disk_matches_baseline")),
+    }
 
 
 def can_approve(pkg: Dict[str, Any]) -> Dict[str, Any]:

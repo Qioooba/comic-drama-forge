@@ -56,9 +56,11 @@
 > - ⚠️ **`compose_plan_to_ffmpeg_args` 未经真实渲染验证**：两轮修复都明确禁止跑 FFmpeg，
 >   `xfade` / `acrossfade` / `concat` / `atrim` 的 offset 与长度递推只有**参数串断言**与
 >   **由图反推的算术验证**。首次启用**必须**渲一支短样片核对时长、转场边界与音画同步。
-> - ⚠️ `TimelineRepo` 尚未有 `EpisodeRenderVersion` 的**落库表**；
->   登记目前只随端点响应返回（`render_version` 字段），跨请求查不回
->   —— 比「无表」更弱：**它连内存里都不持有**，请求结束即丢。
+> - ✅ **后续补修已关闭该项**：`episode_render_versions` 已在 `timeline_repo` schema v2 落库；
+>   `record_render()` 必须携带 `output_path + output_sha256`，并提供
+>   `/api/timeline/revisions/<id>/renders`、`/api/timeline/renders/<id>`、
+>   `/api/timeline/renders/by-fingerprint/<fingerprint>` 查询端点。
+>   `dry_run=true` 不再伪造登记。
 >
 > ### 2026-10-07 缺陷修复轮（6 处，静态验证 + 纯逻辑探针）
 >

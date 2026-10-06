@@ -39,6 +39,7 @@ app.py 在模块加载期 import 本模块，此时 app 尚未完成初始化。
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -928,12 +929,149 @@ def step_assets(ctx) -> dict:
     return {"ok": True, "detail": {"results": results}}
 
 
+def _start_episode_job(ctx) -> dict:
+    """把一次整集生产登记为 Job + Attempt（best-effort，不阻断既有流水线）。"""
+    job_id = ""
+    svc = None
+    try:
+        try:
+            from application.jobs_service import JobsService
+        except ImportError:  # pragma: no cover - 脚本方式导入兜底
+            from app.application.jobs_service import JobsService
+        payload = {
+            "video_mode": (ctx.get("config") or {}).get("video_mode"),
+            "style": (ctx.get("config") or {}).get("style"),
+            "qc_enabled": (ctx.get("config") or {}).get("qc_enabled"),
+            "enable_upscale": (ctx.get("config") or {}).get("enable_upscale"),
+            "steps": list(STEP_SEQUENCE),
+        }
+        workflow_hash = hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                       default=str).encode("utf-8")).hexdigest()
+        svc = JobsService()
+        job = svc.create_job(
+            kind="episode_production",
+            project=str(ctx.get("project_name") or ""),
+            episode=str(ctx.get("episode_no") or ""),
+            title=f"{ctx.get('project_name')} 第{ctx.get('episode_no')}集生产",
+            params=payload, created_by="autopilot")
+        job_id = job.get("job_id") or ""
+        svc.set_job_status(job["job_id"], "running")
+        attempt = svc.start_attempt(job["job_id"], workflow_hash=workflow_hash)
+        attempt_row = attempt.get("attempt") or {}
+        svc.set_attempt_status(attempt_row.get("attempt_id") or "", "running")
+        return {"service": svc, "job_id": job.get("job_id") or "",
+                "attempt_id": attempt_row.get("attempt_id") or "",
+                "workflow_hash": workflow_hash}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Job/Attempt 登记不可用（不影响生产）：%s", exc)
+        return {"service": svc, "job_id": job_id} if job_id else {}
+
+
+def _finish_episode_job(job_ctx: dict, result: dict) -> None:
+    """结束本轮 Job/Attempt；状态机失败只记录日志，不覆盖生产结论。"""
+    if not job_ctx:
+        return
+    if not job_ctx.get("attempt_id"):
+        if job_ctx.get("job_id") and job_ctx.get("service"):
+            try:
+                job_ctx["service"].set_job_status(
+                    job_ctx["job_id"], "failed",
+                    error=str(result.get("error") or "attempt 未启动"))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Job 收尾失败（不影响生产结论）：%s", exc)
+        return
+    status = {"done": "succeeded", "cancelled": "cancelled"}.get(
+        str(result.get("status") or ""), "failed")
+    units = {}
+    for step, out in (result.get("steps") or {}).items():
+        if not isinstance(out, dict):
+            continue
+        artifact = str(out.get("artifact") or "")
+        units[step] = {"unit_key": step, "result_path": artifact,
+                       "status": out.get("status") or ""}
+    try:
+        job_ctx["service"].finish_attempt(
+            job_ctx["attempt_id"], status=status, units=units,
+            error=str(result.get("error") or ""))
+        job_ctx["service"].set_job_status(
+            job_ctx["job_id"], status,
+            error=str(result.get("error") or ""))
+        result["job"] = {"job_id": job_ctx.get("job_id"),
+                         "attempt_id": job_ctx.get("attempt_id"),
+                         "status": status}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Job/Attempt 收尾失败（不影响生产结论）：%s", exc)
+
+
+def _record_pipeline_facts(ctx, kind: str, shots, paths) -> dict:
+    """把托管生成产物登记为 GenerationIntent + MediaVersion（best-effort）。
+
+    生成事实是 Shot Studio「候选对比 / 采用 / 批准」的唯一数据源；登记失败必须
+    留在日志与步骤详情里，但不让已通过质检的产物因数据库瞬时故障整集回滚。
+    """
+    rows = list(shots or [])
+    items = list(paths or [])
+    if not rows or not items:
+        return {"registered": 0, "errors": []}
+    try:
+        try:
+            from application.production import ProductionService, sha256_file
+        except ImportError:  # pragma: no cover - 脚本方式导入兜底
+            from app.application.production import ProductionService, sha256_file
+        svc = ProductionService()
+        existing = {}
+        for mv in svc.list_media_versions():
+            if mv.get("path"):
+                existing[(str(mv.get("path")), str(mv.get("media_sha256") or ""))] = True
+        registered, errors = 0, []
+        media_kind = "image" if kind == "storyboard" else kind
+        episode = str(ctx.get("episode_no") or 1)
+        for idx, (shot, path) in enumerate(zip(rows, items), 1):
+            if not path or not os.path.isfile(path):
+                continue
+            shot_key = str(shot.get("shot_id") or f"shot_{idx}")
+            prompt = str(shot.get("prompt_h3") or shot.get("prompt")
+                        or shot.get("description") or "")
+            digest = sha256_file(path)
+            if not digest or (str(path), digest) in existing:
+                continue
+            try:
+                intent = svc.create_intent(
+                    project=str(ctx.get("project_name") or ""),
+                    episode=episode, shot_key=shot_key, prompt=prompt,
+                    kind=media_kind, seed=int(shot.get("seed") or -1),
+                    workflow_version=str(ctx.get("episode_tag") or "pipeline"),
+                    created_by="autopilot")
+                svc.register_media(intent["intent_id"], path=path,
+                                   media_sha256=digest,
+                                   attempt_id=f"{kind}:{episode}:{shot_key}")
+                registered += 1
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{shot_key}: {exc}")
+        if errors:
+            logger.warning("版本化生产事实登记部分失败（不影响产物）：%s",
+                           "；".join(errors[:5]))
+        return {"registered": registered, "errors": errors}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("版本化生产事实登记不可用（不影响产物）：%s", exc)
+        return {"registered": 0, "errors": [str(exc)]}
+
+
 def step_storyboard(ctx) -> dict:
     """分镜图（逐镜生成，图片 AI 质检不达标自动换 seed 重生成并可阻断入库）"""
     A = _A()
     pd = probe_storyboard(ctx)
     if pd.get("done"):
-        return {"ok": True, "skipped": True, "detail": {"probe": pd}, "artifact": pd["dir"]}
+        shots0 = (ctx.get("script") or {}).get("shots") or []
+        paths0 = []
+        for i, sh in enumerate(shots0):
+            seq = _A()._shot_seq(sh.get("shot_id", i + 1), i + 1)
+            paths0.append(os.path.join(pd["dir"], f"shot_{seq:02d}.png"))
+        facts0 = _record_pipeline_facts(ctx, "storyboard", shots0, paths0)
+        return {"ok": True, "skipped": True,
+                "detail": {"probe": pd, "production_facts": facts0},
+                "artifact": pd["dir"]}
     script = ctx.get("script") or {}
     shots = script.get("shots") or []
     if not shots:
@@ -966,6 +1104,11 @@ def step_storyboard(ctx) -> dict:
         return {"ok": False, "detail": detail,
                 "error": f"分镜图缺失 {len(recheck.get('missing') or [])} 镜："
                          f"{recheck.get('missing')[:8]}"}
+    sb_paths = []
+    for i, sh in enumerate(shots):
+        seq = A._shot_seq(sh.get("shot_id", i + 1), i + 1)
+        sb_paths.append(os.path.join(recheck["dir"], f"shot_{seq:02d}.png"))
+    detail["production_facts"] = _record_pipeline_facts(ctx, "storyboard", shots, sb_paths)
     return {"ok": True, "detail": detail, "artifact": recheck["dir"]}
 
 
@@ -1013,7 +1156,20 @@ def step_video(ctx) -> dict:
     A = _A()
     pd = probe_video(ctx)
     if pd.get("done"):
-        return {"ok": True, "skipped": True, "detail": {"probe": pd}, "artifact": pd["dir"]}
+        shots0 = (ctx.get("script") or {}).get("shots") or []
+        mode0 = (ctx.get("config") or {}).get("video_mode") or DEFAULT_VIDEO_MODE
+        paths0 = []
+        if mode0 == "episode":
+            paths0 = [pd.get("file") or ""]
+            shots0 = [{"shot_id": "episode"}]
+        else:
+            for i, sh in enumerate(shots0):
+                seq = _A()._shot_seq(sh.get("shot_id", i + 1), i + 1)
+                paths0.append(os.path.join(pd["dir"], f"shot_{seq:02d}.mp4"))
+        facts0 = _record_pipeline_facts(ctx, "video", shots0, paths0)
+        return {"ok": True, "skipped": True,
+                "detail": {"probe": pd, "production_facts": facts0},
+                "artifact": pd["dir"]}
     script = ctx.get("script") or {}
     shots = script.get("shots") or []
     if not shots:
@@ -1089,6 +1245,16 @@ def step_video(ctx) -> dict:
         return {"ok": False, "blocked": out["blocked"], "detail": detail,
                 "error": f"视频缺失 {len(recheck.get('missing') or [])} 镜："
                          f"{recheck.get('missing')[:8]}"}
+    if mode == "episode":
+        fact_shots = [{"shot_id": "episode"}]
+        fact_paths = [recheck.get("file") or ""]
+    else:
+        fact_shots = shots
+        fact_paths = []
+        for i, sh in enumerate(shots):
+            seq = A._shot_seq(sh.get("shot_id", i + 1), i + 1)
+            fact_paths.append(os.path.join(recheck["dir"], f"shot_{seq:02d}.mp4"))
+    detail["production_facts"] = _record_pipeline_facts(ctx, "video", fact_shots, fact_paths)
     return {"ok": True, "detail": detail, "artifact": recheck["dir"]}
 
 
@@ -1678,6 +1844,7 @@ def run_episode(config: dict, project_name: str, episode_no: int, novel_meta: di
         "chapter_title": (chapter or {}).get("title") or f"第{int(episode_no)}集",
         "started_at": _now(), "deliverable": "", "steps": {}, "error": "",
     }
+    job_ctx = _start_episode_job(ctx)
 
     # 把「是否该停」注册进当前执行上下文（contextvars）：本集内部所有 LLM 调用与
     # 重试退避都能感知到它，从而实现「暂停秒级生效」。作用域仅限本调用链 ——
@@ -1777,6 +1944,7 @@ def run_episode(config: dict, project_name: str, episode_no: int, novel_meta: di
         result["error"] = f"{type(e).__name__}: {e}"
         logger.error("第%s集流水线失败：%s\n%s", episode_no, result["error"], traceback.format_exc())
     finally:
+        _finish_episode_job(job_ctx, result)
         cancellation.reset(_cancel_token)
         _release_episode_lock(project_name, int(episode_no))
 

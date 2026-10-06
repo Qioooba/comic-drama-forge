@@ -537,7 +537,30 @@
     "approve": "Approve",
     "rejectReasonLabel": "Reject reason",
     "rejectReasonInput": "Enter the reject reason...",
-    "confirmReject": "Confirm Reject"
+    "confirmReject": "Confirm Reject",
+    "finalVideo": "Compose final video",
+    "finalVideoHint": "Compose this episode's final video from its script and refresh the delivery list",
+    "finalVideoBusy": "A final-video task is already running",
+    "finalVideoNoScript": "No project script found for this episode; cannot compose the final video",
+    "finalVideoDone": "Episode {n} final video composed and delivery list refreshed",
+    "finalVideoFailed": "Final-video composition failed",
+    "packageTitle": "Delivery package & release",
+    "packageHint": "Export project files first, register a SHA-256 manifest, then require machine verification and human approval before download.",
+    "packagePreset": "Preset",
+    "packageCreate": "Register package",
+    "packageCreated": "Delivery package {id} registered",
+    "packageCreateFailed": "Failed to register delivery package",
+    "approver": "Approver",
+    "approverPlaceholder": "Human approver name",
+    "approverRequired": "Enter a human approver",
+    "packageRelease": "Verify & approve",
+    "packageReleaseHint": "Run machine verification, human approval, then the release gate",
+    "packageReleased": "Delivery package {id} passed the release gate",
+    "packageReleaseBlocked": "Delivery package release gate failed",
+    "packageVerifyFailed": "Delivery package verification failed",
+    "packageActionFailed": "Delivery package action failed",
+    "finalVideoRegisteredFailed": "Video was generated, but delivery registration did not complete",
+    "finalVideoScriptsUnavailable": "The project script list is temporarily unavailable; cannot locate the episode script"
   },
   "upscale": {
     "title": "Super-Resolution (FlashVSR)",
@@ -1188,7 +1211,15 @@
     "moreLines": "More {n} lines...",
     "generate": "Generate Dubbing",
     "generateStarted": "Dubbing generation task started",
-    "activeTasks": "Active Tasks"
+    "activeTasks": "Active Tasks",
+    "batchAssetsGenerate": "Generate assets",
+    "batchAssetsBusy": "Asset tasks are generating sequentially",
+    "batchAssetsNoScript": "No episode data yet; cannot read character/item/scene definitions",
+    "batchAssetsHint": "Generate characters, items, and scenes across every project episode; ready assets are skipped",
+    "batchAssetsDone": "Asset batch tasks finished polling and the asset list was refreshed",
+    "batchAssetsNothing": "The current script has no characters, items, or scenes to generate",
+    "batchAssetsFailed": "Asset batch generation failed",
+    "batchAssetsTimeout": "Asset batch task polling timed out"
   },
   "mix": {
     "title": "Audio Mixing",
@@ -1419,6 +1450,10 @@
     "repaired": "Auto-repaired: {items}",
     "suggestion": "Suggestion: {hint}",
     "promptQcAllPassed": "All lines passed the precheck",
+    "workflowNoticeTitle": "Audio workflow",
+    "workflowNoticeFormal": "Managed production: H3 native audio track + tts_pre character reference voices; the final cut uses the native track.",
+    "workflowNoticeManual": "Legacy line-by-line TTS + mixing: manual rollback/rework path only, not the default final-cut path.",
+    "workflowNoticeHint": "Use the manual tools below only when repairing individual lines after checking the managed path.",
     "workflowTitle": "Workflow",
     "workflowStep1": "Generate TTS dubbing first (synthesize audio for every episode's lines)",
     "workflowStep2": "Then mix audio with video (combine the dubbing with the video clips)",
@@ -1460,7 +1495,15 @@
     "done": "Done",
     "failed": "Failed",
     "skipped": "Skipped",
-    "attention": "Needs attention"
+    "attention": "Needs attention",
+    "selected": "Selected",
+    "approved": "Approved"
+  },
+  "contract": {
+    "checking": "Checking API contract…",
+    "mismatchTitle": "Incompatible API contract",
+    "mismatchBody": "The generated frontend client does not match the backend runtime contract. Regenerate the client and refresh; write operations are stopped until verification succeeds.",
+    "unavailable": "API contract service is unavailable: {message}"
   },
   "vault": {
     "title": "AI Configuration Center",
@@ -1613,6 +1656,7 @@
     "chapterN": "Ch. {n}",
     "episodeGenerate": "Generate whole episode",
     "episodeGenerateStarted": "Episode video generation started ({total} shots)",
+    "generateVideoNoEpisode": "Select an episode before generating video",
     "episodeGenerateFailed": "Failed to start episode video generation",
     "generateVideo": "Generate video",
     "videoModeSaved": "Video generation mode saved",
@@ -1634,7 +1678,16 @@
       "imageAlt": "3x3 candidate composition grid for shot {seq}"
     },
     "zoomTitle": "Storyboard preview",
-    "zoomHint": "Click anywhere or press ESC to close"
+    "zoomHint": "Click anywhere or press ESC to close",
+    "generateAll": "Generate all storyboards",
+    "generateAllHint": "First-run generation for the whole episode; single-shot and batch rework remain available",
+    "generateAllBusy": "Storyboard first-run task is generating",
+    "generateAllNoEpisode": "Select an episode before generating all storyboards",
+    "generateAllStarted": "Storyboard first-run started ({total} shots)",
+    "generateAllDone": "Storyboard first-run completed ({total} shots)",
+    "generateAllFailed": "Storyboard first-run failed",
+    "generateAllTimeout": "Storyboard first-run polling timed out",
+    "generateAllPartial": "Storyboard first-run completed with failed shots ({ok}/{total} succeeded)"
   },
   "video": {
     "batchRetry": {

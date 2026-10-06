@@ -388,11 +388,32 @@
       },
       "CreateIntentRequest": {
         "properties": {
+          "created_by": {
+            "type": "string"
+          },
           "derived_from": {
             "type": "string"
           },
-          "profile": {
+          "episode": {
+            "type": [
+              "string",
+              "integer"
+            ]
+          },
+          "kind": {
             "type": "string"
+          },
+          "negative_prompt": {
+            "type": "string"
+          },
+          "profile_id": {
+            "type": "string"
+          },
+          "profile_version": {
+            "type": [
+              "string",
+              "integer"
+            ]
           },
           "project": {
             "type": "string"
@@ -410,12 +431,20 @@
           "seed": {
             "type": "integer"
           },
+          "shot_key": {
+            "type": "string"
+          },
+          "workflow_hash": {
+            "type": "string"
+          },
           "workflow_version": {
             "type": "string"
           }
         },
         "required": [
           "project",
+          "episode",
+          "shot_key",
           "prompt"
         ],
         "type": "object"
@@ -840,6 +869,16 @@
       },
       "EpisodeRenderVersion": {
         "properties": {
+          "authorization_ref": {
+            "type": "string"
+          },
+          "authorized_by": {
+            "type": "string"
+          },
+          "bind_hash": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
           "compose_fingerprint": {
             "pattern": "^[0-9a-f]{64}$",
             "type": "string"
@@ -847,20 +886,59 @@
           "created_at": {
             "type": "string"
           },
-          "path": {
+          "declared_silences": {
+            "type": "integer"
+          },
+          "entry_media_version_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "episode": {
             "type": "string"
           },
-          "render_version_id": {
+          "note": {
             "type": "string"
           },
-          "sha256": {
+          "output_bytes": {
+            "type": "integer"
+          },
+          "output_duration_sec": {
+            "type": "number"
+          },
+          "output_path": {
+            "type": "string"
+          },
+          "output_sha256": {
             "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "plan_fingerprint": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "project": {
+            "type": "string"
+          },
+          "render_id": {
+            "type": "string"
+          },
+          "revision_id": {
+            "type": "string"
+          },
+          "revision_no": {
+            "type": "integer"
+          },
+          "subtitle_revision": {
             "type": "string"
           }
         },
         "required": [
-          "render_version_id",
-          "compose_fingerprint"
+          "render_id",
+          "revision_id",
+          "compose_fingerprint",
+          "plan_fingerprint"
         ],
         "type": "object"
       },
@@ -1621,6 +1699,62 @@
         ],
         "type": "object"
       },
+      "ReleaseCheckRequest": {
+        "description": "发布检查不接受客户端授权结论；服务端按 requirement 重新评估。",
+        "properties": {},
+        "type": "object"
+      },
+      "ReleaseCheckResponse": {
+        "properties": {
+          "package": {
+            "type": "object"
+          },
+          "release": {
+            "properties": {
+              "approval_state": {
+                "type": "string"
+              },
+              "blockers": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "code": {
+                "type": "string"
+              },
+              "disk_ok": {
+                "type": "boolean"
+              },
+              "licensing_ok": {
+                "type": "boolean"
+              },
+              "message": {
+                "type": "string"
+              },
+              "ok": {
+                "type": "boolean"
+              },
+              "verified_ok": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "ok",
+              "blockers"
+            ],
+            "type": "object"
+          },
+          "success": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "success",
+          "release"
+        ],
+        "type": "object"
+      },
       "RenderManifest": {
         "description": "渲染清单。合法静音在此**前置声明**，而不是渲染后才发现。",
         "properties": {
@@ -1673,6 +1807,9 @@
       "RenderRequest": {
         "description": "按冻结计划发起渲染。``authorized_by`` 必须是人工主体。",
         "properties": {
+          "authorization_ref": {
+            "type": "string"
+          },
           "authorized_by": {
             "description": "机器账号一律 403（复用 require_human_authorization）",
             "type": "string"
@@ -1681,10 +1818,57 @@
             "description": "只做预检不真渲染；用于接上游合成计划的安全接入",
             "type": "boolean"
           },
+          "note": {
+            "type": "string"
+          },
           "output_path": {
             "type": "string"
+          },
+          "preset": {
+            "type": "string"
+          },
+          "preview": {
+            "type": "boolean"
+          },
+          "renderer": {
+            "type": "string"
+          },
+          "target_fps": {
+            "type": "integer"
+          },
+          "target_h": {
+            "type": "integer"
+          },
+          "target_w": {
+            "type": "integer"
           }
         },
+        "required": [
+          "authorized_by"
+        ],
+        "type": "object"
+      },
+      "RenderVersionListResponse": {
+        "properties": {
+          "count": {
+            "type": "integer"
+          },
+          "renders": {
+            "items": {
+              "$ref": "#/components/schemas/EpisodeRenderVersion"
+            },
+            "type": "array"
+          },
+          "success": {
+            "const": true,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "success",
+          "renders",
+          "count"
+        ],
         "type": "object"
       },
       "RenderVersionResponse": {
@@ -2053,21 +2237,48 @@
         "type": "object"
       },
       "VerifyRenderRequest": {
+        "description": "渲完结果核验：传 ffprobe 结果，不登记 EpisodeRenderVersion。",
         "properties": {
-          "authorized_by": {
-            "type": "string"
+          "probed": {
+            "additionalProperties": true,
+            "type": "object"
           },
+          "tolerance_sec": {
+            "minimum": 0,
+            "type": "number"
+          }
+        },
+        "required": [
+          "probed"
+        ],
+        "type": "object"
+      },
+      "VerifyRenderResponse": {
+        "properties": {
           "compose_fingerprint": {
             "pattern": "^[0-9a-f]{64}$",
             "type": "string"
           },
-          "path": {
+          "ok": {
+            "type": "boolean"
+          },
+          "planned_duration_sec": {
+            "type": "number"
+          },
+          "reason": {
             "type": "string"
+          },
+          "success": {
+            "const": true,
+            "type": "boolean"
           }
         },
         "required": [
+          "success",
+          "ok",
+          "reason",
           "compose_fingerprint",
-          "path"
+          "planned_duration_sec"
         ],
         "type": "object"
       },
@@ -2116,7 +2327,7 @@
   "info": {
     "description": "本规格是**前端与后端的唯一契约**。前端客户端由 `scripts/generate_client.py` 从本文件生成，`scripts/check_generated_client.py` 在 CI 校验生成物是否过期。\n\n**手工改这个文件没有意义**：它是生成物，改了会被下一次生成覆盖。",
     "title": "漫剧锻造台 API",
-    "version": "2026-10-07.1"
+    "version": "2026-10-07.2"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -2422,6 +2633,59 @@
           }
         },
         "summary": "交付清单（逐文件 SHA-256 + 包摘要）",
+        "tags": [
+          "delivery"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/delivery/packages/{package_id}/release-check": {
+      "post": {
+        "operationId": "releaseCheckDeliveryPackage",
+        "parameters": [
+          {
+            "description": "交付包 id",
+            "in": "path",
+            "name": "package_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReleaseCheckRequest"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReleaseCheckResponse"
+                }
+              }
+            },
+            "description": "成功"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "交付包不存在"
+          }
+        },
+        "summary": "交付发布总门禁（授权+校验+人工批准+磁盘）",
         "tags": [
           "delivery"
         ],
@@ -3893,6 +4157,82 @@
         "x-contract-source": "manual"
       }
     },
+    "/api/timeline/renders/by-fingerprint/{compose_fingerprint}": {
+      "get": {
+        "operationId": "findTimelineRenderVersions",
+        "parameters": [
+          {
+            "description": "剪辑指纹",
+            "in": "path",
+            "name": "compose_fingerprint",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RenderVersionListResponse"
+                }
+              }
+            },
+            "description": "成功"
+          }
+        },
+        "summary": "按剪辑指纹反查成片登记",
+        "tags": [
+          "timeline"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/timeline/renders/{render_id}": {
+      "get": {
+        "operationId": "getTimelineRenderVersion",
+        "parameters": [
+          {
+            "description": "渲染登记 id",
+            "in": "path",
+            "name": "render_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RenderVersionResponse"
+                }
+              }
+            },
+            "description": "成功"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "成片登记不存在"
+          }
+        },
+        "summary": "读取成片登记（含指纹与 sha256）",
+        "tags": [
+          "timeline"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
     "/api/timeline/revisions": {
       "get": {
         "operationId": "listTimelineRevisions",
@@ -4293,6 +4633,49 @@
         "x-contract-source": "manual"
       }
     },
+    "/api/timeline/revisions/{revision_id}/renders": {
+      "get": {
+        "operationId": "listTimelineRenderVersions",
+        "parameters": [
+          {
+            "description": "时间线 revision id",
+            "in": "path",
+            "name": "revision_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RenderVersionListResponse"
+                }
+              }
+            },
+            "description": "成功"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "revision 不存在"
+          }
+        },
+        "summary": "列出该 revision 的成片登记",
+        "tags": [
+          "timeline"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
     "/api/timeline/revisions/{revision_id}/verify-render": {
       "post": {
         "operationId": "verifyTimelineRender",
@@ -4322,13 +4705,13 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/RenderVersionResponse"
+                  "$ref": "#/components/schemas/VerifyRenderResponse"
                 }
               }
             },
             "description": "成功"
           },
-          "409": {
+          "404": {
             "content": {
               "application/json": {
                 "schema": {
@@ -4336,10 +4719,10 @@
                 }
               }
             },
-            "description": "compose_fingerprint 不匹配"
+            "description": "revision 不存在"
           }
         },
-        "summary": "登记 EpisodeRenderVersion（绑 compose_fingerprint）",
+        "summary": "核验渲染结果与时长（不登记 EpisodeRenderVersion）",
         "tags": [
           "timeline"
         ],
@@ -4367,7 +4750,7 @@
       "name": "licensing"
     }
   ],
-  "x-contract-version": "2026-10-07.1",
+  "x-contract-version": "2026-10-07.2",
   "x-manual-paths": [
     "/api/contracts/error-codes",
     "/api/contracts/openapi.json",
@@ -4376,6 +4759,7 @@
     "/api/delivery/packages/{package_id}",
     "/api/delivery/packages/{package_id}/approve",
     "/api/delivery/packages/{package_id}/manifest",
+    "/api/delivery/packages/{package_id}/release-check",
     "/api/delivery/packages/{package_id}/revoke",
     "/api/delivery/packages/{package_id}/verify",
     "/api/delivery/presets",
@@ -4407,6 +4791,8 @@
     "/api/styles/resolve",
     "/api/styles/{style_id}",
     "/api/timeline/fingerprints/{fingerprint}",
+    "/api/timeline/renders/by-fingerprint/{compose_fingerprint}",
+    "/api/timeline/renders/{render_id}",
     "/api/timeline/revisions",
     "/api/timeline/revisions/latest",
     "/api/timeline/revisions/{revision_id}",
@@ -4414,12 +4800,13 @@
     "/api/timeline/revisions/{revision_id}/manifest",
     "/api/timeline/revisions/{revision_id}/preflight",
     "/api/timeline/revisions/{revision_id}/render",
+    "/api/timeline/revisions/{revision_id}/renders",
     "/api/timeline/revisions/{revision_id}/verify-render"
   ],
   "x-stats": {
-    "manual_ops": 52,
-    "operation_count": 52,
-    "path_count": 46,
+    "manual_ops": 56,
+    "operation_count": 56,
+    "path_count": 50,
     "reflected_ops": 0
   }
 }

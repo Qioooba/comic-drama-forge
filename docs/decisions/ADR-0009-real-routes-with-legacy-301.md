@@ -1,20 +1,15 @@
 # ADR-0009：前端换真路由 + 旧 hash 301 退役层
 
-- 状态：**决策已采纳，路由层已实施，工作台布局与 features 拆分进行中**（2026-10-07）
+- 状态：**决策已采纳，路由层与布局/features 拆分已在当前工作树落地；运行时验证未执行**（2026-10-07）
 - 决策者：项目维护者
 - 相关：`frontend/src/App.tsx:28-41`、`frontend/src/router.tsx`、`frontend/src/routes/**`
 
 > ## ⚠️ 实施状态声明（2026-10-07 收口审核补记）
 >
-> **已实施**（实测存在并通过 `tsc`）：
-> - `frontend/src/router.tsx` —— 9 条真路由，HashRouter
-> - `frontend/src/routes/legacyRedirect.tsx` —— 旧 hash 301 层（31 例映射已临时验证）
-> - `frontend/src/routes/workbenchTabs.tsx` —— 二级导航按**生产顺序**重排
->
-> **未完成**：
-> - `layouts/{AppShell,EpisodeContextBar}.tsx` —— 三栏布局与面包屑未落地
-> - `features/` 按域拆分 —— 见 ADR-0010 的状态声明
-> - 301 层与浏览器行为的**运行时**验证（需真实浏览器，本轮只做静态审阅）
+> **当前工作树静态核对**：
+> - `frontend/src/router.tsx`、`routes/legacyRedirect.tsx`、`routes/workbenchTabs.tsx` 已存在，并由 `App.tsx` 消费；
+> - `layouts/AppShell.tsx`、`layouts/EpisodeContextBar.tsx` 与多个 `features/*` 目录已存在；
+> - 本轮未运行浏览器、`tsc` 或构建，因此只确认源码接线，不宣称运行时验收。
 
 ## 背景
 

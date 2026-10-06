@@ -208,18 +208,35 @@ AI 总控从常驻右栏降为抽屉，保留轨迹可视化与急停开关，�
 
 | 属性 | 样式 |
 |---|---|
-| `[aria-busy="true"]` | 自带 spinner，光标 `progress` |
+| `[aria-busy="true"]` | 光标 `progress`；**spinner 由组件层自带真实节点**（Button/Input/Select/Textarea，见下方复核说明） |
 | `[aria-invalid="true"]` | 红边 + 红字说明 |
 | `[readonly]` | 虚线边框（区别于 disabled 的灰化） |
 | `disabled` | 降透明 + `not-allowed` 光标 + **必须配相邻原因文案** |
 
+**落地状态（2026-10-07 复核修正）**：base 层原先用 `[aria-busy]::after` 伪元素统一造 spinner，实测三处错——① input/select/textarea 是替换元素，`::after` 不渲染，对原生字段是死代码；② Button 自带 spinner 会叠成双转圈；③ `color: transparent` 被 utilities 层的 `text-ink-*` 覆盖，从未生效。修正后 spinner 收归组件层真实节点（`FieldSpinner`），base 层只保留光标语义；Input/Select/Textarea 均补 `busy` / `error` → `aria-busy` / `aria-invalid` / `aria-describedby`，字段焦点环由 `focus:` 收敛为 `focus-visible:`（点击不闪环，键盘必然可见）。
+
 ---
+
+### 4.5 决策徽标（selected / approved）—— 色 + 文本 + 图标缺一不可
+
+共享组件 `DecisionBadge`（`frontend/src/components/ui/index.tsx`）固化 §2.4 两档决策色的三重表达：
+
+| 档 | 类 | 默认图标 | 文本 |
+|---|---|---|---|
+| **selected（已采用）** | `bg-selected-subtle text-selected-strong` | 单勾（创作决定） | `label` 必填 |
+| **approved（已批准）** | `bg-approved-subtle text-approved-strong` | 印章勾（放行决定） | `label` 必填 |
+
+- `label` **必填**：语言包暂无 `state.selected` / `state.approved` 键（locales 非设计系统文件所有权），
+  而 `t()` 缺键会原样返回 key —— 把 `state.selected` 渲染到界面上比缺默认文案更糟。
+  语言包补齐后可将 label 改为可选并回落 `t()`。
+- 图标按档固定，**两档不得共用图标或文案**（ADR-0002 不变量）。
+- `onClick` 仅用于跳转决策记录；不得用它把两档做成同一个按钮。
 
 ## 5. 无障碍
 
 - **焦点可见**：base 层 `:focus-visible` 统一兜底（项目里仍有约 50 处原生
   button/input/select/textarea 未补 focus 样式，逐个补不现实）。
-- **减少动效**：`prefers-reduced-motion: reduce` 下所有动画停止或显著放慢。
+- **减少动效**：`prefers-reduced-motion: reduce` 下所有动画停止或显著放慢。转圈类（`.animate-spin`，含 Button 与字段 spinner）**不停车而是放慢到 2.4s**——完全停转会丢掉「正在处理」的信号。
 - **触达区**：纯图标触达区 ≥ 44×44。
 - **对比度**：正文 ≥ 4.5:1。⚠️ 不要拿 `--success` 等主色直接当文字色
   （浅底上仅 ~2.5:1），用 `-strong` 档。
@@ -277,6 +294,11 @@ AI 总控从常驻右栏降为抽屉，保留轨迹可视化与急停开关，�
 | 42 个镜头 × ~660px = 28,800px 轨道塞进 2,285px 外壳且无滚动条 | 同上 | 长列表 > 50 项虚拟化 |
 | `.glass` 用于长列表导致逐帧重绘 | 同上 | 降级重命名为 `.glass-chrome` |
 | `state-done` 同时表达"采用"与"批准" | 同上 | 拆 `--selected` / `--approved` 两档 |
+| `[aria-busy]::after` 伪元素对原生字段不渲染、对 Button 叠双 spinner、`color:transparent` 被工具类覆盖 | 2026-10-07 静态复核 | spinner 收归组件层真实节点，base 层只留 `cursor:progress` |
+| `Select` 无 error/aria-invalid；表单焦点环用 `focus:` 而非 `focus-visible:` | 同上 | Select 补 error/busy 全套；字段环收敛为 `focus-visible:` |
+| tailwind `fontFamily` 复制字体字面量且与 `--font-*` 令牌漂移（sans 少回退项） | 同上 | 改引用 `var(--font-sans/serif/mono)`，唯一真源回 index.css |
+| selected/approved 无共享徽标组件，三重律靠各页面自觉 | 同上 | 新增 `DecisionBadge`（色+文本+图标，label 必填） |
+| `animate-spin` 未纳入 reduced-motion | 同上 | 放慢至 2.4s（不停车，保「处理中」信号） |
 
 ---
 

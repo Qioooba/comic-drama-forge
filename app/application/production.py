@@ -96,6 +96,21 @@ class ProductionService:
         （`:meth:`_enrich_ref_slots`）—— 参考图被换掉必须能被哈希发现，
         否则同一 intent_hash 会盖住两个不同的画面。
         """
+        # CapabilityProfileVersion 必须是已登记版本：意图引用的 profile 不能是
+        # 随手填的名字，否则“当时允许什么”无法回答（P0-3 的版本化事实）。
+        if str(profile_id or "").strip():
+            try:
+                profile_version_no = int(str(profile_version or "0") or 0)
+            except (TypeError, ValueError):
+                profile_version_no = 0
+            if profile_version_no <= 0:
+                raise ProductionError(
+                    "生成意图引用能力档案时必须给出已登记的 profile_version：%s"
+                    % profile_id)
+            if self.repo.get_capability_profile(profile_id, profile_version_no) is None:
+                raise ProductionError(
+                    "能力档案不存在或版本未登记：%s/v%s（拒绝按未登记能力生成）"
+                    % (profile_id, profile_version_no))
         slots = self._enrich_ref_slots(ref_slots)
         intent = build_intent(intent_id or new_id("in"), project=project, episode=episode,
                               shot_key=shot_key, kind=kind, prompt=prompt,
