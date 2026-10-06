@@ -90,6 +90,7 @@ import plugin_registry
 import deps_check
 import workflow_integrity
 import trt_engine_check
+import stable_profile
 import project_store
 import shot_key
 from fs_atomic import atomic_write_json, read_json_strict
@@ -328,6 +329,18 @@ try:
 except Exception as _e:  # noqa: BLE001  自检失败不得阻断启动
     TRT_ENGINE_CHECK_BOOT = {"success": False, "status": "未测试", "reason": str(_e)}
     app.logger.warning(f"TRT VAE engine 自检失败（不影响启动）：{_e}")
+
+# ⭐ P2-12：把已实测稳定参数变成机器可审计项；只告警，不自动改参数。
+try:
+    STABLE_PROFILE_BOOT = stable_profile.report()
+    if STABLE_PROFILE_BOOT["ok"]:
+        app.logger.info("稳定参数锁定检查通过（P2-12）")
+    else:
+        for _violation in STABLE_PROFILE_BOOT["violations"]:
+            app.logger.warning("稳定参数漂移（P2-12，改动前必须走 A/B）：%s", _violation)
+except Exception as _e:  # noqa: BLE001
+    STABLE_PROFILE_BOOT = {"ok": False, "violations": [str(_e)]}
+    app.logger.warning(f"稳定参数锁定检查失败（不影响启动）：{_e}")
 
 # 无人值守托管：若存在已启用的托管计划，服务启动后自动接着生产（断点续跑）
 # 用一个短延时线程延后启动，避免拖慢 Flask 首次响应；失败不影响服务可用性。
