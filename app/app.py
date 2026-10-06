@@ -3449,7 +3449,9 @@ def api_comfyui_models_select():
     # 只允许已知槽位，脏 key 直接忽略（不报错，避免前后端版本差导致整体失败）
     known = {k: v for k, v in data.items() if k in comfyui_models.SLOTS}
     try:
-        selection = comfyui_models.save_selection(known)
+        # fail-closed：保存前重新拉一次最新 object_info，核验语义 + combo 双重合法性。
+        object_info = comfyui_client.get_object_info(force=True)
+        selection = comfyui_models.save_selection(known, object_info=object_info)
     except Exception as e:  # noqa: BLE001
         return jsonify({"success": False, "error": f"保存失败：{e}"}), 500
     return jsonify({"success": True, "selection": selection})

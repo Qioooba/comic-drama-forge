@@ -163,11 +163,73 @@ def _template_file_for(workflow_key):
         return ""
 
 
-def _filter_slot_values(meta, values):
-    """对带 ``values_filter`` 的槽位过滤候选值（当前只认 ``"h3_lora"``）。"""
-    if meta.get("values_filter") == "h3_lora":
-        return [v for v in values if is_h3_family_lora(v)]
-    return list(values)
+def _slot_semantic_error(slot_key, value):
+    """返回非空字符串表示该值违反 7 槽位语义规则；合法返回 ``None``。
+
+    这层与 ComfyUI combo 校验是两件事：
+      * combo 回答“ComfyUI 能不能看见这个值”；
+      * 语义回答“这个值能不能放进这个职责槽位”。
+    ``MiniMaxH3TRTVAELoader`` 的 decoder/encoder combo 内容完全相同，
+    因此 decoder 槽选中 encoder 引擎必须在这里按文件名拦下。
+    """
+    if value in (None, ""):
+        return None
+    val = str(value)
+    low = val.lower().replace("\\", "/")
+    base = low.rsplit("/", 1)[-1]
+
+    if slot_key in ("lora_channel_a", "lora_channel_b"):
+        if not is_h3_family_lora(val):
+            return f"槽位 {slot_key} 仅接受 MiniMax H3 系 LoRA"
+        return None
+
+    if slot_key == "unet_main":
+        if not ("minimax_h3" in base or "minimax-h3" in base
+                or "minimax_h3" in low or "minimax-h3" in low):
+            return "视频主模型必须是 MiniMax-H3 兼容 UNET"
+        return None
+
+    if slot_key == "clip":
+        if not ("qwen3vl_32b_minimax_h3" in base
+                or "qwen3vl_32b_minimax_h3" in low):
+            return "文本编码器必须是 H3 对应的 Qwen3-VL 32B 编码器"
+        return None
+
+    if slot_key == "vae_audio":
+        if "audio" not in base or "fp32" not in base:
+            return "音频 VAE 必须是 audio FP32 专用模型"
+        if "video_vae" in base or "video-vae" in base:
+            return "音频 VAE 槽不能放视频 VAE"
+        return None
+
+    if slot_key == "vae_video_decoder":
+        if "decoder" not in base:
+            return "视频 VAE 解码槽必须选择 decoder engine"
+        if "encoder" in base:
+            return "视频 VAE 解码槽不能选择 encoder engine"
+        return None
+
+    if slot_key == "vae_video_encoder":
+        if "encoder" not in base:
+            return "视频 VAE 编码槽必须选择 encoder engine"
+        if "decoder" in base:
+            return "视频 VAE 编码槽不能选择 decoder engine"
+        return None
+
+    return None
+
+
+def _filter_slot_values(meta, values, slot_key=None):
+    """过滤候选值：LoRA 白名单 + 7 槽位语义白名单。"""
+    key = slot_key or meta.get("key") or ""
+    out = []
+    for value in values:
+        if meta.get("values_filter") == "h3_lora" and not is_h3_family_lora(value):
+            continue
+        if key and _slot_semantic_error(key, value):
+            continue
+        out.append(value)
+    return out
 
 
 # ---------------------------------------------------------------- 扫描
@@ -259,9 +321,9 @@ def scan(client, force=False):
         if not meta:
             continue
         values = _combo_values(object_info, meta["node_type"], meta["field"])
-        # ⭐ 白名单：带 values_filter 的槽位（LoRA 槽）只暴露 H3 系候选，
-        #    图片链路 LoRA 不进下拉框（用户需求 3 第 2 层）。
-        values = _filter_slot_values(meta, values)
+        # ⭐ 双层白名单：LoRA 只暴露 H3 系；其余槽位再按职责做语义过滤，
+        #    避免 decoder/encoder combo 完全相同时把错误引擎展示成可选项。
+        values = _filter_slot_values(meta, values, slot_key=key)
         current = selection.get(key) or ""
         out["slots"].append({
             "key": key,
@@ -273,7 +335,10 @@ def scan(client, force=False):
             "selected": current,
             # 已选值不在合法值里 → 标红，避免用户以为"选了但没生效"
             # （含「存量脏数据是非 H3 LoRA」的情况：过滤后不在 values 里 → 标红）
-            "selected_valid": (not current) or (current in values),
+            "selected_valid": (
+                (not current)
+                or (current in values and _slot_semantic_error(key, current) is None)
+            ),
             "available": bool(values),
         })
 
@@ -299,14 +364,15 @@ def load_selection():
     return {k: v for k, v in data.items() if k in SLOTS and isinstance(v, str)}
 
 
-def save_selection(patch):
+def save_selection(patch, object_info=None):
     """合并写入用户选定。value 为 None/"" 表示清空该槽位（回落到模板原值）。
 
-    ⭐ 写入侧闸门（fail-closed）：带 ``values_filter="h3_lora"`` 的槽位，
-    值非空且 ``not is_h3_family_lora(val)`` → **直接抛 ValueError 拒绝**，
-    在写入任何内容之前校验，避免手改 ``output/comfyui_models.json`` 或绕过前端
-    把图片链路 LoRA 塞进视频生成。调用方（app.py 的
-    ``/api/comfyui/models`` POST）会把该异常转成 500 + 错误体 → 前端能看到拒绝理由。
+    ⭐ 写入侧闸门（fail-closed）：非空值必须同时通过
+      ① 7 槽位语义校验（例如 decoder 槽不能放 encoder 引擎）；
+      ② ComfyUI ``object_info`` combo 合法候选校验。
+    任一失败都在写入前整体抛 ``ValueError``，调用方（app.py 的
+    ``/api/comfyui/models`` POST）会转成 500 + 错误体 → 前端能看到拒绝理由。
+    ``object_info`` 为空时无法证明 combo 合法，因此拒绝非空写入（不静默放行）。
     """
     if not isinstance(patch, dict):
         return load_selection()
@@ -315,13 +381,20 @@ def save_selection(patch):
         meta = SLOTS.get(key)
         if not meta:
             continue
-        if meta.get("values_filter") != "h3_lora":
-            continue
         if val in (None, ""):
             continue
-        if not is_h3_family_lora(str(val)):
+        val = str(val)
+        semantic_error = _slot_semantic_error(key, val)
+        if semantic_error:
+            raise ValueError(f"{semantic_error}，拒绝值：{val!r}")
+        combo = _combo_values(object_info, meta["node_type"], meta["field"])
+        combo = _filter_slot_values(meta, combo, slot_key=key)
+        if not combo:
             raise ValueError(
-                f"槽位 {key} 仅接受 MiniMax H3 系 LoRA，拒绝非 H3 值：{val!r}")
+                f"无法从 ComfyUI object_info 核验槽位 {key} 的合法候选，拒绝保存：{val!r}")
+        if not any(str(v).lower() == val.lower() for v in combo):
+            raise ValueError(
+                f"槽位 {key} 的值不在 ComfyUI 合法候选中，拒绝保存：{val!r}")
     cur = load_selection()
     for key, val in patch.items():
         if key not in SLOTS:
@@ -351,6 +424,12 @@ def resolve_selection():
         if not v:
             continue
         meta = SLOTS.get(k) or {}
+        semantic_error = _slot_semantic_error(k, v)
+        if semantic_error:
+            logger.warning(
+                "ComfyUI 模型槽位 %s 的存量值 %r 不合法，已剔除：%s",
+                k, v, semantic_error)
+            continue
         if meta.get("values_filter") == "h3_lora" and not is_h3_family_lora(v):
             logger.warning(
                 "ComfyUI 模型槽位 %s 的存量值 %r 不是 MiniMax H3 系 LoRA，已剔除"
