@@ -1299,11 +1299,25 @@ def _collect_project_cast_images(rec: dict, kind_pref: str = "") -> tuple:
     outline = None
     try:
         import book_outline as bo
-        text, _ch = novel_parser.read_novel_text(NOVELS_DIR, rec.get("novel_id") or "")
-        chunks = novel_parser.split_novel(text)
-        outline = bo.load_outline(dir_key, text, len(chunks) or 0, CONTINUITY_DIR) or bo.load_outline(dir_key, text, 0, CONTINUITY_DIR)
+        # ⚠️ 2026-10-07 修复：这一段原先**永远**抛异常、永远走下面的 except，
+        # 整个 book_outline 读取是死的 —— 而且是三处独立错误叠在一起，任一处都足以
+        # 让它 100% 失败：
+        #   ① 本文件顶部是 `from novel_parser import (read_novel_text, split_chapters, …)`
+        #      —— **按函数名直接导入**，`novel_parser` 这个模块名在本模块里并不存在
+        #      → NameError；
+        #   ② novel_parser 里也没有 `split_novel` 这个函数（真名是 split_chapters）；
+        #   ③ read_novel_text 返回的是 **str**，原写法 `text, _ch = …` 试图把正文
+        #      解包成两个变量 → ValueError（正文必然 >2 字符）。
+        # 三者叠在一起还都被 `except Exception` + logger.debug 吞掉，于是界面上看不出
+        # 任何异常，只是「主角/反派映射一直是默认的那一套」——极难定位的静默失效。
+        # 现在直接用顶部已导入的函数名（与全文件口径一致）。
+        text = read_novel_text(NOVELS_DIR, rec.get("novel_id") or "") or ""
+        chunks = split_chapters(text) or []
+        outline = bo.load_outline(dir_key, text, len(chunks), CONTINUITY_DIR)
     except Exception as e:  # noqa: BLE001
-        app.logger.debug("读取 book_outline 失败，使用默认主角/反派映射：%s", e)
+        # debug → warning：读不到大纲会让主角/反派映射退回默认值，属于「结果错了但没人知道」，
+        # 不能只留在 debug 级别。
+        app.logger.warning("读取 book_outline 失败，使用默认主角/反派映射：%s", e)
         outline = None
 
     hero_names, villain_names = [], []
@@ -9217,7 +9231,35 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
                                              "scenes": _scene_reports}]})
                         return
                     os.makedirs(videos_dir, exist_ok=True)
-                    _sdst = _ingest_comfy_output(_sf, _sdst, logger=app.logger)
+                    # 2026-10-07：与预演路径（:9054）对齐，补上 fallback_to_source。
+                    # 此前正式场次落盘**不**带该开关：跨盘 move / copy2 失败时直接抛，
+                    # 整集被判失败中止 —— 而 GPU 已经烧完、产物就躺在 ComfyUI output
+                    # 里没人要（与 _ingest_comfy_output docstring 里记录的「GPU 白烧」
+                    # 事故同型）。预演路径早已修好，正式路径一直漏着。
+                    _sdst = _ingest_comfy_output(_sf, _sdst, logger=app.logger,
+                                                fallback_to_source=True)
+                    # ⚠️ _ingest_comfy_output 在「源列表为空」且 fallback_to_source=True
+                    # 时会**原样返回 dst_path**（一个并不存在的路径）。直接 append 进
+                    # _scene_files 的话，要到 concat 才炸，报错还指向 ffmpeg，现场完全
+                    # 看不出「这一场压根没产物」。这里显式拦一道：返回的不是真实文件
+                    # → 该场判失败并说清是哪一场、为什么（对齐上面「部分场次失败」的
+                    # 既有处理口径，不把整集打成不明原因的中止）。
+                    if not (_sdst and os.path.isfile(_sdst)):
+                        app.logger.error(
+                            "[场次落盘] 第%s场无可用产物（源=%r 目标=%s），本场判失败",
+                            _sn, _sf, _sdst)
+                        _scene_reports.append({"scene_no": _sn, "success": False,
+                                               "error": "ComfyUI 未产出可用文件"})
+                        with lock:
+                            generation_state[task_id].update({
+                                "status": "failed", "success_count": 0,
+                                "error": (f"第 {_sn} 场落盘失败"
+                                          f"（已完成 {_gi}/{len(_scene_groups)} 场；"
+                                          "重跑将自动跳过已完成场次）"),
+                                "results": [{"success": False,
+                                             "mode": "episode_per_scene",
+                                             "scenes": _scene_reports}]})
+                        return
                     _scene_files.append(_sdst)
                     _scene_reports.append({"scene_no": _sn, "success": True,
                                            "path": _sdst,
@@ -16220,17 +16262,39 @@ def _mix_worker(task_id: str, prepared: dict, out_name: str):
                 "report_path": report_path,
                 "url": _mix_audio_url(project_name, report["output_path"]),
                 "audio_qc": _aq,
+                # 音频质检的致命结论随任务态一起对外暴露（此前只落在 report JSON 里，
+                # 界面完全看不到，只能点开文件才知道这一版音轨其实不合格）
+                "qc_blocked": bool(_aq.get("blocked")),
                 "result": report,
             })
         with mix_lock:
             _prune_task_registry(mix_tasks)
         # 带配音成片＝用户真正要验收的成品：自动登记进「成品验收」队列
-        reg = register_final_deliverable(
-            project_name, prepared["episode"], report["output_path"],
-            meta={"source": "mix", "mode": prepared["mode"],
-                  "entry_count": report.get("entry_count"),
-                  "video_source": os.path.basename(prepared["video_path"] or ""),
-                  "report": os.path.basename(report_path)})
+        #
+        # ⚠️ 2026-10-07 收紧为 fail-closed：此前**无条件**登记，音频质检把
+        # 「整条音轨近乎无声 / 不含音频流 / 覆盖率严重不足」判成 blocked=True、
+        # passed=False 之后，结论只写进 *_mix_report.json，任务照样 status=completed、
+        # 照样登记进验收队列 —— 与历史「分镜僵尸成功」同一形态：失败被记成成功，
+        # 用户在验收页看到的是一版**没有可用人声**的成片，还以为混音成功了。
+        # 现在 blocked 时**不登记**，并把原因带进 deliverable，让界面能显式提示。
+        # 注意：仍然保留 status=completed 与产物路径 —— 文件确实产出了，
+        # 用户需要能预览/下载去排查；只是它**不再冒充合格成品**进入验收队列。
+        _aq_blocked = bool(_aq.get("blocked"))
+        if _aq_blocked:
+            reg = {"registered": False,
+                   "reason": ("音频质检判定为致命不合格（"
+                              f"{str(_aq.get('reason') or '')[:80] or '成片音轨不可用'}），"
+                              "本次成片不进入待验收队列")}
+            app.logger.error(
+                "混音成片未登记待验收（%s 第%s集）：%s",
+                project_name, prepared["episode"], reg["reason"])
+        else:
+            reg = register_final_deliverable(
+                project_name, prepared["episode"], report["output_path"],
+                meta={"source": "mix", "mode": prepared["mode"],
+                      "entry_count": report.get("entry_count"),
+                      "video_source": os.path.basename(prepared["video_path"] or ""),
+                      "report": os.path.basename(report_path)})
         with mix_lock:
             mix_tasks[task_id]["deliverable"] = {
                 "registered": bool(reg.get("registered")),

@@ -12,6 +12,7 @@ from typing import List, Optional, Dict
 import json
 
 from config import COMFYUI_URL, PROJECT_OUTPUT_DIR, VIDEOS_DIR, FINAL_DIR
+import subtitle_track  # 字幕轨单一事实源（2026-10-07：与 pipeline.step_final 共用）
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -738,41 +739,33 @@ class VideoPostProcessor:
         #   · 台词字幕（人物开口的转录）→ subtitle_enabled，默认 false；
         #   · 字幕/转场 caption（时空落点/回溯/集尾悬念）→ caption_burn_enabled，默认 true，
         #     它是剧情装置：不烧观众就会看到无过渡的跳切（参考稿靠「春秋蝉，逆转时光。」交代）。
+        # ⚠️ 2026-10-07：字幕轨构建统一委托 subtitle_track（与 pipeline.step_final **共用
+        # 同一实现**）。本函数此前有两个真实缺陷，一并修掉：
+        #   ① 时间轴按剧本 shot["duration"] 累加，而成片是按**真实片段**（video_files）拼的
+        #      —— 每镜的声明值与实测值不等，误差随镜数线性累积，字幕整体前移且不报错；
+        #      而本函数与 pipeline.step_final 写的是**同一个** epNN_final.mp4，
+        #      「字幕对不对」取决于哪条链路先跑完（probe_final 见文件可播放就短路）。
+        #   ② 烧完字幕写到旁挂的 epNN_final_subtitles.mp4，却 return **无字幕**的 output_path
+        #      —— 字幕「做对了但没生效」：字幕文件既没交付也没人读，而调用方
+        #      （app.py 的 /api/final/video）拿这个路径去登记交付物 → 验收页永远是无字幕版。
+        # 现在由 subtitle_track 统一处理时间轴与「烧回本体」。
         # 注意：本函数在旧接口路径（非 pipeline 托管）下调用，无法依赖宿主模块 app，
         # 故这里直接读配置文件，保证「界面点生成成片」这条路与 pipeline 行为一致。
         _want_dlg = _subtitle_enabled_for(project_name)
         _want_cap = _caption_burn_enabled_for(project_name)
         subtitles = []
         if _want_dlg or _want_cap:
-            from dialogue_utils import dialogue_text
-            current_time = 0
-            for shot in script.get("shots", []):
-                duration = shot.get("duration", 5)
-                if _want_dlg:
-                    text = dialogue_text(shot.get("dialogue"))
-                    if text:
-                        subtitles.append({
-                            "start": current_time,
-                            "end": current_time + duration,
-                            "text": text
-                        })
-                if _want_cap:
-                    # caption 兼容结构化 {text, kind} / 旧字符串 / 扁平 caption_text 三种形状
-                    _cap = shot.get("caption")
-                    if isinstance(_cap, dict):
-                        _cap = _cap.get("text")
-                    _cap = str(_cap or shot.get("caption_text") or "").strip()
-                    if _cap:
-                        subtitles.append({"start": current_time,
-                                          "end": current_time + duration,
-                                          "text": _cap})
-                current_time += duration
+            # 逐镜模式：每个片段都能单独 ffprobe → 直接传实测分段时长（顺序与拼接一致）
+            subtitles = subtitle_track.build_subtitle_track(
+                script.get("shots", []),
+                segment_durations=subtitle_track.probe_durations(video_files),
+                want_dialogue=_want_dlg, want_caption=_want_cap)
         else:
             logger.info(f"字幕全部关闭（subtitle_enabled=caption_burn_enabled=false），跳过烧制：{output_path}")
 
         if subtitles:
-            self.add_subtitles(output_path, subtitles,
-                             os.path.join(final_dir, f"ep{ep:02d}_final_subtitles.mp4"))
+            # 烧回 output_path **自身**（原子替换），使返回路径 == 带字幕的那一版
+            subtitle_track.burn_subtitles_inplace(output_path, subtitles, self.add_subtitles)
 
         logger.info(f"第 {ep} 集最终视频: {output_path}")
         return output_path

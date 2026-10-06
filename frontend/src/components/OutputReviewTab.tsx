@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { useApp } from '@/context/AppContext';
-import { exportApi, autopilotApi, qualityApi, type QualityEpisodeRow } from '@/api/client';
+import { exportApi, autopilotApi, qualityApi, projectsApi, type QualityEpisodeRow } from '@/api/client';
 import { Button, Textarea, Skeleton, EmptyState, ErrorState } from '@/components/ui';
 import { ChevronDown, ChevronRight, ClipboardCheck, FileText, Film, FolderOpen } from '@/components/ui/icons';
 import { EpisodeReviewPanel, STATUS_DOT } from '@/components/EpisodeReviewPanel';
@@ -37,7 +37,62 @@ export function OutputReviewTab({ projectKey, assets }: OutputReviewTabProps) {
   const [quality, setQuality] = useState<QualityEpisodeRow[]>([]);
   // 当前展开了「四层状态 · 逐镜复核」的集号（一次只展开一集，避免整页被撑得过长）
   const [expanded, setExpanded] = useState<number | null>(null);
+  // ---- 成片字幕开关（2026-10-07 补前端入口）----
+  // 这两个开关后端一直在读（config.PROJECT_DEFAULT_CONFIG / _project_subtitle_enabled /
+  // _project_caption_burn_enabled，pipeline 与 video_postprocess 两条成片链路都消费它们），
+  // 但此前**界面上没有任何入口** —— 用户想开/关字幕只能手改 output/projects/<id>/config.json。
+  // 放这里是因为它们直接决定「成片长什么样」，与本页的导出/验收同属最后一公里。
+  const [subtitleEnabled, setSubtitleEnabled] = useState<boolean | null>(null);
+  const [captionBurnEnabled, setCaptionBurnEnabled] = useState<boolean | null>(null);
+  const [savingSubtitle, setSavingSubtitle] = useState<string | null>(null);
   const toast = useToast();
+
+  // 与后端同口径的宽容解析：字符串 "false"/"0"/"no"/"off" 不能被 JS 的 truthy 误判为「开」
+  const asBool = (v: unknown, dflt: boolean): boolean => {
+    if (typeof v === 'boolean') return v;
+    if (typeof v === 'number') return v !== 0;
+    if (typeof v === 'string') {
+      const s = v.trim().toLowerCase();
+      if (['false', '0', 'no', 'off'].includes(s)) return false;
+      if (['true', '1', 'yes', 'on'].includes(s)) return true;
+    }
+    return dflt;
+  };
+
+  useEffect(() => {
+    if (!projectKey) return;
+    // 字幕开关是「增补」：读不到就保持 null（控件显示为不可用），不把整页打成硬错误态
+    projectsApi.getConfig(projectKey)
+      .then((d) => {
+        const cfg = (d?.config || {}) as Record<string, unknown>;
+        setSubtitleEnabled(asBool(cfg.subtitle_enabled, false));
+        setCaptionBurnEnabled(asBool(cfg.caption_burn_enabled, true));
+      })
+      .catch(() => { /* 保持 null：控件禁用，不影响本页其它功能 */ });
+  }, [projectKey]);
+
+  /** 保存字幕开关；失败必须回滚 UI，否则界面显示与实际出片行为漂移 */
+  const saveSubtitleConfig = async (key: 'subtitle_enabled' | 'caption_burn_enabled', val: boolean) => {
+    if (!projectKey) return;
+    const prevD = subtitleEnabled;
+    const prevC = captionBurnEnabled;
+    if (key === 'subtitle_enabled') setSubtitleEnabled(val); else setCaptionBurnEnabled(val);
+    setSavingSubtitle(key);
+    try {
+      const d = await projectsApi.updateConfig(projectKey, { [key]: val });
+      const cfg = (d?.config || {}) as Record<string, unknown>;
+      // 以后端归一后的值为准（后端会做口径收敛），避免界面显示 ≠ 实际行为
+      if (key === 'subtitle_enabled') setSubtitleEnabled(asBool(cfg.subtitle_enabled, val));
+      else setCaptionBurnEnabled(asBool(cfg.caption_burn_enabled, val));
+      toast.success(t('deliver.subtitleSaved'));
+    } catch (e) {
+      setSubtitleEnabled(prevD);
+      setCaptionBurnEnabled(prevC);
+      toast.error(e instanceof Error ? e.message : t('common.failed'));
+    } finally {
+      setSavingSubtitle(null);
+    }
+  };
 
   const loadAll = useCallback(async () => {
     if (!projectKey) return;
@@ -207,6 +262,47 @@ export function OutputReviewTab({ projectKey, assets }: OutputReviewTabProps) {
             {notice}
           </div>
         )}
+
+        {/* 成片字幕（2026-10-07 新增：后端一直支持，界面此前无入口） */}
+        <div className="mb-4">
+          <h5 className="text-sm font-medium text-ink-1 mb-2 flex items-center gap-1.5">
+            <Film className="h-4 w-4" /> {t('deliver.subtitleSettings')}
+          </h5>
+          <p className="text-xs text-ink-2 mb-2">{t('deliver.subtitleSettingsHint')}</p>
+          <div className="space-y-2">
+            {([
+              {
+                key: 'subtitle_enabled' as const,
+                val: subtitleEnabled,
+                label: t('deliver.subtitleDialogue'),
+                hint: t('deliver.subtitleDialogueHint'),
+              },
+              {
+                key: 'caption_burn_enabled' as const,
+                val: captionBurnEnabled,
+                label: t('deliver.subtitleCaption'),
+                hint: t('deliver.subtitleCaptionHint'),
+              },
+            ]).map((row) => (
+              <label
+                key={row.key}
+                className="flex items-start gap-2 p-2 bg-surface-2 rounded cursor-pointer"
+              >
+                <input
+                  type="checkbox"
+                  className="mt-0.5 accent-[var(--color-brand)]"
+                  checked={row.val === true}
+                  disabled={row.val === null || savingSubtitle !== null}
+                  onChange={(ev) => void saveSubtitleConfig(row.key, ev.target.checked)}
+                />
+                <span className="min-w-0">
+                  <span className="block text-sm text-ink-1">{row.label}</span>
+                  <span className="block text-xs text-ink-2">{row.hint}</span>
+                </span>
+              </label>
+            ))}
+          </div>
+        </div>
 
         {/* 成片下载 */}
         <div className="mb-4">

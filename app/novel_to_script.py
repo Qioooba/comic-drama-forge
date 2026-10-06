@@ -1083,7 +1083,7 @@ def build_shots_for_chunk(client, bible: dict, outline: dict, chunk: dict, shots
 【本段剧情摘要】{outline.get('summary', '')}
 【本段情节要点】{json.dumps(outline.get('key_beats') or [], ensure_ascii=False)}
 【输出要求】严格只输出一个 JSON 对象，不要 markdown 代码块、不要解释文字，结构如下：
-{{"shots": [{{"camera": "景别+运镜（必须取自上方运镜术语表，如 中景跟随/近景轻推，10 字以内）", "shot_type": "景别（只填以下 {len(SHOT_TYPES)} 值之一：{_SHOT_TYPE_ENUM_ZH}；局部=只拍手部/道具的插入镜；与 camera 里的景别词保持一致；本镜确实无法确定景别时写空字符串）", "camera_motion": "运镜（只填运镜词，优先用上方【克制运镜·推荐】的 固定/轻推/轻摇/跟随/轻手持；无运镜的静止镜头填「固定」）", "location": "所属场景名（必须来自可用场景）", "description": "画面内容描述（80 字以内，只写人物动作过程与关键构图：谁做了什么、怎么做的、在画面什么位置；外貌衣着/环境光线只在推动剧情或首次出场时写，不逐句铺陈，禁止写背景陈述/世界观/来历评述）", "visual_detail": "画面补充细节（可选；当 description 之外还有更细的关键动作过程/环境细节时写在这里，80 字以内；没有多余细节时写空字符串）", "dialogue": [{{"speaker": "说话角色名（必须与可用角色完全一致）", "text": "该角色台词（≤30 字；原文对话尽量原样保留；角色的自语/心声写成该角色本人的台词）"}}], "emotion": "情绪（8 字以内）", "edit_reason": "剪辑动机（20~30字，具体说明这一镜为什么切/承担什么叙事功能，禁止写可套用的空话，如：切掉环境只留下他的反应/用空间拉开取代告别对白/物件回环把十年压缩到一张纸上）", "beat": "叙事节拍（本镜所处节拍，只填「开场」「触发」「高潮」「收尾」四值之一；拿不准填「触发」）", "audio_cues": "音效/配乐提示（60 字以内，只写环境音/音效/配乐，不写人声）", "characters_in_shot": ["出场角色名"], "first_frame": "首帧画面（运动开始前那一刻的静态快照：画面主体与构图，40字以内；无明显运动变化写空字符串）", "last_frame": "末帧画面（运动结束后的终态，40字以内；与首帧相同或无运动时写空字符串）", "motion": "运动描述（严格区分【摄影机运动】推拉摇移跟升降 与【画面内运动】人物/物体自身动作；30字以内；静止镜头写空字符串）", "caption": "字幕（**默认写空对象 {{}}**；仅当本镜承担时空落点交代或集尾悬念时才写，形如 {{"text": "字幕文字（≤20字）", "kind": "时间地点/回溯/悬念 三值之一"}}。字幕是后期叠加的文字，不进画面描述、不产生人声）", "items_in_shot": ["出场物品名"]}}]}}
+{{"shots": [{{"camera": "景别+运镜（必须取自上方运镜术语表，如 中景跟随/近景轻推，10 字以内）", "shot_type": "景别（只填以下 {len(SHOT_TYPES)} 值之一：{_SHOT_TYPE_ENUM_ZH}；局部=只拍手部/道具的插入镜；与 camera 里的景别词保持一致；本镜确实无法确定景别时写空字符串）", "camera_motion": "运镜（只填运镜词，优先用上方【克制运镜·推荐】的 固定/轻推/轻摇/跟随/轻手持；无运镜的静止镜头填「固定」）", "location": "所属场景名（必须来自可用场景）", "description": "画面内容描述（80 字以内，只写人物动作过程与关键构图：谁做了什么、怎么做的、在画面什么位置；外貌衣着/环境光线只在推动剧情或首次出场时写，不逐句铺陈，禁止写背景陈述/世界观/来历评述）", "visual_detail": "画面补充细节（可选；当 description 之外还有更细的关键动作过程/环境细节时写在这里，80 字以内；没有多余细节时写空字符串）", "dialogue": [{{"speaker": "说话角色名（必须与可用角色完全一致）", "text": "该角色台词（≤30 字；原文对话尽量原样保留；角色的自语/心声写成该角色本人的台词）"}}], "emotion": "情绪（8 字以内）", "edit_reason": "剪辑动机（20~30字，具体说明这一镜为什么切/承担什么叙事功能，禁止写可套用的空话，如：切掉环境只留下他的反应/用空间拉开取代告别对白/物件回环把十年压缩到一张纸上）", "beat": "叙事节拍（本镜所处节拍，只填「开场」「触发」「高潮」「收尾」四值之一；拿不准填「触发」）", "audio_cues": "音效/配乐提示（60 字以内，只写环境音/音效/配乐，不写人声）", "characters_in_shot": ["出场角色名"], "blocking": [{{"name": "出场角色名", "x": "left/center/right", "depth": "front/mid/back", "facing": "camera/left/right/back"}}], "action": "本镜动作 beat（谁做了什么、从哪到哪，30 字以内；纯对话镜写神态与小动作，不得留空）", "first_frame": "首帧画面（运动开始前那一刻的静态快照：画面主体与构图，40字以内；无明显运动变化写空字符串）", "last_frame": "末帧画面（运动结束后的终态，40字以内；与首帧相同或无运动时写空字符串）", "motion": "运动描述（严格区分【摄影机运动】推拉摇移跟升降 与【画面内运动】人物/物体自身动作；30字以内；静止镜头写空字符串）", "caption": "字幕（**默认写空对象 {{}}**；仅当本镜承担时空落点交代或集尾悬念时才写，形如 {{"text": "字幕文字（≤20字）", "kind": "时间地点/回溯/悬念 三值之一"}}。字幕是后期叠加的文字，不进画面描述、不产生人声）", "items_in_shot": ["出场物品名"]}}]}}
 【禁止输出 prompt_h3 字段】视频提示词由程序在生成阶段按 H3 规范自动构建（它会结合当次实际传入的参考图，生成 subject_definitions / summary / retention_analysis / detailed_description / overall_soundscape / non_diegetic_music 六段）。你在剧本阶段并不知道最终配几张参考图，写出来的英文提示词缺少 <Picture N> 标签，反而会覆盖规范提示词导致出片偏离设定。因此**不要写 prompt_h3、不要写英文提示词**；把画面信息全部写进 description 即可。
 【站位与动作（3D 导演台依赖，逐镜必填）】每一镜都要写：\n
   ① blocking：本镜出场角色的**站位**，每个出场角色一条，形如 
@@ -1358,6 +1358,66 @@ def _norm_beat(raw) -> str:
     """把模型给的节拍值归一到四值白名单；空/越界值取默认「触发」。"""
     v = str(raw or "").strip()
     return v if v in _BEAT_WHITELIST else _DEFAULT_BEAT
+
+
+# ===================== 站位（blocking）归一（2026-10-07 修复） =====================
+# 取值表与 te_3d_director._X_SLOT / _DEPTH_Z / _FACING_Y **同源**（中文同义词一并认，
+# 归一到英文枚举），避免「剧本侧写中文、渲染侧只认英文」导致整条站位被丢弃。
+_BLOCKING_X_MAP = {"left": "left", "左": "left", "center": "center", "centre": "center",
+                   "middle": "center", "中": "center", "right": "right", "右": "right"}
+_BLOCKING_DEPTH_MAP = {"front": "front", "前": "front", "mid": "mid", "middle": "mid",
+                       "中": "mid", "back": "back", "后": "back"}
+_BLOCKING_FACING_MAP = {"camera": "camera", "镜头": "camera", "front": "camera",
+                        "left": "left", "左": "left", "right": "right", "右": "right",
+                        "back": "back", "背": "back", "away": "back", "背对": "back"}
+
+
+def _norm_blocking(raw, cast) -> list:
+    """把模型给的 blocking 归一成 :func:`te_3d_director._blocking_lookup` 能直接消费的结构。
+
+    为什么这一步曾经不存在（2026-10-07 修复的真实缺陷）
+    --------------------------------------------------
+    剧本提示词**逐镜强制要求**模型输出 ``blocking`` 与 ``action``
+    （见 ``build_shots`` 提示词的「【站位与动作（3D 导演台依赖，逐镜必填）】」），
+    :data:`SHOT_FIELDS_DEFAULT` 也声明了这两个字段。但 ``_norm_shots`` 的字段白名单
+    **从未把它们拷进 row** —— 模型的输出在标准化阶段被静默丢弃，于是
+    ``te_3d_director._blocking_lookup`` 恒读到 ``None``、恒回退「按出场顺序排布」，
+    「8 个镜头折叠成 2 种舞台」这个 2026-10-01 要治的缺陷在**主链路上原样复发**，
+    且全程无任何日志，看起来像是「模型不肯给站位」。
+
+    口径（与相邻的 _norm_shot_type / _norm_beat 保持同一风格）
+    ------------------------------------------------------
+    - **只保留本镜出场角色**（``cast``）的条目：不在场的角色即便模型写了站位，
+      渲染端也会按名字过滤丢弃；这里提前过滤并计数上报，让「模型写了但对不上」
+      变成可观测事实，而不是渲染期的一次静默 no-op。
+    - x/depth/facing 逐字段走白名单；模型给中文同义词（画面左 / 前 / 背对）也认。
+      某一字段不命中 → 该字段**留空**（合法：3D 导演台允许只给部分站位，
+      ``_X_SLOT`` / ``_DEPTH_Z`` / ``_FACING_Y`` 会按默认位兜底）。
+      绝不像景别那样「宁可整条丢弃」—— 站位是**增量信息**，部分正确比全丢更有用。
+    - 角色名对 ``cast`` 做**精确匹配**：模型写别名/简称匹配不上就丢这一条
+      （宁缺毋滥 —— 猜错站位会让构图比没有站位更糟）。
+    """
+    out, dropped = [], 0
+    want = {str(c).strip() for c in (cast or []) if str(c or "").strip()}
+    for it in (raw or []):
+        if not isinstance(it, dict):
+            continue
+        nm = str(it.get("name") or "").strip()
+        if not nm or nm not in want:
+            dropped += 1
+            continue
+        out.append({
+            "name": nm,
+            "x": _BLOCKING_X_MAP.get(str(it.get("x") or it.get("side") or "").strip().lower(), ""),
+            "depth": _BLOCKING_DEPTH_MAP.get(str(it.get("depth") or "").strip().lower(), ""),
+            "facing": _BLOCKING_FACING_MAP.get(str(it.get("facing") or "").strip().lower(), ""),
+        })
+    if dropped:
+        # 不静默：模型写了站位却对不上出场角色，是「站位表为空」的**真实原因**，
+        # 必须与「模型压根没写」区分开，否则又是一次静默失效。
+        logger.warning("[站位归一] 丢弃 %d 条不在出场名单内的 blocking（出场：%s）",
+                       dropped, "、".join(sorted(want)) or "无")
+    return out
 
 
 def required_shot_duration(shot: dict) -> float:
@@ -2566,6 +2626,14 @@ def _norm_shots(raw_shots: list, bible: dict, episodes: int, start_id: int = 1) 
         # 胸口方向」却只登记了赵天霸）→ 生成端/质检端都拿不到羡进的设定图，模型只能凭
         # 想象画脸 → 质检必挂 → 重试循环。这里按画面文本自动补全（只增不减 + 告警）。
         row["characters_in_shot"] = augment_cast_from_text(row, chars, row.get("shot_id"))
+        # ---- 站位与动作（2026-10-07 修复此前被静默丢弃） ----
+        # 放在 augment_cast_from_text **之后**：blocking 必须按**最终出场名单**过滤。
+        # 补全环节可能新增角色（画面文本点名了谁），若在补全前过滤，会把模型为新增
+        # 角色写好的站位误判为「不在场」丢掉。
+        row["blocking"] = _norm_blocking(s.get("blocking"), row["characters_in_shot"])
+        # action 是动作 beat 的文字描述，供 3D 导演台与提示词补充动作语义；
+        # 限长 60 字（与 first_frame/last_frame 的 40、motion 的 30 同量级防越界）。
+        row["action"] = str(s.get("action") or "").strip()[:60]
         # 覆盖率补生成镜头：保留其承载的原文单元编号，便于覆盖率校验与前端回溯
         src_ids = s.get("source_unit_ids")
         if isinstance(src_ids, (list, tuple)) and src_ids:

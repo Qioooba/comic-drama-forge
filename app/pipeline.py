@@ -54,6 +54,7 @@ import quality_stage  # 四层质量状态 + 哈希绑定人审（2026-09-29）
 import task_lease  # 文件租约 + 心跳（2026-09-29：跨进程互斥 + 崩溃可回收）
 import failure_codes  # 结构化失败码（2026-09-29：从既有文案归类，原文一字不改）
 import preview_gate  # 两级生产（2026-09-29：预演产物永不可交付）
+import subtitle_track  # 字幕轨单一事实源（2026-10-07：与 video_postprocess 共用同一实现）
 
 from fs_atomic import atomic_write_json, read_json_strict
 
@@ -180,6 +181,17 @@ STEP_LABELS = {
     "final": "成片合成",
 }
 
+#: 视频生成方式的**唯一权威默认**（2026-10-07 收敛）。
+#:
+#: config.norm_video_mode 无条件返回 "episode"（逐镜 / 关键帧两模式已于 2026-10-01 废弃），
+#: 但本模块曾有 **4 处**在取配置时写成 `cfg.get("video_mode") or DEFAULT_VIDEO_MODE`。这些默认值
+#: 彼此矛盾：normalize_config 走过的配置恒为 episode，而**任何绕过 normalize_config 的
+#: 直调路径**（probe / assert_mode_contract 由外部传入的 ctx）会拿到 "per_shot"，
+#: 于是 step_final 走进「按逐镜拼接」分支去找根本不存在的 shot_NN.mp4 → 报
+#: 「该集没有可拼接的镜头视频」——一个由**默认值**造出来的、与真实产物无关的报错。
+#: 现在所有取默认的地方统一走这个常量，与后端口径同源。
+DEFAULT_VIDEO_MODE = "episode"
+
 #: 需要「质检门禁」的步骤（不达标必须重试，不允许静默通过）
 GATED_STEPS = ("script", "storyboard", "video")
 
@@ -257,10 +269,11 @@ def normalize_config(raw: dict, default_project_key: str = "") -> dict:
               "enable_upscale", "require_consistency",
               "auto_repair", "overwrite_script"):
         cfg[k] = bool(cfg.get(k))
-    # 2026-10-01：只保留整集一次生成（per_shot / keyframe 废弃）
-    cfg["video_mode"] = "episode"
-    if cfg.get("video_mode") == "keyframe":
-        cfg["enable_keyframe"] = True      # 历史关键帧模式分支，现恒不触发
+    # 2026-10-01：只保留整集一次生成（per_shot / keyframe 废弃）—— 与 config.norm_video_mode
+    # 同口径（那里也是无条件返回 episode）。原实现紧接着还有一个
+    # `if cfg.get("video_mode") == "keyframe": cfg["enable_keyframe"] = True` 分支，
+    # 紧跟在上一行的无条件赋值之后，**恒为假**（死分支），已删除。
+    cfg["video_mode"] = DEFAULT_VIDEO_MODE
     try:
         import keyframe as _kf
         cfg["keyframe_chain_mode"] = _kf.norm_chain_mode(cfg.get("keyframe_chain_mode"))
@@ -287,7 +300,7 @@ def assert_mode_contract(cfg: dict) -> None:
     断言失败抛 PipelineError（进入步骤循环前调用，属配置错误而非步骤运行时故障，
     不触发步骤级重试）。
     """
-    mode = cfg.get("video_mode") or "per_shot"
+    mode = cfg.get("video_mode") or DEFAULT_VIDEO_MODE
     if mode not in ("per_shot", "episode", "keyframe"):
         raise PipelineError(f"视频生成模式「{mode}」无法识别（仅支持 per_shot/episode/keyframe），请检查托管计划配置")
     video_on = bool(cfg.get("enable_video"))
@@ -653,9 +666,54 @@ def mix_output_path(ctx) -> str:
                         f"ep{ctx['episode_no']:02d}_dubbed.mp4")
 
 
+def _mix_report_path(ctx) -> str:
+    """混音报告路径（与 app._mix_worker 的落盘命名同口径）"""
+    A = _A()
+    out_name = os.path.basename(mix_output_path(ctx))
+    return os.path.join(A.mix_out_dir(ctx["project_name"]),
+                        f"{os.path.splitext(out_name)[0]}_mix_report.json")
+
+
+def _mix_audio_blocked(report_path: str) -> tuple:
+    """读混音报告的音频质检结论，返回 ``(blocked, reason)``。
+
+    报告**缺失**不算 blocked（老工程没有报告文件，不该因为缺元数据就把已产出的成片
+    判成需重跑）；报告存在但损坏 → 按 blocked 处理并留error 日志，
+    因为「结论读不出来」与「结论是不合格」同样不该被当成合格放行。
+    """
+    if not _nonempty(report_path):
+        return False, ""
+    try:
+        data = read_json_strict(report_path, {}) or {}
+    except (ValueError, OSError) as e:
+        logger.error("混音报告解析失败（按质检不合格处理，项目 %s）：%s",
+                     os.path.basename(report_path), e)
+        return True, f"混音报告损坏，无法确认音频质检结论：{e}"
+    aq = data.get("audio_qc") or {}
+    if not isinstance(aq, dict):
+        return False, ""
+    if bool(aq.get("blocked")):
+        return True, str(aq.get("reason") or "成片音频质检未通过（致命）")[:200]
+    return False, ""
+
+
 def probe_mix(ctx) -> dict:
+    """混音产物就绪判据。
+
+    ⚠️ 2026-10-07：从「文件能播放」升级为「文件能播放 **且** 音频质检未判致命不合格」。
+    旧判据只看 ``_playable(p)``，于是一条「21 句里 17 句落在片外、整条音轨近乎无声」
+    的成片同样判 ``done=True`` → 托管重跑时**直接短路跳过**，坏成片永远留在交付目录里，
+    且与历史「分镜僵尸成功」是同一形态：失败被记成成功。
+
+    判据与 app._mix_worker 的登记闸门**同源**（都读 ``audio_qc.blocked``），
+    所以「不登记验收」与「不允许短路」不会出现一边拦一边放的分叉。
+    """
     p = mix_output_path(ctx)
-    return {"total": 1, "ready": 1 if _playable(p) else 0, "done": _playable(p), "file": p}
+    if not _playable(p):
+        return {"total": 1, "ready": 0, "done": False, "file": p}
+    blocked, reason = _mix_audio_blocked(_mix_report_path(ctx))
+    return {"total": 1, "ready": 0 if blocked else 1, "done": not blocked,
+            "file": p, "qc_blocked": blocked, "qc_reason": reason}
 
 
 def upscale_path(ctx) -> str:
@@ -972,7 +1030,7 @@ def step_video(ctx) -> dict:
                 f"整集剧本没有可朗读台词，出片会得到完全无声的成片，已阻止提交："
                 f"{'；'.join(_aud['warnings'][:3])}"
                 f"（如确认只要画面，请在本集配置里开启「允许静音成片」allow_silent）")
-    mode = cfg.get("video_mode") or "per_shot"
+    mode = cfg.get("video_mode") or DEFAULT_VIDEO_MODE
     if mode == "keyframe":
         kf = probe_keyframe(ctx)
         if not kf.get("done"):
@@ -1034,44 +1092,6 @@ def step_video(ctx) -> dict:
     return {"ok": True, "detail": detail, "artifact": recheck["dir"]}
 
 
-def _probe_concat_duration(concat_video: str, segments: list) -> float:
-    """B-07 P1-5：ffprobe 实测拼接后视频总时长（秒）。
-
-    字幕时间轴基准必须与成片实测时长一致，否则字幕整体漂移。
-    拼接后若存在则优先用 ffprobe 实测；无 ffprobe 时退化用各段实测时长累加。
-    """
-    import subprocess as _sp
-    import json as _json
-    # 1) 若已拼好成片（concat_video 非空且存在），直接 ffprobe 取实测时长
-    if concat_video and _nonempty(concat_video):
-        try:
-            r = _sp.run(["ffprobe", "-v", "error", "-show_entries",
-                         "format=duration", "-of", "json",
-                         os.path.abspath(concat_video)],
-                        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
-            if r.returncode == 0:
-                d = _json.loads(r.stdout or "{}")
-                dur = float((d.get("format") or {}).get("duration") or 0)
-                if dur > 0:
-                    return dur
-        except Exception as e:  # noqa: BLE001
-            logger.debug("时长探测解析失败（忽略）：%s", e)
-    # 2) 退化：各段 ffprobe 实测时长累加（比剧本 duration 累加更可靠）
-    total = 0.0
-    for seg in segments:
-        try:
-            r = _sp.run(["ffprobe", "-v", "error", "-show_entries",
-                         "format=duration", "-of", "json",
-                         os.path.abspath(seg)],
-                        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
-            if r.returncode == 0:
-                d = _json.loads(r.stdout or "{}")
-                total += float((d.get("format") or {}).get("duration") or 0)
-        except Exception:  # noqa: BLE001
-            continue
-    return total
-
-
 def step_final(ctx) -> dict:
     """成片合成：按剧本镜头顺序拼接该集所有片段，可选叠加字幕"""
     A = _A()
@@ -1090,7 +1110,7 @@ def step_final(ctx) -> dict:
     # 整集模式（video_mode=episode）：step_video 由 H3 一次生成「整集视频」，
     # 磁盘上根本没有逐镜 shot_XX.mp4。此时不能按逐镜拼接，直接把整集视频
     # 采用为成片，否则会误报「该集没有可拼接的镜头视频」而整集卡死。
-    mode = (ctx["config"].get("video_mode") or "per_shot")
+    mode = (ctx["config"].get("video_mode") or DEFAULT_VIDEO_MODE)
     if mode == "episode":
         # 优先采用**超分产物**（upscale 步在 video 之后、final 之前）：超分成功则成片
         # 即超分版；超分被跳过 / fail-open 落空时回退整集原片，行为与改动前一致。
@@ -1130,84 +1150,38 @@ def step_final(ctx) -> dict:
     #   · 字幕/转场 caption（时空落点/回溯/集尾悬念）→ caption_burn_enabled，默认 true，
     #     它是**剧情装置**：不烧观众就会看到无过渡的跳切（参考稿靠「春秋蝉，逆转时光。」交代）。
     # 两者都不开时直接沿用拼接产物 tmp，行为与改动前一致。
-    subbed = ""
-    if (A._project_subtitle_enabled(ctx["project_name"])
-            or A._project_caption_burn_enabled(ctx["project_name"])):
+    #
+    # ⚠️ 2026-10-07：字幕轨的构建已抽到 subtitle_track（与 video_postprocess.finalize_episode
+    # **共用同一实现**）。此前本函数与那处各写一份时间轴，且基准不同（这里 ffprobe 实测、
+    # 那里累加剧本 duration），二者又写同一个 epNN_final.mp4 —— 字幕对不对取决于谁先跑完。
+    # 现在「字幕时间轴」只有 subtitle_track 一个口径。
+    _want_dlg = A._project_subtitle_enabled(ctx["project_name"])
+    _want_cap = A._project_caption_burn_enabled(ctx["project_name"])
+    _subs = []
+    if _want_dlg or _want_cap:
         try:
-            from dialogue_utils import dialogue_text
-            _want_dlg = A._project_subtitle_enabled(ctx["project_name"])
-            _want_cap = A._project_caption_burn_enabled(ctx["project_name"])
-
-            def _cap_text(_s):
-                """镜头字幕文本：兼容 {text,kind} / 旧字符串 / 扁平 caption_text 三种形状。"""
-                _c = _s.get("caption")
-                if isinstance(_c, dict):
-                    _c = _c.get("text")
-                return str(_c or _s.get("caption_text") or "").strip()
-
-            subs, cur = [], 0.0
-            # B-07 P1-5：时间轴基准用 ffprobe 实测各段时长累加（而非剧本 duration），
-            # 与成片实际时长一致，避免字幕整体漂移。
+            # 逐镜模式：每段都能单独 ffprobe → 传实测分段时长（最精确）；
+            # 整集模式：只有一条源片、无法逐段探测 → 传实测总时长，由 build_subtitle_track
+            # 按各镜声明时长占比分摊（保证「字幕总跨度 == 成片实测总长」这个更重要的不变量）。
             if mode == "episode":
-                # 整集模式：tmp 是整集视频，按各镜剧本时长占比近似分配（单条源片无法逐段 ffprobe）
-                _ep_total = _probe_concat_duration(tmp, [tmp])
-                for s in shots:
-                    dur = float(s.get("duration") or 5)
-                    _script_total = sum(float(x.get("duration") or 5) for x in shots) or 1.0
-                    if _ep_total > 0:
-                        dur = dur / _script_total * _ep_total
-                    if _want_dlg:
-                        text = dialogue_text(s.get("dialogue"))
-                        if text:
-                            subs.append({"start": cur, "end": cur + dur, "text": text})
-                    if _want_cap:
-                        _ct = _cap_text(s)
-                        if _ct:
-                            subs.append({"start": cur, "end": cur + dur, "text": _ct})
-                    cur += dur
+                _seg_durs, _total = None, subtitle_track.probe_media_duration(tmp)
             else:
-                # 逐镜模式：各段 ffprobe 实测时长累加
-                seg_durs = []
-                for p in files:
-                    _d = 0.0
-                    try:
-                        import subprocess as _sp2
-                        import json as _json2
-                        _r = _sp2.run(["ffprobe", "-v", "error", "-show_entries",
-                                       "format=duration", "-of", "json",
-                                       os.path.abspath(p)],
-                                      capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
-                        if _r.returncode == 0:
-                            _d = float((_json2.loads(_r.stdout or "{}").get("format")
-                                        or {}).get("duration") or 0)
-                    except Exception:  # noqa: BLE001
-                        _d = 0.0
-                    seg_durs.append(_d)
-                for i, s in enumerate(shots):
-                    dur = seg_durs[i] if i < len(seg_durs) else float(s.get("duration") or 5)
-                    if dur <= 0:
-                        dur = float(s.get("duration") or 5)
-                    if _want_dlg:
-                        text = dialogue_text(s.get("dialogue"))
-                        if text:
-                            subs.append({"start": cur, "end": cur + dur, "text": text})
-                    if _want_cap:
-                        _ct = _cap_text(s)
-                        if _ct:
-                            subs.append({"start": cur, "end": cur + dur, "text": _ct})
-                    cur += dur
-            if subs:
-                subbed = A.video_processor.add_subtitles(tmp, subs, out)
+                _seg_durs, _total = subtitle_track.probe_durations(files), 0.0
+            _subs = subtitle_track.build_subtitle_track(
+                shots, segment_durations=_seg_durs, total_duration=_total,
+                want_dialogue=_want_dlg, want_caption=_want_cap)
         except Exception as e:  # noqa: BLE001  字幕失败不阻断成片
-            logger.warning("成片字幕生成跳过（不影响成片）：%s", e)
+            logger.warning("成片字幕轨构建失败（不影响成片）：%s", e)
 
-    produced = subbed if _nonempty(subbed) else ""
-    if not produced:
-        os.replace(tmp, out)
-        produced = out
-    elif os.path.abspath(produced) != os.path.abspath(out):
-        os.replace(produced, out)
-        produced = out
+    # 先把「未烧字幕」的拼接/采用产物落到最终路径：成片本身是主产物，
+    # 字幕是它之上的增强 —— 字幕烧制失败不应该连成片都交不出来。
+    os.replace(tmp, out)
+    if _subs:
+        # 烧回 out 自身（不再旁挂 *_subtitles.mp4 后返回无字幕的原路径 —— 那会让
+        # 「做对了但没生效」：字幕文件既没交付也没人读，而交付物登记的是无字幕版）。
+        subtitle_track.burn_subtitles_inplace(out, _subs, A.video_processor.add_subtitles)
+
+    produced = out
     if _nonempty(tmp):
         try:
             os.remove(tmp)
@@ -1232,8 +1206,10 @@ def step_final(ctx) -> dict:
         A._maybe_clear_comfyui_history("成片步骤收尾")
     except Exception as e:  # noqa: BLE001  可观测性优化，绝不能阻断成片
         logger.debug("ComfyUI 任务历史清理跳过：%s: %s", type(e).__name__, e)
-    return {"ok": True, "artifact": out,
-            "detail": {"segments": len(files), "subtitles": bool(subbed), "size": os.path.getsize(out)}}
+    return {"ok": True, "artifact": produced,
+            "detail": {"segments": len(files), "subtitle_count": len(_subs),
+                       "subtitle_enabled": _want_dlg, "caption_enabled": _want_cap,
+                       "size": os.path.getsize(out)}}
 
 
 def step_tts(ctx) -> dict:
@@ -1307,7 +1283,9 @@ def step_mix(ctx) -> dict:
     recheck = probe_mix(ctx)
     if not recheck.get("done"):
         return {"ok": False, "detail": {"task": final, "probe": recheck},
-                "error": (final or {}).get("error") or "混音未产出有效文件"}
+                "error": ((final or {}).get("error")
+                          or (f"混音成片音频质检未通过：{recheck.get('qc_reason')}"
+                              if recheck.get("qc_blocked") else "混音未产出有效文件"))}
     return {"ok": True, "detail": {"probe": recheck, "lines": len(prepared["entries"])},
             "artifact": recheck["file"]}
 
@@ -1518,8 +1496,19 @@ def _load_script_into_ctx(ctx) -> dict:
 
 
 def _deliverable_of(ctx, steps: dict) -> str:
-    """该集的最终交付物：优先超分成品，其次成片"""
-    for key in ("upscale", "final"):
+    """该集的最终交付物：**成片（final）**，超分产物只作兜底。
+
+    ⚠️ 2026-10-07 修正此处曾经存在的**顺序错误**（交付「看不见字幕的那一版」）：
+    旧实现是 ``for key in ("upscale", "final")`` —— 优先返回超分产物
+    ``epNN_upscaled.mp4``。但字幕是在 ``step_final``（:1200 add_subtitles）才烧进
+    ``epNN_final.mp4`` 的，而 :1094-1107 的整集模式恰恰是**拿超分片当源**再烧字幕。
+    于是 ``upscale`` 拿到的是**字幕烧制之前**的中间片：用户在「成品验收」看到、下载、
+    发布的成片与工作台里预览的那一版**不是同一个文件**，字幕凭空消失。
+    （超分本身没丢——它已经被 step_final 吃进 final 了，所以这里只需认 final。）
+
+    仅当 final 缺失（例如用户关了成片合成、只留超分产物）时才回退到 upscale。
+    """
+    for key in ("final", "upscale"):
         art = (steps.get(key) or {}).get("artifact") or ""
         if _nonempty(art):
             return art
