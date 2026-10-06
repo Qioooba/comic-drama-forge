@@ -167,11 +167,10 @@ def models_search_dirs() -> list:
     return out
 
 
-# P1-10：Qwen 2512 UNET **已下线**（2026-09-23 起现役图片链路全部切 Qwen-Image 2.1 INT8，
-# 见 WORKFLOW_TEMPLATE 的 *_Qwen21.json）。原名 QWEN_IMAGE_MODEL 会让状态页/依赖检测/
-# 新代码误以为 2512 仍在役，故改名为 LEGACY_ 前缀；若确认全仓无引用可直接删除。
-LEGACY_QWEN_IMAGE_MODEL = os.path.join(MODELS_DIR, "diffusion_models", "qwen-image-2512",
-                                       "qwen_image_2512_fp8_e4m3fn.safetensors") if MODELS_DIR else ""
+# P1-10：Qwen 2512 UNET 已于 2026-09-23 下线，现役图片链路全部是
+# Qwen-Image 2.1 INT8（WORKFLOW_TEMPLATE 的 *_Qwen21.json）。
+# 旧 2512 模型常量已确认无调用方，故直接删除，
+# 防止状态页、依赖检测或新代码继续把 2512 当作在役模型。
 H3_MODEL = os.path.join(MODELS_DIR, "diffusion_models", "minimax-h3",
                         "minimax_h3_ref2va_pruned_int8_convrot.safetensors") if MODELS_DIR else ""
 FLASHVSR_MODEL = os.path.join(MODELS_DIR, "FlashVSR-v1.1",
