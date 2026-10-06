@@ -31,6 +31,7 @@ import cancellation  # S9：远端任务取消（中止信号贯穿 ComfyUI 轮�
 import comfyui_job_store as job_store  # 崩溃免重渲检查点（2026-09-29：台账复用 + 重连，不重复提交）
 import actual_params  # P0-5：提交时记录“最终生效参数”快照
 import performance_metrics  # P2-11：任务期真实性能采样（只采数，不调参）
+import template_test_guard  # P1-6：最终提交前拦截模板测试 timeline
 import asset_library  # 跨项目角色资产库（2026-09-29：形象指纹命中即零渲染复用）
 from typing import Dict, List, Optional, Any, Tuple, Sequence
 # ⚠️ Sequence 曾被漏导入：类级注解 `_LIGHT_KEYWORDS: Sequence[...]` 在类创建时**不求值**，
@@ -1288,6 +1289,12 @@ class ComfyUIClient:
             return f"{sub}/{uploaded}" if sub else uploaded
 
     def queue_prompt(self, api_prompt: dict) -> str:
+        # P1-6：唯一最终提交点做 fail-closed 校验，防止旧模板测试 timeline 进生产。
+        try:
+            template_test_guard.assert_no_template_test_data(api_prompt)
+        except template_test_guard.TemplateTestDataError:
+            _bump("prompt_failed")
+            raise
         payload = {"prompt": api_prompt, "client_id": self.client_id}
         # 先捕获工作流元数据，避免并发提交时被下一次 load_workflow 覆盖。
         workflow_meta = dict(self.last_workflow_meta or {})
