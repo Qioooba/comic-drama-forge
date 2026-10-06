@@ -5,16 +5,23 @@
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title data-i18n="app.title">漫剧生成系统</title>
-    <!-- 主题防闪烁：React 挂载前按「localStorage 覆盖 > 系统偏好」先注入 .dark，
-         判定逻辑与 src/context/ThemeContext.tsx 必须保持一致（默认跟随系统）。 -->
+    <!-- 主题防闪烁：React 挂载前注入 .light。
+         2026-10-07：深色成为**默认主题**，浅色降为可选皮肤（见 index.css 的
+         :root / :root.light 两套 token）。
+
+         ⚠️ 判定必须与 src/context/ThemeContext.tsx **逐字一致**。`system` 档
+         在这里也要跑一次 matchMedia —— 否则「浅色系统 + system 偏好」的用户
+         首屏先按深色渲染，挂载后 ThemeContext 才切成浅色，肉眼可见一次深色
+         闪烁（FOUC）。这是审核 P0-1 复现出的真实缺陷。-->
     <script>
       (function () {
         var stored = null;
         try { stored = localStorage.getItem('theme-mode'); } catch (e) { /* 隐私模式等存不了就当没存过 */ }
-        var dark = stored === 'dark' ||
+        var light = stored === 'light' ||
+          // system / 未知值：跟随系统（与 ThemeContext 里 resolved 的解析一致）
           ((stored === 'system' || stored === null) &&
-            window.matchMedia('(prefers-color-scheme: dark)').matches);
-        if (dark) document.documentElement.classList.add('dark');
+            !window.matchMedia('(prefers-color-scheme: dark)').matches);
+        if (light) document.documentElement.classList.add('light');
       })();
     </script>
     <!-- Tailwind 已改为构建期编译（见 tailwind.config.js / postcss.config.js），
@@ -34,17 +41,20 @@
         to { opacity: 1; }
       }
       /* 首屏样式：index.css 尚未加载时用，token 由 :root 提供；
-         滚动条具体取值与 index.css 的滚动条规则保持一致（深色下 --brand 随
-         :root.dark 覆盖层自动切换，无需单独定义变体）。 */
-      html.dark { background: #020617; color-scheme: dark; } /* 防闪烁：深色首屏底色，与 :root.dark 的 --bg-canvas 一致 */
+         滚动条具体取值与 index.css 的滚动条规则保持一致。
+         深色是默认主题，:root 即深色取值，所以默认底色直接写在 html 上，
+         不需要等 class —— 这是「防闪烁」能生效的关键。 */
+      html { background: #020617; color-scheme: dark; } /* 与 :root 的 --bg-canvas 一致 */
+      html.light { background: #F7F8FA; color-scheme: light; } /* 可选浅色皮肤 */
       ::-webkit-scrollbar { width: 6px; height: 6px; }
       ::-webkit-scrollbar-track { background: transparent; }
       ::-webkit-scrollbar-thumb { background: rgb(var(--brand) / 0.35); border-radius: 3px; }
     </style>
-    <script type="module" crossorigin src="/assets/index-Y8Gwn6xO.js"></script>
-    <link rel="stylesheet" crossorigin href="/assets/index-BoyZZeDd.css">
+    <script type="module" crossorigin src="/assets/index-Dp4QMBct.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-B-GtxM4u.css">
   </head>
   <body class="bg-canvas text-ink-1">
-    <div id="root"></div>
+    <div id="root"></div>
+
   </body>
 </html>

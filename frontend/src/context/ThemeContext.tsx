@@ -4,10 +4,13 @@ import React, { createContext, useCallback, useContext, useEffect, useMemo, useS
  * 界面主题（浅色 / 深色 / 跟随系统）
  *
  * 设计要点：
- * - 三档 mode，默认 system；持久化在 localStorage。key 与判定逻辑必须和
+ * - 三档 mode，**默认 dark**；持久化在 localStorage。key 与判定逻辑必须和
  *   index.html 的防闪烁脚本保持一致（两边改一边要同步另一边）。
- * - 深色的落地方式 = 给 <html> 注入 .dark 类，配合 index.css 的 :root.dark
- *   token 覆盖层整站换肤；组件层不感知主题，禁止散落 dark: 变体类。
+ * - 2026-10-07 起**深色是默认主题**（ADR-0003）：`:root` 直接承载深色工作站取值，
+ *   浅色降为可选皮肤放在 `:root.light`。所以这里只在浅色时给 <html> 加 `.light`，
+ *   深色**不加任何类** —— 「默认什么都不加」就是深色。
+ *   ⚠️ 因此默认主题下首屏不会有 `.dark` 类，别再按「有没有 .dark」判断当前主题。
+ * - 组件层不感知主题，禁止散落 dark: 变体类。
  * - mode=system 时监听 prefers-color-scheme，系统切换外观实时跟随。
  * - 监听 storage 事件，多标签页之间保持一致。
  */
@@ -26,8 +29,8 @@ interface ThemeContextType {
 }
 
 const ThemeContext = createContext<ThemeContextType>({
-  mode: 'system',
-  resolved: 'light',
+  mode: 'dark',
+  resolved: 'dark',
   setMode: () => {},
 });
 
@@ -36,9 +39,11 @@ function readStoredMode(): ThemeMode {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw === 'light' || raw === 'dark' || raw === 'system') return raw;
   } catch {
-    // localStorage 不可用（隐私模式等）：退回跟随系统
+    // localStorage 不可用（隐私模式等）：退回默认深色
   }
-  return 'system';
+  // 2026-10-07：默认深色。原先默认 system（跟随系统），对浅色系统偏好的用户
+  // 会在长时创作工作台里得到浅底 + 白卡片，工作台改为低眩光深色更合适。
+  return 'dark';
 }
 
 export function ThemeProvider({ children }: { children: React.ReactNode }) {
@@ -48,9 +53,10 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
 
   const resolved: 'light' | 'dark' = mode === 'system' ? (sysDark ? 'dark' : 'light') : mode;
 
-  // .dark 挂在 <html> 上；index.css 的 :root.dark 覆盖层随之生效
+  // .light 挂在 <html> 上；index.css 的 :root.light 覆盖层随之生效。
+  // 深色是默认（不加类），浅色才加 .light —— 与 index.html 的防闪烁脚本一致。
   useEffect(() => {
-    document.documentElement.classList.toggle('dark', resolved === 'dark');
+    document.documentElement.classList.toggle('light', resolved === 'light');
   }, [resolved]);
 
   // Electron 桌面壳：标题栏覆盖层是主进程画的，切主题要同步过去；

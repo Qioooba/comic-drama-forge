@@ -39,7 +39,7 @@ export function Sidebar({
 
   return (
     <aside
-      className={`glass relative z-sticky flex flex-col border-r border-line transition-all duration-300 ${
+      className={`glass-chrome relative z-sticky flex flex-col border-r border-line transition-colors duration-300 ${
         collapsed ? 'w-16' : 'w-16 md:w-56'
       }`}
     >
@@ -47,7 +47,7 @@ export function Sidebar({
       <button
         onClick={onToggle}
         aria-label={collapsed ? t('nav.expandSidebar') : t('nav.collapseSidebar')}
-        className={`m-2 hidden self-end rounded-lg p-2 text-ink-2 transition-all duration-200 hover:bg-surface-2 hover:text-ink-1 md:block ${FOCUS_RING}`}
+        className={`m-2 hidden self-end rounded-lg p-2 text-ink-2 transition-colors duration-200 hover:bg-surface-2 hover:text-ink-1 md:block ${FOCUS_RING}`}
       >
         <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" />
@@ -78,7 +78,7 @@ export function Sidebar({
               onClick={() => onNavigate(item.id)}
               aria-current={isActive ? 'page' : undefined}
               aria-label={t(item.label)}
-              className={`mb-1 flex w-full items-center gap-3 rounded-lg px-3 py-2.5 transition-all duration-200 group ${
+              className={`mb-1 flex w-full items-center gap-3 rounded-lg px-3 py-2.5 transition-colors duration-200 group ${
                 isActive
                   ? 'bg-brand-subtle text-brand'
                   : 'text-ink-2 hover:bg-surface-2 hover:text-ink-1'

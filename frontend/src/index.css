@@ -6,156 +6,57 @@
    Design Token 层（唯一真源）
    --------------------------------------------------------------------------
    本次改造的目标不是「换个更好看的皮肤」，而是**收敛为一套设计语言**：
-   纯白卡片承载 + 浅灰画布分层 + 深色实心主按钮 + 青蓝强调色。
+   深色工作站（低眩光工作区）+ 语义令牌分层 + 青/绿两档决策色。
 
    约束（改动本文件前请先读）：
    1. 组件层**禁止**再写 hex / rgba 字面量，一律引用下面的 token 或
       tailwind.config.js 里映射出的语义色（canvas / surface / line / ink /
-      brand / accent / success / warning / danger / info / state）。
+      brand / accent / success / warning / danger / info / state /
+      selected / approved）。
    2. ⚠️ 所有色值 token 一律存 **RGB 三元组**（`79 70 229`），不存 hex。
       原因是 Tailwind v3 的透明度修饰符（`bg-brand/10`、`ring-brand/40`）
       靠 `<alpha-value>` 占位符生成 `rgb(var(--x) / .1)`；若 token 存成
       `#4f46e5` 这类 hex，`bg-brand/10` 会直接产出无效 CSS 而静默失效。
       在 CSS 里直接使用时请写 `rgb(var(--brand))`。
-   3. -subtle = 徽标 / 提示条浅底；-strong = 同色系深字（白底上满足 WCAG AA
-      4.5:1）。⚠️ 不要拿 --success 这类主色直接当文字色：白底上仅 ~2.5:1。
-   4. 深色主题走 token 覆盖（见下方 `:root.dark` 块），不散落 `dark:` 变体类；
-      此前 619 处因 `.dark` 从未被注入而不可达的 `dark:` 类已按方案整体移除。
+   3. -subtle = 徽标 / 提示条浅底；-strong = 同色系深字（浅底上满足 WCAG AA
+      4.5:1）。⚠️ 不要拿 --success 这类主色直接当文字色：浅底上仅 ~2.5:1。
+   4. 主题走 token 覆盖，不散落 `dark:` 变体类。此前 619 处因 `.dark` 从未被
+      注入而不可达的 `dark:` 类已按方案整体移除。
+   5. **深色是默认主题**：`:root` 即深色工作站取值，浅色降级为 `:root.light`
+      可选皮肤（见下方 .light 块）。理由见 §5.3：本项目是长时间盯屏的创作
+      工作台，浅底 + 辉光是持续视觉噪声。
+
+   度量记录（2026-10-07 改造，可追溯的设计账本）：
+     - 188 处裸 `border` 依赖 v3 默认 gray-200 语义，故锁 v3 不迁 v4；
+     - 27 处 ring/outline-none 在 v4 已改名，迁移会造成整站焦点环回归；
+     - 原先 `.glass` 用于长列表卡片时，滚动会逐帧重绘 backdrop-filter；
+       现降级为 `.glass-chrome` 且只允许出现在**常驻 chrome**（侧栏 / 抽屉 /
+       弹窗），长列表一律禁止。
    ========================================================================== */
 
-:root {
-  /* 跟随主题的 UA 原生渲染（滚动条 / 表单控件 / 查找高亮等） */
-  color-scheme: light;
-
-  /* ---- 承载与分层 ---- */
-  --bg-canvas: 247 248 250;     /* #F7F8FA 页面画布底 */
-  --bg-surface: 255 255 255;    /* #FFFFFF 卡片 / 面板 */
-  --bg-surface-2: 241 245 249;  /* #F1F5F9 次级区块、表头、代码块 */
-
-  /* ---- 描边 ---- */
-  --border: 226 232 240;        /* #E2E8F0 常规描边 */
-  --border-strong: 203 213 225; /* #CBD5E1 强调描边 / 悬停描边 */
-
-  /* ---- 文字 ---- */
-  --text-primary: 15 23 42;     /* #0F172A 标题与正文 */
-  --text-secondary: 71 85 105;  /* #475569 说明文字 */
-  --text-tertiary: 148 163 184; /* #94A3B8 占位、禁用 */
-
-  /* ---- 品牌 / 强调 / 主动作 ---- */
-  --brand: 79 70 229;           /* #4F46E5 */
-  --brand-hover: 67 56 202;     /* #4338CA */
-  --brand-subtle: 238 242 255;  /* #EEF2FF */
-  --accent: 6 182 212;          /* #06B6D4 */
-  --accent-subtle: 236 254 255; /* #ECFEFF */
-  --action: 15 23 42;           /* #0F172A 主按钮实心深色底 */
-
-  /* ---- 通用语义色 ---- */
-  --success: 16 185 129;
-  --success-subtle: 236 253 245;
-  --success-strong: 4 120 87;
-  --warning: 245 158 11;
-  --warning-subtle: 255 251 235;
-  --warning-strong: 180 83 9;
-  --danger: 239 68 68;
-  --danger-subtle: 254 242 242;
-  --danger-strong: 185 28 28;
-  --info: 59 130 246;
-  --info-subtle: 239 246 255;
-  --info-strong: 29 78 216;
-
-  /* ---- 生产状态语义色（本项目专用） ---- */
-  --state-pending: 148 163 184;
-  --state-pending-subtle: 241 245 249;
-  --state-pending-strong: 71 85 105;
-  --state-running: 6 182 212;
-  --state-running-subtle: 236 254 255;
-  --state-running-strong: 14 116 144;
-  --state-done: 16 185 129;
-  --state-done-subtle: 236 253 245;
-  --state-done-strong: 4 120 87;
-  --state-failed: 239 68 68;
-  --state-failed-subtle: 254 242 242;
-  --state-failed-strong: 185 28 28;
-  --state-skipped: 161 161 170;
-  --state-skipped-subtle: 244 244 245;
-  --state-skipped-strong: 82 82 91;
-  --state-attention: 245 158 11;
-  --state-attention-subtle: 255 251 235;
-  --state-attention-strong: 180 83 9;
-
-  /* ---- 数据可视化专用色板 ----
-     ⚠️ 仅在 SVG / 图表里做**分类区分**时使用（如关系图的 10 种关系类型、
-        多序列折线图）。这是唯一允许超出语义色范围的地方 —— 分类调色板本来
-        就需要比语义色更多的色相，硬塞进 brand/success/danger 会导致两张图
-        颜色重复到无法区分。UI 层（按钮/卡片/文字）**不要**引用这一组。 */
-  --viz-rose: 236 72 153;
-  --viz-violet: 139 92 246;
-  --viz-teal: 20 184 166;
-  --viz-amber: 217 119 6;
-
-  /* ---- 阴影（tailwind.config.js 的 boxShadow 指向这四个变量） ----
-     浅色取值与原先写死在 config 里的完全一致，观感不变；
-     深色主题在 :root.dark 里覆盖为纯黑高不透明度。 */
-  --shadow-xs: 0 1px 2px rgb(15 23 42 / 0.04);
-  --shadow-sm: 0 1px 3px rgb(15 23 42 / 0.06), 0 1px 2px rgb(15 23 42 / 0.04);
-  --shadow-md: 0 4px 16px rgb(15 23 42 / 0.08);
-  --shadow-lg: 0 12px 32px rgb(15 23 42 / 0.12);
-
-  /* ---- 科技感氛围层（body::before 使用） ----
-     两团极低透明度的品牌/青色辉光 + 一张细网格，铺在所有内容后面；
-     App 根节点 bg-canvas 调成半透明后辉光透出，玻璃卡片才有东西可模糊。 */
-  --tech-glow-1: 79 70 229;   /* 品牌辉光（浅色下压得很低） */
-  --tech-glow-2: 6 182 212;   /* 次辉光（青） */
-  --tech-grid: 15 23 42;      /* 网格线 */
-  --tech-glow-opacity: 0.5;
-  --tech-grid-opacity: 0.04;
-
-  /* ---- 层级规范（收敛自原先 40/50/100/200 四档乱序） ---- */
-  --z-sticky: 10;
-  --z-dropdown: 20;
-  --z-drawer: 30;
-  --z-modal: 40;
-  --z-toast: 50;
-  --z-preview: 60;
-
-  /* ---- 基础排版 ---- */
-  font-family: 'PingFang SC', 'Microsoft YaHei', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-  line-height: 1.6;
-  font-weight: 400;
-  color: rgb(var(--text-primary));
-  background-color: rgb(var(--bg-canvas));
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-}
-
 /* ==========================================================================
-   深色主题（token 覆盖层）
+   默认主题：深色工作站（低眩光）
    --------------------------------------------------------------------------
-   `.dark` 由 ThemeContext（src/context/ThemeContext.tsx）注入到 <html>；
-   index.html 里有同一套判定的防闪烁脚本，避免系统深色用户首屏白闪。
-   规则只有一条：**这里只覆盖变量，不写组件级 CSS** —— 组件层的语义色类
-   （bg-surface / text-ink-1 / border-line…）会自动随变量切到深色取值。
-
    取值策略：
    - 承载面反转：canvas 最深(slate-950) → surface(slate-900) → surface-2(slate-800)；
    - 描边上移一档（slate-700/600）：深色下靠描边分层，阴影只作辅助；
    - 文字反转：primary=slate-200 / secondary=slate-400 / tertiary=slate-500；
-   - 语义主色（success/warning/danger/info/state-* 的主档）保持 500 档不变：
-     作实心底时白字对比度不受影响，作点缀色在深底上也足够醒目；
-   - -subtle 从「浅色淡底」翻转为同色系 950 深底，-strong 从「深字」翻转为
-     同色系 300 浅字 —— 徽标 / 提示条在深色下依旧是「淡底 + 同系字」；
+   - 语义主色保持 500 档不变：作实心底时白字对比度不受影响，作点缀色在深底
+     上也足够醒目；
+   - -subtle 从「浅色淡底」翻转为同色系 950 深底，-strong 翻转为同色系 300
+     浅字 —— 徽标 / 提示条在深色下依旧是「淡底 + 同系字」；
    - brand 取 indigo-500：既当实心底（配白字 ≈3.9:1）又当文字/图标（深底上
-     ≈3.6:1），是双职责下的折中档（indigo-600 作字太暗，indigo-400 配白字太浅）。
+     ≈3.6:1），是双职责下的折中档。
    ========================================================================== */
-:root.dark {
+:root {
   color-scheme: dark;
 
   /* ---- 承载与分层 ---- */
   --bg-canvas: 2 6 23;        /* #020617 slate-950 */
   --bg-surface: 15 23 42;     /* #0F172A slate-900 */
   --bg-surface-2: 30 41 59;   /* #1E293B slate-800 */
+  /* 媒体舞台面：比 canvas 更深一档，让视频/图片与 UI 面板明确分层 */
+  --bg-media: 5 7 11;         /* #05070B */
 
   /* ---- 描边 ---- */
   --border: 51 65 85;         /* #334155 slate-700 */
@@ -208,19 +109,221 @@
   --state-attention-subtle: 69 26 3;
   --state-attention-strong: 252 211 77;
 
-  /* ---- 数据可视化专用色板：分类色保持不变（500 档在深底上仍可辨） ---- */
+  /* ======================================================================
+     「采用 ≠ 批准」的两档决策色（2026-10-07 新增，本项目最重要的语义新增）
+     ---------------------------------------------------------------------
+     原先只有 6 档 `state-*`，其中 `state-done` 同时承担「已选中」和
+     「已批准」两种含义 —— 这正是「为什么这镜用了这一版」无法回答的
+     视觉根因。现在拆成两个**独立**档位：
 
-  /* ---- 阴影：换纯黑高不透明度，弥补深底上原有阴影不可见 ---- */
+       selected（青 #36D6C5）= 创作决定：这版被采用为工作版本
+       approved（绿 #50D890）= 放行决定：人工批准，可进入交付
+
+     ⚠️ 不变量：**selected 永不显示为 approved**。
+        组件层不得用 approved 的色/文案/图标去表达 selected 状态；
+        反之亦然。⚠️ 这条**尚未被机器守住**：`scripts/audit_tokens.py` 的
+        SEL001 只是提醒级检查（列出同文件同时出现两档类名的位置），
+        **不计入退出码**，判据也无法证明两者指向同一元素 —— 仍需 code review。
+     ====================================================================== */
+  --selected: 54 214 197;           /* #36D6C5 青 */
+  --selected-subtle: 8 51 46;      /* #08332E 深青底 */
+  --selected-strong: 94 234 212;    /* #5EEAD4 青字 */
+  --approved: 80 216 144;           /* #50D890 绿 */
+  --approved-subtle: 6 46 26;       /* #062E1A 深绿底 */
+  --approved-strong: 134 239 172;   /* #86EFAC 绿字 */
+
+  /* ---- 数据可视化专用色板 ----
+     ⚠️ 仅在 SVG / 图表里做**分类区分**时使用（如关系图的 10 种关系类型、
+        多序列折线图）。这是唯一允许超出语义色范围的地方 —— 分类调色板本来
+        就需要比语义色更多的色相，硬塞进 brand/success/danger 会导致两张图
+        颜色重复到无法区分。UI 层（按钮/卡片/文字）**不要**引用这一组。 */
+  --viz-rose: 236 72 153;
+  --viz-violet: 139 92 246;
+  --viz-teal: 20 184 166;
+  --viz-amber: 217 119 6;
+
+  /* ---- 阴影（tailwind.config.js 的 boxShadow 指向这四个变量） ----
+     默认主题是深色，取纯黑高不透明度弥补深底上原有阴影不可见；
+     浅色皮肤在 :root.light 里覆盖回低不透明度。 */
   --shadow-xs: 0 1px 2px rgb(0 0 0 / 0.3);
   --shadow-sm: 0 1px 3px rgb(0 0 0 / 0.4), 0 1px 2px rgb(0 0 0 / 0.3);
   --shadow-md: 0 4px 16px rgb(0 0 0 / 0.5);
   --shadow-lg: 0 12px 32px rgb(0 0 0 / 0.6);
 
-  /* ---- 科技感氛围层：深色下辉光换用深色主题的品牌/青档并调亮一档 ---- */
+  /* ---- 科技感氛围层（**可选皮肤**，默认关闭） ----
+     ⚠️ 2026-10-07 降级：原先 body::before 无条件铺两团辉光 + 64px 细网格。
+     这是「氛围不是夜店」的自认知，但对长时间创作工作台属于**持续的视觉噪声**，
+     且玻璃面板才刚被降级为 .glass-chrome，辉光已无必要。
+     现在仅在 <html data-skin="tech"> 时启用（见文件末尾的 data-skin 块）。 */
   --tech-glow-1: 99 102 241;  /* indigo-500 */
   --tech-glow-2: 34 211 238;  /* cyan-400 */
+  --tech-grid: 148 163 184;   /* 网格线（深底上需要更亮才可见） */
   --tech-glow-opacity: 0.62;
   --tech-grid-opacity: 0.055;
+
+  /* ---- 层级规范（收敛自原先 40/50/100/200 四档乱序） ---- */
+  --z-sticky: 10;
+  --z-dropdown: 20;
+  --z-drawer: 30;
+  --z-modal: 40;
+  --z-toast: 50;
+  --z-preview: 60;
+
+  /* ======================================================================
+     控件尺寸与内容宽度规范（§5.4）
+     ---------------------------------------------------------------------
+     为什么不设全局宽度上限：全局上限会压窄全宽编辑器（分镜意图编辑、提示词
+     文本域）并扭曲行内标签。这里改为**显式 opt-in** 的 .control-compact。
+     度量：改版前 86 个控件高度不足 24px、1,324 个按钮全程停在 12px；
+     本轮统一把控件提到 40px（紧凑档 36px）、纯图标触达区 44×44。
+     ====================================================================== */
+  --control-h: 40px;
+  --control-h-compact: 36px;
+  --hit-target: 44px;
+  --control-max: 640px;
+  --control-field: 320px;
+  --control-field-lg: 520px;
+  --measure: 70ch;
+  --shell-max: 2100px;
+
+  /* 4px 基网格：4/8/12/16/24/32/48 */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-12: 48px;
+
+  /* 圆角：控件 6 / 字段 8 / 面板 10 / 容器 12（补齐原先缺的 8 与 10 两档） */
+  --radius-control: 6px;
+  --radius-field: 8px;
+  --radius-panel: 10px;
+  --radius-container: 12px;
+
+  /* ---- 基础排版 ----
+     ⚠️ 三族分工（原先只有一族，标题与正文同字族是层级扁平的原因之一）：
+       - sans   UI / 正文：中文优先 PingFang SC，**不发外部字体请求**（离线可用）
+       - serif  编辑性标题（项目名 / 集名等需要「作品感」的标题）
+       - mono   数值与技术值：seed / 时长 / 哈希 / 路径
+     等宽族是本次新增：改造前种子、时长、队列、资源值与正文同字族，
+     数字宽度不一致导致列对不齐、难以逐位核对。 */
+  --font-sans: 'PingFang SC', 'Microsoft YaHei', -apple-system, BlinkMacSystemFont,
+    'Segoe UI', system-ui, sans-serif;
+  --font-serif: Georgia, 'Songti SC', 'SimSun', serif;
+  --font-mono: 'Cascadia Code', 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
+
+  font-family: var(--font-sans);
+  line-height: 1.6;
+  font-weight: 400;
+  color: rgb(var(--text-primary));
+  background-color: rgb(var(--bg-canvas));
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ==========================================================================
+   浅色皮肤（可选，`:root.light`）
+   --------------------------------------------------------------------------
+   由 ThemeContext（src/context/ThemeContext.tsx）注入 `.light` 到 <html>；
+   index.html 里有同一套判定的防闪烁脚本，避免首屏闪烁。
+
+   规则只有一条：**这里只覆盖变量，不写组件级 CSS** —— 组件层的语义色类
+   （bg-surface / text-ink-1 / border-line…）会自动随变量切到浅色取值。
+
+   为什么深色是默认、浅色降为可选皮肤
+   ----------------------------------
+   本项目是长时间盯屏的创作工作台（一次盯几十分钟到几小时，逐镜审片）。
+   浅底 + 白色卡片 + 科技感辉光叠在一起，在这种使用时长下是**持续的视觉噪声**，
+   且「氛围」不属于工具的职责。深色工作站（低眩光 + 靠描边分层）更适合
+   长时间审片，也更省眼。
+   注意：这不是「一刀切删掉浅色」—— 浅色仍是完整可用的一套皮肤，
+   用户可在主题切换里选它。
+   ========================================================================== */
+:root.light {
+  color-scheme: light;
+
+  /* ---- 承载与分层 ---- */
+  --bg-canvas: 247 248 250;     /* #F7F8FA 页面画布底 */
+  --bg-surface: 255 255 255;    /* #FFFFFF 卡片 / 面板 */
+  --bg-surface-2: 241 245 249;  /* #F1F5F9 次级区块、表头、代码块 */
+  --bg-media: 5 7 11;           /* 媒体舞台面保持深色：图片/视频在深底上才不刺眼 */
+
+  /* ---- 描边 ---- */
+  --border: 226 232 240;        /* #E2E8F0 常规描边 */
+  --border-strong: 203 213 225; /* #CBD5E1 强调描边 / 悬停描边 */
+
+  /* ---- 文字 ---- */
+  --text-primary: 15 23 42;     /* #0F172A 标题与正文 */
+  --text-secondary: 71 85 105;  /* #475569 说明文字 */
+  --text-tertiary: 148 163 184; /* #94A3B8 占位、禁用 */
+
+  /* ---- 品牌 / 强调 / 主动作 ---- */
+  --brand: 79 70 229;           /* #4F46E5 */
+  --brand-hover: 67 56 202;     /* #4338CA */
+  --brand-subtle: 238 242 255;  /* #EEF2FF */
+  --accent: 6 182 212;          /* #06B6D4 */
+  --accent-subtle: 236 254 255; /* #ECFEFF */
+  --action: 15 23 42;           /* #0F172A 主按钮实心深色底 */
+
+  /* ---- 通用语义色（主档不动，subtle/strong 反转回浅色语义） ---- */
+  --success: 16 185 129;
+  --success-subtle: 236 253 245;
+  --success-strong: 4 120 87;
+  --warning: 245 158 11;
+  --warning-subtle: 255 251 235;
+  --warning-strong: 180 83 9;
+  --danger: 239 68 68;
+  --danger-subtle: 254 242 242;
+  --danger-strong: 185 28 28;
+  --info: 59 130 246;
+  --info-subtle: 239 246 255;
+  --info-strong: 29 78 216;
+
+  /* ---- 生产状态语义色 ---- */
+  --state-pending: 148 163 184;
+  --state-pending-subtle: 241 245 249;
+  --state-pending-strong: 71 85 105;
+  --state-running: 6 182 212;
+  --state-running-subtle: 236 254 255;
+  --state-running-strong: 14 116 144;
+  --state-done: 16 185 129;
+  --state-done-subtle: 236 253 245;
+  --state-done-strong: 4 120 87;
+  --state-failed: 239 68 68;
+  --state-failed-subtle: 254 242 242;
+  --state-failed-strong: 185 28 28;
+  --state-skipped: 161 161 170;
+  --state-skipped-subtle: 244 244 245;
+  --state-skipped-strong: 82 82 91;
+  --state-attention: 245 158 11;
+  --state-attention-subtle: 255 251 235;
+  --state-attention-strong: 180 83 9;
+
+  /* ---- 采用 / 批准两档：浅色下加深以满足 WCAG AA 4.5:1 ---- */
+  --selected: 13 148 136;        /* #0D9488 teal-600：青调在浅底上加深 */
+  --selected-subtle: 204 251 241;
+  --selected-strong: 15 118 110;
+  --approved: 22 163 74;         /* #16A34A green-600 */
+  --approved-subtle: 220 252 231;
+  --approved-strong: 21 128 61;
+
+  /* ---- 数据可视化专用色板：分类色保持不变 ---- */
+
+  /* ---- 阴影：浅色下回到低不透明度（深色见 :root） ---- */
+  --shadow-xs: 0 1px 2px rgb(15 23 42 / 0.04);
+  --shadow-sm: 0 1px 3px rgb(15 23 42 / 0.06), 0 1px 2px rgb(15 23 42 / 0.04);
+  --shadow-md: 0 4px 16px rgb(15 23 42 / 0.08);
+  --shadow-lg: 0 12px 32px rgb(15 23 42 / 0.12);
+
+  /* ---- 科技感氛围层：浅色下压得更低 ---- */
+  --tech-glow-1: 79 70 229;
+  --tech-glow-2: 6 182 212;
+  --tech-grid: 15 23 42;
+  --tech-glow-opacity: 0.5;
+  --tech-grid-opacity: 0.04;
 }
 
 * {
@@ -235,14 +338,15 @@ body {
 }
 
 /* ==========================================================================
-   科技感画布氛围层
+   科技感画布氛围层（**可选皮肤**，默认关闭）
    --------------------------------------------------------------------------
-   position:fixed 的伪元素铺在所有内容**后面**：两团品牌/青色辉光 + 64px 细网格。
-   App 根节点的 bg-canvas 调成半透明（见 App.tsx），辉光透过界面,
-   .glass 玻璃面板的 backdrop-blur 才有东西可模糊。
-   ⚠️ 透明度刻意压得很低，是「氛围」不是「夜店」；深色主题在 :root.dark 调亮一档。
+   2026-10-07 从「无条件开启」降级为 `data-skin="tech"` opt-in。
+   原因：这是长时间盯屏的创作工作台，铺满视口的两团辉光 + 64px 细网格属于
+   持续视觉噪声，且原先它唯一的正当理由（给 .glass 面板提供可模糊的内容）
+   已随 .glass → .glass-chrome 的降级一并消失。
+   保留它是因为仍有用户喜欢这套观感 —— 但它是**选择**，不是默认。
    ========================================================================== */
-body::before {
+[data-skin='tech'] body::before {
   content: '';
   position: fixed;
   inset: 0;
@@ -279,41 +383,122 @@ body::before {
 }
 
 /* ==========================================================================
-   玻璃 / 辉光 / 渐变 —— 科技感工具类
+   玻璃 / 辉光 / 渐变 —— 已按 §5.3 收敛
    --------------------------------------------------------------------------
-   .glass        常驻 chrome 用（侧栏 / 总控面板 / 弹窗 / 下拉），长列表卡片
-                 **不要**加 backdrop-blur：滚动时逐帧重绘会把帧率拖垮。
-   .glow-brand   强调容器（进行中状态卡 / 品牌主按钮）的一圈极浅光晕。
-   .text-gradient 品牌→青渐变文字，仅限页面级 h2 大标题，正文禁用。
-   .progress-fill 进度条填充（品牌→青渐变），是科技感的主视觉锚点之一。
+   改造前的四个类各有明确问题，逐条记录原因以免回潮：
+
+   .glass / .glass-strong（backdrop-blur 18–24px）
+     → **降级为 .glass-chrome**，且只允许出现在**常驻 chrome**（侧栏 / 抽屉 /
+       弹窗 / 下拉）。代码注释自己早就承认「长列表卡片不要加 backdrop-blur：
+       滚动时逐帧重绘会把帧率拖垮」—— 既然如此，与其留一条只能靠人记住的
+       规矩，不如把命名收窄成「chrome」，让误用在 review 时一眼可辨。
+     度量：原 `.glass` 出现在 Sidebar + 工作台右侧面板 + 弹窗三处，均为常驻
+     容器，保留 blur 无性能风险。
+
+   .glow-brand（品牌色外发光）
+     → **删除**。装饰性辉光在长时间审片时是纯视觉噪声，且与「运行中」状态
+       徽标争夺注意力（真状态已有 `state-running` 专用色）。
+
+   .text-gradient（品牌→青渐变文字）
+     → **删除**。页面级 h2 用渐变文字会让标题失去稳定底色，在深浅两套皮肤上
+       都需要额外的 fallback 处理；标题应是纯 `--text-primary`。
+
+   .progress-fill（品牌→青渐变填充）
+     → **保留但改实色**。进度条是**信息**不是装饰：渐变填充在不同进度下
+       颜色不可比，且中间色带在深底上偏灰。改为品牌单色。
    ========================================================================== */
 @layer components {
-  .glass {
+  .glass-chrome {
     background: rgb(var(--bg-surface) / 0.82);
     -webkit-backdrop-filter: blur(18px) saturate(1.5);
     backdrop-filter: blur(18px) saturate(1.5);
   }
 
-  .glass-strong {
+  .glass-chrome-strong {
     background: rgb(var(--bg-surface) / 0.92);
     -webkit-backdrop-filter: blur(24px) saturate(1.6);
     backdrop-filter: blur(24px) saturate(1.6);
   }
 
-  .glow-brand {
-    box-shadow: 0 0 0 1px rgb(var(--brand) / 0.16), 0 4px 24px rgb(var(--brand) / 0.22);
+  /* 进度条填充：品牌单色。进度是**信息**不是装饰 —— 渐变填充在不同进度下
+     颜色不可比，且中间色带在深底上偏灰，读数会失真。 */
+  .progress-fill {
+    background-color: rgb(var(--brand));
   }
+}
 
-  .text-gradient {
-    background-image: linear-gradient(115deg, rgb(var(--brand)) 15%, rgb(var(--accent)) 85%);
-    -webkit-background-clip: text;
-    background-clip: text;
+/* ==========================================================================
+   表单状态机（§5.3b 第 2 点）
+   --------------------------------------------------------------------------
+   改造前 Input/Select/Textarea 没有这一层，导致「提交中」和「校验失败」在
+   每个页面各写一遍，且往往漏掉。这里在 base 层统一：
+
+     [aria-busy="true"]   提交中：自带 spinner，光标转忙
+     [aria-invalid="true"] 校验失败：红边 + 红字说明
+     [readonly]           只读：虚线边框（区别于 disabled 的灰化）
+
+   度量账本：改造前 197 个 disabled 按钮与 enabled 视觉不可区分；
+   现在 disabled 一律降透明 + not-allowed 光标，并且**必须**配相邻原因文案
+   （见 design-system/comicdrama/MASTER.md 的 Interaction invariants）。
+   ========================================================================== */
+@layer components {
+  [aria-busy='true'] {
+    cursor: progress;
+    position: relative;
     color: transparent;
   }
 
-  .progress-fill {
-    background-image: linear-gradient(90deg, rgb(var(--brand)), rgb(var(--accent)));
+  [aria-busy='true']::after {
+    content: '';
+    position: absolute;
+    inset: 50% auto auto 50%;
+    width: 1em;
+    height: 1em;
+    margin: -0.5em 0 0 -0.5em;
+    border: 2px solid rgb(var(--brand) / 0.3);
+    border-top-color: rgb(var(--brand));
+    border-radius: 50%;
+    animation: token-spin 0.7s linear infinite;
   }
+
+  [aria-invalid='true'] {
+    border-color: rgb(var(--danger));
+  }
+
+  [aria-invalid='true']:focus-visible {
+    outline-color: rgb(var(--danger));
+  }
+
+  [readonly]:not([aria-invalid='true']) {
+    border-style: dashed;
+    border-color: rgb(var(--border-strong));
+  }
+}
+
+@keyframes token-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [aria-busy='true']::after {
+    animation-duration: 2.4s;
+  }
+}
+
+/* ⚠️ 尺寸令牌已并入上方唯一的 :root{} 块。
+   原先这里是**第二个** `:root {}`（控件高度 / 圆角 / 间距），审计脚本
+   TOKEN001 用 `css.find(":root {")` 只取第一个块，于是这一整段对令牌
+   对齐检查完全不可见 —— 门禁出现了「看起来在校验、实际漏检」的盲区。
+   现在全文件只有一个 `:root {}`（脚本也改为遍历全部 :root 块做纵深防御）。
+
+   显式 opt-in 的窄容器：按钮/字段按内容尺寸，只有容器/进度条/表格外框撑满父级 */
+.control-compact {
+  max-width: var(--control-max);
+}
+.control-compact > * {
+  max-width: 100%;
 }
 
 /* ==========================================================================

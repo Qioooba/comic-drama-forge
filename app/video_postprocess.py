@@ -8,7 +8,7 @@ import logging
 import shutil
 import time
 from pathlib import Path
-from typing import List, Optional, Dict
+from typing import Any, List, Optional, Dict
 import json
 
 from config import COMFYUI_URL, PROJECT_OUTPUT_DIR, VIDEOS_DIR, FINAL_DIR
@@ -792,3 +792,293 @@ class VideoPostProcessor:
             result["final"] = final_files[0] if final_files else None
 
         return result
+
+
+# =====================================================================================
+# 按冻结时间线计划渲染（ADR-0012 决策第 3 点）
+# -------------------------------------------------------------------------------------
+# 2026-10-07 追加。上面整个模块（含 :class:`VideoPostProcessor.generate_final_video`）
+# 走的是**旧路径**：「按磁盘上现有文件 listdir 直接合并」。本节是**新增的旁路**，
+# 既有函数**一个字节都没改**、旧行为一条都没变。
+#
+# 为什么必须是旁路而不是改造旧路径
+# ------------------------------
+# 旧路径没有「计划」这个概念：它 listdir 拿 ``shot_NN.mp4``、按文件名数字排序、
+# 缺片就跳过（部分拼接）。这些行为在在产链路上都成立，改动风险远大于收益。
+# 因此新路径**默认关闭**：只有显式传入 :class:`ComposePlan`（由
+# ``TimelineService.compose_preflight`` 放行后产出）才走；
+# 不传 plan 时 :func:`render_from_plan` 直接拒绝，绝不「顺手退回旧路径」。
+#
+# fail-closed 四条（本函数内）
+# ----------------------
+# ① 计划为空 / 缺 compose_fingerprint / 计划指纹自校验失败 → 拒绝渲染；
+# ② 计划里任何一项**无法对应到磁盘上可读、非空的已登记文件** → 拒绝渲染，
+#    并在错误里点名**缺哪一镜**（不允许静默跳过 —— 跳过会让成片与计划悄悄脱钩）；
+# ③ 计划项声明了静音却带了配音轨（互斥）→ 拒绝；
+# ④ 转场在领域层没有 FFmpeg 实现 → 拒绝（渲染期才炸等于白烧卡）。
+#
+# 字幕**不在这里**（ADR-0012 决策第 4 点）：字幕挂到时间线的 ``subtitle_revision`` 上，
+# 由 :meth:`VideoPostProcessor.add_subtitles` 在成片渲完后单独消费，
+# **不混进合成逻辑**。
+# =====================================================================================
+
+
+class PlanRenderError(RuntimeError):
+    """按冻结计划渲染的前置校验失败（fail-closed，一律不产出成片）。"""
+
+
+def _plan_fingerprint_of(plan: Any) -> str:
+    """取计划的指纹（兼容 dict / ComposePlan 两种形态）。"""
+    if isinstance(plan, dict):
+        return str(plan.get("plan_fingerprint") or "")
+    return str(getattr(plan, "plan_fingerprint", "") or "")
+
+
+def _plan_entries(plan: Any) -> List[Dict]:
+    """取计划的镜头列表（兼容 dict / ComposePlan 两种形态）。"""
+    if isinstance(plan, dict):
+        return [dict(e) for e in (plan.get("entries") or [])]
+    return [e.to_dict() for e in getattr(plan, "entries", ()) or ()]
+
+
+def validate_render_plan(plan: Any) -> Dict:
+    """渲染**前**的计划自检（纯逻辑，无 I/O、无子进程）。返回计划摘要。
+
+    存在的意义：把「渲到一半才发现计划不对」的成本降到 0 秒。
+    这四条阻断点与 :meth:`VideoPostProcessor.render_from_plan` 内的一致，
+    单独暴露出来是为了让调用方（/ 端点 / 测试）能**不落盘**地先问一句
+    「这份计划能不能渲」。
+    """
+    if not plan:
+        raise PlanRenderError("必须显式传入冻结的时间线计划（plan）；"
+                              "本函数不接受『按磁盘上有什么就合什么』")
+    compose_fp = str((plan.get("compose_fingerprint") if isinstance(plan, dict)
+                      else getattr(plan, "compose_fingerprint", "")) or "")
+    if not compose_fp:
+        raise PlanRenderError("计划缺少 compose_fingerprint：成片无法绑定到冻结的剪辑")
+    entries = _plan_entries(plan)
+    if not entries:
+        raise PlanRenderError("合成计划为空（零镜头的计划无法渲染）")
+    plan_fp = _plan_fingerprint_of(plan)
+    if not plan_fp:
+        raise PlanRenderError("计划缺少 plan_fingerprint：无法判断计划是否被旁路改写")
+    # 阻断点 ②：每一项都必须能解析到一个**非空**的文件路径，且点名缺哪一镜
+    missing: List[str] = []
+    for e in entries:
+        if not str(e.get("video_path") or "").strip():
+            missing.append("%s(%s 未解析到文件)"
+                           % (e.get("shot_key"), e.get("media_version_id")))
+            continue
+        # 阻断点 ③：声明静音与配音轨互斥
+        if e.get("declared_silence") and str(e.get("audio_path") or "").strip():
+            missing.append("%s(同时声明静音与配音轨)" % e.get("shot_key"))
+        if e.get("declared_silence") and not str(e.get("silence_reason") or "").strip():
+            missing.append("%s(声明静音未写明 silence_reason)" % e.get("shot_key"))
+    if missing:
+        raise PlanRenderError("合成计划不完整，拒绝渲染（缺：%s）" % "、".join(missing))
+    return {"compose_fingerprint": compose_fp, "plan_fingerprint": plan_fp,
+            "entries": len(entries),
+            "declared_silences": sum(1 for e in entries if e.get("declared_silence"))}
+
+
+def _assert_output_under_root(output_path: str, output_root: str) -> str:
+    """落盘**前**再查一次「输出路径在指定根目录之内」（TOCTOU 收窄）。
+
+    调用方（``api/timeline.py::_resolve_output_path``）已经查过一次，但那一次
+    是**检查**，这里是**写**：两次之间隔着一次子进程启动，期间中间目录若被换成
+    指向别处的符号链接 / 目录联接，就是一次路径逃逸。把同一条检查挪到写之前，
+    窗口从「检查 → 起 ffmpeg 进程」缩到「复查 → 建目录 → exec」。
+
+    ⚠️ **只收窄，未完全关闭**：复查与 ``os.makedirs`` / ffmpeg 自己 ``open()``
+    之间仍有缝隙。彻底关闭需要基于句柄的打开方式（``CreateFileW`` +
+    ``FILE_FLAG_OPEN_REPARSE_POINT``）或强制中间目录不得为链接，
+    属于渲染器的结构性改造，本轮不做。
+
+    ``output_root`` 为空 ⇒ **拒绝写**（fail-closed）：无法验证归属就不落盘。
+    """
+    root = os.path.abspath(str(output_root or ""))
+    if not root:
+        raise PlanRenderError(
+            "按冻结计划渲染必须显式给出 output_root（项目输出根）；"
+            "没有根就无法在落盘前复查路径归属，拒绝写盘")
+    target = os.path.realpath(os.path.abspath(str(output_path or "")))
+    try:
+        inside = os.path.commonpath([os.path.normcase(target),
+                                     os.path.normcase(root)]) == os.path.normcase(root)
+    except (OSError, ValueError):
+        inside = False
+    if not inside:
+        raise PlanRenderError(
+            "成片路径在落盘前复查时落到项目输出根 %s 之外（拒绝路径逃逸）：%s"
+            % (root, output_path))
+    return target
+
+
+def render_from_plan(plan: Any, output_path: str, *, caller: str = "",
+                     subtitle_revision: str = "", dry_run: bool = False,
+                     target_w: int = 0, target_h: int = 0, target_fps: int = 0,
+                     crf: int = 20, x264_preset: str = "veryfast",
+                     output_root: str = "") -> Dict:
+    """**只消费冻结计划**渲染成片（ADR-0012 决策第 3 点）。
+
+    与旧路径的差别，一句话：这里**不接受**「磁盘上有什么就合什么」。
+    计划里几镜就渲几镜，顺序由计划定，时长由计划定，转场由计划定，
+    音轨来源由计划定（含 :meth:`RenderManifest.declare_silence` 的合法静音）。
+    **缺任何一项直接抛 :class:`PlanRenderError`，绝不静默跳过** ——
+    跳过会让成片与计划悄悄脱钩，而「成片对不上当时批准的那一版剪辑」
+    正是铁律 4 要杜绝的。
+
+    字幕**不参与本函数**（ADR-0012 决策第 4 点）：``subtitle_revision`` 只是
+    原样带回登记，供字幕链路事后挂到同一版时间线上消费。
+
+    ``dry_run=True`` 时只做 fail-closed 校验并回传将要执行的 ffmpeg 参数，
+    **不落盘、不起子进程** —— 用于「先看一眼命令对不对」。
+
+    返回 ``{"ok": bool, "output_path": str, "compose_fingerprint": str,
+    "plan_fingerprint": str, "ffmpeg": {...}, ...}``；失败时 ``ok=False``
+    且 ``error`` 写明原因（与本模块其它函数的 report 风格一致）。
+    """
+    from application.timeline_service import (   # 延迟导入：避免模块级循环依赖
+        compose_plan_to_ffmpeg_args, TimelineServiceError,
+    )
+    from domain.timeline import ComposePlan, TimelineError
+
+    report: Dict = {"ok": False, "output_path": "", "renderer": "ffmpeg",
+                    "caller": caller or "render_from_plan", "dry_run": bool(dry_run),
+                    "subtitle_revision": str(subtitle_revision or "")}
+
+    # ---- fail-closed ① ② ③：计划自检（纯逻辑，先于任何 I/O）----
+    try:
+        summary = validate_render_plan(plan)
+    except PlanRenderError as e:
+        report["error"] = str(e)
+        logger.error("按冻结计划渲染被拒（%s）：%s", report["caller"], e)
+        return report
+    report.update({"compose_fingerprint": summary["compose_fingerprint"],
+                   "plan_fingerprint": summary["plan_fingerprint"],
+                   "planned_entries": summary["entries"],
+                   "declared_silences": summary["declared_silences"]})
+
+    obj = plan if isinstance(plan, ComposePlan) else ComposePlan.from_dict(plan)
+    # 计划指纹自校验：内容被旁路改写（改了 entries 却没重算指纹）时拒绝渲染
+    if not obj.verify_plan_fingerprint():
+        report["error"] = ("合成计划指纹与内容不一致（疑似被旁路改写，拒绝渲染）：%s"
+                           % obj.revision_id)
+        logger.error("%s：%s", report["caller"], report["error"])
+        return report
+
+    # ---- fail-closed ④：转场在领域层与 ffmpeg 层的对应关系 ----
+    try:
+        ffmpeg = compose_plan_to_ffmpeg_args(
+            obj, target_w=target_w, target_h=target_h, target_fps=target_fps,
+            crf=crf, x264_preset=x264_preset)
+    except (TimelineError, TimelineServiceError) as e:
+        report["error"] = "合成计划无法转换为可执行的 ffmpeg 参数：%s" % e
+        logger.error("%s：%s", report["caller"], report["error"])
+        return report
+    report["ffmpeg"] = {k: v for k, v in ffmpeg.items() if k != "planned_entries"}
+    report["expected_duration_sec"] = ffmpeg.get("output_duration_sec")
+
+    if dry_run:
+        report["ok"] = True
+        report["message"] = "dry-run：计划校验通过，未渲染（未落盘、未起 ffmpeg）"
+        return report
+
+    # ---- 计划 → ffmpeg（真渲）----
+    proc = VideoPostProcessor()
+    if ffmpeg.get("mode") == "concat_copy":
+        files = [e.video_path for e in obj.entries]
+        # 复用既有拼接实现（它自己会判空并在失败时返回 ""）
+        out = proc.concat_videos(files, output_path, caller=report["caller"] or "render_from_plan")
+        if not out:
+            report["error"] = "按冻结计划拼接失败（详见 concat_videos 的 error 日志）"
+            return report
+    else:
+        # ---- 落盘前复查路径归属（TOCTOU 收窄，见 _assert_output_under_root）----
+        try:
+            _assert_output_under_root(output_path, output_root)
+        except PlanRenderError as e:
+            report["error"] = str(e)
+            logger.error("%s：%s", report["caller"], report["error"])
+            return report
+        args = ["ffmpeg"] + list(ffmpeg.get("args") or []) + [output_path]
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".",
+                        exist_ok=True)
+        except OSError as e:
+            # 超长路径 / 无权限 / 中间某段是文件：收成一条可读的失败，
+            # 而不是让 OSError 冒到 Flask 变成 500（调用方无从知道自己该改哪）。
+            report["error"] = "创建成片目录失败：%s: %s" % (type(e).__name__, e)
+            logger.error("%s：%s", report["caller"], report["error"])
+            return report
+        try:
+            r = subprocess.run(args, capture_output=True, text=True, encoding="utf-8",
+                               errors="replace", timeout=7200)
+        except Exception as e:  # noqa: BLE001  环境异常同样不产出成片
+            report["error"] = "ffmpeg 调用异常：%s: %s" % (type(e).__name__, e)
+            logger.error("%s：%s", report["caller"], report["error"])
+            return report
+        if r.returncode != 0 or not os.path.exists(output_path):
+            report["error"] = ("ffmpeg 合成失败（返回码 %s）：%s"
+                               % (r.returncode, (r.stderr or "")[-500:]))
+            logger.error("%s：%s", report["caller"], report["error"])
+            return report
+        out = output_path
+
+    probed = probe_media(out)
+    if not probed.get("ok"):
+        logger.warning("按冻结计划渲染完成但 ffprobe 复检失败：%s（error=%s）",
+                       out, probed.get("error"))
+    ok, reason = _verify_plan_duration(obj, probed)
+    report.update({"ok": bool(ok), "output_path": os.path.abspath(out),
+                   "output_sha256": _sha256_file(out),
+                   "output_bytes": int(probed.get("size_bytes") or 0),
+                   "output_duration_sec": float(probed.get("duration") or 0.0),
+                   "verify_reason": reason, "probed": probed,
+                   "revision_id": obj.revision_id,
+                   "project": obj.project, "episode": obj.episode,
+                   "revision_no": int(obj.revision_no),
+                   "entry_media_version_ids": [e.media_version_id for e in obj.entries],
+                   "render_verified": bool(ok)})
+    if not ok:
+        report["error"] = "成片时长与计划不符：%s" % reason
+    else:
+        logger.info("按冻结计划渲染完成：%s（rev=%s fp=%s）",
+                    out, obj.revision_id, obj.compose_fingerprint[:12])
+    return report
+
+
+def _verify_plan_duration(plan: Any, probed: Dict, *, tolerance_sec: float = 0.5):
+    """渲完对照计划时长。
+
+    基线取 ``plan.total_duration_sec``，而该字段按领域层权威口径
+    （``domain.timeline.expected_total_duration_sec``）**已扣掉每个转场吃掉的重叠**
+    —— 以前这里拿「各镜时长求和」当基线，4 镜 ×10s + dissolve 1s + fade 0.5s
+    会拿 40.0s 去比真实的 38.5s，差 1.5s > 0.5s 容差，于是每次带转场的渲染
+    都在 GPU 烧完、文件落盘之后才被判失败。
+    """
+    total = float(getattr(plan, "total_duration_sec", 0.0) or 0.0)
+    try:
+        got = float((probed or {}).get("duration") or 0.0)
+    except (TypeError, ValueError):
+        return False, "ffprobe 未给出可解析的时长"
+    if abs(got - total) > float(tolerance_sec):
+        return False, ("成片时长与计划不符：计划 %.2fs / 实测 %.2fs（差 %.2fs）"
+                       % (total, got, abs(got - total)))
+    return True, "成片时长与计划一致"
+
+
+def _sha256_file(path: str) -> str:
+    """成片字节指纹（内容变了指纹就变，ADR-0012 决策第 3 点）。失败返回空串。"""
+    if not path or not os.path.isfile(path):
+        return ""
+    import hashlib
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1048576), b""):
+                h.update(chunk)
+    except OSError as e:
+        logger.warning("计算成片 sha256 失败（忽略）：%s", e)
+        return ""
+    return h.hexdigest()

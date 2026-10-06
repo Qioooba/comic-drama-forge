@@ -1198,3 +1198,57 @@ export interface AgentKillState {
   reason: string;
   at: number;
 }
+
+// =====================================================================
+// 生成事实：采用 / 批准（ADR-0002）
+// =====================================================================
+
+/**
+ * 决策三态。
+ *
+ * ⚠️ 这是**后端 `domain.production_facts.decision_state` 的直出结构**，
+ *    取值由后端决定，前端不得自行推导、也不得新增取值。
+ *
+ * 关键：`selected_not_approved`（已采用·未批准）是一个**独立取值**，
+ * 不是 `selected` 的子状态。领域层恒返 `selection_implies_approval=False`，
+ * 因为采用是创作决定、批准是放行决定，前者永不隐式升级为后者。
+ * 把它压成布尔 `approved` 就会在界面上重新制造「质检全绿 = 可以交付」的错觉。
+ */
+export type ProductionDecisionStateName =
+  | 'none'
+  | 'selected'
+  | 'selected_not_approved'
+  | 'approved'
+  | 'approved_stale'
+  | 'approved_unverified';
+
+export interface ProductionDecisionState {
+  /** 五态（+ none）之一；前端按此渲染，不做二次推导 */
+  state: ProductionDecisionStateName;
+  /** 是否有**未撤销**的采用记录 */
+  selected: boolean;
+  /** 是否有**有效**的批准记录（哈希仍绑定内容时才为 true） */
+  approved: boolean;
+  /**
+   * 恒为 false。前端若读到 true，说明后端契约被破坏 —— 渲染时必须
+   * 显式拒绝按批准处理，而不是忽略这个字段。
+   */
+  selection_implies_approval: boolean;
+  /** 磁盘现状重算值（判定 approved_stale 的依据） */
+  media_sha256_now: string;
+  /** 是否取得到磁盘现状；false 时一律不得渲染成 approved（fail-closed） */
+  media_verified: boolean;
+}
+
+/** 一次生成产出的候选版本（只追加，不修改） */
+export interface ProductionMediaVersion {
+  media_version_id: string;
+  intent_id: string;
+  path?: string;
+  media_sha256?: string;
+  bytes?: number;
+  created_at?: number | string;
+  attempt_id?: string;
+  probe?: Record<string, unknown>;
+  [key: string]: unknown;
+}

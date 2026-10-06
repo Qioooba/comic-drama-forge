@@ -416,3 +416,43 @@ def estimate_speech_sec(text: str, chars_per_sec: float = 4.5) -> float:
         return 0.0
     rate = float(chars_per_sec) if chars_per_sec and chars_per_sec > 0 else 4.5
     return round(max(0.6, n / rate), 3)
+
+
+# --------------------------------------------------------------------------- #
+# AI 语义复核层入口（2026-10-07 追加）
+# --------------------------------------------------------------------------- #
+# ⚠️ 以下为**纯追加**，既有函数体与判定逻辑一字未改。客观层（probe_metrics /
+#    evaluate / quick_check / render_visuals）仍是唯一的硬闸持有方，AI 语义复核
+#    只在其之后**收紧**结论，绝不放宽。
+#
+# ⚠️ 必须**延迟 import**：``qc_client`` 在顶层 ``import audio_qc``（本文件）。
+#    若在顶层 import qc_client / audio_qc_ai 会成环 —— 这也是既有第 41 行注释
+#    「audio_qc 不反向依赖本模块」的由来，此处不能破坏。
+
+
+def check_with_ai(audio_path: str, expect_sec: Optional[float] = None,
+                  line_text: str = "", cfg: dict = None, override: dict = None,
+                  visuals_dir: str = None, source: str = "",
+                  check_speech_ratio: Optional[bool] = None,
+                  min_speech_ratio: Optional[float] = 0.50,
+                  min_mean_db: Optional[float] = -45.0,
+                  max_drift: Optional[float] = 0.50,
+                  with_ai: bool = True) -> dict:
+    """客观层 + AI 语义复核一条龙（AI 层可关闭）。永不抛异常。
+
+    ``with_ai=False`` 等价于本模块的 ``quick_check``（额外带 ``ai_review_state``
+    标注），既有调用方行为不变。
+
+    整轨口径（成片 / 整集合成音轨自动关闭「有声占比」判定）由 AI 层按
+    ``source`` + 文件扩展名判定；显式传 ``check_speech_ratio`` 则以传入值为准。
+
+    本函数是**薄壳**：客观层在这里跑，语义复核与单向收紧合并都在
+    ``audio_qc_ai`` 里，收敛逻辑只有一处。
+    """
+    import audio_qc_ai  # 延迟 import：避免 audio_qc ↔ qc_client 循环依赖
+
+    return audio_qc_ai.check(
+        audio_path, expect_sec=expect_sec, line_text=line_text, cfg=cfg,
+        override=override, visuals_dir=visuals_dir, source=source,
+        check_speech_ratio=check_speech_ratio, min_speech_ratio=min_speech_ratio,
+        min_mean_db=min_mean_db, max_drift=max_drift, with_ai=with_ai)

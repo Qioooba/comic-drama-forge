@@ -184,7 +184,7 @@ export function GridPage({ projectKey }: { projectKey?: string } = {}) {
                 <div
                   key={i}
                   onClick={() => shot && setSelectedCell(i)}
-                  className={`relative rounded-lg border-2 p-3 transition-all ${
+                  className={`relative rounded-lg border-2 p-3 transition-colors ${
                     shot ? 'cursor-pointer' : 'opacity-50 cursor-not-allowed'
                   } ${
                     isSelected

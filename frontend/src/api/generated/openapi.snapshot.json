@@ -1,0 +1,4425 @@
+{
+  "components": {
+    "schemas": {
+      "ApprovalView": {
+        "properties": {
+          "approved_at": {
+            "type": "string"
+          },
+          "approver": {
+            "type": "string"
+          },
+          "note": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "none",
+              "valid",
+              "stale",
+              "revoked",
+              "hash_missing"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "type": "object"
+      },
+      "ApproveDeliveryPackageRequest": {
+        "properties": {
+          "approver": {
+            "description": "批准人；为空一律拒绝",
+            "type": "string"
+          },
+          "note": {
+            "type": "string"
+          },
+          "package_hash": {
+            "description": "可选：批准时确认的包摘要，与当前不一致则拒绝",
+            "type": "string"
+          }
+        },
+        "required": [
+          "approver"
+        ],
+        "type": "object"
+      },
+      "ApproveMediaRequest": {
+        "description": "批准放行。人工决定；`authorized_by` 必须是人工主体，机器账号一律 403。必须先采用过（否则 409）。",
+        "properties": {
+          "authorization_ref": {
+            "description": "审计引用号；不是身份凭证，不能覆盖主体校验",
+            "type": "string"
+          },
+          "authorized_by": {
+            "type": "string"
+          },
+          "note": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "authorized_by"
+        ],
+        "type": "object"
+      },
+      "Attempt": {
+        "properties": {
+          "attempt_id": {
+            "type": "string"
+          },
+          "finished_at": {
+            "type": "string"
+          },
+          "job_id": {
+            "type": "string"
+          },
+          "seq": {
+            "type": "integer"
+          },
+          "started_at": {
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "running",
+              "completed",
+              "failed",
+              "cancelled"
+            ],
+            "type": "string"
+          },
+          "workflow_hash": {
+            "description": "ComfyUI 工作流指纹；一致即可免重渲复用产物。",
+            "type": "string"
+          }
+        },
+        "required": [
+          "attempt_id",
+          "job_id"
+        ],
+        "type": "object"
+      },
+      "AttemptResponse": {
+        "properties": {
+          "item": {
+            "$ref": "Attempt"
+          },
+          "success": {
+            "const": true,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "success"
+        ],
+        "type": "object"
+      },
+      "BrandKit": {
+        "properties": {
+          "brand_id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "versions": {
+            "description": "品牌与水印的**版本**列表；指定不存在的版本会被门禁拦下",
+            "items": {
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "notes": {
+                  "type": "string"
+                },
+                "updated_at": {
+                  "type": "string"
+                },
+                "version": {
+                  "type": "string"
+                },
+                "watermark_opacity": {
+                  "type": "number"
+                },
+                "watermark_position": {
+                  "type": "string"
+                },
+                "watermark_text": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "version"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "brand_id",
+          "name"
+        ],
+        "type": "object"
+      },
+      "BrandKitsResponse": {
+        "properties": {
+          "brands": {
+            "items": {
+              "$ref": "#/components/schemas/BrandKit"
+            },
+            "type": "array"
+          },
+          "count": {
+            "type": "integer"
+          },
+          "success": {
+            "type": "boolean"
+          },
+          "summary": {
+            "$ref": "#/components/schemas/LicenseRegistrySummary"
+          }
+        },
+        "required": [
+          "success",
+          "count",
+          "brands"
+        ],
+        "type": "object"
+      },
+      "CapabilityProfileListResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "CapabilityProfileVersion"
+            },
+            "type": "array"
+          },
+          "success": {
+            "const": true,
+            "type": "boolean"
+          },
+          "total": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "success",
+          "items"
+        ],
+        "type": "object"
+      },
+      "CapabilityProfileRequest": {
+        "properties": {
+          "capabilities": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "profile_id": {
+            "type": "string"
+          },
+          "verified": {
+            "type": "boolean"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "profile_id",
+          "version"
+        ],
+        "type": "object"
+      },
+      "CapabilityProfileResponse": {
+        "properties": {
+          "item": {
+            "$ref": "CapabilityProfileVersion"
+          },
+          "success": {
+            "const": true,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "success"
+        ],
+        "type": "object"
+      },
+      "CapabilityProfileVersion": {
+        "properties": {
+          "capabilities": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "profile_id": {
+            "type": "string"
+          },
+          "verified": {
+            "type": "boolean"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "profile_id",
+          "version"
+        ],
+        "type": "object"
+      },
+      "ContractVersion": {
+        "properties": {
+          "contract_version": {
+            "type": "string"
+          },
+          "openapi": {
+            "type": "string"
+          },
+          "operation_count": {
+            "type": "integer"
+          },
+          "path_count": {
+            "type": "integer"
+          },
+          "spec_hash": {
+            "description": "规格内容摘要；前端启动闸门据此判断客户端是否过期",
+            "type": "string"
+          }
+        },
+        "required": [
+          "contract_version",
+          "spec_hash"
+        ],
+        "type": "object"
+      },
+      "ContractVersionResponse": {
+        "properties": {
+          "contract_version": {
+            "type": "string"
+          },
+          "manual_operations": {
+            "type": "integer"
+          },
+          "manual_paths": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "openapi": {
+            "type": "string"
+          },
+          "operation_count": {
+            "type": "integer"
+          },
+          "path_count": {
+            "type": "integer"
+          },
+          "reflected_operations": {
+            "type": "integer"
+          },
+          "spec_hash": {
+            "type": "string"
+          },
+          "success": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "success",
+          "contract_version",
+          "spec_hash"
+        ],
+        "type": "object"
+      },
+      "CreateAttemptRequest": {
+        "properties": {
+          "note": {
+            "type": "string"
+          },
+          "workflow_hash": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "CreateDeliveryPackageRequest": {
+        "properties": {
+          "episode_no": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "preset_id": {
+            "description": "portrait_9x16 / landscape_16x9 / portrait_3x4",
+            "type": "string"
+          },
+          "project_name": {
+            "type": "string"
+          },
+          "requirement": {
+            "$ref": "#/components/schemas/LicenseRequirement"
+          }
+        },
+        "required": [
+          "project_name",
+          "preset_id"
+        ],
+        "type": "object"
+      },
+      "CreateIntentRequest": {
+        "properties": {
+          "derived_from": {
+            "type": "string"
+          },
+          "profile": {
+            "type": "string"
+          },
+          "project": {
+            "type": "string"
+          },
+          "prompt": {
+            "type": "string"
+          },
+          "ref_slots": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "seed": {
+            "type": "integer"
+          },
+          "workflow_version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project",
+          "prompt"
+        ],
+        "type": "object"
+      },
+      "CreateJobRequest": {
+        "properties": {
+          "kind": {
+            "type": "string"
+          },
+          "payload": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "project": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project",
+          "kind"
+        ],
+        "type": "object"
+      },
+      "CreateTimelineRevisionRequest": {
+        "properties": {
+          "derived_from": {
+            "type": "string"
+          },
+          "episode": {
+            "type": "integer"
+          },
+          "items": {
+            "items": {
+              "$ref": "TimelineItem"
+            },
+            "type": "array"
+          },
+          "project": {
+            "type": "string"
+          },
+          "subtitle_revision": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project",
+          "items"
+        ],
+        "type": "object"
+      },
+      "DecisionListResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "DecisionResponse"
+            },
+            "type": "array"
+          },
+          "success": {
+            "const": true,
+            "type": "boolean"
+          },
+          "total": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "success",
+          "items"
+        ],
+        "type": "object"
+      },
+      "DecisionRecord": {
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "approval_id": {
+            "type": "string"
+          },
+          "bound_hash": {
+            "description": "批准绑定的三元组哈希；内容变则批准自动失效",
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "selection",
+              "approval"
+            ],
+            "type": "string"
+          },
+          "media_version_id": {
+            "type": "string"
+          },
+          "note": {
+            "type": "string"
+          },
+          "revoked": {
+            "type": "boolean"
+          },
+          "selection_id": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "DecisionResponse": {
+        "properties": {
+          "approval": {
+            "$ref": "DecisionRecord"
+          },
+          "media_verified": {
+            "description": "是否真的按磁盘现状核验过。false = 无法验证，**不得**当成「没变」。",
+            "type": "boolean"
+          },
+          "selection": {
+            "$ref": "DecisionRecord"
+          },
+          "state": {
+            "description": "采用/批准五态。铁律：selected 永不显示为 approved（ADR-0002）",
+            "enum": [
+              "selected",
+              "selected_not_approved",
+              "approved",
+              "approved_stale",
+              "approved_unverified",
+              "none"
+            ],
+            "type": "string"
+          },
+          "success": {
+            "const": true,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "success",
+          "state"
+        ],
+        "type": "object"
+      },
+      "DeliveryFile": {
+        "properties": {
+          "mtime": {
+            "type": "string"
+          },
+          "rel_path": {
+            "description": "相对交付根目录的路径；跨机器可移植",
+            "type": "string"
+          },
+          "sha256": {
+            "description": "文件内容摘要；内容变则摘要变",
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "size_bytes": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "rel_path",
+          "size_bytes",
+          "sha256"
+        ],
+        "type": "object"
+      },
+      "DeliveryManifest": {
+        "properties": {
+          "approval": {
+            "$ref": "#/components/schemas/ApprovalView"
+          },
+          "current_package_hash": {
+            "type": "string"
+          },
+          "disk_matches_baseline": {
+            "type": "boolean"
+          },
+          "file_count": {
+            "type": "integer"
+          },
+          "files": {
+            "items": {
+              "$ref": "#/components/schemas/DeliveryFile"
+            },
+            "type": "array"
+          },
+          "generated_at": {
+            "type": "string"
+          },
+          "licensing_ok": {
+            "type": "boolean"
+          },
+          "note": {
+            "type": "string"
+          },
+          "package_hash": {
+            "type": "string"
+          },
+          "package_id": {
+            "type": "string"
+          },
+          "preset": {
+            "$ref": "#/components/schemas/DeliveryPreset"
+          },
+          "project": {
+            "type": "string"
+          },
+          "schema_version": {
+            "type": "integer"
+          },
+          "status": {
+            "type": "string"
+          },
+          "total_bytes": {
+            "type": "integer"
+          },
+          "verified_ok": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "package_id",
+          "package_hash",
+          "files"
+        ],
+        "type": "object"
+      },
+      "DeliveryManifestResponse": {
+        "properties": {
+          "manifest": {
+            "$ref": "#/components/schemas/DeliveryManifest"
+          },
+          "success": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "success",
+          "manifest"
+        ],
+        "type": "object"
+      },
+      "DeliveryPackage": {
+        "properties": {
+          "approval": {
+            "$ref": "#/components/schemas/ApprovalView"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "current_package_hash": {
+            "description": "按磁盘现状重算的包摘要；与 package_hash 不一致即说明文件被改动过",
+            "type": "string"
+          },
+          "disk_matches_baseline": {
+            "description": "磁盘现状是否仍等于清单基线",
+            "type": "boolean"
+          },
+          "disk_ok": {
+            "description": "清单里的文件是否都还在",
+            "type": "boolean"
+          },
+          "episode_no": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "file_count": {
+            "type": "integer"
+          },
+          "files": {
+            "items": {
+              "$ref": "#/components/schemas/DeliveryFile"
+            },
+            "type": "array"
+          },
+          "licensing_ok": {
+            "type": "boolean"
+          },
+          "package_hash": {
+            "description": "人工批准绑定它；内容变则批准自动失效",
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "package_id": {
+            "type": "string"
+          },
+          "preset": {
+            "$ref": "#/components/schemas/DeliveryPreset"
+          },
+          "project": {
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "built",
+              "verified",
+              "approved",
+              "approval_invalidated"
+            ],
+            "type": "string"
+          },
+          "total_bytes": {
+            "type": "integer"
+          },
+          "verified_at": {
+            "type": "string"
+          },
+          "verified_ok": {
+            "description": "机器校验结果；永远不等于已批准",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "package_id",
+          "project",
+          "preset_id",
+          "package_hash",
+          "status"
+        ],
+        "type": "object"
+      },
+      "DeliveryPackageListResponse": {
+        "properties": {
+          "count": {
+            "type": "integer"
+          },
+          "packages": {
+            "items": {
+              "$ref": "#/components/schemas/DeliveryPackage"
+            },
+            "type": "array"
+          },
+          "success": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "success",
+          "count",
+          "packages"
+        ],
+        "type": "object"
+      },
+      "DeliveryPackageResponse": {
+        "properties": {
+          "package": {
+            "$ref": "#/components/schemas/DeliveryPackage"
+          },
+          "success": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "success",
+          "package"
+        ],
+        "type": "object"
+      },
+      "DeliveryPreset": {
+        "properties": {
+          "aspect_ratio": {
+            "type": "string"
+          },
+          "height": {
+            "type": "integer"
+          },
+          "label": {
+            "description": "面向用户的中文名",
+            "type": "string"
+          },
+          "note": {
+            "type": "string"
+          },
+          "orientation": {
+            "type": "string"
+          },
+          "preset_id": {
+            "examples": [
+              "portrait_9x16"
+            ],
+            "type": "string"
+          },
+          "width": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "preset_id",
+          "label",
+          "width",
+          "height",
+          "aspect_ratio"
+        ],
+        "type": "object"
+      },
+      "DeliveryPresetsResponse": {
+        "properties": {
+          "count": {
+            "type": "integer"
+          },
+          "presets": {
+            "items": {
+              "$ref": "#/components/schemas/DeliveryPreset"
+            },
+            "type": "array"
+          },
+          "success": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "success",
+          "count",
+          "presets"
+        ],
+        "type": "object"
+      },
+      "EpisodeRenderVersion": {
+        "properties": {
+          "compose_fingerprint": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "render_version_id": {
+            "type": "string"
+          },
+          "sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "render_version_id",
+          "compose_fingerprint"
+        ],
+        "type": "object"
+      },
+      "ErrorCodesResponse": {
+        "properties": {
+          "delivery": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "licensing": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "success": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "success",
+          "delivery",
+          "licensing"
+        ],
+        "type": "object"
+      },
+      "ErrorResponse": {
+        "properties": {
+          "code": {
+            "description": "稳定错误码，代码里以此分支，不要解析文案",
+            "type": "string"
+          },
+          "error": {
+            "type": "string"
+          },
+          "success": {
+            "const": false,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "success",
+          "error",
+          "code"
+        ],
+        "type": "object"
+      },
+      "FinishAttemptRequest": {
+        "properties": {
+          "note": {
+            "type": "string"
+          },
+          "result_ref": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "GateViolation": {
+        "properties": {
+          "code": {
+            "examples": [
+              "LIC-MODEL-UNREGISTERED"
+            ],
+            "type": "string"
+          },
+          "detail": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "message": {
+            "description": "面向用户的中文说明（对外契约）",
+            "type": "string"
+          },
+          "subject": {
+            "description": "被拦的对象（模型名/素材 id）",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "type": "object"
+      },
+      "GenerationIntent": {
+        "description": "一次生成的意图。冻结后不可改，改动必须派生新 intent。",
+        "properties": {
+          "created_at": {
+            "type": "string"
+          },
+          "derived_from": {
+            "type": "string"
+          },
+          "frozen": {
+            "const": true,
+            "type": "boolean"
+          },
+          "intent_hash": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "intent_id": {
+            "type": "string"
+          },
+          "profile": {
+            "type": "string"
+          },
+          "project": {
+            "type": "string"
+          },
+          "prompt": {
+            "type": "string"
+          },
+          "ref_slots": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "seed": {
+            "type": "integer"
+          },
+          "workflow_version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "intent_id",
+          "intent_hash"
+        ],
+        "type": "object"
+      },
+      "IntentListResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "GenerationIntent"
+            },
+            "type": "array"
+          },
+          "success": {
+            "const": true,
+            "type": "boolean"
+          },
+          "total": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "success",
+          "items"
+        ],
+        "type": "object"
+      },
+      "IntentResponse": {
+        "properties": {
+          "item": {
+            "$ref": "GenerationIntent"
+          },
+          "state": {
+            "description": "采用/批准五态。铁律：selected 永不显示为 approved（ADR-0002）",
+            "enum": [
+              "selected",
+              "selected_not_approved",
+              "approved",
+              "approved_stale",
+              "approved_unverified",
+              "none"
+            ],
+            "type": "string"
+          },
+          "success": {
+            "const": true,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "success"
+        ],
+        "type": "object"
+      },
+      "Job": {
+        "description": "Job = 一次用户意图；Attempt = 一次执行尝试。",
+        "properties": {
+          "created_at": {
+            "type": "string"
+          },
+          "job_id": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "project": {
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "running",
+              "completed",
+              "failed",
+              "cancelled"
+            ],
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "job_id"
+        ],
+        "type": "object"
+      },
+      "JobListResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "Job"
+            },
+            "type": "array"
+          },
+          "success": {
+            "const": true,
+            "type": "boolean"
+          },
+          "total": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "success",
+          "items"
+        ],
+        "type": "object"
+      },
+      "JobResponse": {
+        "properties": {
+          "item": {
+            "$ref": "Job"
+          },
+          "success": {
+            "const": true,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "success"
+        ],
+        "type": "object"
+      },
+      "JobStats": {
+        "properties": {
+          "by_project": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object"
+          },
+          "by_status": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object"
+          },
+          "total": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "JobStatsResponse": {
+        "properties": {
+          "stats": {
+            "$ref": "JobStats"
+          },
+          "success": {
+            "const": true,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "success",
+          "stats"
+        ],
+        "type": "object"
+      },
+      "LicenseEntry": {
+        "properties": {
+          "attribution_required": {
+            "type": "boolean"
+          },
+          "attribution_text": {
+            "description": "要求署名时，交付方复制到简介的文本",
+            "type": "string"
+          },
+          "commercial_use": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "string"
+          },
+          "kind": {
+            "description": "music / sfx / footage / image",
+            "type": "string"
+          },
+          "license_type": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "notes": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          },
+          "verified": {
+            "description": "false ⇒ 待核实，门禁以 LIC-LICENSE-UNVERIFIED 阻断",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name",
+          "source",
+          "license_type"
+        ],
+        "type": "object"
+      },
+      "LicenseRegistryResponse": {
+        "properties": {
+          "assets": {
+            "items": {
+              "$ref": "#/components/schemas/LicenseEntry"
+            },
+            "type": "array"
+          },
+          "brands": {
+            "items": {
+              "$ref": "#/components/schemas/BrandKit"
+            },
+            "type": "array"
+          },
+          "license_types": {
+            "description": "许可类型 → {commercial, attribution, label}",
+            "type": "object"
+          },
+          "models": {
+            "items": {
+              "$ref": "#/components/schemas/LicenseEntry"
+            },
+            "type": "array"
+          },
+          "success": {
+            "type": "boolean"
+          },
+          "summary": {
+            "$ref": "#/components/schemas/LicenseRegistrySummary"
+          }
+        },
+        "required": [
+          "success",
+          "summary",
+          "models",
+          "assets",
+          "brands"
+        ],
+        "type": "object"
+      },
+      "LicenseRegistrySummary": {
+        "properties": {
+          "asset_count": {
+            "type": "integer"
+          },
+          "brand_count": {
+            "type": "integer"
+          },
+          "load_error": {
+            "type": "string"
+          },
+          "loaded": {
+            "description": "false 时门禁按最严口径阻断（fail-closed）",
+            "type": "boolean"
+          },
+          "model_count": {
+            "type": "integer"
+          },
+          "schema_version": {
+            "type": "integer"
+          },
+          "source_path": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "LicenseRequirement": {
+        "description": "一次交付声明用到的模型与素材。门禁按它逐项核对授权登记。",
+        "properties": {
+          "assets": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "attribution_text": {
+            "description": "交付方提供的署名文本；要求署名的授权缺它即拦",
+            "type": "string"
+          },
+          "brand": {
+            "type": "string"
+          },
+          "brand_version": {
+            "type": "string"
+          },
+          "models": {
+            "description": "模型名称，需与 config/model-licensing.json 的 name 对上",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "music": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "purpose": {
+            "default": "commercial",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "LicensedMusicResponse": {
+        "properties": {
+          "count": {
+            "type": "integer"
+          },
+          "music": {
+            "items": {
+              "$ref": "#/components/schemas/LicenseEntry"
+            },
+            "type": "array"
+          },
+          "success": {
+            "type": "boolean"
+          },
+          "summary": {
+            "$ref": "#/components/schemas/LicenseRegistrySummary"
+          }
+        },
+        "required": [
+          "success",
+          "count",
+          "music"
+        ],
+        "type": "object"
+      },
+      "LicensingGateResponse": {
+        "properties": {
+          "attribution": {
+            "description": "可复制到简介的署名文本",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "gate": {
+            "$ref": "#/components/schemas/LicensingGateResult"
+          },
+          "success": {
+            "description": "与 gate.ok 同值",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "success",
+          "gate"
+        ],
+        "type": "object"
+      },
+      "LicensingGateResult": {
+        "properties": {
+          "checked": {
+            "type": "object"
+          },
+          "ok": {
+            "description": "false 时不得进入交付",
+            "type": "boolean"
+          },
+          "registry": {
+            "type": "object"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "violations": {
+            "items": {
+              "$ref": "#/components/schemas/GateViolation"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "ok",
+          "violations"
+        ],
+        "type": "object"
+      },
+      "MediaVersion": {
+        "description": "一次生成产出的候选。自身**不带** selected/approved —— 那两个是独立的决策记录（ADR-0002）。",
+        "properties": {
+          "created_at": {
+            "type": "string"
+          },
+          "ffprobe": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "intent_id": {
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "image",
+              "video",
+              "audio"
+            ],
+            "type": "string"
+          },
+          "media_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "media_version_id": {
+            "type": "string"
+          },
+          "path": {
+            "description": "磁盘路径；批准时会按它重算 sha256 以判是否被覆盖",
+            "type": "string"
+          }
+        },
+        "required": [
+          "media_version_id",
+          "media_sha256"
+        ],
+        "type": "object"
+      },
+      "MediaVersionListResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "MediaVersionResponse"
+            },
+            "type": "array"
+          },
+          "success": {
+            "const": true,
+            "type": "boolean"
+          },
+          "total": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "success",
+          "items"
+        ],
+        "type": "object"
+      },
+      "MediaVersionResponse": {
+        "properties": {
+          "item": {
+            "$ref": "MediaVersion"
+          },
+          "state": {
+            "description": "采用/批准五态。铁律：selected 永不显示为 approved（ADR-0002）",
+            "enum": [
+              "selected",
+              "selected_not_approved",
+              "approved",
+              "approved_stale",
+              "approved_unverified",
+              "none"
+            ],
+            "type": "string"
+          },
+          "success": {
+            "const": true,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "success"
+        ],
+        "type": "object"
+      },
+      "OkResponse": {
+        "properties": {
+          "success": {
+            "const": true,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "success"
+        ],
+        "type": "object"
+      },
+      "OpenApiSpecResponse": {
+        "properties": {
+          "components": {
+            "type": "object"
+          },
+          "info": {
+            "type": "object"
+          },
+          "openapi": {
+            "type": "string"
+          },
+          "paths": {
+            "type": "object"
+          },
+          "x-contract-version": {
+            "type": "string"
+          },
+          "x-manual-paths": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "openapi",
+          "info",
+          "paths"
+        ],
+        "type": "object"
+      },
+      "PendingUnit": {
+        "properties": {
+          "done": {
+            "type": "boolean"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "unit_key": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "PendingUnitListResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "PendingUnit"
+            },
+            "type": "array"
+          },
+          "success": {
+            "const": true,
+            "type": "boolean"
+          },
+          "total": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "success",
+          "items"
+        ],
+        "type": "object"
+      },
+      "PreflightReport": {
+        "properties": {
+          "compose_fingerprint": {
+            "description": "内容指纹：不含 revision_id/created_at，所以「同一批镜头换机器重渲」不会误判为内容变化。",
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "issues": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "undeclared_silence": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "ok",
+          "compose_fingerprint"
+        ],
+        "type": "object"
+      },
+      "PreflightResponse": {
+        "properties": {
+          "preflight": {
+            "$ref": "PreflightReport"
+          },
+          "success": {
+            "const": true,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "success",
+          "preflight"
+        ],
+        "type": "object"
+      },
+      "RegisterMediaRequest": {
+        "description": "服务端按 path 重算 sha256，**不接受客户端自带摘要**（否则可伪造出「已核验」的假象）。",
+        "properties": {
+          "intent_id": {
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "image",
+              "video",
+              "audio"
+            ],
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "intent_id",
+          "path"
+        ],
+        "type": "object"
+      },
+      "RenderManifest": {
+        "description": "渲染清单。合法静音在此**前置声明**，而不是渲染后才发现。",
+        "properties": {
+          "compose_fingerprint": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "declared_silences": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "renderer": {
+            "type": "string"
+          },
+          "segments": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "subtitle_revision": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "compose_fingerprint"
+        ],
+        "type": "object"
+      },
+      "RenderManifestResponse": {
+        "properties": {
+          "manifest": {
+            "$ref": "RenderManifest"
+          },
+          "success": {
+            "const": true,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "success",
+          "manifest"
+        ],
+        "type": "object"
+      },
+      "RenderRequest": {
+        "description": "按冻结计划发起渲染。``authorized_by`` 必须是人工主体。",
+        "properties": {
+          "authorized_by": {
+            "description": "机器账号一律 403（复用 require_human_authorization）",
+            "type": "string"
+          },
+          "dry_run": {
+            "description": "只做预检不真渲染；用于接上游合成计划的安全接入",
+            "type": "boolean"
+          },
+          "output_path": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "RenderVersionResponse": {
+        "properties": {
+          "render_version": {
+            "$ref": "EpisodeRenderVersion"
+          },
+          "success": {
+            "const": true,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "success",
+          "render_version"
+        ],
+        "type": "object"
+      },
+      "ReuseHintResponse": {
+        "properties": {
+          "reason": {
+            "description": "为何不可复用；workflow_hash 不一致 / 产物缺失",
+            "type": "string"
+          },
+          "reusable": {
+            "type": "boolean"
+          },
+          "success": {
+            "const": true,
+            "type": "boolean"
+          },
+          "workflow_hash": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "success"
+        ],
+        "type": "object"
+      },
+      "RevokeApprovalRequest": {
+        "properties": {
+          "reason": {
+            "type": "string"
+          },
+          "revoked_by": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "revoked_by",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "RevokeDeliveryApprovalRequest": {
+        "properties": {
+          "operator": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "SelectMediaRequest": {
+        "description": "采用这版。创作决定 —— **不会**自动产生批准。",
+        "properties": {
+          "note": {
+            "type": "string"
+          },
+          "selected_by": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "StyleEntry": {
+        "description": "style_id 是**稳定标识**，label 可改名而 id 永不变（否则改名即断历史，ADR-0008）。",
+        "properties": {
+          "aliases": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "aspect_default": {
+            "type": "string"
+          },
+          "category": {
+            "enum": [
+              "2d",
+              "3d",
+              "real"
+            ],
+            "type": "string"
+          },
+          "label": {
+            "description": "写入 config.style 的字面值",
+            "type": "string"
+          },
+          "negative_suffix": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "positive_suffix": {
+            "type": "string"
+          },
+          "style_id": {
+            "description": "纯 ASCII，与缩略图文件名刻意解耦",
+            "type": "string"
+          },
+          "thumbnail": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "style_id",
+          "label",
+          "category"
+        ],
+        "type": "object"
+      },
+      "StyleListResponse": {
+        "properties": {
+          "aspect_presets": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "categories": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "items": {
+            "items": {
+              "$ref": "StyleEntry"
+            },
+            "type": "array"
+          },
+          "success": {
+            "const": true,
+            "type": "boolean"
+          },
+          "total": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "success",
+          "items"
+        ],
+        "type": "object"
+      },
+      "StyleResolveResponse": {
+        "properties": {
+          "match_kind": {
+            "enum": [
+              "id",
+              "label",
+              "alias",
+              "substring"
+            ],
+            "type": "string"
+          },
+          "resolved": {
+            "description": "false = 未命中。调用方**必须**继续按自由文本处理，不得凭空猜一个风格。",
+            "type": "boolean"
+          },
+          "style_id": {
+            "type": "string"
+          },
+          "success": {
+            "const": true,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "success",
+          "resolved"
+        ],
+        "type": "object"
+      },
+      "StyleResponse": {
+        "properties": {
+          "item": {
+            "$ref": "StyleEntry"
+          },
+          "success": {
+            "const": true,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "success"
+        ],
+        "type": "object"
+      },
+      "TimelineItem": {
+        "properties": {
+          "audio_media_version_id": {
+            "type": "string"
+          },
+          "declared_silence": {
+            "description": "合法静音必须**前置声明**。未声明却在渲染后出现静音 → 阻断。",
+            "type": "boolean"
+          },
+          "duration_sec": {
+            "type": "number"
+          },
+          "index": {
+            "type": "integer"
+          },
+          "media_version_id": {
+            "description": "采用的媒体版本；引用未批准/已失效的版本会阻断",
+            "type": "string"
+          },
+          "note": {
+            "type": "string"
+          },
+          "shot_key": {
+            "type": "string"
+          },
+          "silence_reason": {
+            "type": "string"
+          },
+          "transition_in": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "shot_key",
+          "media_version_id"
+        ],
+        "type": "object"
+      },
+      "TimelineRevision": {
+        "description": "不可变时间线。创建后不可原地改；改内容必须派生新 revision。",
+        "properties": {
+          "created_at": {
+            "type": "string"
+          },
+          "derived_from": {
+            "type": "string"
+          },
+          "episode": {
+            "type": "integer"
+          },
+          "items": {
+            "items": {
+              "$ref": "TimelineItem"
+            },
+            "type": "array"
+          },
+          "project": {
+            "type": "string"
+          },
+          "revision_id": {
+            "type": "string"
+          },
+          "revision_no": {
+            "type": "integer"
+          },
+          "subtitle_revision": {
+            "description": "字幕版本与时间线解耦，仅在此引用",
+            "type": "string"
+          }
+        },
+        "required": [
+          "revision_id",
+          "project"
+        ],
+        "type": "object"
+      },
+      "TimelineRevisionListResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "TimelineRevision"
+            },
+            "type": "array"
+          },
+          "success": {
+            "const": true,
+            "type": "boolean"
+          },
+          "total": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "success",
+          "items"
+        ],
+        "type": "object"
+      },
+      "TimelineRevisionResponse": {
+        "properties": {
+          "item": {
+            "$ref": "TimelineRevision"
+          },
+          "success": {
+            "const": true,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "success"
+        ],
+        "type": "object"
+      },
+      "UpdateAttemptRequest": {
+        "properties": {
+          "note": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "type": "object"
+      },
+      "UpdateJobRequest": {
+        "properties": {
+          "note": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "type": "object"
+      },
+      "VerifyDeliveryResponse": {
+        "properties": {
+          "package": {
+            "$ref": "#/components/schemas/DeliveryPackage"
+          },
+          "success": {
+            "description": "与 verify.ok 同值：机器校验结论",
+            "type": "boolean"
+          },
+          "verify": {
+            "$ref": "#/components/schemas/VerifyResult"
+          }
+        },
+        "required": [
+          "success",
+          "verify",
+          "package"
+        ],
+        "type": "object"
+      },
+      "VerifyRenderRequest": {
+        "properties": {
+          "authorized_by": {
+            "type": "string"
+          },
+          "compose_fingerprint": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "compose_fingerprint",
+          "path"
+        ],
+        "type": "object"
+      },
+      "VerifyResult": {
+        "properties": {
+          "checked": {
+            "type": "integer"
+          },
+          "details": {
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "mismatched": {
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "missing": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "violations": {
+            "items": {
+              "$ref": "#/components/schemas/GateViolation"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "ok",
+          "checked",
+          "violations"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "本规格是**前端与后端的唯一契约**。前端客户端由 `scripts/generate_client.py` 从本文件生成，`scripts/check_generated_client.py` 在 CI 校验生成物是否过期。\n\n**手工改这个文件没有意义**：它是生成物，改了会被下一次生成覆盖。",
+    "title": "漫剧锻造台 API",
+    "version": "2026-10-07.1"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/contracts/error-codes": {
+      "get": {
+        "operationId": "getErrorCodes",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorCodesResponse"
+                }
+              }
+            },
+            "description": "成功"
+          }
+        },
+        "summary": "交付与授权的错误码对照表",
+        "tags": [
+          "contracts"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/contracts/openapi.json": {
+      "get": {
+        "operationId": "getOpenapiSpec",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenApiSpecResponse"
+                }
+              }
+            },
+            "description": "成功"
+          }
+        },
+        "summary": "导出 OpenAPI 3.1 规格（契约本体）",
+        "tags": [
+          "contracts"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/contracts/version": {
+      "get": {
+        "operationId": "getContractVersion",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ContractVersionResponse"
+                }
+              }
+            },
+            "description": "成功"
+          }
+        },
+        "summary": "契约版本与规格摘要（前端启动闸门用）",
+        "tags": [
+          "contracts"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/delivery/packages": {
+      "get": {
+        "operationId": "listDeliveryPackages",
+        "parameters": [
+          {
+            "description": "按项目过滤；缺省返回全部",
+            "in": "query",
+            "name": "project",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeliveryPackageListResponse"
+                }
+              }
+            },
+            "description": "成功"
+          }
+        },
+        "summary": "交付包列表（含机器校验与人工批准状态）",
+        "tags": [
+          "delivery"
+        ],
+        "x-contract-source": "manual"
+      },
+      "post": {
+        "operationId": "createDeliveryPackage",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateDeliveryPackageRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeliveryPackageResponse"
+                }
+              }
+            },
+            "description": "成功"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "参数非法"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "授权门禁未通过，未登记授权的模型/素材不得进入交付"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "导出目录内没有任何交付文件"
+          }
+        },
+        "summary": "登记交付包（扫描既有导出产物并算 SHA-256）",
+        "tags": [
+          "delivery"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/delivery/packages/{package_id}": {
+      "get": {
+        "operationId": "getDeliveryPackage",
+        "parameters": [
+          {
+            "description": "交付包 id",
+            "in": "path",
+            "name": "package_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeliveryPackageResponse"
+                }
+              }
+            },
+            "description": "成功"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "交付包不存在"
+          }
+        },
+        "summary": "交付包详情（含文件清单与 SHA-256）",
+        "tags": [
+          "delivery"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/delivery/packages/{package_id}/approve": {
+      "post": {
+        "operationId": "approveDeliveryPackage",
+        "parameters": [
+          {
+            "description": "交付包 id",
+            "in": "path",
+            "name": "package_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApproveDeliveryPackageRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeliveryPackageResponse"
+                }
+              }
+            },
+            "description": "成功"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "缺少操作者 / 包摘要不匹配"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "交付包不存在"
+          }
+        },
+        "summary": "人工批准（须带操作者，批准与包哈希绑定）",
+        "tags": [
+          "delivery"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/delivery/packages/{package_id}/manifest": {
+      "get": {
+        "operationId": "getDeliveryManifest",
+        "parameters": [
+          {
+            "description": "交付包 id",
+            "in": "path",
+            "name": "package_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeliveryManifestResponse"
+                }
+              }
+            },
+            "description": "成功"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "交付包不存在"
+          }
+        },
+        "summary": "交付清单（逐文件 SHA-256 + 包摘要）",
+        "tags": [
+          "delivery"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/delivery/packages/{package_id}/revoke": {
+      "post": {
+        "operationId": "revokeDeliveryApproval",
+        "parameters": [
+          {
+            "description": "交付包 id",
+            "in": "path",
+            "name": "package_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RevokeDeliveryApprovalRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeliveryPackageResponse"
+                }
+              }
+            },
+            "description": "成功"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "交付包不存在"
+          }
+        },
+        "summary": "撤销人工批准",
+        "tags": [
+          "delivery"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/delivery/packages/{package_id}/verify": {
+      "post": {
+        "operationId": "verifyDeliveryPackage",
+        "parameters": [
+          {
+            "description": "交付包 id",
+            "in": "path",
+            "name": "package_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VerifyDeliveryResponse"
+                }
+              }
+            },
+            "description": "成功"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "交付包不存在"
+          }
+        },
+        "summary": "机器校验：逐文件重算 SHA-256",
+        "tags": [
+          "delivery"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/delivery/presets": {
+      "get": {
+        "operationId": "listDeliveryPresets",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeliveryPresetsResponse"
+                }
+              }
+            },
+            "description": "成功"
+          }
+        },
+        "summary": "交付预设列表（竖屏 / 横屏 / 3:4）",
+        "tags": [
+          "delivery"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/jobs": {
+      "get": {
+        "operationId": "listJobs",
+        "parameters": [
+          {
+            "description": "按状态过滤",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobListResponse"
+                }
+              }
+            },
+            "description": "成功"
+          }
+        },
+        "summary": "作业列表（Job = 一次用户意图）",
+        "tags": [
+          "jobs"
+        ],
+        "x-contract-source": "manual"
+      },
+      "post": {
+        "operationId": "createJob",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateJobRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobResponse"
+                }
+              }
+            },
+            "description": "成功"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "参数非法"
+          }
+        },
+        "summary": "创建作业",
+        "tags": [
+          "jobs"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/jobs/attempts/{attempt_id}/finish": {
+      "post": {
+        "operationId": "finishJobAttempt",
+        "parameters": [
+          {
+            "description": "尝试 id",
+            "in": "path",
+            "name": "attempt_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FinishAttemptRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AttemptResponse"
+                }
+              }
+            },
+            "description": "成功"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "尝试不存在"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "终态不可再变更"
+          }
+        },
+        "summary": "结束尝试并结算",
+        "tags": [
+          "jobs"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/jobs/attempts/{attempt_id}/status": {
+      "post": {
+        "operationId": "updateAttemptStatus",
+        "parameters": [
+          {
+            "description": "尝试 id",
+            "in": "path",
+            "name": "attempt_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateAttemptRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AttemptResponse"
+                }
+              }
+            },
+            "description": "成功"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "尝试不存在"
+          }
+        },
+        "summary": "更新尝试状态",
+        "tags": [
+          "jobs"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/jobs/stats": {
+      "get": {
+        "operationId": "getJobStats",
+        "parameters": [
+          {
+            "description": "按项目过滤",
+            "in": "query",
+            "name": "project",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobStatsResponse"
+                }
+              }
+            },
+            "description": "成功"
+          }
+        },
+        "summary": "作业统计（按状态聚合）",
+        "tags": [
+          "jobs"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/jobs/{job_id}": {
+      "get": {
+        "operationId": "getJob",
+        "parameters": [
+          {
+            "description": "作业 id",
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobResponse"
+                }
+              }
+            },
+            "description": "成功"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "作业不存在"
+          }
+        },
+        "summary": "作业详情（含各次尝试）",
+        "tags": [
+          "jobs"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/jobs/{job_id}/attempts": {
+      "post": {
+        "operationId": "createJobAttempt",
+        "parameters": [
+          {
+            "description": "作业 id",
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateAttemptRequest"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AttemptResponse"
+                }
+              }
+            },
+            "description": "成功"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "作业不存在"
+          }
+        },
+        "summary": "为作业开启一次尝试（Attempt = 一次执行）",
+        "tags": [
+          "jobs"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/jobs/{job_id}/pending-units": {
+      "get": {
+        "operationId": "listPendingUnits",
+        "parameters": [
+          {
+            "description": "作业 id",
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PendingUnitListResponse"
+                }
+              }
+            },
+            "description": "成功"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "作业不存在"
+          }
+        },
+        "summary": "待处理单元（断点续跑判据之一）",
+        "tags": [
+          "jobs"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/jobs/{job_id}/reuse-hint": {
+      "get": {
+        "operationId": "getJobReuseHint",
+        "parameters": [
+          {
+            "description": "作业 id",
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReuseHintResponse"
+                }
+              }
+            },
+            "description": "成功"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "作业不存在"
+          }
+        },
+        "summary": "免重渲提示（workflow_hash 命中可复用）",
+        "tags": [
+          "jobs"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/jobs/{job_id}/status": {
+      "post": {
+        "operationId": "updateJobStatus",
+        "parameters": [
+          {
+            "description": "作业 id",
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateJobRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobResponse"
+                }
+              }
+            },
+            "description": "成功"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "作业不存在"
+          }
+        },
+        "summary": "更新作业状态",
+        "tags": [
+          "jobs"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/licensing/brands": {
+      "get": {
+        "operationId": "listBrandKits",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BrandKitsResponse"
+                }
+              }
+            },
+            "description": "成功"
+          }
+        },
+        "summary": "品牌与水印版本列表",
+        "tags": [
+          "licensing"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/licensing/gate": {
+      "post": {
+        "operationId": "evaluateLicensingGate",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LicenseRequirement"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LicensingGateResponse"
+                }
+              }
+            },
+            "description": "成功"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "参数非法"
+          }
+        },
+        "summary": "授权门禁预检（交付前自查）",
+        "tags": [
+          "licensing"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/licensing/music": {
+      "get": {
+        "operationId": "listLicensedMusic",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LicensedMusicResponse"
+                }
+              }
+            },
+            "description": "成功"
+          }
+        },
+        "summary": "音乐库授权列表（CC BY 署名可直接复制）",
+        "tags": [
+          "licensing"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/licensing/registry": {
+      "get": {
+        "operationId": "getLicenseRegistry",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LicenseRegistryResponse"
+                }
+              }
+            },
+            "description": "成功"
+          }
+        },
+        "summary": "授权登记表全量（模型 / 素材 / 品牌）",
+        "tags": [
+          "licensing"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/production_facts/approvals/{approval_id}/revoke": {
+      "post": {
+        "operationId": "revokeProductionApproval",
+        "parameters": [
+          {
+            "description": "批准记录 id",
+            "in": "path",
+            "name": "approval_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RevokeApprovalRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DecisionResponse"
+                }
+              }
+            },
+            "description": "成功"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "撤销者非人工主体"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "批准记录不存在"
+          }
+        },
+        "summary": "撤销人工批准（须人工授权者）",
+        "tags": [
+          "production_facts"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/production_facts/capability-profiles": {
+      "get": {
+        "operationId": "listCapabilityProfiles",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CapabilityProfileListResponse"
+                }
+              }
+            },
+            "description": "成功"
+          }
+        },
+        "summary": "能力档案版本列表",
+        "tags": [
+          "production_facts"
+        ],
+        "x-contract-source": "manual"
+      },
+      "post": {
+        "operationId": "registerCapabilityProfile",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CapabilityProfileRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CapabilityProfileResponse"
+                }
+              }
+            },
+            "description": "成功"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "参数非法"
+          }
+        },
+        "summary": "登记能力档案版本",
+        "tags": [
+          "production_facts"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/production_facts/decisions": {
+      "get": {
+        "operationId": "listDecisions",
+        "parameters": [
+          {
+            "description": "按媒体版本过滤",
+            "in": "query",
+            "name": "media_version_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DecisionListResponse"
+                }
+              }
+            },
+            "description": "成功"
+          }
+        },
+        "summary": "采用/批准决策列表（decision_state 五态）",
+        "tags": [
+          "production_facts"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/production_facts/decisions/history": {
+      "get": {
+        "operationId": "listDecisionHistory",
+        "parameters": [
+          {
+            "description": "按媒体版本过滤",
+            "in": "query",
+            "name": "media_version_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DecisionListResponse"
+                }
+              }
+            },
+            "description": "成功"
+          }
+        },
+        "summary": "决策变更历史（追加式，不覆盖）",
+        "tags": [
+          "production_facts"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/production_facts/intents": {
+      "get": {
+        "operationId": "listProductionIntents",
+        "parameters": [
+          {
+            "description": "按项目过滤",
+            "in": "query",
+            "name": "project",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "按意图过滤",
+            "in": "query",
+            "name": "intent_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IntentListResponse"
+                }
+              }
+            },
+            "description": "成功"
+          }
+        },
+        "summary": "生成意图列表（冻结后的生成事实）",
+        "tags": [
+          "production_facts"
+        ],
+        "x-contract-source": "manual"
+      },
+      "post": {
+        "operationId": "createProductionIntent",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateIntentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IntentResponse"
+                }
+              }
+            },
+            "description": "成功"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "参数非法"
+          }
+        },
+        "summary": "登记生成意图（冻结：此后不可改）",
+        "tags": [
+          "production_facts"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/production_facts/intents/{intent_id}": {
+      "get": {
+        "operationId": "getProductionIntent",
+        "parameters": [
+          {
+            "description": "生成意图 id",
+            "in": "path",
+            "name": "intent_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IntentResponse"
+                }
+              }
+            },
+            "description": "成功"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "意图不存在"
+          }
+        },
+        "summary": "生成意图详情",
+        "tags": [
+          "production_facts"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/production_facts/intents/{intent_id}/derive": {
+      "post": {
+        "operationId": "deriveProductionIntent",
+        "parameters": [
+          {
+            "description": "生成意图 id",
+            "in": "path",
+            "name": "intent_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IntentResponse"
+                }
+              }
+            },
+            "description": "成功"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "意图不存在"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "无实质变更，不予派生"
+          }
+        },
+        "summary": "派生新意图（冻结意图不可原地改）",
+        "tags": [
+          "production_facts"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/production_facts/media": {
+      "get": {
+        "operationId": "listMediaVersions",
+        "parameters": [
+          {
+            "description": "按意图过滤",
+            "in": "query",
+            "name": "intent_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "是否带上 decision_state 五态",
+            "in": "query",
+            "name": "include_state",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MediaVersionListResponse"
+                }
+              }
+            },
+            "description": "成功"
+          }
+        },
+        "summary": "候选媒体版本列表（含采用/批准状态）",
+        "tags": [
+          "production_facts"
+        ],
+        "x-contract-source": "manual"
+      },
+      "post": {
+        "operationId": "registerMediaVersion",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegisterMediaRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MediaVersionResponse"
+                }
+              }
+            },
+            "description": "成功"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "参数非法"
+          }
+        },
+        "summary": "登记一次生成产出的候选",
+        "tags": [
+          "production_facts"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/production_facts/media/{media_version_id}": {
+      "get": {
+        "operationId": "getMediaVersion",
+        "parameters": [
+          {
+            "description": "媒体版本 id",
+            "in": "path",
+            "name": "media_version_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MediaVersionResponse"
+                }
+              }
+            },
+            "description": "成功"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "媒体版本不存在"
+          }
+        },
+        "summary": "媒体版本详情",
+        "tags": [
+          "production_facts"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/production_facts/media/{media_version_id}/approve": {
+      "post": {
+        "operationId": "approveMediaVersion",
+        "parameters": [
+          {
+            "description": "媒体版本 id",
+            "in": "path",
+            "name": "media_version_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApproveMediaRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DecisionResponse"
+                }
+              }
+            },
+            "description": "成功"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "缺少授权者"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "授权者非人工主体（机器账号一律拒绝）"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "媒体版本不存在"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "尚未采用 —— 采用不等于批准"
+          }
+        },
+        "summary": "批准放行（人工决定；须先采用）",
+        "tags": [
+          "production_facts"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/production_facts/media/{media_version_id}/select": {
+      "post": {
+        "operationId": "selectMediaVersion",
+        "parameters": [
+          {
+            "description": "媒体版本 id",
+            "in": "path",
+            "name": "media_version_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SelectMediaRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DecisionResponse"
+                }
+              }
+            },
+            "description": "成功"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "媒体版本不存在"
+          }
+        },
+        "summary": "采用这版（创作决定；永不隐式升级为批准）",
+        "tags": [
+          "production_facts"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/styles": {
+      "get": {
+        "operationId": "listStyles",
+        "parameters": [
+          {
+            "description": "按分类过滤：2d / 3d / real",
+            "in": "query",
+            "name": "category",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StyleListResponse"
+                }
+              }
+            },
+            "description": "成功"
+          }
+        },
+        "summary": "风格库全量（后端单一事实源）",
+        "tags": [
+          "styles"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/styles/resolve": {
+      "get": {
+        "operationId": "resolveStyle",
+        "parameters": [
+          {
+            "description": "项目 config.style 里存的原始字面值",
+            "in": "query",
+            "name": "text",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StyleResolveResponse"
+                }
+              }
+            },
+            "description": "成功"
+          }
+        },
+        "summary": "由自由文本解析风格（存量项目向后兼容）",
+        "tags": [
+          "styles"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/styles/{style_id}": {
+      "get": {
+        "operationId": "getStyle",
+        "parameters": [
+          {
+            "description": "稳定风格 id（改名不变）",
+            "in": "path",
+            "name": "style_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StyleResponse"
+                }
+              }
+            },
+            "description": "成功"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "风格不存在"
+          }
+        },
+        "summary": "风格详情（stable style_id，改名不断历史）",
+        "tags": [
+          "styles"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/timeline/fingerprints/{fingerprint}": {
+      "get": {
+        "operationId": "getTimelineByFingerprint",
+        "parameters": [
+          {
+            "description": "合成指纹",
+            "in": "path",
+            "name": "fingerprint",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TimelineRevisionResponse"
+                }
+              }
+            },
+            "description": "成功"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "无匹配 revision"
+          }
+        },
+        "summary": "按合成指纹反查 revision",
+        "tags": [
+          "timeline"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/timeline/revisions": {
+      "get": {
+        "operationId": "listTimelineRevisions",
+        "parameters": [
+          {
+            "description": "按项目过滤",
+            "in": "query",
+            "name": "project",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TimelineRevisionListResponse"
+                }
+              }
+            },
+            "description": "成功"
+          }
+        },
+        "summary": "时间线 revision 列表（不可变）",
+        "tags": [
+          "timeline"
+        ],
+        "x-contract-source": "manual"
+      },
+      "post": {
+        "operationId": "createTimelineRevision",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateTimelineRevisionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TimelineRevisionResponse"
+                }
+              }
+            },
+            "description": "成功"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "参数非法 / 静音未显式声明"
+          }
+        },
+        "summary": "冻结一个时间线 revision",
+        "tags": [
+          "timeline"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/timeline/revisions/latest": {
+      "get": {
+        "operationId": "getLatestTimelineRevision",
+        "parameters": [
+          {
+            "description": "项目 key",
+            "in": "query",
+            "name": "project",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "集号",
+            "in": "query",
+            "name": "episode",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TimelineRevisionResponse"
+                }
+              }
+            },
+            "description": "成功"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "该集尚无时间线"
+          }
+        },
+        "summary": "该集的最新时间线 revision",
+        "tags": [
+          "timeline"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/timeline/revisions/{revision_id}": {
+      "get": {
+        "operationId": "getTimelineRevision",
+        "parameters": [
+          {
+            "description": "时间线 revision id",
+            "in": "path",
+            "name": "revision_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TimelineRevisionResponse"
+                }
+              }
+            },
+            "description": "成功"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "revision 不存在"
+          }
+        },
+        "summary": "时间线 revision 详情",
+        "tags": [
+          "timeline"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/timeline/revisions/{revision_id}/derive": {
+      "post": {
+        "operationId": "deriveTimelineRevision",
+        "parameters": [
+          {
+            "description": "时间线 revision id",
+            "in": "path",
+            "name": "revision_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TimelineRevisionResponse"
+                }
+              }
+            },
+            "description": "成功"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "revision 不存在"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "无实质变更，不予派生"
+          }
+        },
+        "summary": "由既有 revision 派生新版本（不可原地改）",
+        "tags": [
+          "timeline"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/timeline/revisions/{revision_id}/manifest": {
+      "get": {
+        "operationId": "getTimelineManifest",
+        "parameters": [
+          {
+            "description": "时间线 revision id",
+            "in": "path",
+            "name": "revision_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RenderManifestResponse"
+                }
+              }
+            },
+            "description": "成功"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "revision 不存在"
+          }
+        },
+        "summary": "渲染清单（合法静音必须前置声明）",
+        "tags": [
+          "timeline"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/timeline/revisions/{revision_id}/preflight": {
+      "get": {
+        "operationId": "preflightTimelineRevision",
+        "parameters": [
+          {
+            "description": "时间线 revision id",
+            "in": "path",
+            "name": "revision_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PreflightResponse"
+                }
+              }
+            },
+            "description": "成功"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "revision 不存在"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "存在未声明的合法静音（undeclared_silence）"
+          }
+        },
+        "summary": "合成预检（含 compose_fingerprint）",
+        "tags": [
+          "timeline"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/timeline/revisions/{revision_id}/render": {
+      "post": {
+        "operationId": "renderTimelineRevision",
+        "parameters": [
+          {
+            "description": "时间线 revision id",
+            "in": "path",
+            "name": "revision_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RenderRequest"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RenderVersionResponse"
+                }
+              }
+            },
+            "description": "成功"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "参数非法"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "授权者非人工主体"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "revision 不存在"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "预检未通过（存在未声明静音 / 引用已失效版本）"
+          }
+        },
+        "summary": "按**冻结计划**渲染（只消费 plan，缺任何一镜即 fail-closed）",
+        "tags": [
+          "timeline"
+        ],
+        "x-contract-source": "manual"
+      }
+    },
+    "/api/timeline/revisions/{revision_id}/verify-render": {
+      "post": {
+        "operationId": "verifyTimelineRender",
+        "parameters": [
+          {
+            "description": "时间线 revision id",
+            "in": "path",
+            "name": "revision_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VerifyRenderRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RenderVersionResponse"
+                }
+              }
+            },
+            "description": "成功"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "compose_fingerprint 不匹配"
+          }
+        },
+        "summary": "登记 EpisodeRenderVersion（绑 compose_fingerprint）",
+        "tags": [
+          "timeline"
+        ],
+        "x-contract-source": "manual"
+      }
+    }
+  },
+  "servers": [
+    {
+      "description": "同源部署",
+      "url": "/"
+    }
+  ],
+  "tags": [
+    {
+      "description": "契约本体（OpenAPI 导出与版本）",
+      "name": "contracts"
+    },
+    {
+      "description": "交付预设、SHA-256 校验、人工批准闸门",
+      "name": "delivery"
+    },
+    {
+      "description": "模型/素材授权登记与交付门禁",
+      "name": "licensing"
+    }
+  ],
+  "x-contract-version": "2026-10-07.1",
+  "x-manual-paths": [
+    "/api/contracts/error-codes",
+    "/api/contracts/openapi.json",
+    "/api/contracts/version",
+    "/api/delivery/packages",
+    "/api/delivery/packages/{package_id}",
+    "/api/delivery/packages/{package_id}/approve",
+    "/api/delivery/packages/{package_id}/manifest",
+    "/api/delivery/packages/{package_id}/revoke",
+    "/api/delivery/packages/{package_id}/verify",
+    "/api/delivery/presets",
+    "/api/jobs",
+    "/api/jobs/attempts/{attempt_id}/finish",
+    "/api/jobs/attempts/{attempt_id}/status",
+    "/api/jobs/stats",
+    "/api/jobs/{job_id}",
+    "/api/jobs/{job_id}/attempts",
+    "/api/jobs/{job_id}/pending-units",
+    "/api/jobs/{job_id}/reuse-hint",
+    "/api/jobs/{job_id}/status",
+    "/api/licensing/brands",
+    "/api/licensing/gate",
+    "/api/licensing/music",
+    "/api/licensing/registry",
+    "/api/production_facts/approvals/{approval_id}/revoke",
+    "/api/production_facts/capability-profiles",
+    "/api/production_facts/decisions",
+    "/api/production_facts/decisions/history",
+    "/api/production_facts/intents",
+    "/api/production_facts/intents/{intent_id}",
+    "/api/production_facts/intents/{intent_id}/derive",
+    "/api/production_facts/media",
+    "/api/production_facts/media/{media_version_id}",
+    "/api/production_facts/media/{media_version_id}/approve",
+    "/api/production_facts/media/{media_version_id}/select",
+    "/api/styles",
+    "/api/styles/resolve",
+    "/api/styles/{style_id}",
+    "/api/timeline/fingerprints/{fingerprint}",
+    "/api/timeline/revisions",
+    "/api/timeline/revisions/latest",
+    "/api/timeline/revisions/{revision_id}",
+    "/api/timeline/revisions/{revision_id}/derive",
+    "/api/timeline/revisions/{revision_id}/manifest",
+    "/api/timeline/revisions/{revision_id}/preflight",
+    "/api/timeline/revisions/{revision_id}/render",
+    "/api/timeline/revisions/{revision_id}/verify-render"
+  ],
+  "x-stats": {
+    "manual_ops": 52,
+    "operation_count": 52,
+    "path_count": 46,
+    "reflected_ops": 0
+  }
+}

@@ -155,7 +155,7 @@ export function ComfyUIPage() {
         <div className="flex items-start gap-3 rounded-lg border border-amber-500/40 bg-amber-500/10 p-4">
           <AlertTriangle className="mt-0.5 h-5 w-5 flex-shrink-0 text-amber-500" />
           <div className="text-sm">
-            <p className="font-medium text-amber-600 dark:text-amber-400">
+            <p className="font-medium text-warning-strong">
               {t('wb.cm.offline')}
             </p>
             <p className="mt-1 text-ink-3">{error || data?.error || t('wb.cm.offlineHint')}</p>
@@ -191,7 +191,7 @@ export function ComfyUIPage() {
           </div>
         </div>
         {trt?.reason && (
-          <p className="mt-3 rounded border border-amber-500/30 bg-amber-500/10 p-2 text-xs text-amber-700 dark:text-amber-300">
+          <p className="mt-3 rounded border border-warning/30 bg-warning-subtle p-2 text-xs text-warning-strong">
             {trt.reason}
           </p>
         )}
@@ -315,7 +315,7 @@ export function ComfyUIPage() {
               <div className="space-y-2">
                 <div className="flex flex-wrap items-center gap-2">
                   <h3 className="text-base font-semibold text-ink-1">{slot.label}</h3>
-                  <span className="rounded bg-black/5 px-1.5 py-0.5 font-mono text-[11px] text-ink-3 dark:bg-white/10">
+                  <span className="rounded bg-surface-2 px-1.5 py-0.5 font-mono text-[11px] text-ink-3">
                     {slot.node_type}.{slot.field}
                   </span>
                   {slot.available ? (
@@ -344,7 +344,7 @@ export function ComfyUIPage() {
                 />
 
                 {mismatch && (
-                  <div className="flex items-start gap-2 rounded border border-red-500/40 bg-red-500/10 p-2 text-xs text-red-600 dark:text-red-400">
+                  <div className="flex items-start gap-2 rounded border border-danger/40 bg-danger-subtle p-2 text-xs text-danger-strong">
                     <AlertTriangle className="mt-0.5 h-3.5 w-3.5 flex-shrink-0" />
                     <span>
                       {t('wb.cm.mismatch')}
@@ -354,7 +354,7 @@ export function ComfyUIPage() {
                 )}
 
                 {flash?.key === slot.key && (
-                  <p className={`text-xs ${flash.ok ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>
+                  <p className={`text-xs ${flash.ok ? 'text-success-strong' : 'text-danger-strong'}`}>
                     {flash.msg}
                   </p>
                 )}

@@ -38,7 +38,15 @@
 const token = (name) => `rgb(var(--${name}) / <alpha-value>)`;
 
 module.exports = {
-  darkMode: 'class',
+  // ⚠️ 刻意**不设** darkMode（2026-10-07 修正）。
+  //   原先写的是 `darkMode: 'class'`，但注入 <html> 的类名是 `.light`（浅色皮肤），
+  //   深色是 `:root` 默认 —— 项目里**不存在** `.dark` 类，该配置纯属误导：
+  //   它让人以为「主题靠 dark: 变体类切换」，而真实机制是 index.css 的
+  //   `:root` / `:root.light` **变量覆盖**。
+  //   不设 darkMode 时 Tailwind 默认 'media'；一旦有人写下 `dark:` 类，
+  //   产出的是 `@media (prefers-color-scheme: dark)`（会真的生效、跟着系统走），
+  //   而不是像 'class' 那样悄悄失效 —— 失效比响亮地错好排查。
+  //   且 `scripts/audit_tokens.py` 的 DARK001 会直接拦下任何 `dark:` 类。
   content: [
     './index.html',
     './src/**/*.{js,ts,jsx,tsx}',
@@ -47,6 +55,10 @@ module.exports = {
     extend: {
       fontFamily: {
         sans: ['PingFang SC', 'Microsoft YaHei', 'system-ui', 'sans-serif'],
+        // 编辑性标题（项目名 / 集名）：与正文分族，给「作品」一点编辑感
+        serif: ['Georgia', 'Songti SC', 'SimSun', 'serif'],
+        // 数值与技术值：seed / 时长 / 哈希 / 路径。等宽让数字等宽可逐位核对
+        mono: ['Cascadia Code', 'SFMono-Regular', 'Consolas', 'monospace'],
       },
       colors: {
         canvas: token('bg-canvas'),
@@ -54,6 +66,8 @@ module.exports = {
           DEFAULT: token('bg-surface'),
           2: token('bg-surface-2'),
         },
+        // 媒体舞台面：比 canvas 更深，用于图片/视频查看器与候选对比
+        media: token('bg-media'),
         line: {
           DEFAULT: token('border'),
           strong: token('border-strong'),
@@ -100,6 +114,21 @@ module.exports = {
           subtle: token('info-subtle'),
           strong: token('info-strong'),
         },
+        // ⚠️ 「采用 ≠ 批准」两档**独立**语义色（2026-10-07 新增）。
+        //   selected = 创作决定（这版被采用）；approved = 放行决定（人工批准）。
+        //   不变量：selected 永不显示为 approved，组件层不得混用两档的色/文案/图标。
+        //   原先 `state-done` 同时承担这两种含义，是「为什么这镜用了这一版」
+        //   无法回答的视觉根因，故拆开。
+        selected: {
+          DEFAULT: token('selected'),
+          subtle: token('selected-subtle'),
+          strong: token('selected-strong'),
+        },
+        approved: {
+          DEFAULT: token('approved'),
+          subtle: token('approved-subtle'),
+          strong: token('approved-strong'),
+        },
         state: {
           pending: token('state-pending'),
           'pending-subtle': token('state-pending-subtle'),
@@ -122,10 +151,37 @@ module.exports = {
         },
       },
       borderRadius: {
-        sm: '6px',
-        md: '10px',
-        lg: '12px',
-        xl: '16px',
+        sm: '6px',   // 控件（按钮 / 徽标）
+        DEFAULT: '8px', // 字段（input / select / textarea）—— 原先缺这一档
+        md: '10px',  // 面板
+        lg: '12px',  // 容器
+        xl: '16px',  // 大容器（弹窗等）
+      },
+      // 控件高度与触达区（§5.4）。改造前有 86 个控件不足 24px，
+      // 纯图标按钮的触达区小于 24px —— 这类目标在触屏与桌面都难以稳定命中。
+      height: {
+        control: 'var(--control-h)',         // 40px 标准
+        'control-compact': 'var(--control-h-compact)', // 36px 紧凑
+        'hit-target': 'var(--hit-target)',   // 44×44 纯图标触达区
+      },
+      minWidth: {
+        'hit-target': 'var(--hit-target)',
+      },
+      maxWidth: {
+        measure: 'var(--measure)',           // 70ch 正文可读宽度
+        shell: 'var(--shell-max)',           // 2100px 外壳上限
+        'control-field': 'var(--control-field)',
+        'control-field-lg': 'var(--control-field-lg)',
+      },
+      // 4px 基网格：4/8/12/16/24/32/48
+      spacing: {
+        1: 'var(--space-1)',
+        2: 'var(--space-2)',
+        3: 'var(--space-3)',
+        4: 'var(--space-4)',
+        6: 'var(--space-6)',
+        8: 'var(--space-8)',
+        12: 'var(--space-12)',
       },
       // 阴影指向 index.css 的 --shadow-* 变量：浅色取值与原先写死的完全一致，
       // 深色主题在 :root.dark 里覆盖为纯黑高不透明度（token 唯一真源）。
@@ -136,14 +192,24 @@ module.exports = {
         lg: 'var(--shadow-lg)',
       },
       fontSize: {
+        // 七档，与 design-system MASTER.md 的字号规范一致
         xs: ['12px', '18px'],
         sm: ['13px', '20px'],
         base: ['14px', '22px'],
         lg: ['16px', '24px'],
-        xl: ['20px', '28px'],
+        // 原先 xl=20 / 3xl=30 两档偏大且与正文层级拉不开；按 §5.4 对齐为
+        // 18 / 24 / 32（面板标题 18、页面标题 24、概览大标题 32）
+        xl: ['18px', '28px'],
         '2xl': ['24px', '32px'],
-        '3xl': ['30px', '38px'],
+        '3xl': ['32px', '40px'],
       },
+      // ⚠️ 刻意**不再**定义 fontVariantNumeric.tabular（2026-10-07 修正）。
+      //   它产出的是 `.tabular` 工具类，但全仓 13 处等宽数字用的都是 Tailwind
+      //   **内置**的 `tabular-nums`，`.tabular` 零命中 —— 死配置。
+      //   死配置比没有配置更糟：它让 MASTER「必须加 tabular 类」这句话
+      //   看起来有落地，实则没人用。文档已改为要求 `tabular-nums`。
+      //   （tailwind.config.js 现在被 audit_tokens.py 的 HEX001 真实覆盖，
+      //     因为扫描根已从 frontend/src 扩到 frontend/。）
       transitionDuration: {
         DEFAULT: '160ms',
       },

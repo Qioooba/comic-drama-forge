@@ -17,10 +17,10 @@ function fmtSize(n: number): string {
 
 function lineClass(line: string): string {
   if (line.startsWith('ERROR') || line.includes('ERROR:')) {
-    return 'text-red-600 dark:text-red-400';
+    return 'text-danger-strong';
   }
   if (line.startsWith('WARNING') || line.includes('WARNING:')) {
-    return 'text-amber-600 dark:text-amber-400';
+    return 'text-warning-strong';
   }
   if (line.startsWith('DEBUG')) return 'text-ink-3';
   return 'text-ink-2';
@@ -196,7 +196,7 @@ export function LogsPage() {
       </div>
 
       {error && (
-        <div className="rounded-lg border border-red-500/40 bg-red-500/10 p-3 text-sm text-red-600 dark:text-red-400">
+        <div className="rounded-lg border border-danger/40 bg-danger-subtle p-3 text-sm text-danger-strong">
           {error}
         </div>
       )}

@@ -386,7 +386,7 @@ export function RelationGraphTab({ projectKey }: RelationGraphTabProps) {
                   fill={isSelected ? 'rgb(var(--brand))' : 'rgb(var(--bg-surface))'}
                   stroke={isSelected ? 'rgb(var(--brand-hover))' : 'rgb(var(--border-strong))'}
                   strokeWidth="2"
-                  className="transition-all duration-200"
+                  className="transition-colors duration-200"
                 />
                 
                 {/* 角色首字母 */}

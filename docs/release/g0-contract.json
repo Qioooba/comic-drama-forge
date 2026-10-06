@@ -1,0 +1,680 @@
+{
+  "$comment": [
+    "门禁的**版本化规格**（docs/改造评估_对标LocalDramaStudio.md §P2-8）。",
+    "此前没有门禁文件，验收靠 HANDOFF_P0_20261006.md 这类 49KB 的人工叙述；",
+    "把门禁数据化之后，CI 能自动判断「这次改动有没有破坏契约」。",
+    "",
+    "⚠ **本文件当前只包含 W3（契约 / 交付 / 授权）拥有的字段。**",
+    "文件所有权属 W8（ADR + 决策可追溯）；W8 落地其余字段时请**追加**，",
+    "不要删除或覆盖下面 `w3_contract_and_delivery` 之下的内容 —— 那是被",
+    "`scripts/check_generated_client.py` 与交付门禁按名字引用的。"
+  ],
+  "contract_version": "2026-10-07.1",
+  "openapi_version": "3.1.0",
+  "w3_contract_and_delivery": {
+    "$owner": "W3",
+    "$scope": "契约优先（OpenAPI + 生成客户端）、交付与校验、授权门禁",
+    "required_components": [
+      {
+        "path": "app/contracts/openapi.py",
+        "role": "OpenAPI 3.1 规格生成（url_map 反射 + 手工 schema 补充）",
+        "required": true
+      },
+      {
+        "path": "app/domain/delivery.py",
+        "role": "交付预设、SHA-256、人工批准闸门（纯领域，不 import flask）",
+        "required": true
+      },
+      {
+        "path": "app/domain/licensing.py",
+        "role": "授权登记与交付门禁判定（纯领域，不 import flask）",
+        "required": true
+      },
+      {
+        "path": "app/infrastructure/delivery_repo.py",
+        "role": "交付包 SQLite 持久化 + 磁盘现状摘要重算",
+        "required": true
+      },
+      {
+        "path": "app/infrastructure/licensing_repo.py",
+        "role": "授权登记表加载（mtime 缓存）+ 门禁审计留痕",
+        "required": true
+      },
+      {
+        "path": "app/api/contracts.py",
+        "role": "GET /api/contracts/openapi.json 等契约端点",
+        "required": true
+      },
+      {
+        "path": "app/api/delivery.py",
+        "role": "交付预设 / 校验 / 批准端点",
+        "required": true
+      },
+      {
+        "path": "app/api/licensing.py",
+        "role": "授权登记查询与门禁预检端点",
+        "required": true
+      },
+      {
+        "path": "config/model-licensing.json",
+        "role": "模型 / 素材 / 品牌授权的唯一登记处",
+        "required": true
+      }
+    ],
+    "generated_artifacts": [
+      {
+        "path": "frontend/src/api/generated/types.ts",
+        "produced_by": "scripts/generate_client.py",
+        "hand_editable": false
+      },
+      {
+        "path": "frontend/src/api/generated/client.ts",
+        "produced_by": "scripts/generate_client.py",
+        "hand_editable": false,
+        "note": "错误脱敏逻辑（readError，源自 client.ts:37-40）在此文件内，迁移时不可丢"
+      },
+      {
+        "path": "frontend/src/api/generated/index.ts",
+        "produced_by": "scripts/generate_client.py",
+        "hand_editable": false
+      },
+      {
+        "path": "frontend/src/api/generated/openapi.snapshot.json",
+        "produced_by": "scripts/generate_client.py",
+        "hand_editable": false
+      },
+      {
+        "path": "frontend/src/api/generated/manifest.json",
+        "produced_by": "scripts/generate_client.py",
+        "hand_editable": false,
+        "note": "含 contract_version 与 spec_hash，前端启动闸门据此判断客户端是否过期"
+      }
+    ],
+    "required_schema_versions": {
+      "delivery": 1,
+      "model_licensing": 1,
+      "openapi_contract": "2026-10-07.1"
+    },
+    "quality_gates": [
+      {
+        "id": "generated-client-fresh",
+        "command": "python scripts/check_generated_client.py",
+        "expect_exit_code": 0,
+        "fails_when": "生成物与规格不一致（有人手改了生成物，或改了后端忘了重新生成）",
+        "safety": "不启动服务 / 不连 ComfyUI / 不碰 GPU / 默认不 import app"
+      },
+      {
+        "id": "contract-coverage",
+        "command": "python scripts/check_generated_client.py",
+        "expect_exit_code": 0,
+        "fails_when": "contracts/delivery/licensing 三个蓝图里存在没有 OpenAPI operation 的路由",
+        "safety": "同上；在只注册这三个蓝图的裸 Flask app 上自检"
+      }
+    ],
+    "invariants": [
+      "采用 ≠ 批准：机器校验（verified）永不隐式升级为人工批准（approved）",
+      "人工批准必须带操作者；缺操作者一律拒绝（DLV-APPROVER-REQUIRED）",
+      "批准与交付包内容哈希绑定；内容变则批准自动失效（DLV-APPROVAL-STALE）",
+      "失效判定必须按磁盘现状摘要，而不是清单基线",
+      "未登记授权的模型/素材不得进入交付（LIC-MODEL-UNREGISTERED / LIC-UNREGISTERED-ASSET）",
+      "授权登记表读不出来时按最严口径阻断（LIC-REGISTRY-MISSING）",
+      "生成物禁止手改；改动契约的流程是 改后端 → 重跑 generate_client.py"
+    ],
+    "error_codes": {
+      "$note": "稳定错误码，前端按码分支不解析文案。既有 app/failure_codes.py 的 F-* 体系未改动一个字。",
+      "delivery": {
+        "DLV-EMPTY-PACKAGE": "",
+        "DLV-FILE-MISSING": "",
+        "DLV-HASH-MISMATCH": "",
+        "DLV-APPROVAL-STALE": "",
+        "DLV-APPROVER-REQUIRED": "",
+        "DLV-APPROVER-NOT-HUMAN": "批准者不是人工主体（机器账号/自动化身份一律 403）—— 2026-10-07 审核 P0-3 新增",
+        "DLV-ALREADY-APPROVED": "",
+        "DLV-UNKNOWN-PACKAGE": "",
+        "DLV-NOT-BUILT": ""
+      },
+      "licensing": {
+        "LIC-REGISTRY-MISSING": "授权登记表缺失或格式非法，已按最严口径阻断交付",
+        "LIC-MODEL-UNREGISTERED": "模型未登记授权，不得进入交付",
+        "LIC-MODEL-NONCOMMERCIAL": "模型许可禁止商用，不得进入交付",
+        "LIC-LICENSE-UNVERIFIED": "模型/素材授权待核实，未确认可商用，不得进入交付",
+        "LIC-ATTRIBUTION-MISSING": "该授权要求署名，交付包未提供署名文本",
+        "LIC-UNREGISTERED-ASSET": "音乐/素材未登记授权，不得进入交付",
+        "LIC-ASSET-NONCOMMERCIAL": "音乐/素材许可禁止商用，不得进入交付",
+        "LIC-BRAND-UNRESOLVED": "品牌与水印版本不存在或未启用，不得进入交付",
+        "LIC-GATE-BLOCKED": "授权门禁未通过"
+      }
+    }
+  },
+  "spec_version": "2026-10-07",
+  "spec_note": "本节由 W8 追加。与 contract_version 的区别：contract_version 随 W3 的契约/交付/授权变更，spec_version 随本文件自身的字段集变更。",
+  "required_components": {
+    "$note": "本轮新增 / 改动的组件清单（W3 拥有的三个蓝图见 w3_contract_and_delivery.required_components，不在此重复）。",
+    "items": [
+      {
+        "path": "app/app.py",
+        "role": "composition root：create_app + 蓝图注册 + 错误处理 + SPA 回退",
+        "required": true,
+        "owner": "W1",
+        "adr": "ADR-0001"
+      },
+      {
+        "path": "app/api/__init__.py",
+        "role": "pkgutil 自动发现 + fail-closed 蓝图注册器",
+        "required": true,
+        "owner": "W1",
+        "adr": "ADR-0001",
+        "note": "由协调者写定，任何 agent 不得修改"
+      },
+      {
+        "path": "app/api/_shared.py",
+        "role": "共享 runtime：app 实例 / 历史 helper / config 常量",
+        "required": true,
+        "owner": "W1",
+        "adr": "ADR-0001",
+        "note": "其余 agent 只读；11,144 总行 / 10,343 非空行是已知遗留，见 reserved_for_w8.shared-helper-module-debt"
+      },
+      {
+        "path": "app/api/{projects,novels,script,assets,storyboard,video,audio,qc,agent,ops}.py",
+        "role": "10 个既有域的蓝图搬迁",
+        "required": true,
+        "owner": "W1",
+        "adr": "ADR-0001"
+      },
+      {
+        "path": "app/domain/production_facts.py",
+        "role": "GenerationIntent / MediaVersion / Selection / Approval / CapabilityProfile",
+        "required": true,
+        "owner": "W2",
+        "adr": "ADR-0002"
+      },
+      {
+        "path": "app/domain/timeline.py",
+        "role": "TimelineRevision / compose_fingerprint / RenderManifest.declare_silence",
+        "required": true,
+        "owner": "W2",
+        "adr": "ADR-0012"
+      },
+      {
+        "path": "app/domain/jobs.py",
+        "role": "Job / Attempt 两级任务语义 + 磁盘产物判据 + workflow_hash 复用",
+        "required": true,
+        "owner": "W2",
+        "adr": "ADR-0005"
+      },
+      {
+        "path": "app/domain/__init__.py",
+        "role": "领域层聚合（纯领域，不 import flask）",
+        "required": true,
+        "owner": "W2"
+      },
+      {
+        "path": "app/infrastructure/facts_repo.py",
+        "role": "facts.db 持久化 + 幂等迁移",
+        "required": true,
+        "owner": "W2",
+        "adr": "ADR-0002"
+      },
+      {
+        "path": "app/infrastructure/timeline_repo.py",
+        "role": "timeline_revisions 持久化（与 facts 同库不同表，append-only）",
+        "required": true,
+        "owner": "W2",
+        "adr": "ADR-0012"
+      },
+      {
+        "path": "app/infrastructure/jobs_repo.py",
+        "role": "jobs.db 持久化 + 乐观锁",
+        "required": true,
+        "owner": "W2",
+        "adr": "ADR-0005"
+      },
+      {
+        "path": "app/application/{production,timeline_service,jobs_service}.py",
+        "role": "编排层",
+        "required": true,
+        "owner": "W2"
+      },
+      {
+        "path": "app/api/{production_facts,timeline,jobs}.py",
+        "role": "三个新域蓝图",
+        "required": true,
+        "owner": "W2"
+      },
+      {
+        "path": "app/style_catalog.json",
+        "role": "61 风格 + 8 画幅的后端唯一事实源",
+        "required": true,
+        "owner": "W4",
+        "adr": "ADR-0008"
+      },
+      {
+        "path": "app/domain/style_catalog.py",
+        "role": "风格目录领域模型",
+        "required": true,
+        "owner": "W4",
+        "adr": "ADR-0008"
+      },
+      {
+        "path": "app/infrastructure/style_catalog_repo.py",
+        "role": "风格目录读取",
+        "required": true,
+        "owner": "W4",
+        "adr": "ADR-0008"
+      },
+      {
+        "path": "app/api/styles.py",
+        "role": "GET /api/styles",
+        "required": true,
+        "owner": "W4",
+        "adr": "ADR-0008"
+      },
+      {
+        "path": "frontend/src/features/style/**",
+        "role": "消费 /api/styles 的画廊组件（StyleGallery / useStyles / api）",
+        "required": true,
+        "owner": "W4",
+        "adr": "ADR-0008"
+      },
+      {
+        "path": "design-system/comicdrama/MASTER.md",
+        "role": "设计规范：祈使句不变量",
+        "required": true,
+        "owner": "W6",
+        "adr": "ADR-0011"
+      },
+      {
+        "path": "design-system/comicdrama/pages/quick-create.md",
+        "role": "交互不变量（含 Interaction invariants）",
+        "required": true,
+        "owner": "W6",
+        "adr": "ADR-0011"
+      },
+      {
+        "path": "design-system/comicdrama/pages/diagnostics.md",
+        "role": "诊断页规范",
+        "required": true,
+        "owner": "W6",
+        "adr": "ADR-0011"
+      },
+      {
+        "path": "frontend/src/index.css",
+        "role": "令牌重构：深色默认、浅色降为 :root.light",
+        "required": true,
+        "owner": "W6",
+        "adr": "ADR-0003"
+      },
+      {
+        "path": "frontend/tailwind.config.js",
+        "role": "令牌映射 + --selected / --approved 两档",
+        "required": true,
+        "owner": "W6",
+        "adr": "ADR-0002",
+        "adr_note": "selected/approved 两档由 ADR-0002 要求，落在 W6 的令牌文件"
+      },
+      {
+        "path": "scripts/audit_tokens.py",
+        "role": "令牌一致性审计（HEX001/DARK001/TRANS001/TOKEN001/SEL001）",
+        "required": true,
+        "owner": "W6",
+        "adr": "ADR-0011"
+      },
+      {
+        "path": "scripts/fix_transition_all.py",
+        "role": "TRANS001 的批量处置工具（**不是门禁**）：收敛 transition-all -> transition-colors，并把确属 transform/opacity 语义的处数列出来供人工确认。ADR-0003/0011 把它作为「豁免该报哪几处」的成文约定，故保留而非删除 —— TRANS001 已两次对新代码触发（W4 的 StyleGallery、W6 的批量收敛），复发即复用。",
+        "required": true,
+        "owner": "W6",
+        "adr": "ADR-0011",
+        "caveat": "它是改码脚本不是检查脚本：把 transition-all 收敛成 transition-colors 会**静默改变**那些实际过渡 border-radius / grid-template-columns 等非颜色属性的元素。默认应先跑 --dry-run 复核。"
+      },
+      {
+        "path": "app/audio_qc_ai.py",
+        "role": "音频 AI 质检层：频谱 + 波形 → 多模态语义复核",
+        "required": true,
+        "owner": "W7"
+      },
+      {
+        "path": "scripts/diagnose_readonly.py",
+        "role": "只读诊断链：SQLite mode=ro + query_only，不启动服务 / 不探显卡 / 不提交任务",
+        "required": true,
+        "owner": "W8",
+        "adr": "ADR-0005"
+      }
+    ]
+  },
+  "generated_artifacts": [
+    {
+      "path": "frontend/src/api/generated/types.ts",
+      "produced_by": "scripts/generate_client.py",
+      "hand_editable": false
+    },
+    {
+      "path": "frontend/src/api/generated/client.ts",
+      "produced_by": "scripts/generate_client.py",
+      "hand_editable": false,
+      "note": "错误脱敏逻辑 readError 在此文件内，迁移时不可丢"
+    },
+    {
+      "path": "frontend/src/api/generated/index.ts",
+      "produced_by": "scripts/generate_client.py",
+      "hand_editable": false
+    },
+    {
+      "path": "frontend/src/api/generated/openapi.snapshot.json",
+      "produced_by": "scripts/generate_client.py",
+      "hand_editable": false
+    },
+    {
+      "path": "frontend/src/api/generated/manifest.json",
+      "produced_by": "scripts/generate_client.py",
+      "hand_editable": false,
+      "note": "含 contract_version 与 spec_hash，前端启动闸门据此判断客户端是否过期"
+    },
+    {
+      "path": "_route_snapshot_before.json",
+      "produced_by": "scripts/snapshot_routes.py",
+      "hand_editable": false,
+      "note": "URL 契约基线（协调书 §5：252 rules），url-contract 门禁的比对基准",
+      "gitignored": true,
+      "caveat": "⚠ 基线**不进版本库**（/.gitignore 的 `/_route_snapshot_*.json`）—— 它是「本机改造前」的路由快照，换机器克隆后不存在。新克隆要跑 url-contract 门禁，必须先在**未改造**的提交上跑一次 `python scripts/snapshot_routes.py _route_snapshot_before.json` 生成基线，再改代码；拿现 HEAD 当基线会让 LOST 恒为 0，门禁空转通过。"
+    }
+  ],
+  "generated_artifacts_note": "与 w3_contract_and_delivery.generated_artifacts 为同一份清单的两种视角：W3 块是契约/交付/授权侧的权威记录，本节是「全部生成物」的视角（含路由快照基线）。两处不一致时以 w3 块为准，并由 check_generated_client.py 兜底。",
+  "required_schema_versions": {
+    "facts_repo": 1,
+    "timeline_repo": 1,
+    "jobs_repo": 1,
+    "style_catalog": 1,
+    "delivery": 1,
+    "model_licensing": 1,
+    "openapi_contract": "2026-10-07.1",
+    "$note": "前三个是 SQLite 库内 schema_version 表登记的 module 版本；style_catalog 读自 app/style_catalog.json；delivery / model_licensing 见 w3_contract_and_delivery.required_schema_versions（常量式，非库内登记表）。"
+  },
+  "migration_heads": {
+    "$note": "expected_heads 是各库 schema_version 表里**每个 module 的已应用 head**。低于此值 = 迁移未跑完；高于此值 = 库比代码新，需要人判断。",
+    "expected_heads": {
+      "output/facts.db": {
+        "facts_repo": 1,
+        "timeline_repo": 1
+      },
+      "output/jobs.db": {
+        "jobs_repo": 1
+      }
+    },
+    "constant_heads": {
+      "output/tasks.db": {
+        "note": "既有库（断点续跑 + 串行队列的真源），本轮未改动，无版本化迁移 —— 见 ADR-0005「收敛语义 ≠ 收敛真源」"
+      },
+      "output/delivery/delivery.db": {
+        "delivery": 1
+      },
+      "output/delivery/licensing_audit.db": {
+        "licensing_audit": 1
+      },
+      "app/style_catalog.json": {
+        "style_catalog": 1
+      },
+      "config/model-licensing.json": {
+        "model_licensing": 1
+      }
+    }
+  },
+  "quality_gates": [
+    {
+      "id": "url-contract",
+      "command": "MJSCXT_AUTOPILOT=0 python scripts/snapshot_routes.py BASE --diff NOW",
+      "steps": [
+        "$env:MJSCXT_AUTOPILOT='0'",
+        "python scripts/snapshot_routes.py _route_snapshot_now.json",
+        "python scripts/snapshot_routes.py _route_snapshot_before.json --diff _route_snapshot_now.json"
+      ],
+      "expect_exit_code": 0,
+      "fails_when": "既有 URL 逐字变化（协调书 R1：前端 1508 行全靠字符串拼 URL，改一个字符就 404）",
+      "compare": "只比对路径 + 方法；endpoint 名允许随蓝图改名而变（ADR-0001）",
+      "baseline": "_route_snapshot_before.json（252 rules）",
+      "safety": "MJSCXT_AUTOPILOT=0 必设，否则 import 会触发 autopilot 托管恢复、会真的续跑生产；不启动服务 / 不连 ComfyUI / 不碰 GPU"
+    },
+    {
+      "id": "token-audit",
+      "command": "python scripts/audit_tokens.py --strict",
+      "expect_exit_code": 0,
+      "fails_when": "组件层出现 hex/rgba 字面量（HEX001）、dark: 变体（DARK001）、长列表 transition-all（TRANS001）、深浅两套皮肤令牌集不对齐（TOKEN001）",
+      "note": "SEL001 是提醒级（仅警告），故意不硬失败：Shot Studio 里「采用」与「批准」两个独立按钮合法地共现，硬报错会逼出白名单（ADR-0011）",
+      "safety": "纯静态扫描，不启动服务 / 不连 ComfyUI / 不碰 GPU"
+    },
+    {
+      "id": "generated-fresh",
+      "command": "python scripts/check_generated_client.py --require-ts",
+      "expect_exit_code": 0,
+      "fails_when": "生成物与 OpenAPI 规格不一致（有人手改了生成物，或改了后端忘了重跑 generate_client.py）；以及 contracts/delivery/licensing 三个蓝图里存在没有 OpenAPI operation 的路由",
+      "safety": "不启动服务 / 不连 ComfyUI / 不碰 GPU / 默认不 import app",
+      "adr": "ADR-0004",
+      "note": "--require-ts：缺 typescript 时 fail-closed，而不是静默跳过类型检查"
+    },
+    {
+      "id": "frontend-types",
+      "command": "cd frontend && npx tsc --noEmit",
+      "expect_exit_code": 0,
+      "fails_when": "前端类型不成立（消费生成客户端的强类型响应、路由表、query key 时出错）",
+      "safety": "纯类型检查，不构建、不启服务"
+    },
+    {
+      "id": "readonly-diagnose",
+      "command": "MJSCXT_AUTOPILOT=0 python scripts/diagnose_readonly.py",
+      "expect_exit_code": 0,
+      "fails_when": "**几乎不失败** —— 库不存在 / 被锁 / 表缺失都只报告不阻断，退出码恒为 0",
+      "checks": "按磁盘现状读 output/{tasks,facts,jobs}.db 与 output/delivery/{delivery,licensing_audit}.db，打印各域登记状态 + schema_version",
+      "readonly_guarantee": "SQLite URI 真带 mode=ro（uri=True，否则 file:... 会被当成普通文件名并静默建空库）+ PRAGMA query_only=1 双保险；只执行 SELECT；不启动服务 / 不连 ComfyUI / 不探显卡 / 不提交任务 / 不建目录",
+      "not_an_acceptance_gate": "⚠ 诊断不等于验收。它只回答「库里登记了什么」，不替代授权门禁判定、人工批准有效性、workflow_hash 免重渲判据或任何成片质量判断。真正的验收是本文件 quality_gates 里其他四条。",
+      "safety": "只读，符合 R3（禁止 GPU / ComfyUI）",
+      "adr": "ADR-0005"
+    }
+  ],
+  "quality_gates_note": "五条里只有 readonly-diagnose 的退出码不表达健康度 —— 它刻意恒为 0，因为诊断工具不该因数据缺失而失败（否则在 CI 里会变成噪音）。其余四条 expect_exit_code 0 即通过。",
+  "decision_index": {
+    "$note": "决策 → 门禁的反向索引：想知道某条 ADR 由哪道门禁兜底时查这里。",
+    "ADR-0001": [
+      "url-contract"
+    ],
+    "ADR-0002": [
+      "token-audit",
+      "frontend-types"
+    ],
+    "ADR-0003": [
+      "token-audit"
+    ],
+    "ADR-0004": [
+      "generated-fresh",
+      "frontend-types"
+    ],
+    "ADR-0005": [
+      "readonly-diagnose",
+      "url-contract"
+    ],
+    "ADR-0006": [
+      "readonly-diagnose"
+    ],
+    "ADR-0007": [
+      "readonly-diagnose"
+    ],
+    "ADR-0008": [
+      "frontend-types"
+    ],
+    "ADR-0009": [
+      "frontend-types"
+    ],
+    "ADR-0010": [
+      "frontend-types"
+    ],
+    "ADR-0011": [
+      "token-audit"
+    ],
+    "ADR-0012": [
+      "readonly-diagnose"
+    ]
+  },
+  "adr_directory": "docs/decisions/ADR-00{01..12}.*.md",
+  "$filled_by_w8": {
+    "$note": "W8 已追加的顶层键（回应下方 $reserved_for_w8 的交接清单）。w3_contract_and_delivery 块及其 $reserved_for_w8 原文**未被修改**，仅在其后追加。",
+    "keys_added": [
+      "spec_version",
+      "required_components",
+      "generated_artifacts",
+      "required_schema_versions",
+      "migration_heads",
+      "quality_gates",
+      "quality_gates_note",
+      "decision_index",
+      "adr_directory",
+      "reserved_for_w8"
+    ]
+  },
+  "reserved_for_w8": {
+    "$note": "以下项目**不在本轮范围内**，如实列出以免被误认为已完成。",
+    "pending_components": [
+      {
+        "path": "frontend/src/router.tsx",
+        "owner": "W5",
+        "adr": "ADR-0009",
+        "state": "refreshed 2026-10-07（收口审核按实测刷新）"
+      },
+      {
+        "path": "frontend/src/routes/**（含旧 hash 301 退役层）",
+        "owner": "W5",
+        "adr": "ADR-0009",
+        "state": "refreshed 2026-10-07（收口审核按实测刷新）"
+      },
+      {
+        "path": "frontend/src/api/queryClient.ts",
+        "owner": "W5",
+        "adr": "ADR-0010",
+        "state": "refreshed 2026-10-07（收口审核按实测刷新）"
+      },
+      {
+        "path": "frontend/src/api/queries/**",
+        "owner": "W5",
+        "adr": "ADR-0010",
+        "state": "refreshed 2026-10-07（收口审核按实测刷新）"
+      },
+      {
+        "path": "frontend/src/layouts/{AppShell,EpisodeContextBar}.tsx",
+        "owner": "W5",
+        "state": "refreshed 2026-10-07（收口审核按实测刷新）"
+      },
+      {
+        "path": "frontend/src/features/{storyboard,qc,audio,output,upscale,relation,agent,overview}/**",
+        "owner": "W5",
+        "state": "refreshed 2026-10-07（收口审核按实测刷新）"
+      }
+    ],
+    "open_items": [
+      {
+        "id": "safe-suite-vs-hardware-split",
+        "from": "评估文档 §P2-8 第 3 件",
+        "detail": "「安全集 / 真实硬件集分离」：CI 能跑什么 vs 真机才能跑什么的显式边界（如 MJSCXT 禁 GPU 开关 + pytest marker 过滤 + 退出时恢复原值）。本轮**无人认领**，未实现。",
+        "state": "open"
+      },
+      {
+        "id": "workflow-hash-64",
+        "adr": "ADR-0005",
+        "detail": "comfyui_job_store.workflow_hash 历史截断到 32 位，与 ADR-0002 的 intent_hash / bound_hash（满 64 位）口径不一致；截断后可被人为构造碰撞。建议统一到 64 位。",
+        "state": "open（不在本轮文件范围内）"
+      },
+      {
+        "id": "shared-py-split",
+        "adr": "ADR-0001",
+        "detail": "app/api/_shared.py 仍有 11,144 总行 / 10,343 非空行（212 个跨域共用 helper）。本轮不拆，因为那需要真实测试覆盖兜底，而本轮明确「只实现 + 审核，不写测试」（R4）。",
+        "state": "fixed（2026-10-07 已修，见 ADR-0011/0004）"
+      },
+      {
+        "id": "timeline-revision-retention",
+        "adr": "ADR-0012",
+        "detail": "TimelineRevision 无清理 / 归档策略，长剧项目会累积大量 revision。",
+        "state": "open"
+      },
+      {
+        "id": "style-label-migration",
+        "adr": "ADR-0008",
+        "detail": "style_id 解析与旧 label 自由文本路由两条路径并存，等历史 config.style 数据迁完后才可收敛。",
+        "state": "open（向后兼容的必要代价）"
+      },
+      {
+        "id": "generated-client-duplicate-export",
+        "owner": "W3",
+        "adr": "ADR-0004",
+        "detail": "frontend/src/api/generated/index.ts:14-30 有 15 处 Duplicate identifier（contractsApi x3 / deliveryApi x8 / licensingApi x4）。根因：scripts/generate_client.py 按每个 operation 追加导出名，未去重。修法：生成时 sorted(set(...))。注意 check_generated_client.py **PASS**（生成物与规格一致），只有 frontend-types 能抓到 —— 故两道门禁不冗余。",
+        "gate": "generated-fresh（已加 --require-ts）",
+        "state": "fixed（2026-10-07 已修，见 ADR-0011/0004）",
+        "followup": "g0-contract 的 generated-fresh 命令需追加 --require-ts"
+      },
+      {
+        "id": "token-audit-transition-all-stylegallery",
+        "owner": "W4",
+        "adr": "ADR-0011",
+        "detail": "scripts/audit_tokens.py --strict 实测 exit 1：TRANS001 在 frontend/src/features/style/StyleGallery.tsx:125 检出 1 处长列表 transition-all。W6 收敛 21 处后 PASS，W4 新建组件又引入 1 处 —— 静态门禁对新代码持续生效。修法二选一（由 W4 决定）：改 transition-[transform,opacity]，或按 fix_transition_all.py 既有约定豁免。",
+        "gate": "token-audit",
+        "state": "fixed（2026-10-07 已修，见 ADR-0011/0004）"
+      },
+      {
+        "id": "frontend-features-split-not-implemented",
+        "owner": "W5",
+        "adr": "ADR-0009/0010",
+        "detail": "frontend/src/features/ 下除 style 外无任何域目录（agent/audio/output/qc/shot-studio/storyboard 已确认为空并删除）；ProjectWorkbenchPage.tsx 仍 5,429 行/247KB。TanStack Query 已在 package.json 但前端零引用，工作台 15 处 setInterval 仍在。路由骨架与 301 退役层已落地。",
+        "gate": "frontend-types",
+        "state": "open（2026-10-07 收口审核确认未实施）"
+      },
+      {
+        "id": "selected-not-approved-ui-gap",
+        "owner": "W5",
+        "adr": "ADR-0002",
+        "detail": "采用!=批准在 domain 层与 API 层均成立（select/approve 是两个独立端点；未采用 409 / 机器账号 403），但 frontend/src 对 production_facts / decision_state / selected_not_approved 零引用 —— 用户看不到「已采用未批准」这一状态。",
+        "gate": "manual",
+        "state": "open（2026-10-07 收口审核确认）"
+      },
+      {
+        "id": "timeline-not-consumed-by-render",
+        "owner": "W2",
+        "adr": "ADR-0012",
+        "detail": "TimelineRevision/preflight/compose_fingerprint 已实现，且渲染消费链已补上：domain/timeline.py 的 build_compose_plan() / build_episode_render_version()，application/timeline_service.py 的 compose_plan_to_ffmpeg_args()（纯函数），video_postprocess.py 新增的 render_from_plan() / validate_render_plan()，以及 POST /api/timeline/revisions/<id>/render（复用 require_human_authorization）。⚠️ 对 video_postprocess.py 的改动是「新增为主」而非严格「仅追加」：git diff --numstat = 242 added / 1 deleted，那 1 行删除是第 14 行 typing import（补 Any）；除此之外没有任何既有函数体被修改，故既有行为不变。",
+        "gate": "manual",
+        "state": "partial（2026-10-07 收口审核前由渲染消费 Agent 落地；同日审计查出 6 处缺陷已修；下列 residual 前 5 项仍未接上，第 6 项是指纹值变更说明）",
+        "residual": [
+          "旧渲染路径仍是默认分支 —— render_from_plan() 需显式开启（POST /api/timeline/revisions/<id>/render），生产流程尚未切过去",
+          "compose_plan_to_ffmpeg_args() 的 xfade / acrossfade offset 递推、以及本轮修正的 atrim 累计值，只做了纯逻辑断言，**从未真正跑过 ffmpeg** —— 首次启用必须渲一段短样片逐帧核对（受 R3 禁 GPU 约束，本轮无法验证）",
+          "EpisodeRenderVersion 只随端点响应返回，**连内存里都不持有**（不是「无落库表」那么弱）：请求结束即丢，进程重启更丢，跨请求查不回",
+          "字幕仍与后期混在同一条路径，compose_plan 未把字幕作为独立图层解耦（subtitle_revision 只是挂在计划上的引用）",
+          "compose_fingerprint 与 render_from_plan() 的绑定尚未接入 workflow_hash 免重渲判据 —— 即冻结计划变了，旧计划渲出的成片仍会被判为「无需重渲」",
+          "2026-10-07 修复轮把 total_duration_sec 与 compose_fingerprint 纳入 plan_fingerprint 载荷，**指纹值因此改变**；该路径为 opt-in 新端点、从未有生产渲染走过，故无历史指纹需迁移，但任何已按旧指纹做过比对的人工记录都需重算"
+        ]
+      },
+      {
+        "id": "jobs-dual-store-not-converged",
+        "owner": "W2",
+        "adr": "ADR-0005",
+        "detail": "两套任务语义并存且真源未收敛：app/task_store.py → output/tasks.db（既有断点续跑 + 串行队列的真源，无版本化迁移），app/infrastructure/jobs_repo.py → output/jobs.db（新 Job/Attempt 两级模型，有 schema_version=1）。W2 只收敛了**语义**（Job/Attempt、磁盘产物判据、workflow_hash 复用），没有收敛**真源** —— 「任务失败算谁的」目前仍含糊：旧真源认 exit code，新模型认 attempt 落库状态，两者对同一失败可能给出不同结论。ADR-0005 已明确「收敛语义 ≠ 收敛真源」，本轮登记为未做。",
+        "gate": "manual",
+        "state": "open",
+        "risk": "高。query_only 只读诊断会同时报告两库，某个任务在 jobs.db 记 failed 而在 tasks.db 记 running 的窗口是存在的；调用方若按 job_id 取状态会拿到过期结论。"
+      },
+      {
+        "id": "shared-helper-module-debt",
+        "owner": "W1",
+        "adr": "ADR-0001",
+        "detail": "app/api/_shared.py 11,144 总行 / 10,343 非空行，含全部 212 个 helper。ADR-0001 已记录继续拆的顺序与判据，本轮未拆（无测试护栏下动 212 个函数归属风险高于收益）。",
+        "gate": "url-contract",
+        "state": "open（已记录，非阻塞）"
+      }
+    ],
+    "contract_gate_note": "generated-fresh 门禁原先只注册 3 个蓝图而 MANUAL_BLUEPRINTS 声称 7 个，属空转通过；2026-10-07 已改为注册全部 7 域并豁免 3 个 /health 运维探针。"
+  },
+  "$reserved_for_w8": {
+    "$note": "以下顶层键属 W8（ADR + 决策可追溯）与 W2（领域仓储迁移），本轮 W3 未创建，留空由该 owner 追加：",
+    "keys": [
+      "required_components",
+      "generated_artifacts",
+      "required_schema_versions",
+      "migration_heads.expected_heads",
+      "quality_gates"
+    ]
+  }
+}

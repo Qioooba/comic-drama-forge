@@ -30,6 +30,8 @@ import type {
   VideoRetryBatchResponse,
   ShotGridStartResponse,
   ShotGridApplyResponse,
+  ProductionMediaVersion,
+  ProductionDecisionState,
 } from '../types';
 
 const API_BASE = '/api';
@@ -1579,5 +1581,85 @@ export const qualityApi = {
   /** 批准预演产物 → 安排正式生产（两级生产第二阶段） */
   approvePreview: (data: { project: string; episode_no: number; note?: string }) =>
     request<{ success: boolean }>('/videos/preview/approve', { method: 'POST', body: JSON.stringify(data) }),
+};
+
+// --- 生成事实：采用 / 批准（ADR-0002「采用 ≠ 批准」） ------------------------
+//
+// 为什么单独一组而不是并进 qualityApi
+// ----------------------------------
+// 这两个动作是**有审计留痕的事实写入**，不是「质量状态位」。
+// `qualityApi.setStage` 改的是四层状态标记，这里写的是 SelectionDecision /
+// ApprovalDecision 两类独立实体 —— 合并会让「状态位」与「决策记录」在调用方
+// 眼里变成同一个东西，而把两者混为一谈正是 ADR-0002 要根除的问题。
+//
+// ⚠️ 铁律 1：`select` 与 `approve` 是**两个独立端点**，本文件保持它们分离，
+//    不提供任何 `selectAndApprove` 之类的合并封装 —— 合并入口就是「采用
+//    隐式升级为批准」在客户端层面的复活。
+export const productionFactsApi = {
+  /**
+   * 候选版本列表（每条都带**独立的** selected / approved 字段）。
+   * 供候选比较与 Shot Studio 渲染决策态用。
+   */
+  listMedia: (intentId?: string) =>
+    request<{
+      success: boolean;
+      media_versions: ProductionMediaVersion[];
+      count: number;
+    }>(`/production_facts/media${intentId ? `?intent_id=${encodeURIComponent(intentId)}` : ''}`),
+
+  /** 单个候选 + 三态汇总（decision 是 `domain.production_facts.decision_state` 的直出结构） */
+  getMedia: (mediaVersionId: string) =>
+    request<{
+      success: boolean;
+      media_version: ProductionMediaVersion;
+      decision: ProductionDecisionState;
+    }>(`/production_facts/media/${encodeURIComponent(mediaVersionId)}`),
+
+  /**
+   * 记录**采用**（创作决定）。
+   *
+   * ⚠️ `reason` 后端强制必填（否则 400）—— 不写理由就等于无法回答
+   *    「这镜为什么用这一版」，而那正是引入 SelectionDecision 的目的。
+   * ⚠️ 本方法**只**写采用记录。它不会、也无法产生批准记录。
+   */
+  select: (mediaVersionId: string, data: {
+    reason: string;
+    decided_by?: string;
+    project?: string;
+    episode?: string;
+    shot_key?: string;
+    subject_type?: string;
+    subject_id?: string;
+  }) =>
+    request<{ success: boolean }>(
+      `/production_facts/media/${encodeURIComponent(mediaVersionId)}/select`,
+      { method: 'POST', body: JSON.stringify(data) }),
+
+  /**
+   * 记录**批准**（放行决定）。
+   *
+   * ⚠️ `authorized_by` 后端强制必填（缺参 400）；机器账号 403；
+   *    未采用就批准 409；产物内容已变（哈希失配）403。
+   *    前端**不做**任何自动填充 —— 代填一个人名等于替用户伪造人工授权，
+   *    那会让审批记录看起来有人负责，实际没有。
+   */
+  approve: (mediaVersionId: string, data: {
+    authorized_by: string;
+    reason?: string;
+    authorization_ref?: string;
+    scope?: string;
+    note?: string;
+    subject_type?: string;
+    subject_id?: string;
+  }) =>
+    request<{ success: boolean }>(
+      `/production_facts/media/${encodeURIComponent(mediaVersionId)}/approve`,
+      { method: 'POST', body: JSON.stringify(data) }),
+
+  /** 撤销批准（同样要求人工主体 + 理由） */
+  revokeApproval: (approvalId: string, data: { revoked_by: string; reason: string }) =>
+    request<{ success: boolean }>(
+      `/production_facts/approvals/${encodeURIComponent(approvalId)}/revoke`,
+      { method: 'POST', body: JSON.stringify(data) }),
 };
 

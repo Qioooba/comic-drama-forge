@@ -134,7 +134,7 @@ export function Navbar() {
             onClick={() => setShowThemeMenu(!showThemeMenu)}
             aria-label={t('theme.label')}
             title={t('theme.label')}
-            className={`flex shrink-0 items-center gap-2 rounded-md border border-brand/20 bg-brand-subtle px-2.5 py-1.5 text-brand transition-all duration-200 hover:bg-brand/10 hover:shadow-md sm:px-3 ${FOCUS_RING}`}
+            className={`flex shrink-0 items-center gap-2 rounded-md border border-brand/20 bg-brand-subtle px-2.5 py-1.5 text-brand transition-colors duration-200 hover:bg-brand/10 sm:px-3 ${FOCUS_RING}`}
           >
             {THEME_ICONS[themeMode]}
             <span className="hidden text-sm font-medium sm:inline">{t(`theme.${themeMode}`)}</span>
@@ -167,7 +167,7 @@ export function Navbar() {
         <div className="relative">
           <button
             onClick={() => setShowLangMenu(!showLangMenu)}
-            className={`flex shrink-0 items-center gap-2 rounded-md border border-brand/20 bg-brand-subtle px-2.5 py-1.5 text-brand transition-all duration-200 hover:bg-brand/10 hover:shadow-md sm:px-3 ${FOCUS_RING}`}
+            className={`flex shrink-0 items-center gap-2 rounded-md border border-brand/20 bg-brand-subtle px-2.5 py-1.5 text-brand transition-colors duration-200 hover:bg-brand/10 sm:px-3 ${FOCUS_RING}`}
           >
             <span>{lang === 'zh-CN' ? '🇨🇳' : '🇺🇸'}</span>
             <span className="hidden text-sm font-medium sm:inline">{lang === 'zh-CN' ? t('lang.zh-CN') : 'English'}</span>

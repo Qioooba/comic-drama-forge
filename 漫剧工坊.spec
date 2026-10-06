@@ -19,17 +19,29 @@ from PyInstaller.utils.hooks import collect_submodules, collect_data_files
 _ROOT = os.path.dirname(os.path.abspath(SPEC))
 _APP_DIR = os.path.join(_ROOT, 'app')
 sys.path.insert(0, _APP_DIR)
-for _probe in ('serve', 'app', 'providers', 'env_loader', 'fs_atomic'):
+for _probe in ('serve', 'app', 'providers', 'env_loader', 'fs_atomic', 'api'):
     import importlib as _il
     _il.import_module(_probe)  # 任一失败 → spec 阶段直接崩，fail fast（不产生半残 exe）
 hidden_imports = [
     # 显式：providers 子包（裸名）+ 运行时被裸 import 的关键模块
     'providers', 'providers.base', 'providers.cloud', 'providers.local',
     'env_loader', 'fs_atomic',
-    # 全量：app/ 下所有顶层 .py / 包目录（裸名），与构建期 modulegraph 的模拟路径一致
+    # ⚠️ 2026-10-07：api 包（Blueprint 拆分产物）。
+    # 下面 iter_modules([_APP_DIR]) 只收**顶层**模块，api/ 是子包 —— 不显式收的话
+    # PYZ 里没有 api.projects 等，frozen 启动时 discover_modules() 在 _MEIPASS 下
+    # 找不到实体目录、返回空，**桌面版一个蓝图都注册不上**（= 全部 API 404）。
+    'api',
 ]
 for _m in _pkgutil.iter_modules([_APP_DIR]):
     hidden_imports.append(_m.name)
+
+# api/ 子包：逐个模块显式登记（与 api/__init__.py 的自动发现对称）
+_API_DIR = os.path.join(_APP_DIR, 'api')
+if os.path.isdir(_API_DIR):
+    for _m in _pkgutil.iter_modules([_API_DIR]):
+        if _m.name.startswith('_') or _m.name == '__init__':
+            continue
+        hidden_imports.append('api.' + _m.name)
 
 # 收集所有数据文件
 datas = [

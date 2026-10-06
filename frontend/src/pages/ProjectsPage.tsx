@@ -6,71 +6,13 @@ import { AlertTriangle, Check, Clapperboard, FileText, FolderOpen, ImageIcon, Pe
 import { useToast } from '@/components/ui/toast';
 import type { Project, Novel } from '@/types';
 
-// 风格库缩略图（ComfyUI 真实渲染，与实际成片风格一致；经 Vite 打包进 /assets）。
-// 放 src/assets 下 import 而非 public/：Flask 只挂了 /assets 路由，免加后端路由。
-// 61 张 = 对标 pavo 风格库全量（2D 24 / 3D 11 / 真人 26），由
-// .workbuddy/test/_out/gen_style_thumbs_61.py 批量生成，可复现。
-import img_Style2dUrbanRomance from '@/assets/styles/style_2d_urban_romance.jpg';
-import img_Style2dGuofengDongman from '@/assets/styles/style_2d_guofeng_dongman.jpg';
-import img_StyleBw2dComic from '@/assets/styles/style_bw_2d_comic.jpg';
-import img_Style2dKoreanWebtoon from '@/assets/styles/style_2d_korean_webtoon.jpg';
-import img_Style2dRetroAmerican from '@/assets/styles/style_2d_retro_american.jpg';
-import img_Style2dInkGuofeng from '@/assets/styles/style_2d_ink_guofeng.jpg';
-import img_Style2dCelAnime from '@/assets/styles/style_2d_cel_anime.jpg';
-import img_Style2dCyberpunkIllust from '@/assets/styles/style_2d_cyberpunk_illust.jpg';
-import img_Style2d90sAnime from '@/assets/styles/style_2d_90s_anime.jpg';
-import img_Style2dOtomo from '@/assets/styles/style_2d_otomo.jpg';
-import img_Style2dPixel from '@/assets/styles/style_2d_pixel.jpg';
-import img_Style2dTezuka from '@/assets/styles/style_2d_tezuka.jpg';
-import img_Style2dAnime from '@/assets/styles/style_2d_anime.jpg';
-import img_Style2dMiyazaki from '@/assets/styles/style_2d_miyazaki.jpg';
-import img_Style2dAmericanComicAnim from '@/assets/styles/style_2d_american_comic_anim.jpg';
-import img_Style2dShanghaiStudio from '@/assets/styles/style_2d_shanghai_studio.jpg';
-import img_Style2dStickFigure from '@/assets/styles/style_2d_stick_figure.jpg';
-import img_Style2dShojo from '@/assets/styles/style_2d_shojo.jpg';
-import img_Style2dLooseSketch from '@/assets/styles/style_2d_loose_sketch.jpg';
-import img_Style2dGuochao from '@/assets/styles/style_2d_guochao.jpg';
-import img_Style2dBwInk from '@/assets/styles/style_2d_bw_ink.jpg';
-import img_Style2dChineseMythology from '@/assets/styles/style_2d_chinese_mythology.jpg';
-import img_Style2dCrayon from '@/assets/styles/style_2d_crayon.jpg';
-import img_Style2dShadowPlay from '@/assets/styles/style_2d_shadow_play.jpg';
-import img_Style3dXianxiaCg from '@/assets/styles/style_3d_xianxia_cg.jpg';
-import img_Style3dGuofengCg from '@/assets/styles/style_3d_guofeng_cg.jpg';
-import img_Style3dDarkFantasy from '@/assets/styles/style_3d_dark_fantasy.jpg';
-import img_Style3dAaaConcept from '@/assets/styles/style_3d_aaa_concept.jpg';
-import img_Style3dUe5Urban from '@/assets/styles/style_3d_ue5_urban.jpg';
-import img_Style3dLuxuryFantasy from '@/assets/styles/style_3d_luxury_fantasy.jpg';
-import img_Style3dDisney from '@/assets/styles/style_3d_disney.jpg';
-import img_Style3dFruitPerson from '@/assets/styles/style_3d_fruit_person.jpg';
-import img_Style3dGameRender from '@/assets/styles/style_3d_game_render.jpg';
-import img_Style3dClaymation from '@/assets/styles/style_3d_claymation.jpg';
-import img_Style3dClayStopmotion from '@/assets/styles/style_3d_clay_stopmotion.jpg';
-import img_RpPostApocalyptic from '@/assets/styles/rp_post_apocalyptic.jpg';
-import img_RpXianxiaReal from '@/assets/styles/rp_xianxia_real.jpg';
-import img_Rp80sRural from '@/assets/styles/rp_80s_rural.jpg';
-import img_RpAncientCostume from '@/assets/styles/rp_ancient_costume.jpg';
-import img_RpHongkongFilm from '@/assets/styles/rp_hongkong_film.jpg';
-import img_RpKoreanDrama from '@/assets/styles/rp_korean_drama.jpg';
-import img_RpUrbanReal from '@/assets/styles/rp_urban_real.jpg';
-import img_RpAmericanUpturn from '@/assets/styles/rp_american_upturn.jpg';
-import img_RpAmericanVintageTv from '@/assets/styles/rp_american_vintage_tv.jpg';
-import img_RpBwPhotography from '@/assets/styles/rp_bw_photography.jpg';
-import img_Rp90sRealist from '@/assets/styles/rp_90s_realist.jpg';
-import img_RpRetroHollywood from '@/assets/styles/rp_retro_hollywood.jpg';
-import img_RpBlueOrange from '@/assets/styles/rp_blue_orange.jpg';
-import img_RpHighKeyAbsurd from '@/assets/styles/rp_high_key_absurd.jpg';
-import img_RpSuspense from '@/assets/styles/rp_suspense.jpg';
-import img_RpQuentin from '@/assets/styles/rp_quentin.jpg';
-import img_RpRetroFuturism from '@/assets/styles/rp_retro_futurism.jpg';
-import img_RpRussianMelancholy from '@/assets/styles/rp_russian_melancholy.jpg';
-import img_RpKoreeda from '@/assets/styles/rp_koreeda.jpg';
-import img_RpKoreanCold from '@/assets/styles/rp_korean_cold.jpg';
-import img_RpWarFilm from '@/assets/styles/rp_war_film.jpg';
-import img_RpHorror from '@/assets/styles/rp_horror.jpg';
-import img_RpCourtIntrigue from '@/assets/styles/rp_court_intrigue.jpg';
-import img_RpWilderness from '@/assets/styles/rp_wilderness.jpg';
-import img_Rp60sScifi from '@/assets/styles/rp_60s_scifi.jpg';
-import img_RpAncientChineseReal from '@/assets/styles/rp_ancient_chinese_real.jpg';
+// 风格库（61 项可视化风格 + 8 画幅预设）自 2026-10-07 起改为消费 GET /api/styles：
+// 后端 app/style_catalog.json 是唯一事实源，页面不再内联 61 条中文文案，
+// 前端改了后端立刻知道（此前两边各写一份，是本项目最易漂移的一处）。
+// 缩略图仍在前端 import（Flask 只挂了 /assets 路由，61 张图不搬走后端），
+// style_id -> 图片 URL 的映射见 features/style/thumbnails.ts。
+import { StyleGallery, useStyles, ASPECT_LABEL_KEYS, CUSTOM_STYLE, DEFAULT_ASPECT_VALUE } from '@/features/style';
+import type { StyleCatFilter } from '@/features/style';
 
 type NovelSource = 'upload' | 'existing';
 
@@ -90,98 +32,12 @@ const DEFAULT_CONFIG = {
   voice_map: {},
 };
 
-// 新建项目风格库（对标 pavo 风格库：缩略图卡片 + 分类筛选 + 自定义）。
-// value 与后端 ai_chat.SETTING_FIELDS 里 art_style 的 options 大体对齐（config.style
-// 是自由文本，超集无碍）；仍以 \u 转义书写（本文件零 CJK 约定）。value 即写入 config.style 的字面值。
-type StyleCat = 'all' | '3d' | '2d' | 'real';
-const STYLE_LIBRARY: { value: string; label: string; cat: Exclude<StyleCat, 'all'>; img: string }[] = [
-  { value: "2D\u73b0\u4ee3\u90fd\u5e02\u98ce", label: "2D\u73b0\u4ee3\u90fd\u5e02\u98ce", cat: '2d', img: img_Style2dUrbanRomance },
-  { value: "2D\u53e4\u98ce\u56fd\u6f2b\u98ce", label: "2D\u53e4\u98ce\u56fd\u6f2b\u98ce", cat: '2d', img: img_Style2dGuofengDongman },
-  { value: "\u9ed1\u767d\u4e8c\u7ef4\u6f2b\u753b\u52a8\u753b\u98ce\u683c", label: "\u9ed1\u767d\u4e8c\u7ef4\u6f2b\u753b\u52a8\u753b\u98ce\u683c", cat: '2d', img: img_StyleBw2dComic },
-  { value: "2D\u97e9\u6f2b\u98ce", label: "2D\u97e9\u6f2b\u98ce", cat: '2d', img: img_Style2dKoreanWebtoon },
-  { value: "2D\u590d\u53e4\u7f8e\u6f2b\u98ce", label: "2D\u590d\u53e4\u7f8e\u6f2b\u98ce", cat: '2d', img: img_Style2dRetroAmerican },
-  { value: "2D\u6c34\u58a8\u56fd\u98ce", label: "2D\u6c34\u58a8\u56fd\u98ce", cat: '2d', img: img_Style2dInkGuofeng },
-  { value: "2D\u8d5b\u7490\u7490\u52a8\u753b\u98ce", label: "2D\u8d5b\u7490\u7490\u52a8\u753b\u98ce", cat: '2d', img: img_Style2dCelAnime },
-  { value: "\u8d5b\u535a\u670b\u514b\u6570\u5b57\u63d2\u753b\u98ce\u683c", label: "\u8d5b\u535a\u670b\u514b\u6570\u5b57\u63d2\u753b\u98ce\u683c", cat: '2d', img: img_Style2dCyberpunkIllust },
-  { value: "90\u5e74\u4ee3\u65e5\u5f0f\u52a8\u753b\u98ce\u683c", label: "90\u5e74\u4ee3\u65e5\u5f0f\u52a8\u753b\u98ce\u683c", cat: '2d', img: img_Style2d90sAnime },
-  { value: "\u5927\u53cb\u514b\u6d0b\u98ce\u683c", label: "\u5927\u53cb\u514b\u6d0b\u98ce\u683c", cat: '2d', img: img_Style2dOtomo },
-  { value: "\u50cf\u7d20\u98ce", label: "\u50cf\u7d20\u98ce", cat: '2d', img: img_Style2dPixel },
-  { value: "\u624b\u51a2\u6cbb\u866b\u65f6\u4ee3\u5361\u901a\u63d2\u753b\u98ce\u683c", label: "\u624b\u51a2\u6cbb\u866b\u65f6\u4ee3\u5361\u901a\u63d2\u753b\u98ce\u683c", cat: '2d', img: img_Style2dTezuka },
-  { value: "\u4e8c\u6b21\u5143\u52a8\u6f2b", label: "\u4e8c\u6b21\u5143\u52a8\u6f2b", cat: '2d', img: img_Style2dAnime },
-  { value: "\u5bab\u5d0e\u9a8f\u753b\u98ce", label: "\u5bab\u5d0e\u9a8f\u753b\u98ce", cat: '2d', img: img_Style2dMiyazaki },
-  { value: "\u7f8e\u56fd\u6f2b\u753b\u52a8\u753b\u63d2\u753b\u98ce\u683c", label: "\u7f8e\u56fd\u6f2b\u753b\u52a8\u753b\u63d2\u753b\u98ce\u683c", cat: '2d', img: img_Style2dAmericanComicAnim },
-  { value: "\u4e0a\u7f8e\u5382\u8001\u52a8\u753b\u98ce\u683c", label: "\u4e0a\u7f8e\u5382\u8001\u52a8\u753b\u98ce\u683c", cat: '2d', img: img_Style2dShanghaiStudio },
-  { value: "\u513f\u7ae5\u7b80\u7b14\u753b\u98ce\u683c", label: "\u513f\u7ae5\u7b80\u7b14\u753b\u98ce\u683c", cat: '2d', img: img_Style2dStickFigure },
-  { value: "\u65e5\u5f0f\u5c11\u5973\u6f2b\u98ce\u683c", label: "\u65e5\u5f0f\u5c11\u5973\u6f2b\u98ce\u683c", cat: '2d', img: img_Style2dShojo },
-  { value: "\u677e\u5f1b\u8f6e\u5ed3\u624b\u7ed8\u98ce", label: "\u677e\u5f1b\u8f6e\u5ed3\u624b\u7ed8\u98ce", cat: '2d', img: img_Style2dLooseSketch },
-  { value: "\u56fd\u98ce\u4e8c\u6b21\u5143\u65b0\u56fd\u6f6e\u98ce\u683c", label: "\u56fd\u98ce\u4e8c\u6b21\u5143\u65b0\u56fd\u6f6e\u98ce\u683c", cat: '2d', img: img_Style2dGuochao },
-  { value: "\u9ed1\u767d\u6c34\u58a8\u98ce\u683c", label: "\u9ed1\u767d\u6c34\u58a8\u98ce\u683c", cat: '2d', img: img_Style2dBwInk },
-  { value: "2D\u4e2d\u56fd\u795e\u8bdd\u98ce", label: "2D\u4e2d\u56fd\u795e\u8bdd\u98ce", cat: '2d', img: img_Style2dChineseMythology },
-  { value: "\u513f\u7ae5\u8721\u7b14\u624b\u7ed8\u63d2\u753b\u98ce\u683c", label: "\u513f\u7ae5\u8721\u7b14\u624b\u7ed8\u63d2\u753b\u98ce\u683c", cat: '2d', img: img_Style2dCrayon },
-  { value: "\u76ae\u5f71\u620f\u63d2\u753b\u98ce\u683c", label: "\u76ae\u5f71\u620f\u63d2\u753b\u98ce\u683c", cat: '2d', img: img_Style2dShadowPlay },
-  { value: "3D\u5199\u5b9eCG\u4ed9\u4fa0\u98ce", label: "3D\u5199\u5b9eCG\u4ed9\u4fa0\u98ce", cat: '3d', img: img_Style3dXianxiaCg },
-  { value: "3D\u5199\u5b9eCG\u53e4\u88c5\u98ce", label: "3D\u5199\u5b9eCG\u53e4\u88c5\u98ce", cat: '3d', img: img_Style3dGuofengCg },
-  { value: "\u9ed1\u6697\u5947\u5e7b\u98ce\u683c", label: "\u9ed1\u6697\u5947\u5e7b\u98ce\u683c", cat: '3d', img: img_Style3dDarkFantasy },
-  { value: "\u7f8e\u56fd3A\u6e38\u620f\u6982\u5ff5\u827a\u672f\u98ce\u683c", label: "\u7f8e\u56fd3A\u6e38\u620f\u6982\u5ff5\u827a\u672f\u98ce\u683c", cat: '3d', img: img_Style3dAaaConcept },
-  { value: "3D\u6b21\u4e16\u4ee3\u90fd\u5e02\u602a\u8c08\u98ce", label: "3D\u6b21\u4e16\u4ee3\u90fd\u5e02\u602a\u8c08\u98ce", cat: '3d', img: img_Style3dUe5Urban },
-  { value: "3D\u5199\u5b9eCG\u73b0\u4ee3\u90fd\u5e02\u98ce", label: "3D\u5199\u5b9eCG\u73b0\u4ee3\u90fd\u5e02\u98ce", cat: '3d', img: img_Style3dLuxuryFantasy },
-  { value: "3D\u8fea\u58eb\u5c3c\u52a8\u753b\u98ce\u683c", label: "3D\u8fea\u58eb\u5c3c\u52a8\u753b\u98ce\u683c", cat: '3d', img: img_Style3dDisney },
-  { value: "\u6c34\u679c\u4eba\u98ce\u683c", label: "\u6c34\u679c\u4eba\u98ce\u683c", cat: '3d', img: img_Style3dFruitPerson },
-  { value: "3D\u6e38\u620f\u6e32\u67d3\u98ce\u683c", label: "3D\u6e38\u620f\u6e32\u67d3\u98ce\u683c", cat: '3d', img: img_Style3dGameRender },
-  { value: "\u7c98\u571f\u52a8\u753b\u98ce\u683c", label: "\u7c98\u571f\u52a8\u753b\u98ce\u683c", cat: '3d', img: img_Style3dClaymation },
-  { value: "\u5b9a\u683c\u52a8\u753b\u9ecf\u571f\u98ce\u683c", label: "\u5b9a\u683c\u52a8\u753b\u9ecf\u571f\u98ce\u683c", cat: '3d', img: img_Style3dClayStopmotion },
-  { value: "\u672b\u4e16\u771f\u4eba\u5199\u5b9e\u98ce", label: "\u672b\u4e16\u771f\u4eba\u5199\u5b9e\u98ce", cat: 'real', img: img_RpPostApocalyptic },
-  { value: "\u53e4\u98ce\u4ed9\u4fa0\u5199\u5b9e\u98ce", label: "\u53e4\u98ce\u4ed9\u4fa0\u5199\u5b9e\u98ce", cat: 'real', img: img_RpXianxiaReal },
-  { value: "\u5e74\u4ee3\u5267\u771f\u4eba\u5199\u5b9e\u98ce", label: "\u5e74\u4ee3\u5267\u771f\u4eba\u5199\u5b9e\u98ce", cat: 'real', img: img_Rp80sRural },
-  { value: "\u53e4\u88c5\u771f\u4eba\u5199\u5b9e\u98ce", label: "\u53e4\u88c5\u771f\u4eba\u5199\u5b9e\u98ce", cat: 'real', img: img_RpAncientCostume },
-  { value: "\u6e2f\u98ce\u7535\u5f71\u5199\u5b9e\u98ce", label: "\u6e2f\u98ce\u7535\u5f71\u5199\u5b9e\u98ce", cat: 'real', img: img_RpHongkongFilm },
-  { value: "\u97e9\u5267\u90fd\u5e02\u5199\u5b9e\u98ce", label: "\u97e9\u5267\u90fd\u5e02\u5199\u5b9e\u98ce", cat: 'real', img: img_RpKoreanDrama },
-  { value: "\u73b0\u4ee3\u90fd\u5e02\u5199\u5b9e\u98ce", label: "\u73b0\u4ee3\u90fd\u5e02\u5199\u5b9e\u98ce", cat: 'real', img: img_RpUrbanReal },
-  { value: "\u7f8e\u5f0f\u7ecf\u6d4e\u4e0a\u884c\u98ce\u683c", label: "\u7f8e\u5f0f\u7ecf\u6d4e\u4e0a\u884c\u98ce\u683c", cat: 'real', img: img_RpAmericanUpturn },
-  { value: "\u7f8e\u5f0f\u590d\u53e4\u5f71\u89c6\u98ce\u683c", label: "\u7f8e\u5f0f\u590d\u53e4\u5f71\u89c6\u98ce\u683c", cat: 'real', img: img_RpAmericanVintageTv },
-  { value: "\u9ed1\u767d\u80f6\u7247\u6444\u5f71\u98ce\u683c", label: "\u9ed1\u767d\u80f6\u7247\u6444\u5f71\u98ce\u683c", cat: 'real', img: img_RpBwPhotography },
-  { value: "90\u5e74\u4ee3\u5199\u5b9e\u7535\u5f71\u98ce\u683c", label: "90\u5e74\u4ee3\u5199\u5b9e\u7535\u5f71\u98ce\u683c", cat: 'real', img: img_Rp90sRealist },
-  { value: "\u7f8e\u5f0f\u590d\u53e4\u597d\u83b1\u575e", label: "\u7f8e\u5f0f\u590d\u53e4\u597d\u83b1\u575e", cat: 'real', img: img_RpRetroHollywood },
-  { value: "\u84dd\u6a59\u8272\u8c03\u5f71\u89c6\u98ce\u683c", label: "\u84dd\u6a59\u8272\u8c03\u5f71\u89c6\u98ce\u683c", cat: 'real', img: img_RpBlueOrange },
-  { value: "\u8352\u8bde\u9ad8\u8c03\u767d\u8272\u8272\u8c03\u7535\u5f71\u98ce\u683c", label: "\u8352\u8bde\u9ad8\u8c03\u767d\u8272\u8272\u8c03\u7535\u5f71\u98ce\u683c", cat: 'real', img: img_RpHighKeyAbsurd },
-  { value: "\u60ac\u7591\u7535\u5f71\u98ce\u683c", label: "\u60ac\u7591\u7535\u5f71\u98ce\u683c", cat: 'real', img: img_RpSuspense },
-  { value: "\u6606\u6c40\u80f6\u7247\u7535\u5f71", label: "\u6606\u6c40\u80f6\u7247\u7535\u5f71", cat: 'real', img: img_RpQuentin },
-  { value: "\u7f8e\u5f0f\u590d\u53e4\u672a\u6765\u4e3b\u4e49", label: "\u7f8e\u5f0f\u590d\u53e4\u672a\u6765\u4e3b\u4e49", cat: 'real', img: img_RpRetroFuturism },
-  { value: "\u4fc4\u7f57\u65af\u5fe7\u90c1\u7535\u5f71", label: "\u4fc4\u7f57\u65af\u5fe7\u90c1\u7535\u5f71", cat: 'real', img: img_RpRussianMelancholy },
-  { value: "\u662f\u679d\u88d5\u548c\u65e5\u5f0f\u7eaa\u5b9e", label: "\u662f\u679d\u88d5\u548c\u65e5\u5f0f\u7eaa\u5b9e", cat: 'real', img: img_RpKoreeda },
-  { value: "\u97e9\u56fd\u51b7\u6de1\u98ce\u7535\u5f71\u98ce\u683c", label: "\u97e9\u56fd\u51b7\u6de1\u98ce\u7535\u5f71\u98ce\u683c", cat: 'real', img: img_RpKoreanCold },
-  { value: "\u590d\u53e4\u6218\u4e89\u7535\u5f71\u98ce\u683c", label: "\u590d\u53e4\u6218\u4e89\u7535\u5f71\u98ce\u683c", cat: 'real', img: img_RpWarFilm },
-  { value: "\u6050\u6016\u7535\u5f71\u98ce\u683c", label: "\u6050\u6016\u7535\u5f71\u98ce\u683c", cat: 'real', img: img_RpHorror },
-  { value: "\u5bab\u6597\u6743\u8c0b\u51b7\u5cfb\u98ce\u683c", label: "\u5bab\u6597\u6743\u8c0b\u51b7\u5cfb\u98ce\u683c", cat: 'real', img: img_RpCourtIntrigue },
-  { value: "\u8352\u91ce\u7535\u5f71\u98ce\u683c", label: "\u8352\u91ce\u7535\u5f71\u98ce\u683c", cat: 'real', img: img_RpWilderness },
-  { value: "60\u5e74\u4ee3\u590d\u53e4\u79d1\u5e7b", label: "60\u5e74\u4ee3\u590d\u53e4\u79d1\u5e7b", cat: 'real', img: img_Rp60sScifi },
-  { value: "\u771f\u4eba\u53e4\u98ce\u5199\u5b9e\u98ce\u683c", label: "\u771f\u4eba\u53e4\u98ce\u5199\u5b9e\u98ce\u683c", cat: 'real', img: img_RpAncientChineseReal },
-];
-
-// 风格库分类标签（labelKey 走 i18n）。顺序对标 pavo 风格库：全部 → 2D → 3D → 真人
-const STYLE_CATS: { id: StyleCat; labelKey: string }[] = [
-  { id: 'all', labelKey: 'project.styleCatAll' },
-  { id: '2d', labelKey: 'project.styleCat2d' },
-  { id: '3d', labelKey: 'project.styleCat3d' },
-  { id: 'real', labelKey: 'project.styleCatReal' },
-];
-
-// 新建项目可选画面比例（与 ai_chat.SETTING_FIELDS 里 aspect_ratio 的 options 对齐）。
-// value 即写入 config.aspect_ratio 的字面值，沿用 \u 转义（本文件零 CJK 约定）。
-// 视频 / 分镜画幅由 style 串解析，这里落一个独立字段供生成链路与确认门识别。
-// 8 种比例与 ComfyUI ResolutionSelector 节点的下拉一致（2026-09-23 用户截图）；
-// ⚠️ value 后缀词不要用「横屏/竖屏」（style_kit 关键词已按显式比例优先，
-//    且这些词仅供人读）——「超宽/竖幅/横幅」均可安全透过显式 "a:b" 解析。
-const ASPECT_PRESETS: { value: string; labelKey: string }[] = [
-  { value: '1:1 \u65b9\u5f62', labelKey: 'project.aspect1x1' },
-  { value: '2:3 \u7ad6\u5e45', labelKey: 'project.aspect2x3' },
-  { value: '3:2 \u6a2a\u5e45', labelKey: 'project.aspect3x2' },
-  { value: '3:4 \u7ad6\u5e45', labelKey: 'project.aspect3x4' },
-  { value: '4:3 \u6a2a\u5e45', labelKey: 'project.aspect4x3' },
-  { value: '9:16 \u7ad6\u5c4f', labelKey: 'project.aspect9x16' },
-  { value: '16:9 \u6a2a\u5c4f', labelKey: 'project.aspect16x9' },
-  { value: '21:9 \u8d85\u5bbd', labelKey: 'project.aspect21x9' },
-];
+// 新建项目风格库（缩略图卡片 + 分类筛选 + 自定义）已搬出本文件：
+//   - 61 项风格的文案 / 分类 / 默认画幅 / 关键词 → GET /api/styles（后端唯一事实源）
+//   - 分类标签与卡片网格 → features/style/StyleGallery.tsx
+//   - 8 项画幅预设 → 同上（value 与 i18n key 映射见 features/style/aspectPresets.ts）
+// 选中值仍是**旧自由文本字面值**（config.style 过去仍存中文自由文本，改存 style_id
+// 会打断既有生成链路）；style_id 的用途是稳定标识与历史对照。
 
 // 视频生成方式（写入 config.video_mode）。
 // ⚠️ 2026-10-02 修复：后端 `config.norm_video_mode` 已**只保留「整集一次生成」**
@@ -211,14 +67,24 @@ export function ProjectsPage() {
   const [dragOver, setDragOver] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [formError, setFormError] = useState('');
-  // 风格选择：风格库卡片（缩略图 + 分类筛选）+ 自定义输入。__custom__ 时用自定义值。
-  const [stylePreset, setStylePreset] = useState(STYLE_LIBRARY[0].value);
-  const [styleCat, setStyleCat] = useState<StyleCat>('all');
+  // 风格选择：风格库卡片（缩略图 + 分类筛选）+ 自定义输入。CUSTOM_STYLE 时用自定义值。
+  // 目录来自 /api/styles（后端单一事实源）；端点未就绪时留空，提交时回落默认风格。
+  const {
+    styles: catalogStyles, counts: styleCounts, aspectPresets,
+    defaultStyleId, loading: stylesLoading, error: stylesError,
+  } = useStyles();
+  const [stylePreset, setStylePreset] = useState('');
+  const [styleCat, setStyleCat] = useState<StyleCatFilter>('all');
   const [customStyle, setCustomStyle] = useState('');
+  // 默认风格：优先后端 default_style_id 对应的 value（与迁移前 STYLE_LIBRARY[0].value 同源），
+  // 目录未到时用首项兜底。
+  const defaultStyleValue = useMemo(
+    () => catalogStyles.find((s) => s.style_id === defaultStyleId)?.value || catalogStyles[0]?.value || '',
+    [catalogStyles, defaultStyleId],
+  );
   // 画面比例（视频/分镜画幅）：与风格一起在新建入口统一设置
   // 默认 16:9 横屏（2026-09-28 由 9:16 翻转，与后端 style_kit.DEFAULT_RATIO 一致）。
-  // ⚠️ 不要写 ASPECT_PRESETS[0]：预设按截图顺序排列后第一项是 1:1。
-  const [aspectRatio, setAspectRatio] = useState('16:9 \u6a2a\u5c4f');
+  const [aspectRatio, setAspectRatio] = useState(DEFAULT_ASPECT_VALUE);
   // 视频生成方式（项目级，写入 config.video_mode）：默认整集一次生成
   const [videoMode, setVideoMode] = useState<string>('episode');
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -261,10 +127,10 @@ export function ProjectsPage() {
     setPendingFile(null);
     setDragOver(false);
     setFormError('');
-    setStylePreset(STYLE_LIBRARY[0].value);
+    setStylePreset(defaultStyleValue);
     setStyleCat('all');
     setCustomStyle('');
-    setAspectRatio('16:9 \u6a2a\u5c4f');
+    setAspectRatio(DEFAULT_ASPECT_VALUE);
     setVideoMode('episode');
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
@@ -300,8 +166,12 @@ export function ProjectsPage() {
 
     setSubmitting(true);
     try {
-      // 风格：自定义模式必须填写，否则回落到预设
-      let finalStyle = stylePreset === '__custom__' ? customStyle.trim() : stylePreset;
+      // 风格：自定义模式必须填写，否则回落到预设。
+      // ⚠️ 预设位留空（目录未到）时回落到默认风格，不能让「新建项目」被取数时序卡住；
+      //    自定义模式留空仍按原逻辑报错（静默换默认值会让用户以为填了自定义风格）。
+      let finalStyle = stylePreset === CUSTOM_STYLE
+        ? customStyle.trim()
+        : (stylePreset || defaultStyleValue);
       if (!finalStyle) {
         setFormError(t('project.styleRequired'));
         setSubmitting(false);
@@ -612,95 +482,24 @@ export function ProjectsPage() {
             />
           </div>
 
-          {/* 风格库：分类标签 + 缩略图卡片 + 自定义（对标 pavo 风格库交互） */}
+          {/* 风格库：分类标签 + 缩略图卡片 + 自定义（对标 pavo 风格库交互）。
+              数据取自 GET /api/styles；组件内部保持原交互与文案。 */}
           <div>
             <label className="mb-1 block text-sm font-medium text-ink-2">
               {t('project.style')}
             </label>
-            {/* 分类标签：全部 / 2D / 3D / 真人（对标 pavo 风格库分类），后缀显示该分类风格数 */}
-            <div className="mb-2 flex flex-wrap gap-1.5">
-              {STYLE_CATS.map((c) => (
-                <button
-                  key={c.id}
-                  type="button"
-                  onClick={() => setStyleCat(c.id)}
-                  aria-pressed={styleCat === c.id}
-                  className={`rounded-full px-3 py-1 text-xs font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 ${
-                    styleCat === c.id
-                      ? 'bg-ink-1 text-white'
-                      : 'border border-line text-ink-2 hover:bg-surface-2'
-                  }`}
-                >
-                  {t(c.labelKey)}
-                  <span className="ml-1 opacity-60">
-                    {c.id === 'all'
-                      ? STYLE_LIBRARY.length
-                      : STYLE_LIBRARY.filter(p => p.cat === c.id).length}
-                  </span>
-                </button>
-              ))}
-            </div>
-            {/* 缩略图卡片网格：自定义卡在最前（对标 pavo 风格库「自定义风格」首位卡片）。
-                61 张会很高 → 限高滚动，保持弹窗整体可操作（pavo 风格库弹层同理）。 */}
-            <div className="max-h-72 grid grid-cols-3 gap-2 overflow-y-auto pr-1 sm:grid-cols-4 md:grid-cols-5">
-              <button
-                type="button"
-                onClick={() => { setStylePreset('__custom__'); setFormError(''); }}
-                aria-pressed={stylePreset === '__custom__'}
-                title={t('project.styleCustom')}
-                className={`flex aspect-[3/4] flex-col items-center justify-center gap-1.5 rounded-lg border border-dashed p-1 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 ${
-                  stylePreset === '__custom__'
-                    ? 'border-brand bg-brand-subtle text-ink-1 ring-2 ring-brand/30'
-                    : 'border-line-strong text-ink-3 hover:bg-surface-2'
-                }`}
-              >
-                <Plus className="h-5 w-5" />
-                <span className="px-0.5 text-center text-[11px] leading-tight">
-                  {t('project.styleCustom')}
-                </span>
-              </button>
-              {STYLE_LIBRARY
-                .filter(p => styleCat === 'all' || p.cat === styleCat)
-                .map((p) => (
-                  <button
-                    key={p.value}
-                    type="button"
-                    onClick={() => { setStylePreset(p.value); setFormError(''); }}
-                    aria-pressed={stylePreset === p.value}
-                    title={p.label}
-                    className={`group relative aspect-[3/4] overflow-hidden rounded-lg border transition-all focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 ${
-                      stylePreset === p.value
-                        ? 'border-brand ring-2 ring-brand/40'
-                        : 'border-line hover:border-line-strong'
-                    }`}
-                  >
-                    <img
-                      src={p.img}
-                      alt={p.label}
-                      className="absolute inset-0 h-full w-full object-cover"
-                      loading="lazy"
-                    />
-                    {/* 底部文字遮罩：沿用 Modal 遮罩 slate-900 的例外约定（照片上保证可读） */}
-                    <span className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-slate-900/85 via-slate-900/30 to-transparent px-1.5 pb-1 pt-5 text-left text-[11px] font-medium leading-tight text-white">
-                      {p.label}
-                    </span>
-                    {stylePreset === p.value && (
-                      <span className="absolute right-1 top-1 flex h-5 w-5 items-center justify-center rounded-full bg-brand text-white">
-                        <Check className="h-3 w-3" />
-                      </span>
-                    )}
-                  </button>
-                ))}
-            </div>
-            {stylePreset === '__custom__' && (
-              <div className="mt-2">
-                <Input
-                  value={customStyle}
-                  onChange={setCustomStyle}
-                  placeholder={t('project.styleCustomPlaceholder')}
-                />
-              </div>
-            )}
+            <StyleGallery
+              styles={catalogStyles}
+              counts={styleCounts}
+              cat={styleCat}
+              onCatChange={setStyleCat}
+              selected={stylePreset}
+              onSelect={(v) => { setStylePreset(v); setFormError(''); }}
+              customStyle={customStyle}
+              onCustomChange={(v) => { setCustomStyle(v); setFormError(''); }}
+              loading={stylesLoading}
+              error={stylesError}
+            />
           </div>
 
           {/* 画面比例：与风格一起在新建入口统一设置，决定视频/分镜画幅 */}
@@ -709,7 +508,10 @@ export function ProjectsPage() {
               value={aspectRatio}
               onChange={(v) => { setAspectRatio(v); setFormError(''); }}
               label={t('project.aspectRatio')}
-              options={ASPECT_PRESETS.map(p => ({ value: p.value, label: t(p.labelKey) }))}
+              options={aspectPresets.map(p => ({
+                value: p.value,
+                label: t(ASPECT_LABEL_KEYS[p.aspect_id] || p.aspect_id),
+              }))}
             />
           </div>
 

@@ -271,7 +271,7 @@ export function AudioTab({ projectKey }: AudioTabProps) {
           <React.Fragment key={step.id}>
             <button
               onClick={() => setActiveStep(step.id as 1 | 2 | 3)}
-              className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 focus-visible:ring-offset-2 focus-visible:ring-offset-canvas ${
+              className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 focus-visible:ring-offset-2 focus-visible:ring-offset-canvas ${
                 activeStep === step.id
                   ? 'bg-brand text-white shadow-lg'
                   : 'bg-surface-2 text-ink-2 hover:bg-line'
@@ -460,7 +460,7 @@ export function AudioTab({ projectKey }: AudioTabProps) {
                     </div>
                     <div className="h-1.5 rounded-full bg-line overflow-hidden">
                       <div
-                        className="h-full bg-brand transition-all"
+                        className="h-full bg-brand transition-colors"
                         style={{ width: `${Math.max(0, Math.min(100, mixTask.progress ?? 0))}%` }}
                       />
                     </div>

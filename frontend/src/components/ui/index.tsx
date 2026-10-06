@@ -18,10 +18,16 @@ import { t } from '@/i18n';
 /** 焦点环：鼠标点击不出现，键盘 Tab 必然可见 */
 const FOCUS_RING = 'focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 focus-visible:ring-offset-2 focus-visible:ring-offset-canvas';
 
-/** 表单控件基线：36px 高、10px 圆角、聚焦转品牌色 */
+/** 表单控件基线：圆角、聚焦转品牌色。
+ *  ⚠️ 这里**刻意不含高度**：Textarea 复用同一个基线，写死高度会把多行
+ *  文本域压成单行高。高度由各控件显式声明 Input/Select → h-control-compact
+ *  （36px = --control-h-compact），Textarea 随内容自适应。 */
 const FIELD_BASE =
   'w-full rounded-md border bg-surface px-3 text-base text-ink-1 transition-colors placeholder:text-ink-3 ' +
   'disabled:cursor-not-allowed disabled:opacity-50';
+
+/** 行内单行控件高度：36px（= --control-h-compact）。改尺寸只改这一个令牌。 */
+const FIELD_H = 'h-control-compact';
 
 const FIELD_OK = 'border-line hover:border-line-strong focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/25';
 const FIELD_ERR = 'border-danger focus:border-danger focus:outline-none focus:ring-2 focus:ring-danger/25';
@@ -110,7 +116,7 @@ export function ErrorState({
         <button
           type="button"
           onClick={onRetry}
-          className={`mt-1 inline-flex h-9 items-center rounded-md border border-line bg-surface px-4 text-sm font-medium text-ink-1 transition-colors hover:bg-surface-2 ${FOCUS_RING}`}
+          className={`mt-1 inline-flex h-control-compact items-center rounded-md border border-line bg-surface px-4 text-sm font-medium text-ink-1 transition-colors hover:bg-surface-2 ${FOCUS_RING}`}
         >
           {t('common.retry')}
         </button>
@@ -249,7 +255,7 @@ export function Button({
 }: {
   children: React.ReactNode;
   onClick?: () => void;
-  /** primary=实心深色主 CTA；brand=品牌色动作；secondary=白底描边；ghost=透明工具条；danger=删除类；link=行内 */
+  /** primary=品牌色实心主 CTA（默认，一屏唯一）；brand=primary 的显式别名；secondary=描边；ghost=透明工具条；danger=删除类；link=行内 */
   variant?: 'primary' | 'brand' | 'secondary' | 'danger' | 'ghost' | 'link';
   size?: 'sm' | 'md' | 'lg';
   disabled?: boolean;
@@ -262,19 +268,30 @@ export function Button({
 }) {
   const base = `inline-flex items-center justify-center gap-2 rounded-md font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${FOCUS_RING}`;
   const variants = {
-    primary: 'bg-action text-white hover:bg-action/85',
-    // 品牌=科技感主视觉：品牌→青渐变 + 极浅辉光（.progress-fill 见 index.css）
-    brand: 'progress-fill text-white shadow-[0_2px_16px_rgb(var(--brand)/0.35)] hover:shadow-[0_2px_24px_rgb(var(--brand)/0.5)] hover:brightness-110',
+    // 主 CTA = 品牌色实底（2026-10-07 修正）：原先 primary 走 --action，
+    // 深色下解析成 slate-700 中性灰、浅色下是近黑 —— 全站**唯一的主 CTA
+    // 识别位是品牌色**，却让中性灰占了默认位，主次动作视觉权重一样重。
+    // 对比度：白字压 indigo-500（--brand）≈ 4.45:1，达 WCAG 正文 4.5:1 门槛。
+    // hex 取值见 index.css 的 --brand 注释（此处不写字面量，HEX001 会拦）。
+    primary: 'bg-brand text-white hover:bg-brand-hover',
+    // brand 变体与 primary 同形（历史调用点保留；新代码直接用默认 primary）
+    brand: 'bg-brand text-white hover:bg-brand-hover',
     secondary: 'border border-line bg-surface text-ink-1 hover:bg-surface-2',
-    danger: 'bg-danger text-white hover:bg-danger-strong',
+    // 破坏性动作：**红边红字**，不与只读动作共享轮廓（MASTER §4.1 / invariant 5）。
+    // hover 只把底色推向「红 + 更淡的实底」方向，**不做整块实心填充** ——
+    // 原先 `hover:bg-danger hover:text-white` 会让 danger 在 hover 后与
+    // primary（实心 + 白字）完全同形，破坏性语义在悬停瞬间消失，
+    // 而破坏性动作恰恰是用户最需要看清的一刻。红边红字始终保留。
+    danger: 'border border-danger bg-danger-subtle text-danger-strong hover:bg-danger/25',
     ghost: 'bg-transparent text-ink-2 hover:bg-surface-2 hover:text-ink-1',
     link: 'bg-transparent p-0 text-brand underline-offset-4 hover:text-brand-hover hover:underline',
   };
-  // 高度 32 / 36 / 44（方案 §6.1）；link 走行内不设高度
+  // 高度：sm 36 / md 40 / lg 44 —— 40px 是规范底线，纯图标触达区 44×44。
+  // 原先 sm=32 / md=36 低于规范（改造前量到 86 个控件不足 24px）。
   const sizes = {
-    sm: 'h-8 px-3 text-sm',
-    md: 'h-9 px-4 text-sm',
-    lg: 'h-11 px-6 text-base',
+    sm: 'h-control-compact px-3 text-sm',
+    md: 'h-control px-4 text-sm',
+    lg: 'h-hit-target px-6 text-base',
   };
   const spin = { sm: 'w-3 h-3', md: 'w-3.5 h-3.5', lg: 'w-4 h-4' };
   return (
@@ -335,7 +352,7 @@ export function Input({
       autoFocus={autoFocus}
       aria-invalid={error ? true : undefined}
       onKeyDown={onEnter ? (e) => { if (e.key === 'Enter') onEnter(); } : undefined}
-      className={`${FIELD_BASE} h-9 ${suffix ? 'pr-10' : ''} ${error ? FIELD_ERR : FIELD_OK} ${className}`}
+      className={`${FIELD_BASE} ${FIELD_H} ${suffix ? 'pr-10' : ''} ${error ? FIELD_ERR : FIELD_OK} ${className}`}
     />
   );
   const field = suffix ? (
@@ -420,7 +437,7 @@ export function Select({
       value={value}
       onChange={(e) => onChange(e.target.value)}
       disabled={disabled}
-      className={`${FIELD_BASE} h-9 cursor-pointer ${FIELD_OK} ${className}`}
+      className={`${FIELD_BASE} ${FIELD_H} cursor-pointer ${FIELD_OK} ${className}`}
     >
       {options.map((o) => (
         <option key={o.value} value={o.value}>{o.label}</option>
@@ -505,7 +522,7 @@ export function Modal({
         aria-modal="true"
         aria-labelledby={titleId}
         aria-describedby={description ? descId : undefined}
-        className={`glass-strong relative flex max-h-[90vh] w-full animate-modal-in flex-col rounded-xl border border-line shadow-lg ${MODAL_SIZES[size]}`}
+        className={`glass-chrome-strong relative flex max-h-[90vh] w-full animate-modal-in flex-col rounded-xl border border-line shadow-lg ${MODAL_SIZES[size]}`}
       >
         <div className="flex shrink-0 items-start justify-between gap-3 border-b border-line px-6 py-4">
           <div className="min-w-0">

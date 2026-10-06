@@ -1,0 +1,787 @@
+{
+  "schema_version": 1,
+  "catalog_version": "2026.10.07",
+  "note": "61 项可视化风格库的后端单一事实源。style_id 为稳定标识（纯 ASCII、不含中文、不随文案变化），label 可随意改名而不影响历史；label 同时是写入 config.style 的旧自由文本字面值（向后兼容）。positive_suffix / negative_suffix 供 app/style_kit.py 注入链路消费，aspect_default 仅作解析回退。",
+  "default_style_id": "style_2d_urban_romance",
+  "default_aspect_id": "aspect_16x9",
+  "thumbnail_dir": "frontend/src/assets/styles",
+  "categories": [
+    {
+      "id": "2d",
+      "label": "2D 动漫",
+      "order": 1
+    },
+    {
+      "id": "3d",
+      "label": "3D 渲染",
+      "order": 2
+    },
+    {
+      "id": "real",
+      "label": "真人写实",
+      "order": 3
+    }
+  ],
+  "styles": [
+    {
+      "style_id": "style_2d_urban_romance",
+      "label": "2D现代都市风",
+      "category": "2d",
+      "thumbnail": "style_2d_urban_romance.jpg",
+      "aspect_default": "9:16",
+      "positive_suffix": "2D现代都市风",
+      "negative_suffix": [],
+      "aliases": []
+    },
+    {
+      "style_id": "style_2d_guofeng_dongman",
+      "label": "2D古风国漫风",
+      "category": "2d",
+      "thumbnail": "style_2d_guofeng_dongman.jpg",
+      "aspect_default": "9:16",
+      "positive_suffix": "2D古风国漫风",
+      "negative_suffix": [
+        "写实照片",
+        "真人摄影",
+        "3D 写实渲染"
+      ],
+      "aliases": []
+    },
+    {
+      "style_id": "style_bw_2d_comic",
+      "label": "黑白二维漫画动画风格",
+      "category": "2d",
+      "thumbnail": "style_bw_2d_comic.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "黑白二维漫画动画风格",
+      "negative_suffix": [],
+      "aliases": []
+    },
+    {
+      "style_id": "style_2d_korean_webtoon",
+      "label": "2D韩漫风",
+      "category": "2d",
+      "thumbnail": "style_2d_korean_webtoon.jpg",
+      "aspect_default": "9:16",
+      "positive_suffix": "2D韩漫风",
+      "negative_suffix": [],
+      "aliases": []
+    },
+    {
+      "style_id": "style_2d_retro_american",
+      "label": "2D复古美漫风",
+      "category": "2d",
+      "thumbnail": "style_2d_retro_american.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "2D复古美漫风",
+      "negative_suffix": [],
+      "aliases": []
+    },
+    {
+      "style_id": "style_2d_ink_guofeng",
+      "label": "2D水墨国风",
+      "category": "2d",
+      "thumbnail": "style_2d_ink_guofeng.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "2D水墨国风",
+      "negative_suffix": [
+        "写实照片",
+        "真人摄影",
+        "3D 写实渲染"
+      ],
+      "aliases": []
+    },
+    {
+      "style_id": "style_2d_cel_anime",
+      "label": "2D赛璐璐动画风",
+      "category": "2d",
+      "thumbnail": "style_2d_cel_anime.jpg",
+      "aspect_default": "9:16",
+      "positive_suffix": "2D赛璐璐动画风",
+      "negative_suffix": [
+        "写实照片",
+        "真人摄影",
+        "3D 写实渲染"
+      ],
+      "aliases": []
+    },
+    {
+      "style_id": "style_2d_cyberpunk_illust",
+      "label": "赛博朋克数字插画风格",
+      "category": "2d",
+      "thumbnail": "style_2d_cyberpunk_illust.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "赛博朋克数字插画风格",
+      "negative_suffix": [],
+      "aliases": []
+    },
+    {
+      "style_id": "style_2d_90s_anime",
+      "label": "90年代日式动画风格",
+      "category": "2d",
+      "thumbnail": "style_2d_90s_anime.jpg",
+      "aspect_default": "9:16",
+      "positive_suffix": "90年代日式动画风格",
+      "negative_suffix": [
+        "写实照片",
+        "真人摄影",
+        "3D 写实渲染"
+      ],
+      "aliases": []
+    },
+    {
+      "style_id": "style_2d_otomo",
+      "label": "大友克洋风格",
+      "category": "2d",
+      "thumbnail": "style_2d_otomo.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "大友克洋风格",
+      "negative_suffix": [],
+      "aliases": []
+    },
+    {
+      "style_id": "style_2d_pixel",
+      "label": "像素风",
+      "category": "2d",
+      "thumbnail": "style_2d_pixel.jpg",
+      "aspect_default": "9:16",
+      "positive_suffix": "像素风",
+      "negative_suffix": [],
+      "aliases": []
+    },
+    {
+      "style_id": "style_2d_tezuka",
+      "label": "手冢治虫时代卡通插画风格",
+      "category": "2d",
+      "thumbnail": "style_2d_tezuka.jpg",
+      "aspect_default": "9:16",
+      "positive_suffix": "手冢治虫时代卡通插画风格",
+      "negative_suffix": [
+        "写实照片",
+        "真人摄影",
+        "3D 写实渲染"
+      ],
+      "aliases": []
+    },
+    {
+      "style_id": "style_2d_anime",
+      "label": "二次元动漫",
+      "category": "2d",
+      "thumbnail": "style_2d_anime.jpg",
+      "aspect_default": "9:16",
+      "positive_suffix": "二次元动漫",
+      "negative_suffix": [
+        "写实照片",
+        "真人摄影",
+        "3D 写实渲染"
+      ],
+      "aliases": []
+    },
+    {
+      "style_id": "style_2d_miyazaki",
+      "label": "宫崎骏画风",
+      "category": "2d",
+      "thumbnail": "style_2d_miyazaki.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "宫崎骏画风",
+      "negative_suffix": [],
+      "aliases": []
+    },
+    {
+      "style_id": "style_2d_american_comic_anim",
+      "label": "美国漫画动画插画风格",
+      "category": "2d",
+      "thumbnail": "style_2d_american_comic_anim.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "美国漫画动画插画风格",
+      "negative_suffix": [
+        "写实照片",
+        "真人摄影",
+        "3D 写实渲染"
+      ],
+      "aliases": []
+    },
+    {
+      "style_id": "style_2d_shanghai_studio",
+      "label": "上美厂老动画风格",
+      "category": "2d",
+      "thumbnail": "style_2d_shanghai_studio.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "上美厂老动画风格",
+      "negative_suffix": [],
+      "aliases": []
+    },
+    {
+      "style_id": "style_2d_stick_figure",
+      "label": "儿童简笔画风格",
+      "category": "2d",
+      "thumbnail": "style_2d_stick_figure.jpg",
+      "aspect_default": "9:16",
+      "positive_suffix": "儿童简笔画风格",
+      "negative_suffix": [],
+      "aliases": []
+    },
+    {
+      "style_id": "style_2d_shojo",
+      "label": "日式少女漫风格",
+      "category": "2d",
+      "thumbnail": "style_2d_shojo.jpg",
+      "aspect_default": "9:16",
+      "positive_suffix": "日式少女漫风格",
+      "negative_suffix": [
+        "写实照片",
+        "真人摄影",
+        "3D 写实渲染"
+      ],
+      "aliases": []
+    },
+    {
+      "style_id": "style_2d_loose_sketch",
+      "label": "松弛轮廓手绘风",
+      "category": "2d",
+      "thumbnail": "style_2d_loose_sketch.jpg",
+      "aspect_default": "9:16",
+      "positive_suffix": "松弛轮廓手绘风",
+      "negative_suffix": [],
+      "aliases": []
+    },
+    {
+      "style_id": "style_2d_guochao",
+      "label": "国风二次元新国潮风格",
+      "category": "2d",
+      "thumbnail": "style_2d_guochao.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "国风二次元新国潮风格",
+      "negative_suffix": [
+        "写实照片",
+        "真人摄影",
+        "3D 写实渲染"
+      ],
+      "aliases": []
+    },
+    {
+      "style_id": "style_2d_bw_ink",
+      "label": "黑白水墨风格",
+      "category": "2d",
+      "thumbnail": "style_2d_bw_ink.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "黑白水墨风格",
+      "negative_suffix": [
+        "写实照片",
+        "真人摄影",
+        "3D 写实渲染"
+      ],
+      "aliases": []
+    },
+    {
+      "style_id": "style_2d_chinese_mythology",
+      "label": "2D中国神话风",
+      "category": "2d",
+      "thumbnail": "style_2d_chinese_mythology.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "2D中国神话风",
+      "negative_suffix": [],
+      "aliases": []
+    },
+    {
+      "style_id": "style_2d_crayon",
+      "label": "儿童蜡笔手绘插画风格",
+      "category": "2d",
+      "thumbnail": "style_2d_crayon.jpg",
+      "aspect_default": "9:16",
+      "positive_suffix": "儿童蜡笔手绘插画风格",
+      "negative_suffix": [],
+      "aliases": []
+    },
+    {
+      "style_id": "style_2d_shadow_play",
+      "label": "皮影戏插画风格",
+      "category": "2d",
+      "thumbnail": "style_2d_shadow_play.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "皮影戏插画风格",
+      "negative_suffix": [],
+      "aliases": []
+    },
+    {
+      "style_id": "style_3d_xianxia_cg",
+      "label": "3D写实CG仙侠风",
+      "category": "3d",
+      "thumbnail": "style_3d_xianxia_cg.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "3D写实CG仙侠风",
+      "negative_suffix": [
+        "卡通描边",
+        "平涂色块"
+      ],
+      "aliases": []
+    },
+    {
+      "style_id": "style_3d_guofeng_cg",
+      "label": "3D写实CG古装风",
+      "category": "3d",
+      "thumbnail": "style_3d_guofeng_cg.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "3D写实CG古装风",
+      "negative_suffix": [
+        "卡通描边",
+        "平涂色块"
+      ],
+      "aliases": []
+    },
+    {
+      "style_id": "style_3d_dark_fantasy",
+      "label": "黑暗奇幻风格",
+      "category": "3d",
+      "thumbnail": "style_3d_dark_fantasy.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "黑暗奇幻风格",
+      "negative_suffix": [],
+      "aliases": []
+    },
+    {
+      "style_id": "style_3d_aaa_concept",
+      "label": "美国3A游戏概念艺术风格",
+      "category": "3d",
+      "thumbnail": "style_3d_aaa_concept.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "美国3A游戏概念艺术风格",
+      "negative_suffix": [],
+      "aliases": []
+    },
+    {
+      "style_id": "style_3d_ue5_urban",
+      "label": "3D次世代都市怪谈风",
+      "category": "3d",
+      "thumbnail": "style_3d_ue5_urban.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "3D次世代都市怪谈风",
+      "negative_suffix": [],
+      "aliases": []
+    },
+    {
+      "style_id": "style_3d_cg_urban",
+      "label": "3D写实CG现代都市风",
+      "category": "3d",
+      "thumbnail": "style_3d_luxury_fantasy.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "3D写实CG现代都市风",
+      "negative_suffix": [
+        "卡通描边",
+        "平涂色块"
+      ],
+      "aliases": [
+        "3D写实CG都市风"
+      ]
+    },
+    {
+      "style_id": "style_3d_disney",
+      "label": "3D迪士尼动画风格",
+      "category": "3d",
+      "thumbnail": "style_3d_disney.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "3D迪士尼动画风格",
+      "negative_suffix": [],
+      "aliases": []
+    },
+    {
+      "style_id": "style_3d_fruit_person",
+      "label": "水果人风格",
+      "category": "3d",
+      "thumbnail": "style_3d_fruit_person.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "水果人风格",
+      "negative_suffix": [],
+      "aliases": []
+    },
+    {
+      "style_id": "style_3d_game_render",
+      "label": "3D游戏渲染风格",
+      "category": "3d",
+      "thumbnail": "style_3d_game_render.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "3D游戏渲染风格",
+      "negative_suffix": [],
+      "aliases": [
+        "3D动漫渲染"
+      ]
+    },
+    {
+      "style_id": "style_3d_claymation",
+      "label": "粘土动画风格",
+      "category": "3d",
+      "thumbnail": "style_3d_claymation.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "粘土动画风格",
+      "negative_suffix": [],
+      "aliases": []
+    },
+    {
+      "style_id": "style_3d_clay_stopmotion",
+      "label": "定格动画黏土风格",
+      "category": "3d",
+      "thumbnail": "style_3d_clay_stopmotion.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "定格动画黏土风格",
+      "negative_suffix": [],
+      "aliases": []
+    },
+    {
+      "style_id": "rp_post_apocalyptic",
+      "label": "末世真人写实风",
+      "category": "real",
+      "thumbnail": "rp_post_apocalyptic.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "末世真人写实风",
+      "negative_suffix": [
+        "卡通描边",
+        "平涂色块"
+      ],
+      "aliases": []
+    },
+    {
+      "style_id": "rp_xianxia_real",
+      "label": "古风仙侠写实风",
+      "category": "real",
+      "thumbnail": "rp_xianxia_real.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "古风仙侠写实风",
+      "negative_suffix": [
+        "卡通描边",
+        "平涂色块"
+      ],
+      "aliases": []
+    },
+    {
+      "style_id": "rp_period_drama",
+      "label": "年代剧真人写实风",
+      "category": "real",
+      "thumbnail": "rp_80s_rural.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "年代剧真人写实风",
+      "negative_suffix": [
+        "卡通描边",
+        "平涂色块"
+      ],
+      "aliases": []
+    },
+    {
+      "style_id": "rp_ancient_costume",
+      "label": "古装真人写实风",
+      "category": "real",
+      "thumbnail": "rp_ancient_costume.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "古装真人写实风",
+      "negative_suffix": [
+        "卡通描边",
+        "平涂色块"
+      ],
+      "aliases": []
+    },
+    {
+      "style_id": "rp_hongkong_film",
+      "label": "港风电影写实风",
+      "category": "real",
+      "thumbnail": "rp_hongkong_film.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "港风电影写实风",
+      "negative_suffix": [
+        "卡通描边",
+        "平涂色块"
+      ],
+      "aliases": []
+    },
+    {
+      "style_id": "rp_korean_drama",
+      "label": "韩剧都市写实风",
+      "category": "real",
+      "thumbnail": "rp_korean_drama.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "韩剧都市写实风",
+      "negative_suffix": [
+        "卡通描边",
+        "平涂色块"
+      ],
+      "aliases": []
+    },
+    {
+      "style_id": "rp_urban_real",
+      "label": "现代都市写实风",
+      "category": "real",
+      "thumbnail": "rp_urban_real.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "现代都市写实风",
+      "negative_suffix": [
+        "卡通描边",
+        "平涂色块"
+      ],
+      "aliases": []
+    },
+    {
+      "style_id": "rp_american_upturn",
+      "label": "美式经济上行风格",
+      "category": "real",
+      "thumbnail": "rp_american_upturn.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "美式经济上行风格",
+      "negative_suffix": [],
+      "aliases": []
+    },
+    {
+      "style_id": "rp_american_vintage_tv",
+      "label": "美式复古影视风格",
+      "category": "real",
+      "thumbnail": "rp_american_vintage_tv.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "美式复古影视风格",
+      "negative_suffix": [],
+      "aliases": []
+    },
+    {
+      "style_id": "rp_bw_photography",
+      "label": "黑白胶片摄影风格",
+      "category": "real",
+      "thumbnail": "rp_bw_photography.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "黑白胶片摄影风格",
+      "negative_suffix": [],
+      "aliases": []
+    },
+    {
+      "style_id": "rp_90s_realist",
+      "label": "90年代写实电影风格",
+      "category": "real",
+      "thumbnail": "rp_90s_realist.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "90年代写实电影风格",
+      "negative_suffix": [
+        "卡通描边",
+        "平涂色块"
+      ],
+      "aliases": []
+    },
+    {
+      "style_id": "rp_retro_hollywood",
+      "label": "美式复古好莱坞",
+      "category": "real",
+      "thumbnail": "rp_retro_hollywood.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "美式复古好莱坞",
+      "negative_suffix": [],
+      "aliases": []
+    },
+    {
+      "style_id": "rp_blue_orange",
+      "label": "蓝橙色调影视风格",
+      "category": "real",
+      "thumbnail": "rp_blue_orange.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "蓝橙色调影视风格",
+      "negative_suffix": [],
+      "aliases": []
+    },
+    {
+      "style_id": "rp_high_key_absurd",
+      "label": "荒诞高调白色调电影风格",
+      "category": "real",
+      "thumbnail": "rp_high_key_absurd.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "荒诞高调白色调电影风格",
+      "negative_suffix": [],
+      "aliases": []
+    },
+    {
+      "style_id": "rp_suspense",
+      "label": "悬疑电影风格",
+      "category": "real",
+      "thumbnail": "rp_suspense.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "悬疑电影风格",
+      "negative_suffix": [],
+      "aliases": []
+    },
+    {
+      "style_id": "rp_quentin",
+      "label": "昆汀胶片电影",
+      "category": "real",
+      "thumbnail": "rp_quentin.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "昆汀胶片电影",
+      "negative_suffix": [],
+      "aliases": []
+    },
+    {
+      "style_id": "rp_retro_futurism",
+      "label": "美式复古未来主义",
+      "category": "real",
+      "thumbnail": "rp_retro_futurism.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "美式复古未来主义",
+      "negative_suffix": [],
+      "aliases": []
+    },
+    {
+      "style_id": "rp_russian_melancholy",
+      "label": "俄罗斯忧郁电影",
+      "category": "real",
+      "thumbnail": "rp_russian_melancholy.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "俄罗斯忧郁电影",
+      "negative_suffix": [],
+      "aliases": []
+    },
+    {
+      "style_id": "rp_koreeda",
+      "label": "是枝裕和日式纪实",
+      "category": "real",
+      "thumbnail": "rp_koreeda.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "是枝裕和日式纪实",
+      "negative_suffix": [
+        "写实照片",
+        "真人摄影",
+        "3D 写实渲染"
+      ],
+      "aliases": []
+    },
+    {
+      "style_id": "rp_korean_cold",
+      "label": "韩国冷淡风电影风格",
+      "category": "real",
+      "thumbnail": "rp_korean_cold.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "韩国冷淡风电影风格",
+      "negative_suffix": [],
+      "aliases": []
+    },
+    {
+      "style_id": "rp_war_film",
+      "label": "复古战争电影风格",
+      "category": "real",
+      "thumbnail": "rp_war_film.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "复古战争电影风格",
+      "negative_suffix": [],
+      "aliases": []
+    },
+    {
+      "style_id": "rp_horror",
+      "label": "恐怖电影风格",
+      "category": "real",
+      "thumbnail": "rp_horror.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "恐怖电影风格",
+      "negative_suffix": [],
+      "aliases": []
+    },
+    {
+      "style_id": "rp_court_intrigue",
+      "label": "宫斗权谋冷峻风格",
+      "category": "real",
+      "thumbnail": "rp_court_intrigue.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "宫斗权谋冷峻风格",
+      "negative_suffix": [],
+      "aliases": []
+    },
+    {
+      "style_id": "rp_wilderness",
+      "label": "荒野电影风格",
+      "category": "real",
+      "thumbnail": "rp_wilderness.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "荒野电影风格",
+      "negative_suffix": [],
+      "aliases": []
+    },
+    {
+      "style_id": "rp_60s_scifi",
+      "label": "60年代复古科幻",
+      "category": "real",
+      "thumbnail": "rp_60s_scifi.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "60年代复古科幻",
+      "negative_suffix": [],
+      "aliases": []
+    },
+    {
+      "style_id": "rp_ancient_chinese_real",
+      "label": "真人古风写实风格",
+      "category": "real",
+      "thumbnail": "rp_ancient_chinese_real.jpg",
+      "aspect_default": "16:9",
+      "positive_suffix": "真人古风写实风格",
+      "negative_suffix": [
+        "卡通描边",
+        "平涂色块"
+      ],
+      "aliases": []
+    }
+  ],
+  "aspect_presets": [
+    {
+      "aspect_id": "aspect_1x1",
+      "ratio": "1:1",
+      "label": "1:1 方形",
+      "value": "1:1 方形",
+      "orientation": "square",
+      "comfy_widget": "1:1 (Square)"
+    },
+    {
+      "aspect_id": "aspect_2x3",
+      "ratio": "2:3",
+      "label": "2:3 竖幅（照片）",
+      "value": "2:3 竖幅",
+      "orientation": "portrait",
+      "comfy_widget": "2:3 (Portrait Photo)"
+    },
+    {
+      "aspect_id": "aspect_3x2",
+      "ratio": "3:2",
+      "label": "3:2 横幅（照片）",
+      "value": "3:2 横幅",
+      "orientation": "landscape",
+      "comfy_widget": "3:2 (Photo)"
+    },
+    {
+      "aspect_id": "aspect_3x4",
+      "ratio": "3:4",
+      "label": "3:4 竖幅（标准）",
+      "value": "3:4 竖幅",
+      "orientation": "portrait",
+      "comfy_widget": "3:4 (Portrait Standard)"
+    },
+    {
+      "aspect_id": "aspect_4x3",
+      "ratio": "4:3",
+      "label": "4:3 横幅（标准）",
+      "value": "4:3 横幅",
+      "orientation": "landscape",
+      "comfy_widget": "4:3 (Standard)"
+    },
+    {
+      "aspect_id": "aspect_9x16",
+      "ratio": "9:16",
+      "label": "9:16 竖屏（短视频）",
+      "value": "9:16 竖屏",
+      "orientation": "portrait",
+      "comfy_widget": "9:16 (Portrait Widescreen)"
+    },
+    {
+      "aspect_id": "aspect_16x9",
+      "ratio": "16:9",
+      "label": "16:9 横屏（宽屏）",
+      "value": "16:9 横屏",
+      "orientation": "landscape",
+      "comfy_widget": "16:9 (Widescreen)"
+    },
+    {
+      "aspect_id": "aspect_21x9",
+      "ratio": "21:9",
+      "label": "21:9 超宽（电影感）",
+      "value": "21:9 超宽",
+      "orientation": "ultrawide",
+      "comfy_widget": "21:9 (UltraWide)"
+    }
+  ]
+}

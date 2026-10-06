@@ -8,7 +8,7 @@ ref_img_path.txt
 
 # P0-3 密钥加密：主密钥与加密密钥库
 .secret_key
-output/secrets.enc
+/output/secrets.enc
 secrets.enc
 .env
 .env.*
@@ -17,16 +17,16 @@ profiles/*.env
 profiles/local.env
 
 # ===================== 运行产物（体积大，不入库） =====================
-# output/ 下全部为生成产物（图/视频/质检/超分）与运行时数据（项目索引/死信/密钥库），总计数百 MB
-output/
-# A-24（F-09）：此处**不能**再用 `!output/projects/index.json` 把索引拉回版本控制——
+# /output/ 下全部为生成产物（图/视频/质检/超分）与运行时数据（项目索引/死信/密钥库），总计数百 MB
+/output/
+# A-24（F-09）：此处**不能**再用 `!/output/projects/index.json` 把索引拉回版本控制——
 # git 规则「父目录被整体忽略后，子文件无法再用 ! 否定重新包含」，该否定行实测恒失效
-# （git check-ignore 命中 output/ 第 21 行）。index.json 是运行时数据（项目目录指针表），
+# （git check-ignore 命中 /output/ 第 21 行）。index.json 是运行时数据（项目目录指针表），
 # 配合 project_store 的 `.bak` 快照（P1-12/A-12）可恢复，缺失时应用按默认索引重建，
-# 故明确不入库。若日后确需入库，须改「选择性忽略」：逐目录忽略 output/assets/ 等 +
-# `output/projects/*`（带 /* 而非 /）配 `!output/projects/index.json`，切勿整体 output/。
+# 故明确不入库。若日后确需入库，须改「选择性忽略」：逐目录忽略 /output/assets/ 等 +
+# `/output/projects/*`（带 /* 而非 /）配 `!/output/projects/index.json`，切勿整体 /output/。
 temp/
-# 任务/凭证库的**权威路径**是 output/tasks.db（已被上方 `output/` 覆盖，不入库）。
+# 任务/凭证库的**权威路径**是 /output/tasks.db（已被上方 `/output/` 覆盖，不入库）。
 # 根目录若出现同名文件，是临时的 `sqlite3 tasks.db` 之类命令误建的空壳（无任何代码引用），
 # 一律不入库；排查见 `.workbuddy/memory/FRONTEND_NOTES.md`。
 /tasks.db
@@ -197,3 +197,11 @@ artifacts/
 # qc_config.json 的原子写只会留 .bak；.bak-before-* 是人工排查时手工复制的
 # 多份配置快照，同样不入库（避免 git status 里堆噪音）。
 /qc_config.json.bak-*
+
+# ---- 2026-10-07 改造新增的本地验证产物 ----
+# 路由快照是 scripts/snapshot_routes.py 的**本地比对基线**，由本机 import app 生成。
+# ⚠️ 它必须不入库：基线一旦被提交，任何人跑一次都会因本机注册顺序差异产生
+# 噪音 diff，久而久之就没人看这个门禁了。「URL 契约」的权威记录是 ADR-0001
+# 与该脚本的文档，不是仓库里的一个 JSON。
+/_route_snapshot_*.json
+/_split_manifest.json

@@ -1,0 +1,180 @@
+{
+  "schema_version": 1,
+  "_readme": [
+    "本文件是**模型 / 素材 / 品牌授权的唯一登记处**。改造前 grep license = 0 命中，",
+    "整个链路没有授权概念；现在交付前有强制门禁（app/domain/licensing.py）。",
+    "",
+    "字段语义（见 app/domain/licensing.py）：",
+    "  name                模型/素材名（门禁按它匹配，大小写与分隔符无关）",
+    "  source              来源（发证方 / 下载站 / 作者）",
+    "  license_type        许可类型，必须是 LICENSE_TYPES 里的键之一",
+    "  commercial_use      可商用；显式写 false 可比许可类型更严格",
+    "  verified            **是否已人工核实过**。false 或缺失 ⇒ 门禁阻断",
+    "  attribution_required 是否要求署名",
+    "  attribution_text    署名文本（要求署名时交付方要复制到简介）",
+    "",
+    "为什么 verified 默认要显式写：许可类型猜错的代价是「已经发出去的成片」。",
+    "拿不准就写 false，门禁会把它挡下来并在 /api/licensing/registry 里列出来 ——",
+    "这比事后补一份免责声明有用。"
+  ],
+  "models": [
+    {
+      "name": "qwen-image-2.1",
+      "source": "阿里通义千问（Qwen Image）",
+      "license_type": "apache-2.0",
+      "commercial_use": true,
+      "verified": true,
+      "attribution_required": false,
+      "attribution_text": "",
+      "notes": "Qwen-Image-2.1 权重以 Apache-2.0 发布，可商用；保留 NOTICE 即可。现役出图 UNET（见 app/deps_check.py MODEL_CHECKLIST）。"
+    },
+    {
+      "name": "qwen3-vl",
+      "source": "阿里通义千问（Qwen3-VL）",
+      "license_type": "apache-2.0",
+      "commercial_use": true,
+      "verified": true,
+      "attribution_required": false,
+      "attribution_text": "",
+      "notes": "视频/图像两路 CLIP 均用 Qwen3-VL 系权重（32B 给 H3，8B 给 QwenImage2.1）。"
+    },
+    {
+      "name": "sdxl-1.0",
+      "source": "Stability AI",
+      "license_type": "openrail++-m",
+      "commercial_use": true,
+      "verified": true,
+      "attribution_required": true,
+      "attribution_text": "Stable Diffusion XL 1.0 — Stability AI — CreativeML Open RAIL++-M",
+      "notes": "可商用，但必须遵守使用政策（不得生成违法内容等）并在简介署名。"
+    },
+    {
+      "name": "flux.1-schnell",
+      "source": "Black Forest Labs",
+      "license_type": "apache-2.0",
+      "commercial_use": true,
+      "verified": true,
+      "attribution_required": false,
+      "attribution_text": "",
+      "notes": "FLUX.1-schnell 为 Apache-2.0，可商用。"
+    },
+    {
+      "name": "flux.1-dev",
+      "source": "Black Forest Labs",
+      "license_type": "non-commercial",
+      "commercial_use": false,
+      "verified": true,
+      "attribution_required": true,
+      "attribution_text": "FLUX.1-dev — Black Forest Labs — 非商用授权",
+      "notes": "⚠ FLUX.1-**dev** 是非商用权重，只有 schnell 可商用。门禁会拦下 dev，商业交付需换 schnell 或另购授权。"
+    },
+    {
+      "name": "minimax-h3",
+      "source": "MiniMax",
+      "license_type": "unknown",
+      "commercial_use": false,
+      "verified": false,
+      "attribution_required": true,
+      "attribution_text": "",
+      "notes": "待核实：现役视频主模型（ref2va 单采模板）。需确认官网 LICENSE 的商用条款后再把 verified 改 true。"
+    },
+    {
+      "name": "flashvsr-v1.1",
+      "source": "OpenGVLab",
+      "license_type": "unknown",
+      "commercial_use": false,
+      "verified": false,
+      "attribution_required": true,
+      "attribution_text": "",
+      "notes": "待核实：可选超分 DiT（enable_upscale=true 时用）。仅研究用则商业交付不可带。"
+    }
+  ],
+  "assets": [
+    {
+      "id": "bgm_calm_loop",
+      "name": "舒缓铺底循环",
+      "kind": "music",
+      "source": "Free Music Archive",
+      "license_type": "cc0-1.0",
+      "commercial_use": true,
+      "verified": true,
+      "attribution_required": false,
+      "attribution_text": "",
+      "notes": "公有领域，直接用、无需署名。"
+    },
+    {
+      "id": "bgm_tense_loop",
+      "name": "紧张推进循环",
+      "kind": "music",
+      "source": "Free Music Archive",
+      "license_type": "cc-by-4.0",
+      "commercial_use": true,
+      "verified": true,
+      "attribution_required": true,
+      "attribution_text": "紧张推进循环 — 作者见 Free Music Archive 原页面（CC BY 4.0）",
+      "notes": "可商用，但**必须署名** —— 门禁在没有 attribution_text 时会以 LIC-ATTRIBUTION-MISSING 拦下。"
+    },
+    {
+      "id": "bgm_ending_theme",
+      "name": "片尾主题",
+      "kind": "music",
+      "source": "Free Music Archive",
+      "license_type": "cc-by-sa-4.0",
+      "commercial_use": true,
+      "verified": true,
+      "attribution_required": true,
+      "attribution_text": "片尾主题 — 作者见 Free Music Archive 原页面（CC BY-SA 4.0）",
+      "notes": "SA 条款：需署名，且改编需同协议共享。"
+    },
+    {
+      "id": "sfx_slash",
+      "name": "挥击音效",
+      "kind": "sfx",
+      "source": "Freesound",
+      "license_type": "cc0-1.0",
+      "commercial_use": true,
+      "verified": true,
+      "attribution_required": false,
+      "attribution_text": "",
+      "notes": "公有领域音效。"
+    },
+    {
+      "id": "amb_rain_ambience",
+      "name": "雨声环境音",
+      "kind": "sfx",
+      "source": "Freesound",
+      "license_type": "cc-by-nc-4.0",
+      "commercial_use": false,
+      "verified": true,
+      "attribution_required": true,
+      "attribution_text": "",
+      "notes": "⚠ 带 NC 的环境音，**不可商用**。门禁会以 LIC-ASSET-NONCOMMERCIAL 拦下，商业交付请换 CC0 版本。"
+    }
+  ],
+  "brands": [
+    {
+      "brand_id": "comicdrama",
+      "name": "漫剧锻造台",
+      "versions": [
+        {
+          "version": "v1",
+          "watermark_text": "漫剧锻造台",
+          "watermark_position": "bottom_right",
+          "watermark_opacity": 0.6,
+          "enabled": true,
+          "updated_at": "2026-09-01",
+          "notes": "首版：右下角小字水印。"
+        },
+        {
+          "version": "v2",
+          "watermark_text": "漫剧锻造台 · 预览",
+          "watermark_position": "bottom_right",
+          "watermark_opacity": 0.8,
+          "enabled": true,
+          "updated_at": "2026-10-01",
+          "notes": "预览版水印：成片未批准前必须带。品牌版本参与交付包记录，指定不存在的版本会被门禁拦下。"
+        }
+      ]
+    }
+  ]
+}

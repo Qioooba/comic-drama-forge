@@ -877,3 +877,88 @@ def apply_asset_style_all(assets: Optional[List[dict]], style) -> int:
     """中英双语一起补写风格（资产参考提示词的统一收尾入口）"""
     return (apply_asset_style(assets, style, key="reference_prompt_zh")
             + apply_asset_style(assets, style, key="reference_prompt_en"))
+
+
+# --------------------------------------------------------------------------- #
+# 风格目录（style_id）解析 —— 2026-10-07 追加
+#
+# ⚠️ 本节**只追加**，不改上面任何既有函数体：既有链路（分镜/资产/尾帧/视频重试）
+#    继续按自由文本风格串工作，行为逐字不变。本节提供「风格目录」这条并行通道：
+#
+#    * 单一事实源 ``app/style_catalog.json``（61 风格 + 8 画幅预设）
+#    * ``style_id`` 稳定且不含中文 → 改名只改 label，历史不断
+#    * 目录不可用时**全部返回空**（fail-soft）：风格是增强项，
+#      不能因为目录读不出来就让整条生成链路挂掉。
+# --------------------------------------------------------------------------- #
+
+def _load_style_catalog():
+    """按需载入风格目录；不可用返回 None（不抛异常，见本节 fail-soft 约定）。"""
+    try:
+        from infrastructure.style_catalog_repo import safe_get_catalog
+        return safe_get_catalog()
+    except Exception:  # noqa: BLE001 目录不可用绝不能连带影响既有注入链路
+        return None
+
+
+def resolve_style_id(text) -> Optional[str]:
+    """把任意风格串解析成稳定的 ``style_id``，解析不到返回 None。
+
+    这是**向后兼容的关键**：老项目 ``config.json`` 里存的是中文自由文本
+    （如「国漫风格/偏写实/竖屏9:16」），加 id 之后仍能解析回同一个条目，
+    不会因为目录升级而断掉存量项目。
+
+    匹配顺序见 :meth:`domain.style_catalog.StyleCatalog.resolve_text`
+    （id 精确 → 归一化 label/alias → 最长子串）。
+    """
+    catalog = _load_style_catalog()
+    if catalog is None:
+        return None
+    entry = catalog.resolve_text(text)
+    return entry.style_id if entry else None
+
+
+def resolve_by_id(style_id) -> Optional[Dict[str, object]]:
+    """按 ``style_id`` 取风格条目的全部落地参数，未命中返回 None。
+
+    返回体可直接喂给既有注入链路：``positive_suffix`` 交给
+    :func:`with_style`，``negative_suffix`` 交给负向词列表，
+    ``aspect_ratio`` 交给 :func:`aspect_size` / :func:`apply_latent_size`。
+
+    ⚠️ ``aspect_default`` 只是**回退**：既有链路仍以风格串里的显式比例
+       与 ``config.aspect_ratio`` 为准（见 :func:`aspect_ratio` 的优先级），
+       调用方须自行决定是否采用，避免悄悄改掉存量项目的画幅。
+    """
+    catalog = _load_style_catalog()
+    if catalog is None:
+        return None
+    entry = catalog.resolve_id(style_id)
+    if entry is None:
+        return None
+    return {
+        "style_id": entry.style_id,
+        "label": entry.label,
+        # value = 写入 config.style 的旧字面值（= label），老项目读它不变
+        "value": entry.value,
+        "category": entry.category,
+        "positive_suffix": entry.prompt_style,
+        "negative_suffix": list(entry.negative_suffix),
+        "aliases": list(entry.aliases),
+        "aspect_default": entry.aspect_default,
+        "aspect_ratio": entry.aspect_ratio(),
+        "thumbnail": entry.thumbnail,
+    }
+
+
+def negative_for_style_id(style_id) -> List[str]:
+    """取该风格的负向词；条目/目录不存在时回落到 :func:`negative_for_style`。
+
+    目录里显式存的 ``negative_suffix`` 优先（事实源可人工调优），
+    没有记录时才按风格串推导，保证既有调用点零改动。
+    """
+    info = resolve_by_id(style_id)
+    if info is not None:
+        saved = [str(x) for x in (info.get("negative_suffix") or []) if str(x).strip()]
+        if saved:
+            return saved
+        return negative_for_style(str(info.get("positive_suffix") or info.get("value") or ""))
+    return []
