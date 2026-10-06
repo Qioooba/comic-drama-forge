@@ -95,6 +95,7 @@ import shot_key
 from fs_atomic import atomic_write_json, read_json_strict
 import providers
 import comfyui_models
+import actual_params
 import log_viewer
 import asset_name_match
 import scene_grid
@@ -3488,6 +3489,20 @@ def api_comfyui_models_select():
     except Exception as e:  # noqa: BLE001
         return jsonify({"success": False, "error": f"保存失败：{e}"}), 500
     return jsonify({"success": True, "selection": selection})
+
+
+@app.route('/api/comfyui/actual-params', methods=['GET'])
+def api_comfyui_actual_params():
+    """P0-5：返回最近提交的“实际生效参数”快照（模板 ≠ 最终提交值）。"""
+    try:
+        limit = int(request.args.get('limit') or 20)
+    except (TypeError, ValueError):
+        limit = 20
+    try:
+        return jsonify({"success": True,
+                        "items": actual_params.latest(limit)})
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"success": False, "items": [], "error": str(e)}), 200
 
 
 @app.route('/api/logs', methods=['GET'])

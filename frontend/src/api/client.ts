@@ -17,6 +17,7 @@ import type {
   QCConfig, QCResponse,
   Episode, EpisodeListResponse, NovelSplitPlanResponse, ComfyUIModelsResponse,
   TrtEngineCheckResponse,
+  ActualParamsResponse,
   LogSource, LogsResponse,
   AutopilotStatus, AutopilotProgress,
   Deliverable, DeliverablesResponse,
@@ -993,6 +994,11 @@ export const trtEngineApi = {
   /** P0-3：默认只做静态检查；probe=true 会提交 Encode→Decode 最小加载探针。 */
   check: (probe = false) =>
     request<TrtEngineCheckResponse>(`/trt-engine/check${probe ? '?probe=1' : ''}`),
+};
+
+export const actualParamsApi = {
+  latest: (limit = 10) =>
+    request<ActualParamsResponse>(`/comfyui/actual-params?limit=${limit}`),
 };
 
 export const comfyuiModelsApi = {

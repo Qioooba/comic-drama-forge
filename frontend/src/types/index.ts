@@ -724,6 +724,39 @@ export interface ComfyUIModelsResponse {
   error?: string;
 }
 
+export interface ActualParamsSnapshot {
+  prompt_id: string;
+  submitted_at: string;
+  node_count: number;
+  workflow_path: string;
+  workflow_file: string;
+  workflow_hash: string;
+  models: Record<string, unknown>;
+  width: number | null;
+  height: number | null;
+  fps: number | null;
+  seed: number | string | null;
+  segment_count: number | null;
+  total_frames: number | null;
+  segment_frames: number[] | null;
+  audio_mode: string | null;
+  continuity: boolean | null;
+  overlap_frames: number | null;
+  common_refs: number | null;
+  refine_present: boolean;
+  dlss_present: boolean;
+  refine_expected: boolean | null;
+  dlss_bypassed: boolean | null;
+  node_types: string[];
+  snapshot_path?: string;
+}
+
+export interface ActualParamsResponse {
+  success: boolean;
+  items: ActualParamsSnapshot[];
+  error?: string;
+}
+
 export interface TrtEngineInfo {
   key: string;
   name: string;

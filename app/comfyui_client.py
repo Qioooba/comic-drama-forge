@@ -29,6 +29,7 @@ import threading
 import requests
 import cancellation  # S9：远端任务取消（中止信号贯穿 ComfyUI 轮询，与 pipeline/llm_client 同一套）
 import comfyui_job_store as job_store  # 崩溃免重渲检查点（2026-09-29：台账复用 + 重连，不重复提交）
+import actual_params  # P0-5：提交时记录“最终生效参数”快照
 import asset_library  # 跨项目角色资产库（2026-09-29：形象指纹命中即零渲染复用）
 from typing import Dict, List, Optional, Any, Tuple, Sequence
 # ⚠️ Sequence 曾被漏导入：类级注解 `_LIGHT_KEYWORDS: Sequence[...]` 在类创建时**不求值**，
@@ -819,6 +820,9 @@ class ComfyUIClient:
         self._object_info = None
         self._object_info_ts = 0.0
         self.last_convert_meta: Dict[str, Any] = {}
+        # 最近一次 load_workflow 的路径/hash；queue_prompt 在拿到 prompt_id 后
+        # 用它生成 actual_params 快照。直接 to_api 的调用会清空，避免沿用陈旧路径。
+        self.last_workflow_meta: Dict[str, Any] = {}
 
     def _generate_client_id(self) -> str:
         import uuid
@@ -926,7 +930,14 @@ class ComfyUIClient:
         workflow_path = resolve_workflow_path(workflow_file)
         with open(workflow_path, "r", encoding="utf-8-sig") as f:   # 兼容 UTF-8 BOM
             wf = json.load(f)
-        return self.to_api(wf, return_meta=return_meta)
+        result = self.to_api(wf, return_meta=return_meta)
+        # P0-5：记录实际读取的模板路径与文件 hash（不是内存里的 UI 副本）。
+        self.last_workflow_meta = {
+            "path": os.path.abspath(workflow_path),
+            "file": os.path.basename(workflow_path),
+            "hash": actual_params.file_sha256(workflow_path),
+        }
+        return result
 
     @staticmethod
     def _is_api_format(wf: dict) -> bool:
@@ -938,6 +949,8 @@ class ComfyUIClient:
 
     def to_api(self, wf: dict, return_meta: bool = False):
         """UI(node-graph) → API prompt"""
+        # 直接转换内存工作流时没有可证明的文件路径；清空以免快照沿用旧模板。
+        self.last_workflow_meta = {}
         if self._is_api_format(wf):
             meta = {"already_api": True, "node_count": len(wf)}
             return (wf, meta) if return_meta else wf
@@ -1275,6 +1288,8 @@ class ComfyUIClient:
 
     def queue_prompt(self, api_prompt: dict) -> str:
         payload = {"prompt": api_prompt, "client_id": self.client_id}
+        # 先捕获工作流元数据，避免并发提交时被下一次 load_workflow 覆盖。
+        workflow_meta = dict(self.last_workflow_meta or {})
         try:
             result = self._post("/prompt", payload)
         except Exception:
@@ -1284,7 +1299,23 @@ class ComfyUIClient:
             _bump("prompt_failed")
             raise RuntimeError(f"ComfyUI 队列错误: {result['error']}")
         _bump("prompt_submitted")
-        return result.get("prompt_id", "")
+        prompt_id = str(result.get("prompt_id", "") or "")
+        # P0-5：拿到 prompt_id 立即落最终参数快照；失败只 warning，不影响提交。
+        try:
+            snapshot = actual_params.extract(
+                api_prompt, workflow_meta=workflow_meta, prompt_id=prompt_id)
+            snapshot_path = actual_params.save(snapshot)
+            logger.info("[actual_params] %s", json.dumps(
+                {k: snapshot.get(k) for k in (
+                    "prompt_id", "workflow_path", "workflow_hash", "node_count",
+                    "width", "height", "fps", "seed", "segment_count",
+                    "total_frames", "refine_expected", "dlss_bypassed",
+                )}, ensure_ascii=False))
+            if snapshot_path:
+                logger.debug("[actual_params] path=%s", snapshot_path)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("实际参数快照写入失败（不影响生成）：%s", exc)
+        return prompt_id
 
     def get_history(self, prompt_id: str) -> dict:
         return self._get(f"/history/{prompt_id}")

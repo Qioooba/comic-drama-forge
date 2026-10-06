@@ -2,11 +2,12 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { useApp } from '@/context/AppContext';
 import { Badge, Button, Card, Select } from '@/components/ui';
 import { AlertTriangle, RefreshCw } from '@/components/ui/icons';
-import { comfyuiModelsApi, trtEngineApi } from '@/api/client';
+import { actualParamsApi, comfyuiModelsApi, trtEngineApi } from '@/api/client';
 import type {
   ComfyUIModelSlot,
   ComfyUIModelsResponse,
   TrtEngineCheckResponse,
+  ActualParamsSnapshot,
 } from '@/types';
 
 /**
@@ -29,6 +30,16 @@ export function ComfyUIPage() {
   const [showPlugins, setShowPlugins] = useState(false);
   const [trt, setTrt] = useState<TrtEngineCheckResponse | null>(null);
   const [trtProbing, setTrtProbing] = useState(false);
+  const [actual, setActual] = useState<ActualParamsSnapshot | null>(null);
+
+  const loadActual = useCallback(async () => {
+    try {
+      const res = await actualParamsApi.latest(1);
+      setActual(res.items?.[0] || null);
+    } catch {
+      setActual(null);
+    }
+  }, []);
 
   const checkTrt = useCallback(async (probe: boolean) => {
     if (probe) setTrtProbing(true);
@@ -60,7 +71,8 @@ export function ComfyUIPage() {
   useEffect(() => {
     void scan(false);
     void checkTrt(false);
-  }, [scan, checkTrt]);
+    void loadActual();
+  }, [scan, checkTrt, loadActual]);
 
   const handleChange = async (slot: ComfyUIModelSlot, value: string) => {
     setSavingKey(slot.key);
@@ -203,6 +215,65 @@ export function ComfyUIPage() {
             {' '}{t('wb.cm.trtCompute')} {trt.environment.compute_cap || '-'}
             {trt.checked_at ? ` · ${t('wb.cm.trtCheckedAt')} ${trt.checked_at}` : ''}
           </p>
+        )}
+      </Card>
+
+      {/* ===== Actual submitted params (P0-5) ===== */}
+      <Card bodyClassName="p-5">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h3 className="text-base font-semibold text-ink-1">{t('wb.cm.actualTitle')}</h3>
+            <p className="mt-1 text-xs text-ink-3">{t('wb.cm.actualHint')}</p>
+          </div>
+          <Button variant="secondary" size="sm" onClick={() => void loadActual()}>
+            <RefreshCw className="mr-2 h-4 w-4" />
+            {t('wb.cm.actualRefresh')}
+          </Button>
+        </div>
+        {!actual ? (
+          <p className="mt-3 text-sm text-ink-3">{t('wb.cm.actualEmpty')}</p>
+        ) : (
+          <div className="mt-3 space-y-3">
+            <div className="flex flex-wrap gap-2">
+              <Badge variant="default">{t('wb.cm.actualNodes')}: {actual.node_count}</Badge>
+              <Badge variant="default">{t('wb.cm.actualSeed')}: {actual.seed ?? '-'}</Badge>
+              <Badge variant="default">
+                {t('wb.cm.actualSize')}: {actual.width ?? '-'}×{actual.height ?? '-'}
+              </Badge>
+              <Badge variant="default">{t('wb.cm.actualFps')}: {actual.fps ?? '-'}</Badge>
+              <Badge variant="default">
+                {t('wb.cm.actualSegments')}: {actual.segment_count ?? '-'}
+              </Badge>
+              <Badge variant="default">
+                {t('wb.cm.actualFrames')}: {actual.total_frames ?? '-'}
+              </Badge>
+            </div>
+            <div className="grid gap-2 text-xs sm:grid-cols-2">
+              <div className="rounded border border-border px-3 py-2">
+                <span className="text-ink-3">{t('wb.cm.actualRefine')}：</span>
+                <span className={actual.refine_present ? 'text-success-strong' : 'text-ink-2'}>
+                  {actual.refine_present ? t('wb.cm.actualRefineOn') : t('wb.cm.actualRefineOff')}
+                </span>
+              </div>
+              <div className="rounded border border-border px-3 py-2">
+                <span className="text-ink-3">{t('wb.cm.actualDlss')}：</span>
+                <span className={actual.dlss_bypassed ? 'text-warning-strong' : 'text-ink-2'}>
+                  {actual.dlss_bypassed
+                    ? t('wb.cm.actualDlssBypass')
+                    : actual.dlss_present
+                      ? t('wb.cm.actualDlssOn')
+                      : t('wb.cm.actualDlssAbsent')}
+                </span>
+              </div>
+            </div>
+            <div className="rounded border border-border px-3 py-2 text-[11px]">
+              <p className="truncate font-mono text-ink-2">{actual.workflow_path || '-'}</p>
+              <p className="mt-1 truncate font-mono text-ink-3">
+                {t('wb.cm.actualWorkflowHash')}: {actual.workflow_hash || '-'}
+                {actual.submitted_at ? ` · ${actual.submitted_at}` : ''}
+              </p>
+            </div>
+          </div>
         )}
       </Card>
 
