@@ -111,6 +111,10 @@ _MIN_INK_RATIO = 0.004            # 非背景像素占比下限：低于此值�
 _lock = threading.Lock()
 _assets_dir: Optional[str] = None          # 资产目录（None = 未初始化）
 _assets_ready = False
+#: 「渲染资产缺失」告警是否已发过（2026-10-06）。
+#: 该降级是**每 shot 触发一次**的，原先无节制重复打 warning，一集下来刷屏几十条。
+#: 用列表当哨兵（模块级可变对象，list.append 原子且不需 global 声明）。
+_warned_missing_assets: list = []
 _server: Optional["_AssetServer"] = None
 _browser_path: Optional[str] = None
 _browser_checked = False
@@ -138,13 +142,85 @@ def default_root_dir() -> str:
 # 资产自举
 # --------------------------------------------------------------------------- #
 
+def _te_man_js_candidates() -> tuple:
+    """按「配置优先 → 本机真实 ComfyUI 根 → 历史硬编码」顺序给出 web/js 候选。
+
+    ⚠️ 2026-10-06 修复：原先候选里只有三条硬编码的
+    ``D:\\ComfyUI_portable_TE_v260619\\...``，而本机实际 ComfyUI 根是
+    ``.env`` 里的 ``COMFYUI_ROOT=F:/AI_Models/LocalDramaStudio/ComfyUI-2nd``。
+    于是日志永远打「未找到 TE MAN 插件 web 目录」，而**即便用户装好了插件也找不到**
+    —— 这与 .env 里记录的 COMFYUI_OUTPUT_DIR 历史事故是同一类问题（配置与代码脱节）。
+    现在从 `config.COMFYUI_ROOT` 推导，并把「自定义节点根」一并纳入。
+    """
+    cands = []
+    env_dir = (os.environ.get("MJSCXT_TE_MAN_JS_DIR") or "").strip()
+    if env_dir:
+        cands.append(env_dir)
+    comfy_dir = (os.environ.get("COMFYUI_DIR") or "").strip()
+    if comfy_dir:
+        cands.append(os.path.join(comfy_dir, "custom_nodes", "TE_MAN", "web", "js"))
+    try:
+        import config  # noqa: PLC0415
+        root = str(getattr(config, "COMFYUI_ROOT", "") or "").strip()
+    except Exception:  # noqa: BLE001  独立测试时可能没有 config
+        root = ""
+    if root:
+        # 两种常见布局：<root>/custom_nodes/... 与 <root>/ComfyUI/custom_nodes/...
+        for sub in (("custom_nodes",), ("ComfyUI", "custom_nodes")):
+            cands.append(os.path.join(root, *sub, "TE_MAN", "web", "js"))
+    cands.extend(_TE_MAN_JS_CANDIDATES)
+    return tuple(cands)
+
+
+def _has_all_assets(js_dir: str) -> bool:
+    """该 web/js 目录是否同时具备渲染所需的全部资产。"""
+    try:
+        return all(os.path.isfile(os.path.join(js_dir, *rel.split("/")))
+                   for rel, _ in _ASSET_FILES)
+    except OSError:
+        return False
+
+
 def _te_man_js_dir() -> Optional[str]:
-    env = (os.environ.get("MJSCXT_TE_MAN_JS_DIR") or "").strip()
-    if env and os.path.isdir(env):
-        return env
-    for cand in _TE_MAN_JS_CANDIDATES:
-        if cand and os.path.isdir(cand):
+    """返回**已确认具备全部渲染资产**的 web/js 目录。
+
+    ⚠️ 必须资产感知：原先是「第一个存在的目录就返回」，若某处存在同名但残缺的
+    `TE_MAN/web/js`（例如插件装了一半、或只剩 js 没带 Xbot.glb），会一路返回它，
+    随后在 `ensure_assets` 里因「渲染资产缺失」直接 return None —— **兜底扫描
+    `_find_asset_src()` 根本没机会跑**。改成按资产判据逐个校验。
+    """
+    for cand in _te_man_js_candidates():
+        if cand and os.path.isdir(cand) and _has_all_assets(cand):
             return cand
+    return None
+
+
+def _find_asset_src() -> Optional[str]:
+    """找到**具备全部渲染资产**的 web/js 目录（找不到就返回 None）。
+
+    兜底扫描 ``<ComfyUI根>/custom_nodes/*/web/js``：插件不一定叫 TE_MAN，
+    任何带齐 three.js + Xbot.glb 的同名布局目录都能用（同名布局是 TE MAN 的接口约定）。
+    只探一层、通配不递归，避免在超大 custom_nodes 树上做无谓 IO。
+    """
+    roots = []
+    for cand in _te_man_js_candidates():
+        # <...>/custom_nodes/TE_MAN/web/js → <...>/custom_nodes
+        parts = cand.replace("\\", "/").rstrip("/").split("/")
+        if "custom_nodes" in parts:
+            roots.append("/".join(parts[:parts.index("custom_nodes") + 1]).replace("/", os.sep))
+    seen = set()
+    for nodes_dir in roots:
+        if nodes_dir in seen or not os.path.isdir(nodes_dir):
+            continue
+        seen.add(nodes_dir)
+        try:
+            entries = sorted(os.listdir(nodes_dir))
+        except OSError:
+            continue
+        for name in entries:
+            js_dir = os.path.join(nodes_dir, name, "web", "js")
+            if os.path.isdir(js_dir) and _has_all_assets(js_dir):
+                return js_dir
     return None
 
 
@@ -180,10 +256,18 @@ def ensure_assets(root_dir: str) -> Optional[str]:
             else:
                 logger.warning("[3D站位图] 渲染页缺失（已尝试）：%s", " | ".join(_PAGE_SRC_CANDIDATES))
                 return None
-            src = _te_man_js_dir()
+            src = _te_man_js_dir() or _find_asset_src()
             if not src:
-                logger.warning("[3D站位图] 未找到 TE MAN 插件 web 目录（可用 "
-                               "MJSCXT_TE_MAN_JS_DIR 指定），跳过渲染资产复制")
+                # ⚠️ 2026-10-06：原来这条每个 shot 都打一遍，一集下来刷屏几十条，
+                # 把真正的渲染故障淹没。改为**每进程只报一次**，并给出可执行指引
+                # （本机三套 ComfyUI 的 custom_nodes 里都没有 TE_MAN，属真实缺失）。
+                if not _warned_missing_assets:
+                    _warned_missing_assets.append(True)
+                    logger.warning(
+                        "[3D站位图] 未找到带渲染资产（three.js + Xbot.glb）的插件 web/js 目录，"
+                        "本次跳过 3D 站位图渲染（降级为纯文字锚点，不影响出片）。"
+                        "已尝试：%s。若插件已安装，请用 MJSCXT_TE_MAN_JS_DIR 指向其 web/js 目录。",
+                        " | ".join(p for p in _te_man_js_candidates() if p) or "(无候选)")
                 return None
             for rel, target in _ASSET_FILES:
                 s = os.path.join(src, *rel.split("/"))
