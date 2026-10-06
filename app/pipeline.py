@@ -48,6 +48,7 @@ import time
 import traceback
 
 import cancellation
+import dialogue_utils  # 台词闸门：整集无台词不得出片（2026-10-07）
 import gpu_task_gate
 import quality_stage  # 四层质量状态 + 哈希绑定人审（2026-09-29）
 import task_lease  # 文件租约 + 心跳（2026-09-29：跨进程互斥 + 崩溃可回收）
@@ -960,15 +961,51 @@ def step_video(ctx) -> dict:
     if not shots:
         raise NeedsHumanError("剧本没有镜头数据，无法生成视频")
     cfg = ctx["config"]
+    # 台词闸门（2026-10-07 fail-closed，与 app.api_generate_videos 同一判据）。
+    # 托管流水线**直接调 worker、绕过 HTTP**，所以闸门必须在这里也有一份，
+    # 否则「无声成片」只在手动出片时被拦、托管模式照样一路跑完。
+    # 实测《测灵根》第 1 集：模型分镜失败 → 整集兜底 → dialogue 全空 → 成片无人声。
+    if not cfg.get("allow_silent"):
+        _aud = dialogue_utils.audit_script(script)
+        if not _aud["ok"]:
+            raise NeedsHumanError(
+                f"整集剧本没有可朗读台词，出片会得到完全无声的成片，已阻止提交："
+                f"{'；'.join(_aud['warnings'][:3])}"
+                f"（如确认只要画面，请在本集配置里开启「允许静音成片」allow_silent）")
     mode = cfg.get("video_mode") or "per_shot"
     if mode == "keyframe":
         kf = probe_keyframe(ctx)
         if not kf.get("done"):
             raise NeedsHumanError("关键帧模式要求尾帧齐全，请先完成尾帧生成")
 
-    # 参考图：优先剧本自带，缺失时由 worker 内部从磁盘资产兜底
-    char_refs = script.get("characters") or []
-    scene_refs = script.get("scenes") or []
+    # 参考图：走 _build_asset_index 统一解析，产出带本地绝对路径的 refs。
+    #
+    # ⚠️ 2026-10-06 真实缺陷修复：原先直接把剧本的 characters/scenes 原样透传，
+    # 而剧本角色对象只有描述字段（name/appearance/reference_prompt_zh/…），
+    # **没有 front/base 键**。worker 侧 _collect_reference_images 只认 front/base，
+    # 于是 p 恒为 None → 每镜都打「角色参考图不可用: <名字>」→ 参考图列表恒空。
+    # worker 虽有磁盘兜底分支，但那里是 `character_refs = character_refs or _auto_chars`：
+    # 剧本列表**非空**（6 个对象），`or` 短路让磁盘兜底根本没触发，
+    # 反而一路走到「自动补做角色资产」——而 _generate_asset_task 判定资产已达标、
+    # 全部「断点续跑跳过」，白等一轮，最后只靠同函数第二次扫描碰巧命中。
+    # 实测日志（serve_stdout.log）：磁盘 6 张 base.png 齐备，却在视频链路全军覆没。
+    #
+    # 现在在 pipeline 侧就把入参修成 worker 能直接吃的结构（带 front/base 本地路径），
+    # 不去改 app._collect_reference_images —— 它是通用函数，不该背上项目目录的业务知识。
+    _char_index = A._build_asset_index(script.get("characters") or [],
+                                      ctx["project_name"], "character")
+    _scene_index = A._build_asset_index(script.get("scenes") or [],
+                                       ctx["project_name"], "scene")
+    char_refs = [{"name": n, "front": e.get("image"), "base": e.get("image")}
+                 for n, e in _char_index.items() if e.get("image")]
+    scene_refs = [{"name": n, "front": e.get("image"), "base": e.get("image")}
+                  for n, e in _scene_index.items() if e.get("image")]
+    if not char_refs:
+        # 真的一个角色锚点都没有 → 人物一致性无法保证，必须在日志里指明查哪。
+        # （用宿主模块的资产目录常量，不自己拼路径——pipeline 不该重复推导目录约定）
+        logger.warning("[托管·视频] 角色参考图解析为空（人物一致性将无法保证）："
+                       "project=%s，请检查 %s", ctx["project_name"],
+                       os.path.join(A._ASSET_DIRS["character"], ctx["project_name"]))
     ctx["progress"](f"生成视频（{len(shots)} 镜 · {mode}）", 50, phase="video")
     # 审计 P1-3：托管视频是闸门最重要的覆盖点（整集提交，独占 GPU 时间最长）
     with gpu_task_gate.run_gpu_task(

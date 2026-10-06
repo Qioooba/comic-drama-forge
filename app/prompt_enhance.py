@@ -152,7 +152,7 @@ def _skeleton_ok(kind: str, original: str, candidate: str) -> Tuple[bool, str]:
     cand = str(candidate or "").strip()
     if not cand:
         return False, "空结果"
-    if len(cand) > h3_prompt_kit.MAX_PROMPT_CHARS:
+    if len(cand) > h3_prompt_kit.max_prompt_chars(kind):
         return False, "超出长度上限"
     # 骤缩保护：增强只会更具体，篇幅骤减多半是丢段/丢内容
     if len(cand) < max(24, int(len(original) * 0.7)):
@@ -183,6 +183,33 @@ def _skeleton_ok(kind: str, original: str, candidate: str) -> Tuple[bool, str]:
         if v.get("blocked"):
             return False, "确定性检查判废"
     return True, ""
+
+
+def _length_budget_clause(kind: str, original: str) -> str:
+    """把 :func:`_skeleton_ok` 的长度闸门写进**模型指令**（2026-10-06 修）
+
+    闸门只在校验端生效，指令端却只说「扩充 / 更具体」而不给上限——模型无从得知
+    上限，只能越写越长。实测分镜提示词改写后撞穿长度闸门，整条增强被丢弃
+    （日志「结果未通过骨架校验（超出长度上限），保持原文」），等于白花一次
+    text 模型调用。这里把上限与余量显式告诉模型，并要求余量不足时**收敛措辞**
+    而不是继续扩写。
+
+    阈值取 :func:`h3_prompt_kit.max_prompt_chars`（按 kind 分档：storyboard 4000 /
+    h3 6000）——**必须与 :func:`_skeleton_ok` 同源**，否则指令端报的数和校验端卡的数
+    不一致，模型会精准地踩线失败。
+
+    注意：增强跑在确定性截断**之前**（见 ``prompt_qc.preflight``），所以原文本身
+    可能已贴近甚至超过上限——那种情况下要 instructions 的是「压缩」而非「不增长」。
+    """
+    limit = h3_prompt_kit.max_prompt_chars(kind)
+    n = len(str(original or ""))
+    if n >= limit:
+        return (f"\n【长度硬约束】整条输出不得超过 {limit} 字符；原文已 {n} 字符，"
+                "已超上限——请在**全部协议段名与 <imageN> / <Picture N> 标签逐字不动**"
+                f"的前提下，把其余描述压缩到 {limit} 字符以内。")
+    return (f"\n【长度硬约束】整条输出不得超过 {limit} 字符（原文 {n} 字符，"
+            f"最多只能再增加 {limit - n} 字符）。优先**收敛措辞**：删掉同义重复与"
+            "修饰性从句，而不是继续扩写；宁可保持接近原长度，也绝不允许超长。")
 
 
 # --------------------------------------------------------------------------- #
@@ -303,13 +330,15 @@ def enhance_prompt(kind: str, prompt: str, ctx=None, style: str = "") -> dict:
                 f"【镜头上下文】\n{_ctx_brief(ctx)}\n"
                 f"【待增强的生成提示词】\n{prompt}")
         resp = client.chat(
-            [{"role": "system", "content": _ENHANCE_INSTRUCTIONS[kind]},
+            [{"role": "system", "content": _ENHANCE_INSTRUCTIONS[kind]
+                                         + _length_budget_clause(kind, prompt)},
              {"role": "user", "content": user}],
             temperature=0.4, max_tokens=8192, timeout=PROMPT_ENHANCE_TIMEOUT_SEC)
         cand = _strip_fence(resp)
         ok, why = _skeleton_ok(kind, prompt, cand)
         if not ok:
-            logger.info("提示词增强[%s] 结果未通过骨架校验（%s），保持原文", kind, why)
+            logger.info("提示词增强[%s] 结果未通过骨架校验（%s），保持原文（%d -> %d 字符）",
+                        kind, why, len(prompt), len(cand))
             out["note"] = f"增强输出未过校验（{why}），保持原文"
             _cache_put_fail(key)
             return out
@@ -409,7 +438,7 @@ def model_review(kind: str, prompt: str, ctx=None, style: str = "") -> dict:
                 f"【镜头上下文】\n{_ctx_brief(ctx)}\n"
                 f"【待审提示词】\n{prompt}")
         resp = client.chat(
-            [{"role": "system", "content": _REVIEW_INSTRUCTION},
+            [{"role": "system", "content": _REVIEW_INSTRUCTION + _length_budget_clause(kind, prompt)},
              {"role": "user", "content": user}],
             temperature=0.1, max_tokens=8192, timeout=PROMPT_ENHANCE_TIMEOUT_SEC)
         data = _extract_json(resp)
@@ -425,6 +454,8 @@ def model_review(kind: str, prompt: str, ctx=None, style: str = "") -> dict:
         if improved:
             ok, why = _skeleton_ok(kind, prompt, improved)
             if not ok:
+                logger.info("质检复审[%s] 改进版未通过骨架校验（%s），弃用（%d -> %d 字符）",
+                            kind, why, len(prompt), len(improved))
                 improved = ""
                 out["note"] = f"改进版未过骨架校验（{why}），弃用"
         result = {"passed": passed, "issues": issues,

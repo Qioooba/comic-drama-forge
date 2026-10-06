@@ -9,6 +9,7 @@ import {
   FolderOpen, ImageIcon, MessageSquare, Mountain, Music, Network, Share2, Target, Upload, User, X, ZoomIn,
 } from '@/components/ui/icons';
 import { useToast } from '@/components/ui/toast';
+import { Markdown } from '@/components/Markdown';
 import { useComfyProgress } from '@/hooks/useComfyProgress';
 import { getAgentSession, type ChatMsg } from '@/agentSession';
 import { GridPage } from '@/pages/GridPage';
@@ -5363,7 +5364,15 @@ function ChatPanel({ projectKey, onClose }: { projectKey: string; onClose: () =>
                       : 'bg-surface border border-line text-ink-1 mr-6 rounded-bl-sm'
                   }`}
                 >
-                  <p className="whitespace-pre-wrap break-words">{msg.content}</p>
+                  {/* AI 回复按 Markdown 渲染（2026-10-07）：总控模型返回的是 Markdown
+                      源码，此前原样当纯文本吐给用户，满屏的 ## 和 ** 。用户自己发的气泡
+                      仍是纯文本 —— 那是输入，不是展示内容，且白底反白底时行内代码/表格
+                      的配色会跟气泡打架。 */}
+                  {msg.role === 'user' ? (
+                    <p className="whitespace-pre-wrap break-words">{msg.content}</p>
+                  ) : (
+                    <Markdown>{msg.content || ''}</Markdown>
+                  )}
                 </div>
               )
             )}

@@ -1486,6 +1486,7 @@
     "testSuccess": "测试成功",
     "testFailed": "测试失败",
     "thinkingOn": "思考：开",
+    "thinkingOff": "思考：关",
     "noVision": "不支持图像",
     "visionUnconfirmed": "视觉能力未确认",
     "modelReply": "模型回复：{reply}",

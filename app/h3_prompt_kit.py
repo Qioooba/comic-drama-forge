@@ -98,6 +98,38 @@ MAX_PROMPT_CHARS = 6000
 #: 单段"补充细节"（旧裸英文提示词 / merged detail）的长度闸门
 MAX_DETAIL_CHARS = 800
 
+#: 按提示词类型分档的长度闸门（2026-10-06）
+#:
+#: :data:`MAX_PROMPT_CHARS` 这个 6000 的**真实来由只有 H3 一个** —— MiniMax H3 服务端对超长
+#: 提示词**静默截断**（见上方注释）。图片链路（本机 QwenImage2.1）**根本没有这个限制**：
+#: ``TextEncodeQwenImage21`` 的 ``prompt`` 是无 max 的 STRING，底层
+#: ``Qwen3VLSDTokenizer`` 的 ``max_length=99999999``（comfy/text_encoders/qwen3vl.py:151）。
+#: 拿 6000 去量图片提示词 = **借错了模型的尺子**（历史教训见 model_capabilities 模块文档
+#: 「口径漂移」：同一个常量硬量四类提示词）。
+#:
+#: 实测基线（本机 测灵根_第一集，21 镜，4 参考图）：中位 **2382** 字符 / 约 870 token。
+#: 6000 等于给增强器 2.5 倍膨胀空间 —— 这正是「改写后撞穿上限被整条丢弃、白花一次
+#: text 模型调用」的来源（见 prompt_enhance._length_budget_clause）。
+#: **4000 ≈ 基线 1.7 倍**：够增强器做实事，又挡住翻倍灌水。
+#:
+#: ⚠️ asset / keyframe **尚未实测**（asset 实测中位仅 185 字符，但只覆盖单项目样本，
+#: 且未观察到任何超长告警），暂留 6000 不动 —— **拿不到证据就不改口径**。
+#: 等有了真实长度分布再校准，别凭感觉调。
+KIND_MAX_PROMPT_CHARS = {
+    "storyboard": 4000,   # 实测基线 2382（4 参考图）≈1.7x
+    "h3": 6000,          # H3 服务端真实静默截断，**不能动**
+    "asset": 6000,       # 未实测，保持原值
+    "keyframe": 6000,    # 未实测，保持原值
+}
+
+
+def max_prompt_chars(kind: str = "") -> int:
+    """按提示词类型取长度闸门；未知/空类型回落到 :data:`MAX_PROMPT_CHARS`（=H3 口径）。
+
+    图片类与视频类分档的理由见 :data:`KIND_MAX_PROMPT_CHARS` 的注释。
+    """
+    return KIND_MAX_PROMPT_CHARS.get(str(kind or "").strip().lower(), MAX_PROMPT_CHARS)
+
 #: 截断标记（计入闸门额度，保证输出严格不超过 limit）
 _CLAMP_MARK = "…[截断]"
 
@@ -120,17 +152,20 @@ def _clamp(text: str, limit: int, label: str) -> str:
     return text[:limit - len(_CLAMP_MARK)] + _CLAMP_MARK
 
 
-def clamp_prompt(text: str, label: str = "prompt_h3") -> str:
-    """对外统一入口：把最终提示词截到 :data:`MAX_PROMPT_CHARS`
+def clamp_prompt(text: str, label: str = "prompt_h3", kind: str = "") -> str:
+    """对外统一入口：把最终提示词截到该 kind 的闸门（:func:`max_prompt_chars`）
 
-    任何产出最终 H3 提示词的路径都应过一道这里，避免绕过 :func:`resolve` 的裸返回
+    任何产出最终提示词的路径都应过一道这里，避免绕过 :func:`resolve` 的裸返回
     （例如 ``comfyui_client.resolve_h3_prompt`` 里直接放行既有 ``prompt_h3`` 的分支）。
 
     ``label`` **只用于日志标签**（默认 ``prompt_h3``），不影响截断行为与返回值；
     所有 kind 共用本函数时传入各自标签（如 ``prompt_qc.audio``），避免超长日志里
     统一被误标成 H3（P-4，2026-09-22）。
+
+    ``kind`` **决定截断阈值**（2026-10-06）：不传 = H3 口径 6000；``kind="storyboard"``
+    = 4000。不传 kind 的老调用方行为逐字不变。
     """
-    return _clamp(str(text or ""), MAX_PROMPT_CHARS, label or "prompt_h3")
+    return _clamp(str(text or ""), max_prompt_chars(kind), label or "prompt_h3")
 
 
 _SECTION_RE_CACHE: Optional[re.Pattern] = None
@@ -1539,6 +1574,7 @@ def transition_clause(prev_shot: dict, shot: dict,
 __all__ = [
     "REF_SECTIONS", "BASE_SECTIONS",
     "MAX_PROMPT_CHARS", "MAX_DETAIL_CHARS", "clamp_prompt", "clamp_h3_prompt",
+    "KIND_MAX_PROMPT_CHARS", "max_prompt_chars",
     "BEAT_MAX_SEC", "H3_SEGMENT_MAX_SEC", "H3_SEGMENT_MIN_SEC",
     "segment_durations", "segment_shot",
     "fmt_ts", "lang_tag", "dialogue_lines", "speaker_slots",

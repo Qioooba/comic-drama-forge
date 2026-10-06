@@ -43,7 +43,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import shutil
 import threading
 import time
 
@@ -64,18 +63,50 @@ def last_good_bak(path: str) -> str:
     return path + ".bak"
 
 
+def _atomic_write_bytes(path: str, data: bytes) -> None:
+    """唯一临时名 + flush/fsync + `os.replace`（Windows 占用退避）。失败原样抛出。"""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.{os.urandom(3).hex()}.tmp"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        _atomic_replace(tmp, path)
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError as e:
+            logger.debug("清理临时文件失败（忽略）：%s", e)
+        raise
+
+
 def _snapshot_bak(path: str) -> None:
     """发布前快照：若活文件当前**可解析**，复制到 `.bak`（保留最后一次好版本）。
 
     只对「可解析」的活文件做快照 —— 若活文件已损坏，绝不把它当好版本盖到
     `.bak` 上（否则连唯一可恢复的来源都丢）。语义与
     `project_store._snapshot_bak` 完全一致。
+
+    ⚠️ 2026-10-06 修复：本函数原先用 ``shutil.copy2(path, path + '.bak')`` ——
+    **固定目标名、非原子的裸复制**，正是本模块文档开头（第 6~16 行）明令废除的
+    「固定临时名」反模式：两个写者同时快照时，B 以 ``"wb"`` 截断 ``.bak``、A 还在
+    往里写 → 备份本身被写坏。而 ``.bak`` 是**唯一**的损坏恢复来源，一旦它也坏了，
+    ``read_json_strict`` 的 ValueError 分支只能 fail-loud 抛错，整份数据不可用
+    （现场：`ERROR:fs_atomic:读取 attempts.json 解析失败，已从 .bak 恢复最后一份好版本`
+    —— 活文件坏掉的瞬间，唯一能救命的备份本身正在被并发写坏）。
+
+    改为与活文件同一套纪律：唯一临时名 → 写完 → fsync → `os.replace` 原子发布。
     """
     if not os.path.isfile(path):
         return
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            json.load(f)
+        with open(path, "rb") as f:
+            raw = f.read()
+        # 与「活文件可解析」判据一致：用同一份字节校验，避免「校验的是旧内容、
+        # 发布的是新内容」的窗口。
+        json.loads(raw.decode("utf-8"))
     except (OSError, ValueError) as e:
         # 活文件已不可解析 → 不覆盖既有 .bak。这是**预期分支**（不是故障），
         # 但必须留痕：否则「为什么 .bak 一直停在旧版本」将无法追查。
@@ -86,7 +117,7 @@ def _snapshot_bak(path: str) -> None:
         logger.debug("跳过 .bak 快照（活文件不可解析）：%s: %s", type(e).__name__, e)
         return
     try:
-        shutil.copy2(path, last_good_bak(path))
+        _atomic_write_bytes(last_good_bak(path), raw)
     except OSError as e:
         # C4-2（2026-09-22 复验）：级别对齐 project_store._snapshot_bak
         # （app/project_store.py:139 用 logger.warning）。.bak 快照是**可恢复性**保障，
@@ -178,21 +209,7 @@ def atomic_write_bytes(path: str, data: bytes) -> None:
     重算，留一份同体积副本不划算），但保留「唯一临时名 + 先落盘再 replace」的原子语义。
     失败语义：先尽力删除临时文件，然后**原样抛出**。
     """
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.{os.urandom(3).hex()}.tmp"
-    try:
-        with open(tmp, "wb") as f:
-            f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
-        _atomic_replace(tmp, path)
-    except Exception:
-        try:
-            if os.path.exists(tmp):
-                os.remove(tmp)
-        except OSError as e:
-            logger.debug("清理临时文件失败（忽略）：%s", e)
-        raise
+    _atomic_write_bytes(path, data)
 
 
 # =====================================================================

@@ -1053,6 +1053,12 @@ export interface AITestResult {
   /** 该次探测实际使用的 max_tokens */
   max_tokens?: number;
   disable_thinking?: boolean;
+  /**
+   * 本次探测**实际注入**的思考档位（low/high/max；空 = 未注入，由服务端取默认档）。
+   * 与 disable_thinking 互斥：设了档位就按档位发，disable_thinking 会是 false。
+   * ⚠️ 不能只看 disable_thinking 判断「有没有思考」——它是 false 时可能根本没注入任何参数。
+   */
+  reasoning_effort?: string;
   /** 视觉探测：true 支持 / false 不支持 / null 未确认（无正文） */
   vision?: boolean | null;
   /** 视觉探测未确认时为 true */

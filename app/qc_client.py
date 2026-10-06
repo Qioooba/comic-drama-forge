@@ -786,6 +786,11 @@ CONFIG_KEYS = (
     # 推理模型控制（2026-09-17 新增，确保配置能正确落盘）
     "disable_thinking",
     "min_tokens_when_thinking",
+    # 思考档位（2026-10-06 补）：此前 AI 设置页「质检模型」的「思考档位」下拉是**死控件** ——
+    # 页面按 ai_config 回显 low/high/max，而质检运行时只认 disable_thinking，档位从头到尾
+    # 没有进过请求体（用户反馈「质检模型为什么还是低思考显示的」）。现由 qc_client 真正消费，
+    # 取值来自 AI 凭证单一事实源（见 load_config 里 DB 合并那段），与文本链路同口径。
+    "reasoning_effort",
     # 音频阈值（此前未在白名单，导致配置丢失）
     "audio_min_speech_ratio", "audio_min_mean_db", "audio_max_drift",
     # 尾帧质检开关
@@ -859,6 +864,9 @@ def _empty_config() -> dict:
         "disable_thinking": False,
         # 允许思考时质检请求的最小 max_tokens（思考本身就要吃几百 token）
         "min_tokens_when_thinking": 1024,
+        # 思考档位（2026-10-06）："" = 不注入（由服务端取默认档）；off = 显式关思考；
+        # low/high/max = 注入 reasoning_effort。与 disable_thinking **互斥，档位优先**。
+        "reasoning_effort": "",
         # 剧本质检各维度权重和合格线
         "script_categories": {
             "structure": {"weight": 0.2, "pass_threshold": 80},
@@ -941,6 +949,11 @@ def load_config(config_path: str) -> dict:
             cfg["base_url"] = db_ep["base_url"]
         if db_ep.get("model"):
             cfg["model"] = db_ep["model"]
+        if db_ep.get("reasoning_effort"):
+            # 思考档位与端点同源：AI 设置页「质检模型」的档位由 ai_config.save_module 镜像进
+            # 这张表（ai_config._mirror_credentials_db），DB 非空即为准 —— 否则页面上选的
+            # 档位与实际发出的请求各说各话（这正是「显示低思考、实际是空档/关思考」的根因）。
+            cfg["reasoning_effort"] = db_ep["reasoning_effort"]
         if db_ep.get("api_key"):
             db_key = db_ep["api_key"]
             cfg["api_key"] = db_key
@@ -1149,12 +1162,17 @@ def _save_config_impl(config_path: str, patch: dict, keep_key_if_blank: bool = T
             continue
         if k in ("enabled", "image_enabled", "video_enabled", "image_ref_compare",
     "image_blocking_ref_compare",
-                 "image_qc_recheck"):
+                 "image_qc_recheck", "disable_thinking"):
             # ⚠️ 审计 G2：这里原本是 `bool(v)` —— 字符串 "false"/"0"/"no"/"off"/"none"
             #    都是**非空字符串**，`bool()` 一律判 True。用户在页面或第三方脚本里把开关
             #    存成 "false"，读回来反而是「开」，开关形同虚设。
             #    同文件 `_as_bool` 的 docstring 恰好记录了这条坑，只有 save_config 自己漏改。
             #    非法值沿用当前（已归一化的）取值，绝不静默翻转开关。
+            # ⚠️ disable_thinking（2026-10-06 补）：本字段此前**不在**这个白名单里，
+            #    于是 save_config 落到末尾的 `cfg[k] = str(v or "")`，把 True 存成
+            #    字符串 "True"。读侧 resolve_endpoint 用 _as_bool 能正确解析，功能不坏，
+            #    但落盘格式与旁边 enabled/image_enabled 的原生布尔不一致，且任何新增的
+            #    裸 bool() 读取都会踩 G2 那个坑（"false" 恒为真）。与读侧对齐归一化。
             cfg[k] = _as_bool(v, bool(cfg.get(k, False)))
         elif k in ("pass_score", "max_retries", "video_frame_count", "image_max_side",
                    "timeout", "api_retries", "best_of"):
@@ -1167,6 +1185,10 @@ def _save_config_impl(config_path: str, patch: dict, keep_key_if_blank: bool = T
                 cfg[k] = float(v)
             except Exception:  # noqa: BLE001
                 continue
+        elif k == "reasoning_effort":
+            # 必须归一化后再落盘：部分模型会把**非法档位静默解析成最高档（最贵）**，
+            # 笔误原样落盘 = 悄悄按 max 烧 token。非法值一律收敛成 ""（不注入）。
+            cfg[k] = normalize_reasoning_effort(v)
         else:
             cfg[k] = str(v or "")
     cfg = load_config_dict(cfg)
@@ -1333,17 +1355,27 @@ def resolve_endpoint(cfg: dict, override: dict = None) -> dict:
     """
     ov = _normalize_override(override) if override else {"base_url": "", "api_key": "", "model": ""}
     saved = _normalize_override(cfg.get("endpoint_override"))
+    # ⚠️ 2026-10-06：思考状态此前**只在下面的 qc_config 分支里算**，test_override 分支直接
+    #    `return {**ov, ...}` —— 字典里根本没有 disable_thinking/min_tokens 键，于是
+    #    _post_chat 读到默认值 False，「测试连通性」永远按「允许思考」发请求，而真实质检
+    #    按 qc_config 的 disable_thinking 发。测试结果与真实行为分叉（用户看到
+    #    「思考：开」而实际是关的）。现在两个分支共用同一份归一结果。
+    effort, disable = _resolve_thinking(cfg)
+    thinking = {
+        "reasoning_effort": effort,
+        "disable_thinking": disable,
+        "min_tokens_when_thinking": int(cfg.get("min_tokens_when_thinking")
+                                        or MIN_TOKENS_WHEN_THINKING),
+    }
     if ov["base_url"] and ov["api_key"] and ov["model"]:
-        return {**ov, "source": "test_override",
+        return {**ov, **thinking, "source": "test_override",
                 "auto_synced": bool(saved["base_url"]) and saved["base_url"] == ov["base_url"]}
     ep = {"base_url": (cfg.get("base_url") or "").strip(),
           "api_key": (cfg.get("api_key") or "").strip(),
           "model": (cfg.get("model") or "").strip(),
           # ⚠️ 审计 G2 同型：不能裸 `bool()` —— "false"/"0"/"off" 都是非空字符串，一律判 True，
           #    于是「关闭思考」的开关在字符串写法下永远关不掉。
-          "disable_thinking": _as_bool(cfg.get("disable_thinking"), DISABLE_THINKING_DEFAULT),
-          "min_tokens_when_thinking": int(cfg.get("min_tokens_when_thinking")
-                                          or MIN_TOKENS_WHEN_THINKING)}
+          **thinking}
     auto = bool(saved["base_url"] and saved["base_url"] == ep["base_url"]
                 and saved["api_key"] and saved["api_key"] == ep["api_key"]
                 and saved["model"] and saved["model"] == ep["model"])
@@ -1422,6 +1454,12 @@ def public_view(cfg: dict) -> dict:
         "api_key_masked": mask_key(cfg.get("api_key") or ""),
         "effective_base_url": ep["base_url"],
         "effective_model": ep["model"],
+        # 思考的真实生效状态（2026-10-06）：此前 public_view 只有 cfg 里的 disable_thinking，
+        # 页面无从知道「档位」和「开关」归一后到底是什么，只能各自显示自己那一份 ——
+        # 于是出现「档位显示 low、实际发的是 enable_thinking=false」这种自相矛盾的界面。
+        # 这里下发**归一后的**唯一有效状态，前端照它显示即可。
+        "reasoning_effort": ep.get("reasoning_effort", ""),
+        "thinking_disabled": bool(ep.get("disable_thinking", False)),
         "endpoint_source": ep["source"],
         "endpoint_auto_synced": ep.get("auto_synced", False),
         "ready": ready,
@@ -1578,6 +1616,74 @@ def _with_thinking_off(payload: dict) -> dict:
     return p
 
 
+# ---- 思考档位（2026-10-06，与 llm_client 同口径）----
+# 档位与「关思考开关」是**互斥的两套机制**：可关思考的模型（Qwen/vLLM 系）用
+# enable_thinking=false；思考不可关闭的模型（GLM-5.3-Flash 等 always-on reasoning）
+# 没有该开关，只有 reasoning_effort = low/high/max（默认往往是最贵的 max）。
+# 优先级与 llm_client._build_payload 一致：**档位优先**，设了档位就不再尝试关思考。
+#
+# 档位定义惰性取自 llm_client（单一事实源，不在此处复制一份常量表）；
+# 用惰性 import 而不是模块级 import，是因为 qc_client 被 app.py / consistency.py /
+# script_generator.py 依赖，惰性导入把「新增档位支持」对既有 import 链的风险降到 0。
+_EFFORT_LEVELS_FALLBACK = ("low", "high", "max")   # 与 llm_client.REASONING_EFFORT_LEVELS 一致
+_EFFORT_OFF = "off"
+# 档位模式的额度下限：与 llm_client.MIN_TOKENS_WHEN_REASONING_EFFORT 同值（官方建议 ≥2048）。
+# 思考本身要吃 token，额度给太小必然只剩 reasoning_content、正文恒空。
+MIN_TOKENS_WHEN_REASONING_EFFORT = 2048
+
+
+def _effort_levels() -> tuple:
+    try:
+        import llm_client
+        return tuple(llm_client.REASONING_EFFORT_LEVELS)
+    except Exception:  # noqa: BLE001  llm_client 不可用时用同值兜底
+        return _EFFORT_LEVELS_FALLBACK
+
+
+def normalize_reasoning_effort(value) -> str:
+    """思考档位归一化：low/high/max 原样返回（小写），off = 显式关思考，其余一律 ""。
+
+    ⚠️ 非法值必须在这里挡掉：部分模型会把非法档位**静默解析成最高档**，
+    笔误原样发出去 = 悄悄按 max 烧 token。
+    """
+    v = str(value or "").strip().lower()
+    if v == _EFFORT_OFF:
+        return _EFFORT_OFF
+    return v if v in _effort_levels() else ""
+
+
+def _with_reasoning_effort(payload: dict, effort: str) -> dict:
+    """注入思考档位（chat_template_kwargs 形式，与 llm_client._build_payload 同款封装）"""
+    p = dict(payload or {})
+    ctk = p.get("chat_template_kwargs")
+    ctk = dict(ctk) if isinstance(ctk, dict) else {}
+    ctk["reasoning_effort"] = effort
+    p["chat_template_kwargs"] = ctk
+    return p
+
+
+def _resolve_thinking(cfg: dict) -> tuple:
+    """把「档位」与「关思考开关」归一成**唯一有效状态**，返回 (effort, disable_thinking)。
+
+    - effort ∈ (low/high/max) → 注入档位，disable_thinking 恒 False（档位优先）
+    - effort == "off"          → 显式关思考，disable_thinking=True
+    - effort == ""             → 沿用 disable_thinking 开关（质检自己的开关，默认不关）
+
+    ⚠️ 两者同时存在时按「档位优先」并**响亮记日志**：否则用户改了档位却毫无反应，
+    又变成一个查不出来的「死控件」。
+    """
+    raw = normalize_reasoning_effort((cfg or {}).get("reasoning_effort"))
+    legacy_disable = _as_bool((cfg or {}).get("disable_thinking"), DISABLE_THINKING_DEFAULT)
+    if raw == _EFFORT_OFF:
+        return "", True
+    if raw:
+        if legacy_disable:
+            logger.warning("质检思考档位=%s 覆盖了 qc_config 的 disable_thinking=true"
+                           "（两者互斥，档位优先）：本次请求按 %s 档发送", raw, raw)
+        return raw, False
+    return "", legacy_disable
+
+
 def _without_thinking_opt(payload: dict) -> dict:
     return {k: v for k, v in (payload or {}).items() if k != "chat_template_kwargs"}
 
@@ -1695,7 +1801,23 @@ def _post_chat(ep: dict, payload: dict, timeout: int, retries: int = None,
     base = API_RETRY_BACKOFF if backoff is None else max(0.0, float(backoff))
     errors: list = []
     cur = dict(payload)
-    if ep.get("disable_thinking", DISABLE_THINKING_DEFAULT):
+    # 思考控制三分支（**互斥，档位优先** —— 与 llm_client._build_payload 同口径）：
+    #   1) 有档位 → 注入 reasoning_effort，并抬到档位模式的额度下限
+    #   2) disable_thinking → 注入 enable_thinking=false
+    #   3) 都没配 → 不注入，但保证「允许思考」时的额度下限，否则思考吃光 token 只剩空正文
+    effort = str(ep.get("reasoning_effort") or "").strip().lower()
+    if effort:
+        cur = _with_reasoning_effort(cur, effort)
+        try:
+            mt = int(cur.get("max_tokens") or 0)
+        except (TypeError, ValueError):
+            mt = 0
+        # 取下限的较大者：用户在 qc_config 里把 min_tokens_when_thinking 调得更高时不能被拉低
+        floor = max(MIN_TOKENS_WHEN_REASONING_EFFORT,
+                    int(ep.get("min_tokens_when_thinking") or 0))
+        if 0 < mt < floor:
+            cur["max_tokens"] = floor
+    elif ep.get("disable_thinking", DISABLE_THINKING_DEFAULT):
         cur = _with_thinking_off(cur)          # 显式关思考（默认不关）
     else:
         # 允许思考 → 保证额度下限，否则思考吃光 token 只剩空正文
@@ -1739,7 +1861,7 @@ def _post_chat(ep: dict, payload: dict, timeout: int, retries: int = None,
 
 
 # 1x1 PNG（视觉连通性探测用，避免依赖本地文件）
-_PROBE_PNG_B64 = ("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8AAAwAB/AGtDQAAAABJRU5ErkJggg==")
+_PROBE_PNG_B64 = ("iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAGUlEQVR4nGMUCVggwsCAiVgY+BmwgsEpAQBjkQIXj61uSwAAAABJRU5ErkJggg==")
 
 
 def test_vision(ep: dict, timeout: int = 60) -> dict:
@@ -4104,3 +4226,4 @@ def script_qc_ready(cfg: dict, override: dict = None) -> bool:
     """检查剧本质检是否就绪"""
     return bool(cfg.get("enabled") and cfg.get("script_enabled")
                 and qc_endpoint_ready(cfg, override))
+

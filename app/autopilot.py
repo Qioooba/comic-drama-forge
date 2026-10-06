@@ -1234,6 +1234,30 @@ def _produce(project: str, plan: dict, pick: dict) -> None:
         logger.error("第%s集托管执行异常：%s\n%s", episode_no, e, traceback.format_exc())
 
     # ---- 结果登记 ----
+    # ⭐ 2026-10-06：busy（集级互斥锁被别的执行体持有）根本不是一次「生产」——
+    # 一镜都没跑、没产物、没耗时。若走下面的常规登记，会在三处留下假象：
+    #   ① `append_history` 往生产流水里塞一条「失败」；
+    #   ② `record_run_result` 把 last_run 写成失败 → 前端「上次运行」显示红字，
+    #      而真因（另一个执行体在跑）与本集无关；
+    #   ③ `_bump_attempt` 记一次失败 → 连续 2 次 busy（max_episode_attempts=2）
+    #      就把整集判「需人工介入」并永久挂起。实测事故：第 1 集在毫秒级内
+    #      连吃两次 busy 被挂起，而实际一镜都没跑。
+    #
+    # ⚠️ 但**必须**留下防自旋节流：`_loop()` 里 `if did: continue` 不休眠，
+    #    而 `_rerun_allowed` 靠 `_LAST_RUN["at"]` 判 MIN_RERUN_INTERVAL(45s)。
+    #    若这里完全不碰 `_LAST_RUN`，下一轮会立刻重新挑中同一集再撞一次 busy，
+    #    变成毫秒级空转（比原 bug 更糟：既烧 CPU 又刷屏）。
+    #    所以：只刷新时间戳（= 「刚刚试过这一集」），**不动 repeat 计数**
+    #    （repeat 是「连续成功但状态未更新」的异常计数器，与 busy 无关）。
+    if result.get("status") == "busy":
+        with _LOCK:
+            _LAST_RUN["key"] = f"{project}#{episode_no}"
+            _LAST_RUN["at"] = time.time()
+        logger.info("第%s集正被另一个执行体生产（busy），本轮跳过：不计失败次数、不写运行记录，"
+                    "%ds 后重试", episode_no, MIN_RERUN_INTERVAL)
+        _clear_current()
+        return
+
     retries = sum(max(0, int((s or {}).get("attempts") or 1) - 1)
                   for s in (result.get("steps") or {}).values())
     with _LOCK:

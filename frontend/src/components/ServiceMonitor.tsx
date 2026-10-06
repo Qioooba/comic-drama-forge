@@ -25,7 +25,7 @@ export function ServiceMonitor() {
       // ComfyUI 会以 "non matching host and origin" 返回 403，且每 30s 刷一次，
       // 在 ComfyUI 日志里形成高频告警。改为由后端代查即可彻底消除。
       try {
-        const response = await fetch('/api/status', { signal: AbortSignal.timeout(4000) });
+        const response = await fetch('/api/status');
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const data: any = await response.json().catch(() => ({}));
         const comfy = data?.comfyui || {};
@@ -70,3 +70,4 @@ export function ServiceMonitor() {
     </div>
   );
 }
+

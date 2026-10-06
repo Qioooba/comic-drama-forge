@@ -23,7 +23,11 @@ import time
 from datetime import datetime
 
 from llm_client import LLMError, LLMTruncatedError, LLMGatewayUnavailable
-from dialogue_utils import dialogue_text as _dlg_text, normalize_lines as _dlg_lines
+from dialogue_utils import (dialogue_text as _dlg_text, normalize_lines as _dlg_lines,
+                            extract_quoted_dialogue as _extract_quoted_dialogue,
+                            split_quoted_dialogue as _split_quoted_dialogue,
+                            QUOTE_OPEN_CHARS as _DLG_QUOTE_OPEN,
+                            QUOTE_CLOSE_CHARS as _DLG_QUOTE_CLOSE)
 import fs_atomic
 import style_kit
 import h3_prompt_kit
@@ -1184,12 +1188,86 @@ def build_shots_for_chunk(client, bible: dict, outline: dict, chunk: dict, shots
     return out
 
 
+#: 兜底路径切句用的「句末标点」。注意必须配合 :func:`_split_sentences` 的引号感知 ——
+#: 直接用 ``re.split(r"(?<=[。！？!?…；;])")`` 会把**引号内部**的句号也当断点，
+#: 把「“土灵根，下品。”」从中间劈成两半 → 引号不再成对 → 台词被静默丢弃。
+_SENT_END = "。！？!?…；;"
+
+
+def _split_sentences(text: str) -> list:
+    """按句末标点切句，**引号内部不切**。
+
+    为什么必须引号感知：中文小说的引语自带句号（“土灵根，下品。”），
+    朴素按标点切会把一句话从引号中间劈开，结果是引号不配对、
+    :func:`dialogue_utils.extract_quoted_dialogue` 直接跳过 —— 台词凭空消失。
+    实测《测灵根》：朴素切句丢 4 条台词（“土灵根，下品。”“你说什么？”“嗡”
+    “你这灵根……”），引号感知后 36 条全中。
+
+    引号不配对（原文漏写右引号）时状态机会一直开着 —— 故设一个「安全阀」：
+    单引号未闭合超过 :data:`_QUOTE_STUCK_LIMIT` 个字符就强制回到引号外。
+    **强制时保留已累积文本**（只重置引号状态、继续往下读），否则会把这一段
+    连人带引号一起吞掉 —— 那是「丢内容」，比引号感知的收益更糟。
+    """
+    out, buf = [], []
+    depth = 0
+    quote_pos = 0          # 当前未闭合引号的起点（安全阀用）
+    for i, ch in enumerate(str(text or "")):
+        if ch in _DLG_QUOTE_OPEN:
+            depth += 1
+            quote_pos = i
+        elif ch in _DLG_QUOTE_CLOSE:
+            depth = max(0, depth - 1)
+        buf.append(ch)
+        if ch in _SENT_END and depth == 0:
+            piece = "".join(buf).strip()
+            if piece:
+                out.append(piece)
+            buf = []
+            continue
+        if depth > 0 and i - quote_pos > _QUOTE_STUCK_LIMIT:
+            depth = 0          # 只重置引号状态，绝不清空 buf（清空=丢内容）
+    piece = "".join(buf).strip()
+    if piece:
+        out.append(piece)
+    return out
+
+
+#: 引号未闭合的安全阀长度（字符）。见 :func:`_split_sentences`。
+_QUOTE_STUCK_LIMIT = 60
+
+
+def _mentioned_chars(text: str, names: list) -> list:
+    """原文该段里**真实出现过**的角色名（长名优先，避免「周小」抢「周野」的归因）。
+
+    兜底镜头没有 LLM 设计的出场表，只能从原文措辞反推 —— 总比无脑取角色表首位好：
+    那样会让每一镜都挂同一个角色，配音音色全程单一。
+    """
+    t = str(text or "")
+    hit = []
+    for nm in sorted([n for n in (names or []) if n], key=len, reverse=True):
+        if nm in t and not any(nm in got for got in hit):
+            hit.append(nm)
+    return hit
+
+
 def _fallback_shots_for_chunk(chunk: dict, shots_target: int = 1, bible: dict = None) -> list:
     """分镜阶段模型失败时的兜底：按原文逐句生成「原文承载镜头」，保证该段内容不丢。
 
     与覆盖率补生成同源（只增不删）：原文措辞写进 description（超长部分由 _norm_shots
     拆进 visual_detail，故正文不会因为 200 字截断而丢失），标记 fallback=True 供前端提示需人工润色。
-    这类镜头没有台词（本系统不产出旁白），成片该段留白 —— dialogue_utils.audit_script 会显式告警。
+
+    **台词必须从原文引语里救回来**（2026-10-07 修，实测《测灵根》第 1 集）：
+    旧实现写死 ``"dialogue": []``，理由是注释里的「本系统不产出旁白」——
+    但那说的是 ``narration``（旁白）通道已于 2026-09-19 关闭，与 ``dialogue`` 无关。
+    ``dialogue`` 恰恰是**唯一人声来源**（tts_client / qc_client / prompt_qc 三处口径一致）。
+
+    于是模型一次分镜失败（本例：只返回 reasoning_content 没有正文）就让**整集 21 镜
+    台词全清零**，原文里 33 处引号台词被原样塞进 description 当画面描述，成片彻底没人声，
+    而流程一路「成功」走到出片 —— 用户只看到没声音，无从判断是哪一环坏的。
+
+    现在用 ``dialogue_utils.extract_quoted_dialogue`` 把 ``「…」`` / ``“…”`` 抽进
+    dialogue；说话人归因宁缺毋滥（推断不出就留空，退回默认音色），**但文本绝不丢**。
+    原文措辞仍保留在 description 里 —— 「内容不丢」的契约不变。
     """
     text = str((chunk or {}).get("text") or "")
     if not text.strip():
@@ -1201,7 +1279,7 @@ def _fallback_shots_for_chunk(chunk: dict, shots_target: int = 1, bible: dict = 
               if isinstance(s, dict) and s.get("name")]
     total = int(chunk.get("char_count") or len(text))
     per = max(CHARS_PER_SHOT, total // max(1, int(shots_target)))
-    sentences = [s.strip() for s in re.split(r"(?<=[。！？!?…；;])\s*|\n+", text) if s.strip()]
+    sentences = _split_sentences(text)
     if not sentences:
         sentences = [text.strip()]
     groups, buf = [], ""
@@ -1214,14 +1292,28 @@ def _fallback_shots_for_chunk(chunk: dict, shots_target: int = 1, bible: dict = 
     if buf:
         groups.append(buf)
     out = []
+    n_dialogue = 0
     for g in groups:
+        # 兜底镜头的出场角色：优先取该段原文里**真实出现过**的角色名，
+        # 而不是无脑取角色表首位（取首位会让所有兜底镜头都挂同一个角色）。
+        cast = _mentioned_chars(g, chars)
+        dlg = _extract_quoted_dialogue(g, bible.get("characters"), cast)
+        n_dialogue += len(dlg)
+        # 无台词的兜底镜头补音效提示：否则该镜既无人声也无音效（audit_script 的
+        # silent 口径），成片到该镜是彻底的黑屏静音，比「正常留白」更糟。
+        cues = "" if dlg else "环境底噪"
         out.append({
             "camera": "中景", "location": (scenes[0] if scenes else ""),
-            "description": g[:200], "dialogue": [], "emotion": "平静", "audio_cues": "",
-            "characters_in_shot": chars[:1], "items_in_shot": [], "prompt_h3": "",
+            "description": g[:200], "dialogue": dlg, "emotion": "平静",
+            "audio_cues": cues,
+            "characters_in_shot": cast[:1] if cast else chars[:1],
+            "items_in_shot": [], "prompt_h3": "",
             "fallback": True,
             "fallback_reason": f"第 {chunk.get('index')} 段模型分镜失败，按原文逐句承载",
         })
+    if n_dialogue:
+        logger.warning("第 %s 段兜底镜头已从原文引语恢复 %d 条台词（speaker 留空者退回默认音色）",
+                       chunk.get("index"), n_dialogue)
     return out
 
 
@@ -1805,6 +1897,11 @@ def _derive_insert_shot(src: dict, prop: str) -> dict:
     row["visual_detail"] = ""
     row["dialogue"] = []
     row["dialogue_text"] = ""
+    # 插入镜无台词（画手/道具特写），但成片仍需铺底：源镜头若没写音效提示，
+    # 这里给一个中性底噪，否则该镜既无人声也无音效 —— dialogue_utils.audit_script
+    # 的 silent 口径会把它判成缺陷（实测《测灵根》兜底剧本一次补出 8 个空响镜）。
+    if not str(row.get("audio_cues") or "").strip():
+        row["audio_cues"] = "环境底噪"
     row["first_frame"] = ""
     row["last_frame"] = ""
     row["motion"] = ""
@@ -1859,14 +1956,30 @@ def _split_long_dialogue_shot(row: dict) -> list:
         return [row]
     pa, pb = best
     a, b = dict(row), dict(row)
-    la = [dict(x) for x in lines]
-    lb = [dict(x) for x in lines]
-    la[idx]["text"] = pa
-    lb[idx]["text"] = pb
+    # ⚠️ 2026-10-07 修：被拆的那条台词**只能存在于一镜**，其余台词各归一镜。
+    # 旧实现两条新镜都拿到完整 lines 列表、只改写 idx 那条的文本 → 除被拆条外，
+    # 其余台词在前后两镜**各存一份**，配音会把它们念两遍。
+    # 实测《测灵根》兜底剧本：镜 6/7 重复念「记名，入外门」「无灵根」，
+    # 全集 12 条台词被重复（修前 46 条 vs 修后应回到 30 条）。
+    # 规则：被拆条的前半留 a、后半进 b；a 拿 idx 之前的台词，b 拿 idx 之后的台词。
+    la = [dict(x) for x in lines[:idx]]
+    lb = [dict(x) for x in lines[idx + 1:]]
+    _head = dict(lines[idx])
+    _tail = dict(lines[idx])
+    _head["text"] = pa
+    _tail["text"] = pb
+    la.append(_head)
+    lb.insert(0, _tail)
     a["dialogue"] = la
     b["dialogue"] = lb
     a["dialogue_text"] = _dlg_text(la)
     b["dialogue_text"] = _dlg_text(lb)
+    # 无台词的那半镜要继承音效提示，否则拆镜后多出一个「既无人声也无音效」的
+    # 空响镜头（audit_script 的 silent 口径会把它判成缺陷）。
+    if not la and not str(a.get("audio_cues") or "").strip():
+        a["audio_cues"] = str(row.get("audio_cues") or "") or "环境底噪"
+    if not lb and not str(b.get("audio_cues") or "").strip():
+        b["audio_cues"] = str(row.get("audio_cues") or "") or "环境底噪"
     # 后半：景别推近一档，形成真正的「切换」而不是同画面重播
     st = _shot_type_of(b)
     closer = _CLOSER_TYPE.get(st, st)
@@ -2072,6 +2185,12 @@ def _split_multi_action_row(row: dict) -> list:
     b["description"] = b_txt[:200]
     b["dialogue"] = []
     b["dialogue_text"] = ""
+    # 后半镜按设计不携带台词（同一段表演的第二个动作），所以它必须自带音效铺底：
+    # 否则这一镜既无人声也无音效 —— dialogue_utils.audit_script 的 silent 口径判为缺陷，
+    # 成片到该镜是彻底的黑屏静音。源镜头若也没写 cues，给一个中性底噪。
+    # （实测《测灵根》兜底剧本一次补出 5 个空响镜。）
+    if not str(b.get("audio_cues") or "").strip():
+        b["audio_cues"] = str(row.get("audio_cues") or "") or "环境底噪"
     a["last_frame"] = ""
     b["first_frame"] = ""
     b.pop("source_unit_ids", None)     # 覆盖率只算一次（留在前半）
@@ -2335,6 +2454,30 @@ def _norm_shots(raw_shots: list, bible: dict, episodes: int, start_id: int = 1) 
         if not loc and scenes:
             loc = scenes[0]
         _smeta = scene_meta_map.get(loc) or ("外景", "日")
+
+        # ---- 台词归位（2026-10-07）----
+        # 实测《测灵根》ep01：模型把 5 条原文金句原样写进了 description，dialogue
+        # 写 []。而 dialogue 是**唯一人声来源**（旁白已关闭），于是成片整集无声；
+        # 更糟的是校验器搜的是整个 shots，台词躺在描述里照样判 hit_rate=1.0，
+        # 三道防线在同一点集体失效。
+        # 这里把「描述里写了、但 dialogue 是空的」那部分**确定性地**摘出来归位，
+        # 不依赖模型配合 —— 模型的引号已经落在正确的那一镜里，我们只负责搬字段。
+        _dlg_final = _dlg_lines(s.get("dialogue"), chars, chars,
+                                infer_when_empty=not bool(s.get("fallback")))
+        _desc_src = str(s.get("description") or "").strip()
+        _vdet_src = str(s.get("visual_detail") or "").strip()
+        if not _dlg_final and not s.get("fallback"):
+            _pool = _desc_src if not _vdet_src else (_desc_src + "\n" + _vdet_src)
+            _rescued, _cleaned = _split_quoted_dialogue(
+                _pool, chars, cast=s.get("characters_in_shot"))
+            if _rescued:
+                _dlg_final = _rescued
+                _seg = _cleaned.split("\n", 1)
+                _desc_src, _vdet_src = _seg[0], (_seg[1] if len(_seg) > 1 else "")
+                logger.info("[台词归位] shot%s 从画面描述救回 %d 条台词：%s",
+                            s.get("shot_id"), len(_rescued),
+                            " / ".join(x["text"][:12] for x in _rescued[:3]))
+
         row = {
             "shot_id": sid,
             "duration": 5,
@@ -2355,13 +2498,13 @@ def _norm_shots(raw_shots: list, bible: dict, episodes: int, start_id: int = 1) 
             # 但画面细节不丢：原始描述若超长，把超出的部分拆进 visual_detail（分镜图/视频
             # 提示词会把它并回画面主体）。历史缺陷：description 截断 200 字后剩余细节
             # 直接丢失，导致「动作完整、光影明确」的要求只能靠模型猜。
-            "description": str(s.get("description") or "").strip()[:200],
+            "description": _desc_src[:200],
             # visual_detail：优先用模型直接输出的字段（分镜 schema 已要求模型把超出
             # description 的更细画面细节写这里）；模型没给时用 _overflow_detail 兜底
             #（description 截断 200 字后的剩余部分）。供 build_storyboard_prompt /
             # h3_prompt_kit 等下游取用。
-            "visual_detail": (str(s.get("visual_detail") or "").strip()[:400]
-                              or _overflow_detail(s.get("description"), 200)),
+            "visual_detail": (_vdet_src[:400]
+                              or _overflow_detail(_desc_src, 200)),
             # narration：**已废弃字段（登记于 DEPRECATED_SHOT_FIELDS），此处显式丢弃**；
             # 模型若越界输出会在本函数末尾打一条 warning（可见地拒绝，不是注释君子协定）。
             # 历史缺陷：narration 被当成「心理活动 + 背景补叙 + 环境描写」的公共出口，
@@ -2372,7 +2515,13 @@ def _norm_shots(raw_shots: list, bible: dict, episodes: int, start_id: int = 1) 
             # 旧剧本文件里残留的 narration 由读取侧（coverage / h3_prompt_kit / tts_client）
             # 按需兼容，这是 DEPRECATED_SHOT_FIELDS 里 narration 唯一的合法消费方。
             # 台词：结构化 [{"speaker","text"}]（分镜阶段直接写明说话人，配音链路直接读取）
-            "dialogue": _dlg_lines(s.get("dialogue"), chars, chars),
+            #
+            # 兜底镜头（fallback=True）传 infer_when_empty=False：它们的台词是
+            # extract_quoted_dialogue 从原文引语救回来的，speaker 空是**有意为之**
+            # （原文只写「执事」不写「执事弟子」，猜错会让主角替全场说话）。
+            # 若这里让 normalize_lines 再按角色表推断，就会把留空统统填成角色表首位，
+            # 等于把刚躲掉的错归因重新灌回来。正常 LLM 产出走原口径不变。
+            "dialogue": _dlg_final,
             "emotion": str(s.get("emotion") or "平静").strip()[:20],
             # edit_reason：剪辑动机（「为什么切到这一镜/承担什么叙事功能」，改写规则 9 新增字段）。
             # 它不解释给观众，是给构图与取舍的依据。限长 50 字（防模型越界输出塞一长段）。

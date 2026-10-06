@@ -177,3 +177,15 @@ electron_dirs.json
 electron_dist_files.txt
 electron_root_dirs.json
 .local/
+
+# ===================== 本地审计/排查工作区（2026-10-06） =====================
+# review_tmp/ 是一次性排查脚本 + 分镜截图（十几 MB PNG），随用随弃；
+# artifacts/ 里的探针脚本、h3 历史 JSON、wav 采样与 serve 日志同理，
+# 都是本机调试验证产物，与仓库源码无关，不入库。
+review_tmp/
+artifacts/
+.probe_key_len
+
+# qc_config.json 的原子写只会留 .bak；.bak-before-* 是人工排查时手工复制的
+# 多份配置快照，同样不入库（避免 git status 里堆噪音）。
+/qc_config.json.bak-*

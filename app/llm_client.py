@@ -906,31 +906,44 @@ class LLMClient:
             except LLMReasoningOnlyError as e:
                 # 思考吃光额度。⚠️ 救助顺序是「先提额、再降档」，不能反过来：
                 # 空正文的根因是「思考量 > max_tokens」，而低档位并不保证思考就短到装得下
-                # （实测 low 档 + 4800 额度仍 100% 空正文）。先前只降档不提额，
-                # 在 ladder 首项已被越过时 `_next_tokens` 会原地返回同值 → 每次重试都空转，
-                # 最后被误判成「模型/服务端故障」。
+                # （实测 low 档 + 4800 额度仍 100% 空正文）。
                 last_err = e
                 # ① 无条件越过思考水位（这是唯一能真正把正文挤出来的手段）。
                 raised = _raise_over_thinking_floor(cur)
-                # ② 越过水位后仍无正文，才说明思考确实过长 → 再压思考档位。
+                # ② 「还有没有提额空间」必须独立判断，不能拿 `_next_tokens(cur) <= cur`
+                #    当判据 —— `_next_tokens` 的契约是**恒返回 ≥ 入参**
+                #    （命中 ladder 就返回更大项，否则 min(cur*2, CEILING)），
+                #    所以 `_next_tokens(cur) <= cur` 只在 `cur >= MAX_TOKENS_CEILING`
+                #    时才成立。
+                #    ⭐ 2026-10-06 修复（现场日志）：max_tokens=19984 / 18184 时，
+                #    该判据为 False → 既没尝试降档、`nxt` 又被算成 `cur` → 直接判定
+                #    「模型/服务端异常」并 break。但当时离 32768 上限还差 12800，
+                #    **额度没用完就宣布没救了**；而 reasoning_effort 本来就是 low
+                #    （REASONING_EFFORT_DOWNGRADE_ORDER 的最低档），确实无可降。
+                #    结果是一个本可重试的额度问题被上报成模型故障，整步卡死。
+                can_raise = cur < MAX_TOKENS_CEILING
+                # ③ 越过水位后仍无正文 → 压思考档位（仅在真的还有下一档时才降）。
                 downgraded = False
-                if raised <= cur and _next_tokens(cur) <= cur and self.reasoning_effort:
+                if raised <= cur and self.reasoning_effort and not can_raise:
                     downgraded = _downgrade_reasoning_effort()
-                nxt = max(raised, _next_tokens(max(cur, _thinking_floor())) if downgraded or raised > cur
-                          else cur)
+                # ④ 提额：既然还能加额度就**一次跨到上限**，而不是按 ladder 小步试探
+                #    （模块头部的实测记录已证明阶梯试探只是把用户时间烧光）。
+                nxt = MAX_TOKENS_CEILING if can_raise else cur
+                nxt = max(nxt, raised)
                 nxt = min(nxt, MAX_TOKENS_CEILING)
-                # ③ 额度已顶到上限、档位也降无可降 → 才是真的模型/服务端异常，快速失败上浮。
+                # ⑤ 只有「额度顶到 MAX_TOKENS_CEILING 且档位也降无可降」才是真的没救了。
                 if nxt <= cur and not downgraded:
                     logger.error(
-                        f"模型在最低思考档（{getattr(self, 'reasoning_effort', '') or '未注入'}）下"
-                        f"仍只吐思考内容（第 {attempts} 次，max_tokens={cur} 已达上限），"
+                        f"模型在思考档位 {getattr(self, 'reasoning_effort', '') or '未注入'}"
+                        f"（已无可降档）下仍只吐思考内容（第 {attempts} 次，"
+                        f"max_tokens={cur} 已达 {MAX_TOKENS_CEILING} 上限），"
                         "判定为模型/服务端异常，停止无意义提额，快速失败上浮。")
                     history.append({"attempt": attempts, "max_tokens": cur,
                                     "finish_reason": "reasoning_only", "truncated": True,
                                     "content_len": 0, "latency_ms": None})
                     break
                 logger.warning(f"模型只吐思考内容（第 {attempts} 次，max_tokens={cur}），"
-                               f"提高到 {nxt} 重试"
+                               f"一次跨到上限 {nxt} 重试"
                                + (f"（并把思考档位降为 {self.reasoning_effort}）" if downgraded else ""))
                 history.append({"attempt": attempts, "max_tokens": cur,
                                 "finish_reason": "reasoning_only", "truncated": True,
@@ -1003,12 +1016,27 @@ class LLMClient:
                 f"最后错误：{last_err}", detail=detail)
         # 全是「只吐思考」的失败：给出针对性提示，别让上层/用户误以为是「JSON 格式问题」。
         if history and all(h.get("finish_reason") == "reasoning_only" for h in history):
+            # ⭐ 2026-10-06 修复：提示语原先无条件让人「把 reasoning_effort 降到 low」。
+            # 但档位**本来就常常已经是 low**（REASONING_EFFORT_DOWNGRADE_ORDER 的最低档），
+            # 此时这条建议等于「请把 low 改成 low」，用户看到只会觉得系统在胡说
+            # （原话：「模型的思考等级？现在是 low 啊」）。改为按实际档位给建议。
+            _eff = str(getattr(self, "reasoning_effort", "") or "").strip().lower()
+            if _eff == "low":
+                _advice = ("当前该模块的 reasoning_effort 已经是最低档 low，无法再降。"
+                           "可选做法：① 换一个非 reasoning / 思考更短的模型；"
+                           "② 把该任务拆得更小（减少单次要产出的镜头/字段数），"
+                           "降低单次思考量；③ 稍后重试（服务端思考长度可能波动）。")
+            elif _eff:
+                _advice = (f"建议到「AI 设置」把该模块的 reasoning_effort 从 {_eff} 降到 low，"
+                           "或换一个非 reasoning 模型。")
+            else:
+                _advice = ("建议到「AI 设置」为该模块显式设定 reasoning_effort（low 或 off），"
+                           "或换一个非 reasoning 模型。")
             raise LLMError(
                 f"模型连续 {attempts} 次只返回思考内容（reasoning_content）而没有正文，"
-                "即使已把思考档位降到最低、额度提到上限仍无正文。这通常是模型/服务端异常"
-                "（思考无限长或参数异常），并非本任务的 JSON 格式问题。建议："
-                "到「AI 设置」降低该模块的 reasoning_effort（low）、或换一个非 reasoning 模型、"
-                "或稍后重试。")
+                f"即使已把额度提到 {MAX_TOKENS_CEILING} 上限仍无正文。这不是本任务的 JSON 格式问题"
+                f"（最后一次 max_tokens={detail['max_tokens']}，思考档位={_eff or '未注入'}）。"
+                + _advice)
         raise LLMError(f"连续 {attempts} 次调用均未返回合法 JSON。最后错误：{last_err}")
 
     # ---- 连接测试 ----
@@ -1037,6 +1065,10 @@ class LLMClient:
             "model": self.model,
             "disable_thinking": bool(getattr(self, "disable_thinking",
                                              DISABLE_THINKING_DEFAULT)),
+            # 思考档位（2026-10-06）：此前回包只有 disable_thinking，前端只能显示
+            # 「思考：开/关」——设了档位时那一栏是误导（档位 low 与「开」是两回事，
+            # 而且 disable_thinking=False 并不代表没有思考）。把真实注入的档位一并下发。
+            "reasoning_effort": str(getattr(self, "reasoning_effort", "") or ""),
         }
         payload = self._build_payload(messages, 0, 256)
         base_out["max_tokens"] = payload.get("max_tokens")
@@ -1079,11 +1111,15 @@ class FailoverLLMClient:
     无需任何改动 —— 同一个鸭子接口。
 
     切换语义：
-    - 只对「API 级错误」计数（LLMError 族，含 LLMGatewayUnavailable）：
-      模型输出质量问题（JSON 解析失败 / 截断 / 只吐思考）由调用方各自的
-      retry 逻辑处理，不触发切换。
-    - 当前 active 连续 3 次 API 报错 → 切到下一个 client（计数清零）；
+    - 「API 级错误」计数（LLMError 族，含 LLMGatewayUnavailable）：
+      当前 active 连续 3 次 API 报错 → 切到下一个 client（计数清零）；
       备用也挂就按序试下一个；全链耗尽才抛最后一次的错。
+    - **「只吐思考」（LLMReasoningOnlyError）立即切备用、不占失败预算**（2026-10-07 改）：
+      原先把它当普通 LLMError 处理，但该错误的重试空间（提额到上限 + 降档到最低）
+      已被 active client 自己的重试**试尽**，在同一模型上再吃 3 次预算纯属重复失败；
+      而它恰恰是「换模型能解决」的那一类。实测《测灵根》整集台词全丢、成片无声
+      就是主模型思考水位超过 32768 上限，而用户配的备用模型从未被用上。
+      其余输出质量问题（JSON 解析失败 / 单纯截断）仍由调用方各自 retry 处理，不触发切换。
     - 切到备用后，每次调用前先对主模型做一次轻量探活（45s 超时）；
       主模型活了就回切，任务零感知。
     """
@@ -1220,6 +1256,16 @@ class FailoverLLMClient:
         语义：当前 active 累计 _FAILOVER_THRESHOLD 次 API 报错后，自动切到下一个
         client 并清空计数（_note_api_error 内部处理）。整条链（主 + 各备用）依次
         给足各自阈值次数；全链耗尽才抛最后一次的错。
+
+        ⚠️ 2026-10-07 补一条：**「只吐思考」（LLMReasoningOnlyError）立即切备用，
+        不计入 _FAILOVER_THRESHOLD 的连续失败预算**。
+        原因：这类失败里，active client 自己的重试已经把「提额到 MAX_TOKENS_CEILING
+        + 降档到最低」全部试尽了 —— 实测《测灵根》就是 mimo-v2.6-flash 在 low 档、
+        32768 上限下仍然连续只返回 reasoning_content。对**同一个模型**再试 N 次
+        只是重复烧同样的失败，而换一个思考更短的模型恰恰能解决。
+        原先本类错误走通用 LLMError 分支、要在同模型上连吃 3 次预算才切换，
+        而 novel_to_script 的 chunk 二分重试又把它放大成整集降级 → 台词全丢 → 成片无声。
+        实测那次正是「连续 1 次」就抛了出来，用户配了备用模型也根本没被用上。
         """
         self._try_return_to_primary()
         last_exc = None
@@ -1232,6 +1278,24 @@ class FailoverLLMClient:
                     result = getattr(client, method)(*args, **kwargs)
                     self._consec_fail = 0
                     return result
+                except LLMReasoningOnlyError as e:
+                    # 该模型的思考水位超出额度上限，同模型再试无意义 → 立刻换下一个
+                    last_exc = e
+                    cur = self._active_idx
+                    if cur + 1 >= len(self.clients):
+                        self._consec_fail = 0
+                        raise
+                    nxt = cur + 1
+                    self._switch_log.append({
+                        "from": self.labels[cur], "to": self.labels[nxt],
+                        "reason": "只返回思考内容无正文（同模型提额/降档已试尽）",
+                        "at": datetime.now().isoformat(timespec="seconds")})
+                    logger.warning("LLM 故障转移：%s → %s（只返回思考内容，"
+                                   "同模型已试尽提额与降档）：%s",
+                                   self.labels[cur], self.labels[nxt], str(e)[:160])
+                    self._active_idx = nxt
+                    self._consec_fail = 0
+                    break       # 换模型后由外层 for 轮继续
                 except LLMError as e:
                     last_exc = e
                     self._note_api_error(e)

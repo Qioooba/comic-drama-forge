@@ -1040,16 +1040,34 @@ def _plain(text: str) -> str:
 
 def check_quotes_in_script(continuity_dir: str, project_key: str, script: dict,
                            episode_no: int) -> dict:
-    """校验金句是否落进本集台词（允许标点/空白差异）"""
+    """校验金句是否落进本集**台词**（允许标点/空白差异）。
+
+    ⚠️ 这里必须只搜 ``dialogue``，不能搜整个 shots。
+
+    历史缺陷（2026-10-07 实测《测灵根》ep01）：实现里搜的是
+    ``json.dumps(script["shots"])``，**包含 description / visual_detail**。
+    模型把金句原样写进画面描述、``dialogue`` 留空时，本函数照样判
+    ``hit_rate=1.0, missed=[]`` —— 校验器在「整集 0 台词」的剧本上报满分通过，
+    把它唯一的预警功能废掉了。现在按台词字段判定：金句躺在画面描述里 = **未命中**。
+    """
     store = load_quotes(continuity_dir, project_key)
     rows = [q for q in store["quotes"] if int(q.get("episode_no") or 0) == int(episode_no)]
     if not rows:
-        return {"required": 0, "hit": [], "missed": [], "hit_rate": 1.0}
-    script_text = _plain(json.dumps(script.get("shots") or [], ensure_ascii=False))
+        return {"required": 0, "hit": [], "missed": [], "hit_rate": 1.0,
+                "spoken_total_chars": _spoken_total_chars(script)}
+    # 只取 dialogue —— dialogue 是本系统唯一人声来源（旁白已关闭）
+    spoken = []
+    for sh in (script.get("shots") or []):
+        if isinstance(sh, dict):
+            d = sh.get("dialogue")
+            if d:
+                spoken.append(d)
+    script_text = _plain(json.dumps(spoken, ensure_ascii=False))
     hit, missed = [], []
     for q in rows:
         key = _plain(q.get("text"))
-        ok = bool(key) and (key in script_text or key[:-1] in script_text or key[1:] in script_text)
+        ok = bool(key) and bool(script_text) and (
+            key in script_text or key[:-1] in script_text or key[1:] in script_text)
         q["in_script"] = ok
         (hit if ok else missed).append(q.get("text"))
     store["updated_at"] = _now()
@@ -1057,7 +1075,26 @@ def check_quotes_in_script(continuity_dir: str, project_key: str, script: dict,
     save_json(quotes_path(continuity_dir, project_key), store)
     total = len(rows)
     return {"required": total, "hit": hit, "missed": missed,
-            "hit_rate": round(len(hit) / total, 3) if total else 1.0}
+            "hit_rate": round(len(hit) / total, 3) if total else 1.0,
+            "spoken_total_chars": _spoken_total_chars(script)}
+
+
+def _spoken_total_chars(script: dict) -> int:
+    """本集台词总字数（金句校验的旁证：0 字 = 整集无声，与 hit_rate 无关的硬事实）。"""
+    n = 0
+    for sh in (script.get("shots") or []):
+        if not isinstance(sh, dict):
+            continue
+        d = sh.get("dialogue")
+        if isinstance(d, str):
+            n += len(d)
+        elif isinstance(d, (list, tuple)):
+            for line in d:
+                if isinstance(line, dict):
+                    n += len(str(line.get("text") or ""))
+                else:
+                    n += len(str(line or ""))
+    return n
 
 
 # ===================== C⑧ 人物口吻词典 + 运镜术语表 =====================

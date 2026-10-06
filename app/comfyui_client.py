@@ -882,12 +882,34 @@ class ComfyUIClient:
         return " | ".join(x for x in bits if x)[:900]
 
     def _post(self, path: str, data: dict = None) -> Any:
+        """POST 并解析 JSON 响应。
+
+        ⚠️ 2026-10-06 修复：ComfyUI 的 `/interrupt`、`POST /history {"clear":true}`、
+        `POST /queue {"delete":[...]}` 成功时返回 **200 + 空 body**（不是 `{}`）。
+        原实现无条件 `resp.json()` → `json.decoder.JSONDecodeError:
+        Expecting value: line 1 column 1 (char 0)`，于是每一次「打断远端任务」和
+        每一次「清任务历史」都被记成失败（日志里高频刷这两条 warning，真故障被淹没）。
+
+        现在的口径：
+          · 200 + 空/纯空白 body → 返回 ``{}``（**成功**，调用方按 dict 处理即可）；
+          · 200 + 能解析 → 返回解析结果；
+          · 200 + 非空但**确实是坏的 JSON** → 仍抛（那是真异常，不该被吞）；
+          · 非 2xx → 仍抛 RuntimeError（带服务端细节）。
+        """
         resp = requests.post(f"{self.base_url}{path}", json=data or {}, timeout=300)
         if resp.status_code >= 400:
             raise RuntimeError(
                 f"ComfyUI POST {path} 失败：HTTP {resp.status_code}"
                 + (f" —— {self._http_error_detail(resp)}" if self._http_error_detail(resp) else ""))
-        return resp.json()
+        text = (resp.text or "").strip()
+        if not text:
+            return {}
+        try:
+            return resp.json()
+        except ValueError as e:
+            raise RuntimeError(
+                f"ComfyUI POST {path} 返回了非 JSON 响应（HTTP {resp.status_code}，"
+                f"前 200 字符：{text[:200]!r}）：{e}") from e
 
     def get_status(self, timeout: int = 3) -> dict:
         """探测 ComfyUI 在线状态。
@@ -1358,10 +1380,8 @@ class ComfyUIClient:
         失败静默（网络抖了也不应让取消路径本身抛错拖垮上层）。
         """
         try:
-            if prompt_id is None:
-                self._post("/interrupt")
-            else:
-                self._post("/interrupt")
+            self._post("/interrupt")
+            if prompt_id is not None:
                 self.delete_queued(prompt_id)
             logger.info(f"已请求 ComfyUI 打断远端任务: {prompt_id or '(当前出队)'}")
         except Exception as e:  # noqa: BLE001
@@ -1612,7 +1632,23 @@ class ComfyUIClient:
             logger.debug("免重渲：台账收尾记录失败（不影响生成）：%s", e)
         return history, pid, False
 
-    def get_output_files(self, history: dict, file_ext: str = "") -> List[str]:
+    def get_output_files(self, history: dict, file_ext: str = "",
+                         require_exists: bool = True) -> List[str]:
+        """从 history 提取产物路径。
+
+        ⚠️ 2026-10-06：**默认只返回磁盘上真实存在的文件**。
+        ComfyUI 的 history 是「曾经跑过什么」的记录，它引用的文件可能已经不存在：
+          · 被并发执行体先一步 move 走；
+          · 被 `disk_reclaim` 的 ComfyUI output 滚动回收清掉。
+        原实现原样返回全部条目，调用方再盲取 `[0]` → 拿到一个不存在的路径
+        → 后续 `shutil.move` 抛 `FileNotFoundError`（**注意：跨盘时是 WinError 3
+        「找不到指定的路径」而不是 WinError 2「找不到指定的文件」，因为炸的是
+        `copy2` 里 `open(dst,'wb')` 的目标目录**），日志完全指不到真正的原因。
+        实测事故：整批角色资产渲染成功却被判 failed，产物留在 ComfyUI output 没人要。
+
+        ``require_exists=False`` 可退回旧行为（仅供「清理类」调用方使用 ——
+        它们要的正是「这些路径曾经存在过」这个信息）。
+        """
         files = []
         for _node_id, node_output in (history.get("outputs") or {}).items():
             for _key, value in (node_output or {}).items():
@@ -1626,7 +1662,14 @@ class ComfyUIClient:
                         full = os.path.join(base, filename)
                         if not file_ext or filename.endswith(file_ext):
                             files.append(full)
-        return files
+        if not require_exists:
+            return files
+        existing = [f for f in files if os.path.isfile(f)]
+        if len(existing) != len(files):
+            logger.debug("history 引用了 %d 个已不存在的产物（并发取走/输出回收），已过滤：%s",
+                         len(files) - len(existing),
+                         [f for f in files if f not in existing][:5])
+        return existing
 
     # ---------- 路径工具（P0-4：HTTP 资源路径 → 本地绝对路径） ----------
 

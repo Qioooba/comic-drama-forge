@@ -988,9 +988,20 @@ export function AIVaultPage() {
                       {result.max_tokens != null && (
                         <span className="text-xs opacity-75">max_tokens={result.max_tokens}</span>
                       )}
-                      {result.disable_thinking === false && (
+                      {/* 思考的真实状态：设了档位就显示档位，否则按开关显示开/关。
+                          ⚠️ 此前只判 `disable_thinking === false` 就写「思考：开」——
+                          设了档位时那一栏既不准确（档位≠开关），也看不出实际发的是哪一档，
+                          于是「页面显示 low、请求其实发 enable_thinking=false」这类分叉无从发现。 */}
+                      {result.reasoning_effort ? (
+                        <span className="text-xs opacity-75">
+                          {t('vault.reasoningLabel')}：
+                          {t(REASONING_EFFORT_LABEL_KEYS[result.reasoning_effort] || 'vault.reasoning.default')}
+                        </span>
+                      ) : result.disable_thinking === false ? (
                         <span className="text-xs opacity-75">{t('vault.thinkingOn')}</span>
-                      )}
+                      ) : result.disable_thinking === true ? (
+                        <span className="text-xs opacity-75">{t('vault.thinkingOff')}</span>
+                      ) : null}
                       {visionBlocked && (
                         <span className="text-xs font-semibold">{t('vault.noVision')}</span>
                       )}

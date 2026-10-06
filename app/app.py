@@ -29,7 +29,7 @@ from config import (
     AI_CONFIG_PATH, AI_MODULES, AI_CHAT_HISTORY_PATH, AI_SETTINGS_PATH,
     UPSCALE_DIR, UPSCALE_DEFAULT_PARAMS, COMFYUI_OUTPUT_DIR,
     TE_UPSCALE_DEFAULT_PARAMS, TE_UPSCALE_LOWVRAM_PARAMS, UPSCALE_ENGINE,
-    DUB_DIR, TTS_DEFAULT_PARAMS, H3_STRIP_AUDIO, H3_EMIT_AUDIO, H3_SFX_ISOLATE,
+    DUB_DIR, TTS_DEFAULT_PARAMS, TTS_VOICE_BANK_TIMEOUT, H3_STRIP_AUDIO, H3_EMIT_AUDIO, H3_SFX_ISOLATE,
     DUB_MIX_DIR, MIX_DEFAULT_PARAMS, CONTINUITY_DIR,
     TASKS_DB_PATH, TASK_QUEUE_CONCURRENCY, TASK_UNIT_MIN_BYTES,
     KEYFRAME_CHAIN_MODE, WORKFLOW_TEMPLATE,
@@ -321,8 +321,11 @@ video_processor = VideoPostProcessor()
 try:
     TRT_ENGINE_CHECK_BOOT = trt_engine_check.check()
     if TRT_ENGINE_CHECK_BOOT.get("status") == "不兼容":
+        # 2026-10-06：reason 可能携带 ComfyUI 整段 status.messages（含未转义换行的
+        # traceback），直接打出来会产出数千字符的单行 WARNING 并污染后续日志解析。
+        # 改用 trt_engine_check._reason_for_log 压成单行限长文本。
         app.logger.warning("TRT VAE engine 自检：%s",
-                           TRT_ENGINE_CHECK_BOOT.get("reason") or "文件缺失/为空")
+                           trt_engine_check._reason_for_log(TRT_ENGINE_CHECK_BOOT))
     else:
         app.logger.info("TRT VAE engine 自检：%s（真实加载探针未执行）",
                         TRT_ENGINE_CHECK_BOOT.get("status"))
@@ -396,6 +399,172 @@ def _safe_project(name: str) -> str:
 
 # B-16 P2-11：失败路径清理中间产物。把「生成失败 / 质检阻断 / 异常」时的 scratch
 # 目录、.tmp 文件等中间产物统一删掉，避免只增不减。
+#: 命中即判定「环境级 TTS 不可用」的特征串（ComfyUI 侧 qwen_tts 包 import 失败等）。
+#: 这些错误对**每个角色**完全一致 —— 继续逐角色重试只是把同一条失败放大 N 次。
+#:
+#: ⚠️ 2026-10-06 收紧：原先含裸串 ``"failed to import"``，任何 import 相关报错
+#: （包括与 TTS 无关的节点加载失败）都会误触发熔断，把本可成功的角色一起跳过。
+#: 改为要求「TTS 特征」与「未加载/导入失败特征」**同时**出现，避免误伤。
+_TTS_MODEL_UNAVAILABLE_MARKERS = (
+    "Model class is not loaded",
+    "Critical Import Error",
+    "qwen_tts",
+)
+_TTS_IMPORT_FAILURE_MARKERS = (
+    "failed to import",
+    "ImportError",
+    "ModuleNotFoundError",
+    "未加载",
+)
+#: 「环境缺依赖」类特征（2026-10-06 现场补充，W3 复发的新形态）。
+#:
+#: 现场：8190 实例的 Qwen21 venv 缺 ``accelerate``，Qwen-TTS 节点先试 sdpa、
+#: 失败回退 eager，两次都撞 ``Using a `device_map` ... requires `accelerate```。
+#: 这条 exception_message 里**没有**上面任何一个标记；唯一能匹配上的 ``qwen_tts``
+#: 只存在于 traceback 中，而 ``tts_client._await_prompt`` 把详情截到 400 字符
+#: （完整 traceback 4600+ 字符，``qwen_tts`` 落在截断线之后）→
+#: 熔断对「缺 accelerate」这条错误**完全失明**，角色会一个个继续送必败任务。
+#:
+#: 因此这里只收「出现在 exception_message 头部、400 字符内可见」的串，
+#: 不依赖 traceback。判据输入本身已是 TTS 执行失败（调用点仅在 TTS 路径），
+#: 不会误伤 2026-10-06 那次收紧要防的「无关节点 import 失败」。
+_TTS_DEP_MISSING_MARKERS = (
+    "requires `accelerate`",
+    "You can install it with",
+    "No module named",
+    "ModuleNotFoundError",
+)
+
+
+def _is_tts_model_unavailable(err_text: str) -> bool:
+    """ComfyUI 侧 TTS 模型类是否因依赖缺失而整体不可用（可熔断，不再逐角色重试）。"""
+    t = str(err_text or "")
+    if any(m in t for m in _TTS_MODEL_UNAVAILABLE_MARKERS):
+        return True
+    # 缺依赖（accelerate / 模块缺失）同样是环境级故障：每个角色报同一条，
+    # 特征串都在 exception_message 头部，不受 400 字符截断影响
+    if any(m in t for m in _TTS_DEP_MISSING_MARKERS):
+        return True
+    # 「未加载/导入失败」类特征必须同时带 TTS 语境，避免误伤无关节点的 import 失败
+    return (any(m in t for m in _TTS_IMPORT_FAILURE_MARKERS)
+            and ("tts" in t.lower() or "TTS" in t))
+
+
+def _asset_err_traceback(exc: BaseException) -> str:
+    """把异常格式化器统一收口：拿不到 traceback 时退化为「（无）」，绝不二次抛错。
+
+    背景：资产批量生成的隔离分支原先只打 `类型: 消息`，而像
+    ``FileNotFoundError: [WinError 3] 系统找不到指定的路径`` 这类消息在
+    ComfyUI output 读取、质检暂存区落盘、跨盘 move 三处都可能抛出 ——
+    消息里**没有任何路径**，日志里也没��堆栈，故障完全不可定位（2026-10-06 现场）。
+    打堆栈本身绝不能成为新的失败源，所以整段包在 try 里。
+    """
+    try:
+        import traceback as _tb
+        return "".join(_tb.format_exception(type(exc), exc, exc.__traceback__)).rstrip()
+    except Exception:  # noqa: BLE001  取堆栈失败不能盖掉原始异常
+        return "（traceback 不可用）"
+
+
+def _ingest_comfy_output(src_files, dst_path: str, logger=None,
+                         fallback_to_source: bool = False) -> str:
+    """把 ComfyUI 产出的媒体**可靠地**落到 ``dst_path``，返回最终可用路径。
+
+    这是全代码库消费 ComfyUI output 的**唯一入口**（2026-10-06）。
+    原先散落着 11 处 ``shutil.move(files[0], dst)``，每一处都有同样的三个缺陷。
+
+    为什么不能直接 ``shutil.move(files[0], dst)``
+    --------------------------------------------
+    实测事故：第 1 集的 4 个角色资产在 ComfyUI 上**渲染成功**
+    （``output/performance/<prompt_id>.json`` 里 ``success: true``，
+    产物也真的落在 ComfyUI output 里），应用却在消费产物时抛
+    ``FileNotFoundError: [WinError 3] 系统找不到指定的路径``，
+    把整批资产判 failed —— **GPU 白烧，产物留在 ComfyUI output 里没人要**。
+
+    三个叠加缺陷：
+    1. **目标目录是 20~40 秒 GPU 渲染之前**建的。渲染期间它被外部清理 /
+       被并发任务动过，move 时就抛 WinError 3。
+       跨盘（F: ComfyUI output → H: 项目 output）时 ``shutil.move`` 必然走
+       ``copy2`` 回退分支，而 ``copy2`` 里的 ``open(dst,'wb')`` 正是抛
+       WinError 3（``ERROR_PATH_NOT_FOUND``）的那一步 —— 报错完全指不到
+       真正缺失的是哪个目录。
+    2. **盲取 ``[0]``**：``get_output_files`` 会把 history 里**所有**输出条目
+       （含临时/预览图）平铺返回，第 0 个未必是真正要用的正式产物，
+       也可能已被并发执行体取走。
+    3. 失败即**整步判死**，没有降级空间。
+
+    现在的语义：
+      · 落地前**重新**确保目标目录存在（不信任渲染前的 makedirs）；
+      · 只挑**真实存在**的源文件；
+      · 同盘 ``os.replace``（原子）/ 跨盘显式 ``copy2`` + ``remove``
+        （不依赖 ``shutil.move`` 的隐式回退）；
+      · 源与目标同路径时直接返回（等价于原来的 ``if abspath != abspath`` 守卫）；
+      · 失败信息里带**完整源/目标路径与候选清单**；
+      · ``fallback_to_source=True`` 时：搬移失败不抛，**返回仍可用的源路径**
+        （给「搬移只是优化、不是必需」的调用点，例如预演产物）；
+        仍会记 warning，绝不静默。
+    """
+    _log = logger
+    files = [f for f in (src_files or []) if f]
+    dst_dir = os.path.dirname(os.path.abspath(dst_path))
+    if not files:
+        if fallback_to_source:
+            return dst_path
+        raise FileNotFoundError(f"ComfyUI 未返回任何产物（目标：{dst_path}）")
+
+    # ① 落地前重新确保目标目录存在（渲染期间可能被清理）
+    try:
+        os.makedirs(dst_dir, exist_ok=True)
+    except OSError as e:
+        if fallback_to_source:
+            if _log:
+                _log.warning("[产物落盘] 目标目录不可建，改用 ComfyUI 原始路径：%s（%s）", dst_dir, e)
+            return files[0]
+        raise RuntimeError(f"产物目标目录无法创建：{dst_dir}（{e}）") from e
+
+    # ② 只挑真实存在的源（跳过已被并发取走 / 被输出回收清掉的条目）
+    existing = [f for f in files if os.path.isfile(f)]
+    if not existing:
+        if fallback_to_source:
+            if _log:
+                _log.warning("[产物落盘] ComfyUI 产物均已不存在，沿用原始路径：%s", files[0])
+            return files[0]
+        raise FileNotFoundError(
+            f"ComfyUI 产物均已不存在（无法落盘）：{files!r}；目标：{dst_path}。"
+            f"可能是并发执行体已取走，或被 ComfyUI 输出回收清掉")
+
+    src = existing[0]
+    # ③ 源与目标本就是同一路径 → 无需搬移（等价于原调用点的 abspath 守卫）
+    if os.path.normcase(os.path.abspath(src)) == os.path.normcase(os.path.abspath(dst_path)):
+        return dst_path
+
+    # ④ 跨盘安全落地
+    try:
+        if os.path.dirname(os.path.normcase(os.path.abspath(src))) == \
+           os.path.dirname(os.path.normcase(os.path.abspath(dst_path))):
+            os.replace(src, dst_path)
+        else:
+            shutil.copy2(src, dst_path)
+            try:
+                os.remove(src)
+            except OSError:   # 源删不掉不算失败（产物已安全落盘）
+                if _log:
+                    _log.warning("[产物落盘] 已落盘但源文件删除失败（忽略）：%s", src)
+    except (OSError, shutil.Error) as e:
+        if fallback_to_source:
+            if _log:
+                _log.warning("[产物落盘] 搬移失败（%s → %s：%s），沿用 ComfyUI 原始路径",
+                             src, dst_path, e)
+            return src
+        raise RuntimeError(
+            f"搬移 ComfyUI 产物失败：{src} → {dst_path}（{e}）。"
+            f"目标目录：{dst_dir}；源目录：{os.path.dirname(src)}") from e
+
+    if _log and len(existing) > 1:
+        _log.debug("[产物落盘] 候选 %d 个，取首个：%s（其余：%s）", len(existing), src, existing[1:])
+    return dst_path
+
+
 def _cleanup_scratch_dir(dir_path: str, logger=None) -> None:
     """清空目录内容（保留目录本身），失败时只记日志不抛异常。"""
     import logging
@@ -1231,9 +1400,10 @@ def _generate_project_cover(rec: dict, seed=None) -> str:
     if not outs:
         raise RuntimeError("ComfyUI 未返回任何图片")
     cover = _project_cover_path(dir_key)
-    os.makedirs(os.path.dirname(cover), exist_ok=True)
-    shutil.move(outs[0], cover)   # G8② 同款：move 而非 copy，ComfyUI output 不留副本
-    return cover
+    # 2026-10-06：走统一落盘入口（跨盘安全 + 只挑真实存在的源 + 失败信息可定位）。
+    # 刻意**不开** fallback_to_source：封面失败必须 fail-loud，
+    # 沿用 ComfyUI 原始路径会让前端拿到一个不在可服务目录里的 URL（封面直接裂图）。
+    return _ingest_comfy_output(outs, cover, logger=app.logger)
 
 
 @app.route('/api/projects/<path:pid>/cover')
@@ -2911,7 +3081,9 @@ def _storyboard_retry_shot_impl():
     os.makedirs(scratch_dir, exist_ok=True)
     scratch = os.path.join(scratch_dir, f"shot_{seq:02d}_retry.png")
     # G8②：消费 ComfyUI output 源（与主 worker 的 move 语义对齐），不留 output 残留
-    shutil.move(files[0], scratch)
+    # 2026-10-06：改走统一落盘入口（原先 shutil.move(files[0], scratch) 跨盘会抛
+    # WinError 3，把整次重跑判失败）
+    scratch = _ingest_comfy_output(files, scratch, logger=app.logger)
     if qc_on:
         verdict = qc_client.check_image(scratch, _qc_shot_desc(shot), qc_cfg,
                                         style=(shot.get("style") or _rs_style),
@@ -3122,11 +3294,15 @@ def _video_retry_shot_impl():
     # 避免「无角色锚点」的静默降级。
     if not main_char_img or not ref_imgs:
         auto_chars, auto_scenes = _collect_asset_refs(project)
+        # ⚠️ 2026-10-06 修复：同主链路 —— `char_refs or auto_chars` 会被「结构不完整
+        # 但非空」的剧本 characters 短路，磁盘资产永远用不上（见 _upgrade_refs_with_disk）。
+        if auto_chars:
+            char_refs = _upgrade_refs_with_disk(char_refs, auto_chars)
         if not main_char_img:
-            char_refs = char_refs or auto_chars
             main_char_img = _collect_reference_images(char_refs[:1], [])
         if not ref_imgs:
-            scene_refs = scene_refs or auto_scenes
+            if auto_scenes:
+                scene_refs = _upgrade_refs_with_disk(scene_refs, auto_scenes)
             ref_imgs = _collect_reference_images(char_refs, scene_refs)
         if main_char_img or ref_imgs:
             app.logger.info(f"[retry-shot] 参考图已由磁盘资产补齐："
@@ -3281,9 +3457,8 @@ def _video_retry_shot_impl():
     if not files or not os.path.isfile(files[0]):
         return jsonify({"success": False, "error": "ComfyUI 未返回视频文件"}), 500
     vid_dir = _ep_dir(os.path.join(VIDEOS_DIR, project), _rs_ep)
-    os.makedirs(vid_dir, exist_ok=True)
-    dst = os.path.join(vid_dir, f"shot_{seq:02d}.mp4")
-    shutil.move(files[0], dst)
+    dst = _ingest_comfy_output(files, os.path.join(vid_dir, f"shot_{seq:02d}.mp4"),
+                               logger=app.logger)
     # 该镜已更新 → 同集的旧成片失效，打上「已过期」标记，避免用户对着旧成片点验收
     stale = {}
     try:
@@ -3888,10 +4063,14 @@ def _generate_asset_task(task_id: str, assets: list, asset_type: str, project_na
                         base_gate = {"accept": False, "blocked": True, "skipped": False,
                                      "label": "生成失败", "reason": "基础图生成失败", "critical_issues": []}
                         break
-                    scratch_base = os.path.join(scratch_dir, f"base_try{attempt + 1}.png")
                     # G8②：消费 ComfyUI output 源（视频链路一直用 move，图片链路此前 copy2
                     # 导致 output/comic_drama/ 只增不减）。move 后 output 目录不留残留。
-                    shutil.move(base_files[0], scratch_base)
+                    # 2026-10-06：改走 _ingest_comfy_output —— 旧写法
+                    # `shutil.move(base_files[0], scratch_base)` 在渲染成功后抛
+                    # WinError 3，整批资产判 failed（详见该函数 docstring）。
+                    scratch_base = _ingest_comfy_output(
+                        base_files, os.path.join(scratch_dir, f"base_try{attempt + 1}.png"),
+                        logger=app.logger)
                     if not qc_on:
                         if qc_declared:
                             # 已声明开启质检但接口不可用：明确阻断（图仅留在暂存区），不静默放行
@@ -4078,8 +4257,10 @@ def _generate_asset_task(task_id: str, assets: list, asset_type: str, project_na
                                 app.logger.warning("场景「%s」机位档 %s 出图失败（seed=%s）",
                                                    name, vk, _v_seed)
                                 break
-                            _v_scratch = os.path.join(scratch_dir, f"{vk}_try{_va + 1}.png")
-                            shutil.move(_v_files[0], _v_scratch)
+                            _v_scratch = _ingest_comfy_output(
+                                _v_files,
+                                os.path.join(scratch_dir, f"{vk}_try{_va + 1}.png"),
+                                logger=app.logger)
                             if not qc_on:
                                 _v_gate = {"accept": True, "blocked": False, "skipped": True,
                                            "label": "质检未开启", "reason": "图片质检未开启（跳过）",
@@ -4274,13 +4455,40 @@ def _generate_asset_task(task_id: str, assets: list, asset_type: str, project_na
                     "qc_views": {k: dict(v) for k, v in view_gate.items()},
                 })
 
+            except cancellation.Cancelled as _cancelled:
+                # ⭐ 2026-10-06：用户点「暂停/停止」不是错误。此前 Cancelled 落进下面的
+                # 通用 except，被记成 ERROR 并塞进 results[i]["error"]：
+                #   ① 日志里每暂停一次就刷一批 ERROR，真故障被淹没（本轮日志统计里
+                #      「资产 X 生成失败：Cancelled: …」占 ERROR 的 2/5）；
+                #   ② 前端把暂停显示成「生成失败」，用户以为资产坏了；
+                #   ③ 已完成步骤的产物判定被污染。
+                # 口径：记 info，stage 标「已暂停」，error 留 None（= 没出错）。
+                app.logger.info("资产「%s」因暂停/停止中止（已完成步骤保留，可续跑）：%s",
+                                name, _cancelled)
+                results.append({
+                    "name": name, "success": False, "cancelled": True,
+                    "dir": _asset_full_dir(name),
+                    "stage": "已暂停", "qc_blocked": False,
+                    "error": None,
+                })
+                with lock:
+                    generation_state[task_id].update({
+                        "current": i + 1,
+                        "progress": int((i + 1) / total * 100),
+                        "phase": f"{name} 已暂停",
+                    })
             except Exception as _asset_err:  # noqa: BLE001
                 # ⚠️ 审计 S11：旧代码这里没有 try —— `generate_multiview` 上传基础图失败会
                 #    raise RuntimeError，`queue_prompt` 遇 5xx/超时也会抛。任一处抛出 →
                 #    整个批次被标 failed，`results`（已成功资产的结果）全部丢弃：
                 #    20 个资产在第 7 个时来一次连接抖动，前 6 个已入库的成果用户也看不见。
-                app.logger.error("资产「%s」生成失败（已隔离，继续后续资产）：%s: %s",
-                                 name, type(_asset_err).__name__, _asset_err)
+                # ⚠️ 2026-10-06 补 traceback：本分支原先只打 `类型: 消息`，导致
+                #    「资产 X 生成失败：FileNotFoundError: [WinError 3] 系统找不到指定的路径」
+                #    这类故障**完全不可定位** —— 该消息在 ComfyUI output、质检暂存区、
+                #    移动/复制落盘三处都可能抛出，日志里没有任何路径信息。
+                app.logger.error("资产「%s」生成失败（已隔离，继续后续资产）：%s: %s\n%s",
+                                 name, type(_asset_err).__name__, _asset_err,
+                                 _asset_err_traceback(_asset_err))
                 results.append({
                     "name": name, "success": False,
                     "dir": _asset_full_dir(name),
@@ -6269,7 +6477,17 @@ def _ensure_voice_bank_refs(common: list, project_name: str, all_characters=None
         return
     # 逐角色合成
     import tempfile
+    # ⭐ 2026-10-06：TTS 模型类加载失败的熔断开关。
+    # 现场：ComfyUI 侧 `qwen_tts` 包 import 失败 → `FB_Qwen3TTSCustomVoice` 节点
+    # 每个角色都报同一条 `Model class is not loaded`（一条就带 2KB traceback）。
+    # 本函数按角色循环，20 个角色 = **20 次必失败的 ComfyUI 提交**，
+    # 每次都进 GPU 队列、进 history，20×2KB 刷屏还会把真故障淹没。
+    # 熔断：首次命中「模型类未加载」这类**环境级**错误后，本轮剩余角色全部跳过
+    # 并只记一条汇总 —— 与资产库/质检的 fail-open 口径一致（参考音色本就是可选项）。
+    _tts_model_unavailable = False
     for _cn in _char_names:
+        if _tts_model_unavailable:
+            continue
         try:
             _ref, _ = find_voice_bank_ref(_dub_dir, _cn)
             if _ref and os.path.isfile(_ref):
@@ -6295,15 +6513,32 @@ def _ensure_voice_bank_refs(common: list, project_name: str, all_characters=None
         try:
             _dub_dir2 = _dub_project_dir(project_name)
             _client = tts_client.QwenTTSClient(out_root=_dub_dir2, params=tts_client.TTS_DEFAULT_PARAMS)
-            _res = _client.synthesize_one(_ref_text, _tts_voice, _tmp_path, timeout=60)
+            # ⚠️ 超时曾硬编码 60s，比 Qwen3-TTS 的真实单批耗时（实测 24~78s）还短：
+            # 合成其实已经成功，ComfyUI 侧也产出了音频，这里却在它返回前放弃 ——
+            # 记「配音超时」、丢弃结果、GPU 白烧，下一角色再排一轮（详见 config.TTS_VOICE_BANK_TIMEOUT）。
+            _res = _client.synthesize_one(_ref_text, _tts_voice, _tmp_path,
+                                          timeout=TTS_VOICE_BANK_TIMEOUT)
             if not _res.get("ok"):
-                app.logger.warning("[VoiceBank] %s 合成参考音频失败：%s", _cn, _res.get("error"))
+                _err = str(_res.get("error") or "")
+                app.logger.warning("[VoiceBank] %s 合成参考音频失败：%s", _cn, _err[:400])
+                if _is_tts_model_unavailable(_err):
+                    _tts_model_unavailable = True
+                    app.logger.warning(
+                        "[VoiceBank] TTS 模型类在 ComfyUI 侧未加载（qwen_tts 包 import 失败等），"
+                        "本轮剩余 %d 个角色不再重复提交（参考音色是可选项，不阻断生产）。"
+                        "修复：在 ComfyUI 侧安装/修复 qwen_tts 依赖后重启 ComfyUI。",
+                        max(0, len(_char_names) - _char_names.index(_cn) - 1))
                 continue
             # 存入 voice_bank（按 ref.wav 落盘，save_voice_bank_ref 会覆盖旧文件）
             _saved = save_voice_bank_ref(_dub_dir2, _cn, _tmp_path, ref_text=_ref_text)
             app.logger.info("[VoiceBank] %s 自动生成参考音色：%s", _cn, _saved)
         except Exception as _e:  # noqa: BLE001
-            app.logger.warning("[VoiceBank] %s 自动生成参考音色异常（忽略）：%s", _cn, _e)
+            _err = str(_e)
+            app.logger.warning("[VoiceBank] %s 自动生成参考音色异常（忽略）：%s", _cn, _err[:400])
+            if _is_tts_model_unavailable(_err):
+                _tts_model_unavailable = True
+                app.logger.warning(
+                    "[VoiceBank] TTS 模型类在 ComfyUI 侧未加载，本轮剩余角色不再重复提交：%s", _err[:200])
         finally:
             try:
                 if os.path.isfile(_tmp_path):
@@ -7154,7 +7389,11 @@ def _storyboard_worker(task_id: str, project_name: str, shots: list,
                         # G8②：消费 ComfyUI output 源（与视频链路的 move 语义对齐），
                         # 不再 copy2 导致 output/comic_drama_sb/ 只增不减。
                         # 每轮 attempt 都会重新 generate 出新文件，move 走旧源无副作用。
-                        shutil.move(result["files"][0], scratch_png)
+                        # 2026-10-06：改走统一落盘入口。这一处**一集要跑 20 次**（每镜一次），
+                        # 是 WinError 3 风险最高的调用点：跨盘 shutil.move 在
+                        # 暂存目录被清理时会抛 WinError 3，把整集分镜判失败。
+                        scratch_png = _ingest_comfy_output(
+                            result["files"], scratch_png, logger=app.logger)
                         item.update({
                             "success": True,
                             "file": dst,
@@ -7769,6 +8008,69 @@ def _blocking_spec_text(shot: dict) -> str:
         return ""
 
 
+def _ref_image_local(ref):
+    """取 ref 上第一张真实存在的本地参考图，取不到返回 None。
+
+    全项目「判这张参考图能不能用」的**唯一**判据：`_collect_reference_images`、
+    `_upgrade_refs_with_disk` 都走这里。历史上「判有图」散落多处写法不一致，
+    才会出现「base.png 明明在盘上、日志却说参考图不可用」这类静默降级。
+    """
+    if not isinstance(ref, dict):
+        return None
+    for key in ("front", "base"):
+        p = ref.get(key)
+        if not isinstance(p, str) or not p:
+            continue
+        local = comfyui_client.resolve_local_path(p)
+        if local and os.path.exists(local):
+            return local
+    return None
+
+
+def _upgrade_refs_with_disk(refs: list, disk_refs: list) -> list:
+    """按 name 把磁盘资产的图路径合并进 refs，返回结构完整的 ref 列表。
+
+    ⚠️ 为什么不能用 `refs or disk_refs`（2026-10-06 实测踩坑）：
+    整集生成视频时前端只发 {project_name, episode_no}，后端在 /api/video/generate
+    里用剧本 characters 兜底 —— 而那些对象只有 name/description/reference_prompt_zh，
+    **没有 front/base 图路径**。于是 `refs or disk_refs` 因 refs 非空而永远短路，
+    磁盘资产（base.png 明明在盘上）永远用不上，结果是整集视频**一个角色锚点都拿不到**，
+    人物全靠模型自由发挥 —— 正是「全片人物 OOC / 服装对不上设定图」的根因，
+    而它只表现为日志里一串「角色参考图不可用」，不报错。
+
+    合并语义：
+      - 显式带图路径的 ref 原样保留（前端传参优先，不被磁盘覆盖）；
+      - 缺图的 ref 按 name 从磁盘资产补 front/base，保留原 name 与原有顺序；
+      - 剧本没列出的角色追加在后面，保证前 2 个槽位总能找到真实锚点；
+      - refs 为空时等价于旧行为（直接返回磁盘资产列表）。
+    """
+    by_name = {}
+    for d in (disk_refs or []):
+        if isinstance(d, dict):
+            n = str(d.get("name") or "").strip()
+            if n and _ref_image_local(d) and n not in by_name:
+                by_name[n] = d
+    out, seen = [], set()
+    for r in list(refs or []):
+        if not isinstance(r, dict):
+            continue
+        n = str(r.get("name") or "").strip()
+        merged = r
+        if not _ref_image_local(r):
+            d = by_name.get(n)
+            if d:
+                merged = dict(r)
+                merged["front"] = d.get("front")
+                merged["base"] = d.get("base")
+        out.append(merged)
+        if n:
+            seen.add(n)
+    for n, d in by_name.items():
+        if n not in seen:
+            out.append(d)
+    return out
+
+
 def _collect_reference_images(character_refs: list, scene_refs: list) -> list:
     """把前端传来的参考图（可能是 /api/assets/... 的 HTTP 资源路径）解析为本地绝对路径
 
@@ -7776,21 +8078,15 @@ def _collect_reference_images(character_refs: list, scene_refs: list) -> list:
     """
     ref_imgs = []
     for ref in list(character_refs)[:2]:
-        for key in ("front", "base"):
-            p = ref.get(key) if isinstance(ref, dict) else None
-            local = comfyui_client.resolve_local_path(p) if p else None
-            if local and os.path.exists(local):
-                ref_imgs.append(local)
-                break
+        local = _ref_image_local(ref)
+        if local:
+            ref_imgs.append(local)
         else:
             app.logger.warning(f"角色参考图不可用: {ref.get('name') if isinstance(ref, dict) else ref}")
     for ref in list(scene_refs)[:1]:
-        for key in ("front", "base"):
-            p = ref.get(key) if isinstance(ref, dict) else None
-            local = comfyui_client.resolve_local_path(p) if p else None
-            if local and os.path.exists(local):
-                ref_imgs.append(local)
-                break
+        local = _ref_image_local(ref)
+        if local:
+            ref_imgs.append(local)
     return ref_imgs
 
 
@@ -7862,6 +8158,44 @@ def api_generate_videos():
     _g = _style_aspect_guard(project_name)
     if _g is not None:
         return _g
+
+    # ---- 台词闸门（2026-10-07 fail-closed）----
+    # 为什么必须在这里拦：本系统的 dialogue 是**唯一人声来源**（旁白 narration 已关闭）。
+    # 一旦整集 0 台词，这次出片必然是完全无声的成片，而 GPU 时间已经花掉、
+    # 画面也已经生成完了 —— 用户拿到手才发现「没声音」，返工成本最高。
+    #
+    # 实测《测灵根》第 1 集：模型分镜失败（只返回 reasoning_content 没有正文）→
+    # 整集 21 镜走原文兜底 → dialogue 全空 → 流程一路「成功」走到出片。
+    # 剧本体检 audit_script 早就报了警，但它只是**告警**、从不阻断，
+    # 于是这份「未经模型加工」的剧本畅通无阻地跑完了全链路。
+    #
+    # 覆盖开关 allow_silent=true：用户明确知道是静音成片（例如只要画面做素材、
+    # 或后续单独配音）时显式放行。**默认拒绝** —— 缺台词必须是有意识的决定。
+    if not data.get("allow_silent"):
+        try:
+            _scr_guard = _load_script_for(project_name, _vid_ep)
+        except Exception as ge:      # noqa: BLE001 - 读剧本失败不该阻断出片
+            app.logger.warning("台词闸门读取剧本失败（放行）：project=%s ep=%s err=%s",
+                               project_name, _vid_ep, ge)
+            _scr_guard = None
+        if isinstance(_scr_guard, dict) and (_scr_guard.get("shots") or []):
+            _aud = dialogue_utils.audit_script(_scr_guard)
+            if not _aud["ok"]:
+                _hint = "；".join(_aud["warnings"][:3])
+                app.logger.error(
+                    "出片被台词闸门拦下：project=%s ep=%s stats=%s | %s",
+                    project_name, _vid_ep, _aud["stats"], _hint)
+                return jsonify({
+                    "success": False,
+                    "error": "该集剧本没有可朗读台词，出片会得到完全无声的成片，已阻止提交",
+                    "blocked_by": "dialogue_gate",
+                    "audit": _aud["stats"],
+                    "warnings": _aud["warnings"],
+                    "problem_shots": _aud["problem_shots"],
+                    "hint": _hint,
+                    "can_override": True,
+                    "override_flag": "allow_silent",
+                }), 409
 
     # ⑥ 视频链路自动引用剧本自动判定的镜头时长（缺 duration 时按项目配置兜底）
     episode_stats = _episode_schema_defaults(project_name, shots)
@@ -8054,67 +8388,71 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
         _vurl = (f"/api/videos/{project_name}/ep{_epn:02d}" if _epn > 1
                  else f"/api/videos/{project_name}")
 
+        # 参考图来源优先级：显式传入（带 front/base）> 磁盘资产目录。
+        # ⚠️ 2026-10-06 修复：旧顺序是「先收集 → 失败才兜底」，兜底又写成
+        #    `character_refs = character_refs or _auto_chars`；但 :8087 已用剧本
+        #    characters 填过 character_refs（非空、却没有 front/base 图路径）
+        #    → `or` 永远短路 → 磁盘资产永远用不上 → 整集视频 0 角色锚点，
+        #    人物全靠模型自由发挥，即「全片人物 OOC / 服装对不上设定图」的根因。
+        #    现在把「按 name 合并磁盘资产」提到收集之前：显式传参仍优先，
+        #    剧本描述对象也能拿到真实图路径；且「角色参考图不可用」从此只在
+        #    该角色盘上确实没有图时才打印（详见 _upgrade_refs_with_disk）。
+        _auto_chars, _auto_scenes = _collect_asset_refs(project_name)
+        _upgraded = False
+        if _auto_chars:
+            _merged_chars = _upgrade_refs_with_disk(character_refs, _auto_chars)
+            _upgraded = _merged_chars != character_refs
+            character_refs = _merged_chars
+        if not scene_refs and _auto_scenes:
+            scene_refs = _auto_scenes
+
         ref_imgs = _collect_reference_images(character_refs, scene_refs)
         main_char_img = _collect_reference_images(character_refs[:1], [])
-        # 参考图兜底（2026-10-01 实测补）：前端未传、或传了结构不完整的对象
-        # （例如直接传剧本 characters，只有 reference_prompt_zh 而无 front/base 键）时，
-        # 从磁盘资产目录自动收集 —— 与单镜重跑路径 (_video_retry_shot_impl) 同一口径。
-        # ⚠️ 主链路此前漏了这一步，后果是整集视频**一个角色锚点都拿不到**：
-        # 日志里那句「角色参考图不可用: 羡进 / 赵天霸」就是它，人物完全靠模型自由发挥，
-        # 正是「全片人物 OOC / 服装款式对不上设定图」的根因。这类静默降级不报错，
-        # 只能靠跑一遍全流程看日志才能发现。
-        if not main_char_img or not ref_imgs:
-            _auto_chars, _auto_scenes = _collect_asset_refs(project_name)
-            if not main_char_img:
-                character_refs = character_refs or _auto_chars
-                main_char_img = _collect_reference_images(character_refs[:1], [])
-            if not ref_imgs:
-                scene_refs = scene_refs or _auto_scenes
-                ref_imgs = _collect_reference_images(character_refs, scene_refs)
-            if main_char_img or ref_imgs:
+        if main_char_img or ref_imgs:
+            if _upgraded:
                 app.logger.info("[视频] 参考图已由磁盘资产补齐：角色 %d / 合计 %d",
                                 len(main_char_img), len(ref_imgs))
-            else:
-                # 优化#1（2026-10-01）：连磁盘兜底都拿不到参考图 → 角色资产从未生成或
-                # 目录被清空。此前只 warning 后照跑（人物全靠模型自由发挥，成片必 OOC）。
-                # 现在自动补做：从剧本取角色清单，同步触发生成（上限 4 个、总等待 30 分钟），
-                # 完成后重新收集参考图再继续；补做失败/超时不阻塞出片（fail-open）。
-                app.logger.warning("[视频] 磁盘资产目录里也没有可用参考图 → 自动补做角色资产…")
-                try:
-                    _scr0 = _load_script_for(project_name, episode_no) or {}
-                    _need = [c for c in (_scr0.get("characters") or [])
-                             if isinstance(c, dict) and str(c.get("name") or "").strip()][:4]
-                    if _need:
-                        _task_id = f"character_{project_name}_{uuid.uuid4().hex[:12]}"
-                        with lock:
-                            generation_state[_task_id] = {
-                                "status": "running", "asset_type": "character",
-                                "progress": 0, "total": len(_need), "current": 0,
-                                "phase": "基础图", "results": [],
-                                "overwrite": False, "auto_repair": True}
-                        _t0 = threading.Thread(
-                            target=_generate_asset_task,
-                            args=(_task_id, _need, "character", project_name,
-                                  _project_style(project_name), False))
-                        _t0.daemon = True
-                        _t0.start()
-                        _t0.join(timeout=1800)     # 上限 30 分钟，超时不阻塞出片
-                        if _t0.is_alive():
-                            app.logger.warning("[视频] 资产补做超时（30 分钟）→ 按无锚点继续")
-                        _re_chars, _re_scenes = _collect_asset_refs(project_name)
-                        if _re_chars:
-                            character_refs = _re_chars
-                            main_char_img = _collect_reference_images(character_refs[:1], [])
-                            ref_imgs = _collect_reference_images(character_refs, scene_refs)
-                            app.logger.info("[视频] 资产补做完成：角色参考图已重新挂载"
-                                            "（主角锚点 %d / 合计 %d）",
-                                            len(main_char_img), len(ref_imgs))
-                except Exception as _e:  # noqa: BLE001
-                    app.logger.warning("[视频] 资产自动补做失败（继续生成）：%s", _e)
-                if not (main_char_img or ref_imgs):
-                    app.logger.warning("[视频] 补做后仍无参考图 —— 本集将无角色锚点生成，"
-                                       "人物一致性无法保证（检查 output/assets/characters/%s）",
-                                       project_name)
+        else:
+            # 优化#1（2026-10-01）：连磁盘兜底都拿不到参考图 → 角色资产从未生成或
+            # 目录被清空。此前只 warning 后照跑（人物全靠模型自由发挥，成片必 OOC）。
+            # 现在自动补做：从剧本取角色清单，同步触发生成（上限 4 个、总等待 30 分钟），
+            # 完成后重新收集参考图再继续；补做失败/超时不阻塞出片（fail-open）。
+            app.logger.warning("[视频] 磁盘资产目录里也没有可用参考图 → 自动补做角色资产…")
+            try:
+                _scr0 = _load_script_for(project_name, episode_no) or {}
+                _need = [c for c in (_scr0.get("characters") or [])
+                         if isinstance(c, dict) and str(c.get("name") or "").strip()][:4]
+                if _need:
+                    _task_id = f"character_{project_name}_{uuid.uuid4().hex[:12]}"
+                    with lock:
+                        generation_state[_task_id] = {
+                            "status": "running", "asset_type": "character",
+                            "progress": 0, "total": len(_need), "current": 0,
+                            "phase": "基础图", "results": [],
+                            "overwrite": False, "auto_repair": True}
+                    _t0 = threading.Thread(
+                        target=_generate_asset_task,
+                        args=(_task_id, _need, "character", project_name,
+                              _project_style(project_name), False))
+                    _t0.daemon = True
+                    _t0.start()
+                    _t0.join(timeout=1800)     # 上限 30 分钟，超时不阻塞出片
+                    if _t0.is_alive():
+                        app.logger.warning("[视频] 资产补做超时（30 分钟）→ 按无锚点继续")
+                    _re_chars, _re_scenes = _collect_asset_refs(project_name)
+                    if _re_chars:
+                        character_refs = _re_chars
+                        main_char_img = _collect_reference_images(character_refs[:1], [])
+                        ref_imgs = _collect_reference_images(character_refs, scene_refs)
+                        app.logger.info("[视频] 资产补做完成：角色参考图已重新挂载"
+                                        "（主角锚点 %d / 合计 %d）",
+                                        len(main_char_img), len(ref_imgs))
+            except Exception as _e:  # noqa: BLE001
+                app.logger.warning("[视频] 资产自动补做失败（继续生成）：%s", _e)
+            if not (main_char_img or ref_imgs):
+                app.logger.warning("[视频] 补做后仍无参考图 —— 本集将无角色锚点生成，"
+                                   "人物一致性无法保证（检查 output/assets/characters/%s）",
+                                   project_name)
         app.logger.info(f"视频参考图解析结果: {ref_imgs}；主角锚点: {main_char_img}")
 
         # B-18 P1-7：构建角色索引，供 _shot_segment 逐镜匹配参考图（与分镜链路口径对齐）
@@ -8710,11 +9048,11 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
                     _pv_dst = os.path.join(
                         videos_dir,
                         f"{episode_tag or 'episode'}{preview_gate.PREVIEW_MARK}1.mp4")
-                    try:
-                        shutil.move(_pv_files[0], _pv_dst)
-                    except Exception as _pv_mv:                        # noqa: BLE001
-                        app.logger.warning("[预演] 产物迁移失败（沿用原路径）：%s", _pv_mv)
-                        _pv_dst = _pv_files[0]
+                    # 2026-10-06：统一落盘入口 + fallback_to_source。
+                    # 原 try/except 只兜住「抛异常」，但没兜住「目标目录不存在」这个
+                    # 真正的触发条件（跨盘 shutil.move 的回退分支就是在那一步炸的）。
+                    _pv_dst = _ingest_comfy_output(
+                        _pv_files, _pv_dst, logger=app.logger, fallback_to_source=True)
                     # 预演也记四层状态：A 层判技术完成，B 层取本次质检结论（若送检）
                     try:
                         quality_stage.record_stage(
@@ -8879,7 +9217,7 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
                                              "scenes": _scene_reports}]})
                         return
                     os.makedirs(videos_dir, exist_ok=True)
-                    shutil.move(_sf[0], _sdst)
+                    _sdst = _ingest_comfy_output(_sf, _sdst, logger=app.logger)
                     _scene_files.append(_sdst)
                     _scene_reports.append({"scene_no": _sn, "success": True,
                                            "path": _sdst,
@@ -9014,10 +9352,10 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
                     })
                 return
 
-            src = files[0]
-            dst = os.path.join(videos_dir, ep_name)
-            if os.path.abspath(src) != os.path.abspath(dst):
-                shutil.move(src, dst)
+            # 2026-10-06：统一落盘入口（原先的 `if abspath != abspath: shutil.move` 守卫
+            # 已内建为「同路径直接返回」，跨盘失败不再是 WinError 3）。
+            dst = _ingest_comfy_output(files, os.path.join(videos_dir, ep_name),
+                                       logger=app.logger)
             qc_passed = not episode_failed
             # ★ 用户决策 2：整集成片**保留现行为** —— 不通过仍写入正式目录（dst）供人工复核，
             # 故 app.py 这里的 fail-open **不动**。但**必须清理 ComfyUI 侧历次重试的整集 mp4**
@@ -9225,10 +9563,10 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
                     v_scratch_dir = os.path.join(QC_DIR, project_name, "video_scratch")
                     os.makedirs(v_scratch_dir, exist_ok=True)
                     _qc_prune_attempts(v_scratch_dir)   # G8③：清本镜历史过期 try（视频暂存按镜头前缀保留最近4）
-                    v_scratch = os.path.join(v_scratch_dir,
-                                             f"shot_{seq:02d}_try{attempt + 1}.mp4")
-                    if os.path.abspath(src) != os.path.abspath(v_scratch):
-                        shutil.move(src, v_scratch)
+                    v_scratch = _ingest_comfy_output(
+                        [src], os.path.join(v_scratch_dir,
+                                           f"shot_{seq:02d}_try{attempt + 1}.mp4"),
+                        logger=app.logger)
                     video_item.update({"success": True, "path": dst,
                                        "url": f"{_vurl}/shot_{seq:02d}.mp4"})
                     video_item.pop("error", None)
@@ -9245,7 +9583,8 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
                             break
                         if os.path.exists(dst):
                             os.remove(dst)
-                        shutil.move(v_scratch, dst)   # 质检本就未开启：按原行为直接入库
+                        # 质检本就未开启：按原行为直接入库（统一落盘入口）
+                        _ingest_comfy_output([v_scratch], dst, logger=app.logger)
                         break
                     with lock:
                         generation_state[task_id]["phase"] = \
@@ -9275,7 +9614,8 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
                     if gate["accept"]:
                         if os.path.exists(dst):
                             os.remove(dst)
-                        shutil.move(v_scratch, dst)   # 质检达标 → 写入正式交付目录
+                        # 质检达标 → 写入正式交付目录（统一落盘入口：确保目标目录存在）
+                        _ingest_comfy_output([v_scratch], dst, logger=app.logger)
                         # O2：产物旁路元数据（seed/提示词/工作流 SHA256/质检结论）
                         _write_artifact_meta(
                             dst, kind="video", project_name=project_name,
@@ -12088,7 +12428,11 @@ def api_qc_test():
                         "endpoint_source": ep["source"]}), 400
 
     def _endpoint_view():
-        return {"base_url": ep["base_url"], "model": ep["model"], "source": ep["source"]}
+        # 思考状态随端点一起下发（2026-10-06）：此前只回 base_url/model，
+        # 页面无法区分「档位 low」与「关思考」，测试通过也不代表真实质检用的是同一档。
+        return {"base_url": ep["base_url"], "model": ep["model"], "source": ep["source"],
+                "reasoning_effort": ep.get("reasoning_effort", ""),
+                "disable_thinking": bool(ep.get("disable_thinking", False))}
 
     image_path = data.get("image_path") or ""
     if not image_path:

@@ -8,7 +8,10 @@
 
 能力表口径（与既有硬约束**同源**，不新增第三份标准——历史教训是口径漂移）：
 - 单段时长上限/切段最小值 → h3_prompt_kit.H3_SEGMENT_MAX_SEC / H3_SEGMENT_MIN_SEC
-- 提示词上限 → h3_prompt_kit.MAX_PROMPT_CHARS（预检层 clamp_prompt 执行）
+- 提示词上限 → h3_prompt_kit.KIND_MAX_PROMPT_CHARS / max_prompt_chars(kind)（预检层 clamp_prompt
+  执行）。⚠️ 2026-10-06：不再是单一 MAX_PROMPT_CHARS —— 6000 只是 **H3** 的口径
+  （服务端真实静默截断），图片类按 kind 分档（storyboard 4000，实测基线 2382 的 1.7x）。
+  本模块下面的 H3 能力表用 ``max_prompt_chars("h3")``，取到的仍是 6000，行为不变。
 - 每镜参考图上限 → comfyui_client._cap_storyboard_refs 的 MAX_STORYBOARD_REFS=8
 - 分辨率/画幅 → style_kit（此处不重复）
 - H3 单次生成时长上限 15 秒、最高 2K、原生立体声（MiniMax-AI/MiniMax-H3 官方 README）
@@ -92,7 +95,9 @@ def capability_summary() -> Dict[str, Any]:
         "model": "MiniMax H3 (Director, Ref2VA)",
         "max_segment_sec": h3_prompt_kit.H3_SEGMENT_MAX_SEC,
         "min_segment_sec": h3_prompt_kit.H3_SEGMENT_MIN_SEC,
-        "max_prompt_chars": h3_prompt_kit.MAX_PROMPT_CHARS,
+        # 显式取 "h3" 口径而非用裸 MAX_PROMPT_CHARS：值仍是 6000（行为不变），
+        # 但以后有人调 KIND_MAX_PROMPT_CHARS 时，这张表跟着走而不会悄悄失真。
+        "max_prompt_chars": h3_prompt_kit.max_prompt_chars("h3"),
         "max_shot_refs": MAX_SHOT_REFS,
         "max_duration_sec": H3_MAX_DURATION_SEC,
         "shot_duration_floor": SHOT_DURATION_FLOOR,

@@ -39,6 +39,26 @@ _COMPAT_ERROR = re.compile(
 )
 
 
+#: `reason` 进日志时的**硬上限**（2026-10-06）。
+#: 现场事故：`reason` 直接取 `json.dumps(ComfyUI status.messages)`，
+#: 一条 execution_error 就带 `exception_message` + 完整 `traceback` 数组，
+#: 实测单行 WARNING 长达数千字符，且消息里还嵌着**未转义的换行**（traceback 元素）
+#: —— 日志解析器会把后续几十行 WARNING 一起吞进这一条，整个日志被这条污染。
+#: 保留首行 + 截断即可定位，完整内容仍在 `trt_engine_status.json` 里可查。
+_REASON_LOG_LIMIT = 300
+
+
+def _reason_for_log(report: Dict) -> str:
+    """把自检结论压成**单行**、限长的日志文本。"""
+    reason = str(report.get("reason") or "").strip()
+    if not reason:
+        return "文件缺失/为空"
+    first = reason.replace("\r", " ").replace("\n", " ").strip()
+    if len(first) > _REASON_LOG_LIMIT:
+        return first[:_REASON_LOG_LIMIT] + f"…（已截断，全文见 {os.path.basename(_CACHE_PATH)}）"
+    return first
+
+
 def _find_engine(name: str) -> str:
     roots = deps_check._model_roots(config.MODELS_DIR)
     # 先走常见 vae/ 目录直查：启动自检不应为了两个已知文件扫完整棵模型树。
@@ -180,12 +200,52 @@ def _build_probe_prompt(decoder: str, encoder: str) -> Dict:
 
 
 def _error_text(entry: Dict) -> str:
+    """从 history 条目里**提取**真正的失败原因，而不是把整个 messages 数组 dump 出来。
+
+    ⚠️ 2026-10-06 修复（实测事故）：原实现是 ``json.dumps(messages)``，
+    而一条 ``execution_error`` 事件里带 ``traceback`` 数组 —— 元素本身是**多行字符串**，
+    ``json.dumps`` 转义后仍有数千字符。于是：
+      · 启动自检（读缓存）把整坨内容打进**单行 WARNING**，实测污染后续几十行日志；
+      · 同一坨内容被写进 ``output/trt_engine_status.json`` 的 ``reason``，
+        之后每次启动都原样重打一遍（现场同一段 JSON 出现 3 次）。
+
+    真正有诊断价值的是 ``exception_message`` / ``exception_type`` / ``node_type`` /
+    ``node_id`` —— 它们已经包含 ComfyUI 给出的根因（如
+    ``TensorRT library not found!``）。完整 messages 仍保留在
+    ``output/trt_engine_status.json`` 的 ``runtime.messages`` 里，可按需查。
+    """
     status = entry.get("status") or {}
     messages = status.get("messages") or []
+    parts: List[str] = []
+    for message in messages:
+        if not isinstance(message, (list, tuple)) or len(message) < 2:
+            continue
+        event, payload = message[0], message[1]
+        if event != "execution_error":
+            continue
+        if isinstance(payload, dict):
+            node = payload.get("node_type") or payload.get("node_id") or "?"
+            parts.append(
+                f"节点 {node} 执行失败：{payload.get('exception_type') or 'Error'}"
+                f" —— {str(payload.get('exception_message') or '').strip()[:400]}")
+        else:
+            # ⚠️ 2026-10-06：ComfyUI 正常回传的是 dict；但历史/精简格式会把 payload
+            # 直接压成字符串。原实现对非 dict 一律 continue → 根因文本整个丢掉，
+            # 明明报了 TensorRT 兼容性错误却归类成「未测试」，自检形同虚设。
+            # 这里按字符串取用（同样截 400 字符，日志治理不受影响）。
+            parts.append(f"执行失败：{str(payload).strip()[:400]}")
+    if parts:
+        return " | ".join(parts)
+    # 没有 execution_error（探针超时 / ComfyUI 未回传完整消息）→ 退化为摘要，
+    # 只保留事件名与时间戳，绝不把整个数组序列化出去。
     try:
-        return json.dumps(messages, ensure_ascii=False)
+        brief = []
+        for message in messages[:8]:
+            if isinstance(message, (list, tuple)) and message:
+                brief.append(str(message[0]))
+        return "事件序列：" + " → ".join(brief) if brief else "（无消息）"
     except Exception:  # noqa: BLE001
-        return str(messages)
+        return "（无法解析消息）"
 
 
 def _run_probe(static: Dict, timeout: float = 90.0) -> Dict:

@@ -25,6 +25,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Callable, Dict, List, Optional, Tuple
@@ -93,8 +94,24 @@ def _http_json(url: str, payload: Optional[dict] = None, timeout: int = 60):
         req = urllib.request.Request(
             url, data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        # ComfyUI 的 prompt 校验失败（400）把**真实原因写在响应体**里，例如
+        #   {"error": {...}, "node_errors": {"3": {"errors": [{"message":
+        #   "Required input is missing: target_text", ...}]}}}
+        # 而裸 HTTPError 只有一句 "HTTP Error 400: Bad Request" —— 应用日志里因此
+        # 完全看不到「缺哪个 required 输入」，只有 ComfyUI 的 stderr 里有，排查成本极高。
+        # 这里把响应体贴进异常信息；仍然抛 HTTPError，不改变调用方的异常语义。
+        try:
+            body = e.read().decode("utf-8", "replace").strip()
+        except Exception:  # noqa: BLE001 - 诊断信息取不到不影响主流程
+            body = ""
+        raise urllib.error.HTTPError(
+            e.url, e.code,
+            f"{e.reason}；响应体：{body[:600] if body else '(空)'}",
+            e.headers, None) from e
 
 
 def _http_bytes(url: str, timeout: int = 300) -> bytes:
@@ -1031,7 +1048,13 @@ class QwenTTSClient:
             # 参考音频克隆：FB_Qwen3TTSVoiceClone 用 ref_audio（+可选 ref_text）驱动音色。
             # ⚠️ ref_node 缺失时**绝不**静默退回 CustomVoice —— 那会得到一个与用户
             # 上传音频毫无关系的预置音色，且日志上看不出来。调用方负责先兜底。
-            inputs = dict(common, text=text,
+            # ⚠️ 文本入参名是 `target_text` 而不是 `text`：只有 VoiceClone 这一个节点
+            # 用 target_text（CustomVoice / VoiceDesign 都是 `text`）。写错会被 ComfyUI
+            # 校验拦下 —— POST /prompt 返回 **400 prompt_outputs_failed_validation**，
+            # 一句音频都出不来；且 ComfyUI 只把原因打进自己的 stderr，应用日志里只剩
+            # 一个光秃秃的 "HTTP Error 400"，极易误判成「模型慢/在加载」。
+            # 改动本行前请先核对线上 schema：GET /object_info/FB_Qwen3TTSVoiceClone
+            inputs = dict(common, target_text=text,
                           instruct=str(voice.get("instruct") or ""),
                           x_vector_only=False)
             if ref_node:

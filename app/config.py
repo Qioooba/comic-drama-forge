@@ -643,6 +643,16 @@ TTS_DEFAULT_PARAMS = {
     "timeout": 1800,                # 单批配音等待上限（秒）
 }
 
+# VoiceBank「自动生成参考音色」单句合成的等待上限（秒）。
+# ⚠️ 2026-10-06：此前调用点（app.py::_auto_fill_voice_bank）硬编码 `timeout=60`，
+# **低于 Qwen3-TTS 的真实单批耗时**。当晚 43 次实测采样：成功批次 24~42s，
+# ComfyUI 自己报告的 prompt 执行时间是 67.33s / 78.65s —— 也就是说至少一半
+# 本该成功的合成被 60s 砍掉：应用记「配音超时」并丢弃结果，而 ComfyUI 那边的
+# 任务仍在照跑（白烧 GPU），下一个角色又重新提交一轮 → 越排越慢、越慢越失败。
+# 取 300s：远高于真实耗时（留 4~5 倍余量给显存紧张时的抖动），又远低于曾出现过的
+# 「TTS 挂起 30+ 分钟」（见 docs/开源对标与升级实施方案.md 第四节第 1 条）。
+TTS_VOICE_BANK_TIMEOUT = _env_int("MJSCXT_TTS_VOICE_BANK_TIMEOUT", 300)
+
 # ===================== 音画合成（配音轨 × 成片视频） =====================
 # 带配音成片落盘目录：output/final_dub/<项目>/<成片名>_dubbed.mp4
 DUB_MIX_DIR = os.path.join(PROJECT_OUTPUT_DIR, "final_dub")

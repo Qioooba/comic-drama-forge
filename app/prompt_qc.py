@@ -1278,11 +1278,14 @@ def preflight(kind: str, prompt: str, ctx: dict = None, style: str = "",
     # 预检关闭时上面已 early-return 原样透传，保持「关闭时不改写」契约不变。
     # P-4（2026-09-22 QA 复验）：clamp_prompt 的日志标签按 kind 区分，避免 audio/
     # storyboard 超长时也被打成 prompt_h3（该形参只影响日志，不影响截断行为）。
-    _clamped = h3_prompt_kit.clamp_prompt(final, label=f"prompt_qc.{kind}")
+    # 2026-10-06：kind 同时**决定阈值**（h3_prompt_kit.max_prompt_chars）——
+    # storyboard 走 4000（实测基线 2382 的 1.7x），h3 仍 6000（服务端真实静默截断）。
+    _kind_limit = h3_prompt_kit.max_prompt_chars(kind)
+    _clamped = h3_prompt_kit.clamp_prompt(final, label=f"prompt_qc.{kind}", kind=kind)
     _prompt_clamped = _clamped != final
     if _prompt_clamped:
         repairs.append(f"提示词超长已截断（{len(final)} > "
-                       f"{h3_prompt_kit.MAX_PROMPT_CHARS} 字符）")
+                       f"{_kind_limit} 字符）")
         final = _clamped
     repairs = list(dict.fromkeys(repairs))   # 同类修复（如多次去空词）只报一次
     verdict = check_prompt(kind, final, ctx=ctx, style=style, cfg=cfg,
@@ -1333,7 +1336,8 @@ def preflight(kind: str, prompt: str, ctx: dict = None, style: str = "",
             if (not _rv.get("passed", True)) and _imp and _imp != final:
                 _imp_final, _imp_repairs = repair_prompt(kind, _imp, ctx=ctx, style=style)
                 _imp_final = h3_prompt_kit.clamp_prompt(_imp_final,
-                                                        label=f"prompt_qc.{kind}.review")
+                                                        label=f"prompt_qc.{kind}.review",
+                                                        kind=kind)
                 _v2 = check_prompt(kind, _imp_final, ctx=ctx, style=style, cfg=cfg,
                                    ref_count=ref_count, expect_refs=expect_refs)
                 if not _v2.get("critical_issues") \

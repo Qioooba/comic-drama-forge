@@ -13,7 +13,7 @@
 """
 import logging
 import re
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -125,12 +125,19 @@ def infer_speaker(text: str, characters: Optional[Iterable],
 # ============================ 写 / 规范 ============================
 
 def normalize_dialogue(raw, characters: Optional[Iterable] = None,
-                       cast: Optional[Iterable] = None, max_text: int = 200) -> dict:
+                       cast: Optional[Iterable] = None, max_text: int = 200,
+                       infer_when_empty: bool = True) -> dict:
     """把任意写法的台词规范为 ``{"speaker": str, "text": str}``（空台词返回双空串）。
 
     - 已是结构化的：保留 speaker / text；
     - 旧字符串且带 "角色名：" 前缀：解析出说话人；
     - 完全无线索：按角色表推断（推断不出则取本镜头出场角色首位）。
+
+    ``infer_when_empty=False`` 时**只做前缀解析、不做角色表推断**，
+    推断不出就保持 speaker 为空。给「说话人宁缺毋滥」的调用方用 —— 见
+    :func:`extract_quoted_dialogue`：兜底路径的 speaker 空是有意义的信号
+    （「宁可退回默认音色，也不要安错人」），若这里再被角色表填成首位，
+    就等于把「主角替全场说话」的错归因重新灌回来。
     """
     text = re.sub(r"\s+", " ", dialogue_text(raw)).strip()
     if not text:
@@ -138,26 +145,261 @@ def normalize_dialogue(raw, characters: Optional[Iterable] = None,
     speaker = dialogue_speaker(raw)
     if not speaker:
         speaker = match_prefix_speaker(text, characters)
-    if not speaker:
+    if not speaker and infer_when_empty:
         speaker = infer_speaker(text, characters, cast)
     return {"speaker": speaker[:40], "text": text[:max_text]}
 
 
 def normalize_lines(raw, characters: Optional[Iterable] = None,
-                    cast: Optional[Iterable] = None, max_text: int = 200) -> List[dict]:
+                    cast: Optional[Iterable] = None, max_text: int = 200,
+                    infer_when_empty: bool = True) -> List[dict]:
     """把任意写法的台词规范为 ``[{"speaker": str, "text": str}, ...]``（无台词返回空列表）。
 
     - 已结构化（dict / list[dict]）：逐条保留 speaker / text；
     - 旧字符串：按 "角色名：" 前缀 → 角色表推断 逐级补全说话人；
     - 空台词条目直接丢弃。
+
+    ``infer_when_empty`` 的语义见 :func:`normalize_dialogue`。
     """
     items = raw if isinstance(raw, (list, tuple)) else [raw]
     out: List[dict] = []
     for it in items:
-        line = normalize_dialogue(it, characters, cast, max_text=max_text)
+        line = normalize_dialogue(it, characters, cast, max_text=max_text,
+                                  infer_when_empty=infer_when_empty)
         if line["text"]:
             out.append(line)
     return out
+
+
+# ===================== 兜底路径：从原文引语恢复台词 =====================
+
+# 中文小说里台词的引号形态。含直角引号与单引号：老式/港台文本常用「」『』，
+# 嵌套引语还会再套一层（外层「」+ 内层‘’）——先外后内拆，避免整段当台词。
+_QUOTE_PAIRS = (("“", "”"), ("「", "」"), ("『", "』"), ("‘", "’"))
+
+#: 公开的开/闭引号字符集。**引号感知的切句器需要它**（见 novel_to_script._split_sentences）：
+#: 朴素按句末标点切会把引语自带的句号当断点，把一句话从引号中间劈开。
+#: 单一来源，禁止别处另写一份（口径漂移的老教训）。
+QUOTE_OPEN_CHARS = "".join(p[0] for p in _QUOTE_PAIRS)
+QUOTE_CLOSE_CHARS = "".join(p[1] for p in _QUOTE_PAIRS)
+
+# 角色名之后、紧邻引语的那段话里，是否出现了说话动词 —— 说话人归因的**唯一**判据。
+# 命中才认为「这个名字就是这句台词的说话人」，否则 speaker 留空（宁缺毋滥）。
+_SPEECH_TAIL_RE = re.compile(
+    r"^[\s，,。.：:；;、\-\u2014]*(?:"
+    r"(?:又|才|再|便|就|只|先|随即|接着|继续|低声|大声|冷冷|淡淡|抬头|回头|闻言)?"
+    r"[\u4e00-\u9fff]{0,4}"
+    r"(?:说|道|问|答|喊|叫|吼|喝|笑|叹|嘀咕|低语|开口)"
+    r"|[\u4e00-\u9fff]{0,2}(?:说着|问道|答道|喊道|叫道|笑道|叹道|回道|应道)"
+    r")")
+
+# 单条兜底台词的长度上限（与本模块 normalize_dialogue 的 max_text 默认值同口径）
+QUOTED_MAX_CHARS = 200
+
+
+def _strip_attrib(text: str) -> str:
+    """只去首尾标点，**不剥动词**。
+
+    ⚠️ 曾经在这里按「说/道/问…」剥掉引语开头的叙述成分，代价是两重的：
+    ① 台词**内容**里的动词被误吃 —— “你说什么？” 里的「说」被当成叙述前缀，
+       整句归零直接消失（实测《测灵根》漏 1 条）；
+    ② 违反产品规则「原文对话尽量原样写进 dialogue.text」（novel_to_script 重写规则 5）：
+       兜底路径既然要救台词，就更不能改写它。
+    引号内的内容**就是台词原文**，一律原样保留。
+    """
+    return str(text or "").strip().strip("，,。.：:；;、 \n\t")
+
+
+def _iter_quoted_spans(s: str, start: int = 0):
+    """从 ``start`` 起扫描，逐个产出 ``(引语起点, 引语文本)``。
+
+    一次线性扫描，不做回溯：遇到左引号就找其配对右引号；**找不到配对就整体跳过**
+    （原文漏写/错配右引号是常态，猜配对只会把半句话当台词念出来）。
+    嵌套引号（外层「」套内层‘’）递归取**最内层**，外层仅作上下文。
+    """
+    i, n = start, len(s)
+    while i < n:
+        op = cl = None
+        for o, c in _QUOTE_PAIRS:
+            if s.startswith(o, i):
+                op, cl = o, c
+                break
+        if op is None:
+            i += 1
+            continue
+        end = s.find(cl, i + 1)
+        if end == -1:
+            i += 1
+            continue
+        inner = s[i + 1:end]
+        if any(o in inner for o, _ in _QUOTE_PAIRS):
+            yield from _iter_quoted_spans(inner, 0)          # 递归进内层
+        else:
+            yield i, inner
+        i = end + 1
+
+
+#: 归因时向后回看的最大字符数（够容纳「角色名 + 副词 + 动词 + 标点」）
+_ATTRIB_LOOKBACK = 24
+
+
+def _attrib_speaker(before: str, ordered: List[str]) -> str:
+    """从引语**紧前方**的文字里判定说话人；判不出就返回空串。
+
+    两条硬约束（缺任一条都会把台词安到错的人头上）：
+
+    1. 角色名之后必须紧跟说话动词，且动词与引号之间只有标点/空白
+       —— 判据是 :data:`_SPEECH_TAIL_RE`。
+    2. **角色名与本句引号之间不得夹着任何其他引号**。
+       没有这条时，``…“杂灵根能修仙吗，”周野问，“能，”执事说，“资质是差了些，”``
+       会把「资质是差了些」判给周野（回看窗口里 周野 + 问 恰好成立），
+       而真正紧邻的说话人是「执事说」。实测《测灵根》ep01 shot16。
+
+    判不出宁可留空：留空只是退回默认音色，猜错会让主角替全场说话。
+    """
+    tail = str(before or "")[-_ATTRIB_LOOKBACK:]
+    if not tail:
+        return ""
+    best, best_pos = "", -1
+    for nm in ordered:
+        pos = tail.rfind(nm)
+        if pos > best_pos:
+            best, best_pos = nm, pos
+    if not best or best_pos < 0:
+        return ""
+    rest = tail[best_pos + len(best):]
+    if any(ch in rest for ch in QUOTE_OPEN_CHARS + QUOTE_CLOSE_CHARS):
+        return ""                      # 中间隔着别的引语 → 这个人不是本句说话人
+    return best if _SPEECH_TAIL_RE.match(rest) else ""
+
+
+def extract_quoted_dialogue(text: str, characters: Optional[Iterable] = None,
+                            cast: Optional[Iterable] = None,
+                            max_text: int = QUOTED_MAX_CHARS,
+                            min_text: int = 2) -> List[dict]:
+    """从原文叙述里抽出引号中的台词，转成 ``[{"speaker","text"}]``（无则空列表）。
+
+    **为什么需要**：LLM 分镜失败时 novel_to_script 会走「按原文逐句兜底」，
+    兜底把整段原文塞进 description、``dialogue`` 写死 ``[]``。而本系统的
+    ``dialogue`` 是**唯一人声来源**（旁白 narration 已于 2026-09-19 关闭），
+    台词清零 = 整集无声，用户只看到「成片没人声」却无从判断是哪一环坏了。
+
+    原文的引号本身就是台词的权威标记 —— 兜底路径完全有能力把它救回来，
+    不该因为模型失败就把已存在于原文的台词一并丢掉。
+
+    说话人归因**只用一级判据**：引语紧邻的「角色名 + 说话动词」
+    （"周野道…" / "执事抬眼，道…"）。其余一律留空。
+
+    ⚠️ 为什么只留一级：实测《测灵根》兜底剧本 30 条引语里，真说话人多为
+    执事弟子 / 队伍众人，但原文只写「执事」「前面一个少年」，从不写全名。
+    早期实现加了「前文最近出现的角色名」与「出场角色首位」两级兜底，
+    结果 **30 条全部被安到主角周野头上** —— 主角替全场说话，比留空糟糕得多
+    （TTS 用错音色、逐镜 OOC）。所以宁可大面积留空：speaker 空时下游退回默认音色，
+    台词文本照念，「丢台词」这件事不会发生。
+    配套：:func:`normalize_lines` 的 ``infer_when_empty=False``，防止归一化时
+    把留空重新填成角色表首位。
+    """
+    s = str(text or "")
+    if not s or not any(op in s for op, _ in _QUOTE_PAIRS):
+        return []
+    names = iter_names(characters) or iter_names(cast)
+    # 长名优先，避免「周小」抢走「周野」的归因
+    ordered = sorted(names, key=len, reverse=True)
+    out: List[dict] = []
+
+    def _attrib(before: str) -> str:
+        # 唯一一级判据：引语正前方最近的「角色名 + 说话动词」，且中间不得夹别的引语。
+        return _attrib_speaker(before, ordered)
+
+    for pos, inner in _iter_quoted_spans(s):
+        txt = _strip_attrib(inner)
+        if len(re.sub(r"\s+", "", txt)) < min_text:
+            continue                       # 「嗯」「……」这类纯语气，按无台词处理
+        if not re.search(r"[\u4e00-\u9fffA-Za-z0-9]", txt):
+            continue                       # 纯标点
+        out.append({"speaker": _attrib(s[:pos]), "text": txt[:max_text]})
+    return out
+
+
+#: 剥离台词后残留的「说话引导」尾巴：`周野道` / `执事抬眼，道` 这类。
+#: 引号被摘走后它们会变成悬空的「周野道：，」，必须一并清掉。
+_ATTRIB_TAIL_RE = re.compile(
+    r"(?:[一-鿿A-Za-z0-9]{1,8}(?:抬眼|皱眉|点头|摇头|开口|低声|沉声|冷冷|轻声)?"
+    r"(?:说|道|问|答|喊|叫|回|念|想)[：:，,、]?)\s*$"
+)
+
+
+def split_quoted_dialogue(text: str, characters: Optional[Iterable] = None,
+                          cast: Optional[Iterable] = None,
+                          max_text: int = QUOTED_MAX_CHARS,
+                          min_text: int = 2) -> Tuple[List[dict], str]:
+    """从文本里**摘出**引号台词，并返回剔除这些引号后的剩余文本。
+
+    与 :func:`extract_quoted_dialogue` 的区别：后者只读不改，本函数是
+    「取出 + 就地删除」，供把台词从画面描述里**归位**到 dialogue 字段使用。
+
+    为什么要归位
+    ----------
+    实测《测灵根》第 1 集：模型把 5 条原文金句原样写进了 ``description``
+    （"我爹说，刚放上去的时候石头会凉…"，"四行俱有，俱不纯。…"），
+    ``dialogue`` 却全是 ``[]``。而本系统的 ``dialogue`` 是**唯一人声来源**
+    （旁白 narration 已关闭），于是成片整集无声。
+
+    更糟的是**校验器也骗人**：``continuity.check_quotes_in_script`` 搜的是整个
+    ``shots`` JSON（含 description），金句躺在描述里照样判 ``hit_rate=1.0``。
+    三道防线（提示词强制 / 校验 / 质检对白驱动率）在同一处集体失效。
+
+    归位后 description 只剩画面内容，符合项目既有规则
+    「禁止把台词塞进 description / visual_detail / audio_cues」。
+
+    返回 ``(lines, cleaned_text)``；无引号时 ``lines=[]`` 且 ``cleaned_text``
+    为原文本（不做任何无谓改写）。
+    """
+    s = str(text or "")
+    if not s or not any(op in s for op, _ in _QUOTE_PAIRS):
+        return [], s
+
+    names = iter_names(characters) or iter_names(cast)
+    ordered = sorted(names, key=len, reverse=True)
+
+    def _attrib(before: str) -> str:
+        # 与 extract_quoted_dialogue 同一判据（共享实现，防口径漂移）
+        return _attrib_speaker(before, ordered)
+
+    lines: List[dict] = []
+    # 倒序删除：正序删会让后续 span 的下标全部失效
+    for pos, inner in reversed(list(_iter_quoted_spans(s))):
+        txt = _strip_attrib(inner)
+        keep = (len(re.sub(r"\s+", "", txt)) >= min_text
+                and re.search(r"[一-鿿A-Za-z0-9]", txt))
+        if not keep:
+            continue                      # 「嗯」「……」按无台词处理，**留在描述里**
+        # 定位配对右引号，把「引导 + 引号整段」一起摘掉
+        for o, c in _QUOTE_PAIRS:
+            if s.startswith(o, pos):
+                end = s.find(c, pos + 1)
+                break
+        else:                              # pragma: no cover - 与 _iter_quoted_spans 同源
+            continue
+        cut = s[pos:end + 1]
+        head = s[:pos]
+        # ⚠️ 说话人必须用**剥离引导语之前**的 head 判定。
+        #    先剥再判会让 `_attrib` 越过被剥掉的「执事说，」往前找，
+        #    命中更靠前的「周野问」→ 把执事的台词安到主角头上（实测 ep01 shot16）。
+        speaker = _attrib(head)
+        m = _ATTRIB_TAIL_RE.search(head)
+        if m:                             # 连同紧邻的「周野道：」一起走
+            head = head[:m.start()]
+        s = head + s[end + 1:]
+        lines.append({"speaker": speaker, "text": txt[:max_text]})
+
+    lines.reverse()                       # 恢复原文顺序
+    # 摘完引号可能留下「，，」/「：」/悬空空白，收口但不重写内容
+    cleaned = re.sub(r"[，,、]{2,}", "，", s)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    cleaned = re.sub(r"^[，,、：:；;。\s]+", "", cleaned)
+    cleaned = re.sub(r"[，,：:；;\s]+$", "", cleaned)
+    return lines, cleaned
 
 
 def format_line(raw, sep: str = "：", with_speaker: bool = True) -> str:
