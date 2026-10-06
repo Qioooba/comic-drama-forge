@@ -11,7 +11,8 @@ import { projectsApi, keyframesApi, storyboardApi, videoApi, episodesApi, genera
 import { Button, ConfirmDialog, EmptyState, ErrorState, Loading, Skeleton, Modal, Select } from '@/components/ui';
 import { useToast } from '@/components/ui/toast';
 import { GridPage } from '@/pages/GridPage';
-import { Clapperboard, ImageIcon, Target, X } from '@/components/ui/icons';
+import { Clapperboard, Film, ImageIcon, Target, X } from '@/components/ui/icons';
+import { ShotStudioTab } from './ShotStudioTab';
 import { useEpisodes, useKeyframePlan, useGenerationStatus, useStoryboardCanvas } from '@/api/queries';
 import type { ShotGridStatusResponse, ShotGridTaskState } from '@/types';
 
@@ -255,7 +256,7 @@ function ShotPromptEditor({ shot, novelId, episodeNo, onSaved }: {
 
 function StoryboardHubTab({ projectKey, novelId }: { projectKey: string; novelId?: string }) {
   const { t } = useApp();
-  const [sub, setSub] = useState<'storyboard' | 'ninegrid' | 'keyframes'>('storyboard');
+  const [sub, setSub] = useState<'storyboard' | 'ninegrid' | 'keyframes' | 'studio'>('storyboard');
   // 选中集号：null = 未指定（沿用后端「最新一集」的兜底，兼容无剧集数据的纯项目）
   const [selectedEpisode, setSelectedEpisode] = useState<number | null>(null);
   const episodes = useEpisodeList(novelId);
@@ -273,8 +274,9 @@ function StoryboardHubTab({ projectKey, novelId }: { projectKey: string; novelId
     }
   }, [episodes, selectedEpisode]);
 
-  const subs: { id: 'storyboard' | 'ninegrid' | 'keyframes'; icon: React.ReactNode; label: string; hint: string }[] = [
+  const subs: { id: 'storyboard' | 'ninegrid' | 'keyframes' | 'studio'; icon: React.ReactNode; label: string; hint: string }[] = [
     { id: 'storyboard', icon: <Clapperboard className="h-4 w-4" />, label: t('wb.subStoryboard'), hint: t('sb.subStoryboardHint') },
+    { id: 'studio', icon: <Film className="h-4 w-4" />, label: t('wb.subShotStudio'), hint: t('sb.subShotStudioHint') },
     { id: 'ninegrid', icon: <Target className="h-4 w-4" />, label: t('wb.subNinegrid'), hint: t('sb.subNinegridHint') },
     { id: 'keyframes', icon: <ImageIcon className="h-4 w-4" />, label: t('wb.subKeyframes'), hint: t('sb.subKeyframesHint') },
   ];
@@ -300,7 +302,7 @@ function StoryboardHubTab({ projectKey, novelId }: { projectKey: string; novelId
         ))}
       </div>
 
-      {/* 集切换器：分镜 / 关键帧两类产物按集隔离，必须先在集之间分流 */}
+      {/* 集切换器：分镜 / 关键帧 / 镜头工作台三类产物按集隔离，必须先在集之间分流 */}
       {sub !== 'ninegrid' && (
         <EpisodeSwitcher
           episodes={episodes}
@@ -310,6 +312,9 @@ function StoryboardHubTab({ projectKey, novelId }: { projectKey: string; novelId
       )}
 
       {sub === 'storyboard' && <StoryboardTab projectKey={projectKey} episodeNo={selectedEpisode} />}
+      {sub === 'studio' && (
+        <ShotStudioTab projectKey={projectKey} novelId={novelId} episodeNo={selectedEpisode} />
+      )}
       {sub === 'ninegrid' && <GridPage projectKey={projectKey} />}
       {sub === 'keyframes' && <KeyframesTab projectKey={projectKey} episodeNo={selectedEpisode} />}
     </div>

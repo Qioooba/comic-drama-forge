@@ -40,6 +40,16 @@ export interface EpisodeContextBarProps {
   /** 导航器是否展开（决定左栏宽度） */
   navigatorOpen?: boolean;
   onToggleNavigator?: () => void;
+  /**
+   * 上下文条右侧的**动作插槽**（放在状态区左边）。
+   *
+   * 为什么需要它：决策态徽标（ADR-0002 的唯一渲染入口）必须与
+   * 「项目 → 季 → 集 → 镜」同处一条常驻带 —— 用户在第 37 镜看到
+   * 「已采用·未批准」，才有办法确认自己看的是哪一镜的决定。
+   * 但决策态**不属于**上下文本身（它是产物状态，不是位置状态），
+   * 所以不塞进 EpisodeContext，由调用方经本插槽注入。
+   */
+  actions?: React.ReactNode;
   className?: string;
 }
 
@@ -48,6 +58,7 @@ export function EpisodeContextBar({
   status,
   navigatorOpen,
   onToggleNavigator,
+  actions,
   className = '',
 }: EpisodeContextBarProps): JSX.Element {
   const { projectKey, season, episodeNo, shotSeq } = context;
@@ -88,6 +99,7 @@ export function EpisodeContextBar({
 
       {/* ---- 资源状态：未知就写「未知」，不留空、不隐藏 ---- */}
       <div className="ml-auto flex flex-wrap items-center gap-3 text-xs">
+        {actions}
         <StatusChip
           label="队列"
           value={status?.queueDepth != null ? String(status.queueDepth) : '未知'}

@@ -19,8 +19,48 @@
  */
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { productionFactsApi } from '@/api/client';
-import type { ProductionDecisionState, ProductionMediaVersion } from '@/types';
+import type { ProductionDecisionState, ProductionIntent, ProductionMediaVersion } from '@/types';
 import { queryKeys } from './keys';
+
+/**
+ * 某一镜最近一次冻结的生成意图。
+ *
+ * 为什么需要它
+ * ------------
+ * Shot Studio 的「候选对比 / 采用 / 批准」全部挂在 `intent_id` 上：
+ * 候选列表按意图取，后端也只在意图存在时才谈得上「这一版」。
+ * 而工作台的分镜画布（`StoryboardShot`）**不带 intent_id** —— 它是剧本 +
+ * 磁盘产物的视图，不含生成事实。要把两者接起来，只能按
+ * 「项目 + 集 + 镜号」回查意图：这正是后端 `list_intents` 的过滤维度。
+ *
+ * ⚠️ 取不到就取不到：`enabled` 要求四项齐全（项目 / 集 / 镜号），
+ * 缺一项即不发请求，绝不用「拉全量再前端过滤」把噪音带进来。
+ */
+export function useShotIntents(
+  projectKey: string,
+  episodeNo: number | null | undefined,
+  shotKey: string | null | undefined,
+) {
+  return useQuery({
+    queryKey: queryKeys.productionIntents(projectKey, String(episodeNo ?? ''), shotKey ?? ''),
+    queryFn: () =>
+      productionFactsApi.listIntents({
+        project: projectKey,
+        episode: String(episodeNo ?? ''),
+        shot_key: shotKey ?? '',
+      }),
+    enabled: !!projectKey && episodeNo != null && !!shotKey,
+    // 意图是**冻结**事实（ADR-0002 铁律 2）：写入后不会原地变，
+    // 只会新增一条派生。因此不需要轮询，staleTime 给足。
+    staleTime: 60_000,
+  });
+}
+
+/** 该镜最近一次意图（后端按 created_at DESC 返回，取首条）。 */
+export function latestIntentOf(q: { data?: { intents?: ProductionIntent[] } }): ProductionIntent | null {
+  const list = q.data?.intents;
+  return Array.isArray(list) && list.length > 0 ? list[0] : null;
+}
 
 /** 候选版本列表（候选并排对比的数据源）。 */
 export function useMediaVersions(intentId?: string) {

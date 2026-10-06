@@ -15,7 +15,7 @@ import type {
   TTSEnv, TTSPlanResponse, TTSTask,
   MixEnv, MixPlanResponse, MixTask, MixStatusResponse,
   QCConfig, QCResponse,
-  Episode, EpisodeListResponse, NovelSplitPlanResponse, ComfyUIModelsResponse,
+  Episode, EpisodeDetail, EpisodeListResponse, NovelSplitPlanResponse, ComfyUIModelsResponse,
   TrtEngineCheckResponse,
   ActualParamsResponse,
   LogSource, LogsResponse,
@@ -32,6 +32,7 @@ import type {
   ShotGridApplyResponse,
   ProductionMediaVersion,
   ProductionDecisionState,
+  ProductionIntent,
 } from '../types';
 
 const API_BASE = '/api';
@@ -878,7 +879,8 @@ export const episodesApi = {
   list: (novelId: string) =>
     request<EpisodeListResponse>(`/episodes/${encodeURIComponent(novelId)}`),
   get: (novelId: string, episodeNo: number) =>
-    request<Episode>(`/episodes/${encodeURIComponent(novelId)}/${episodeNo}`),
+    // 返回体带 `script`（剧本正文），见 types/index.ts::EpisodeDetail
+    request<EpisodeDetail>(`/episodes/${encodeURIComponent(novelId)}/${episodeNo}`),
   // 按场次生成视图（2026-10-03）：某集的场次列表 + 各场分镜/视频就绪状态。
   // project=项目键（后端 ?project= 约定），episode_no=集号。
   scenes: (projectKey: string, episodeNo: number) =>
@@ -1596,6 +1598,30 @@ export const qualityApi = {
 //    不提供任何 `selectAndApprove` 之类的合并封装 —— 合并入口就是「采用
 //    隐式升级为批准」在客户端层面的复活。
 export const productionFactsApi = {
+  /**
+   * 生成意图列表（冻结后的生成事实），按 project / episode / shot_key 过滤。
+   *
+   * ⚠️ 这里刻意**不走** `api/generated/client.ts` 的 `listProductionIntents`：
+   * 生成物里的 operation 只声明了 `project` 与 `intent_id` 两个过滤参数
+   * （见 `app/contracts/openapi.py` 的 `_q(...)` 列表），而后端路由
+   * `app/api/production_facts.py::list_intents` 实际还支持 `episode` / `shot_key`。
+   * Shot Studio 要按「本集本镜」定位最近一条意图，缺这两个参数就退化成
+   * 「拉回全项目再前端过滤」，那是把后端已有的过滤能力搬到客户端做无用功。
+   * 生成物按契约不能手改，故在手写客户端这里补齐 —— 端点是既有的，不是新增。
+   */
+  listIntents: (params: { project?: string; episode?: string; shot_key?: string; limit?: number } = {}) => {
+    const qs = new URLSearchParams();
+    if (params.project) qs.set('project', params.project);
+    if (params.episode != null && params.episode !== '') qs.set('episode', String(params.episode));
+    if (params.shot_key) qs.set('shot_key', params.shot_key);
+    qs.set('limit', String(params.limit ?? 100));
+    return request<{
+      success: boolean;
+      intents: ProductionIntent[];
+      count: number;
+    }>(`/production_facts/intents?${qs.toString()}`);
+  },
+
   /**
    * 候选版本列表（每条都带**独立的** selected / approved 字段）。
    * 供候选比较与 Shot Studio 渲染决策态用。

@@ -26,6 +26,10 @@ export const queryKeys = {
   /** 剧集列表（按小说维度） */
   episodes: (novelId: string) => ['episodes', novelId] as const,
 
+  /** 单集剧本正文（Shot Studio 的站位 blocking 只在这里） */
+  episodeScript: (novelId: string, episodeNo: number | null | undefined) =>
+    ['episodes', novelId, 'script', episodeNo ?? 'latest'] as const,
+
   /** 分镜画布（按集） */
   storyboardCanvas: (projectKey: string, episodeNo: number | null | undefined) =>
     ['project', projectKey, 'storyboard', 'canvas', episodeNo ?? 'latest'] as const,
@@ -54,6 +58,13 @@ export const queryKeys = {
 
   /** 单个候选的采用/批准三态 */
   mediaDecision: (mediaVersionId: string) => ['production-facts', 'decision', mediaVersionId] as const,
+
+  /**
+   * 冻结的生成意图（按 项目/集/镜 定位「这一镜最近一次意图」）。
+   * 可变部分放最后，切集切镜即换 key。
+   */
+  productionIntents: (projectKey: string, episode: string, shotKey: string) =>
+    ['production-facts', 'intents', projectKey, episode, shotKey] as const,
 } as const;
 
 export type QueryKeys = typeof queryKeys;

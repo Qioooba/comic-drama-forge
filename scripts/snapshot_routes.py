@@ -51,12 +51,26 @@ def collect(app_obj) -> dict:
     return {"count": len(rules), "rules": rules}
 
 
-def diff(old_path: Path, new_path: Path) -> int:
-    """返回不一致处数量；0 表示 URL 契约未变。
+def diff(old_path: Path, new_path: Path, fail_on_added: bool = False) -> int:
+    """返回**不可接受**的漂移处数量；0 表示门禁通过。
 
     ``old_path`` 是拆分前的基线，``new_path`` 是拆分后的现状。
     打印时必须标出方向，否则「丢失/新增」容易被读反（本次就踩过一次）。
+
+    为什么「新增」默认不判失败（2026-10-07 修正）
+    ----------------------------------------------
+    协调书铁律 R1 是「**既有** URL 逐字不变」——前端 1508 行全靠字符串拼 URL，
+    改一个既有字符就 404。新增端点不违反 R1，而且本轮就是**设计性地**新增：
+    W2/W3 加了生产事实、任务、契约、交付、授权、风格、时间线等共 56 条。
+
+    旧实现 ``return len(lost) + len(added)`` 导致：只要新增一条，退出码就非 0。
+    叠加本轮 56 条新增，这道门禁**永远不可能通过** —— 一道永远红的门禁不是门禁，
+    它只会训练所有人忽略退出码。本函数此前一度被记成「EXIT=0 全绿」，那是误读
+    输出文本、没看真实退出码，属于比缺陷更伤信任的错误，故一并写在此处。
+
+    真要严判「本轮不该有任何新增」时，用 ``--fail-on-added`` 显式打开。
     """
+
     old = json.loads(old_path.read_text(encoding="utf-8"))
     new = json.loads(new_path.read_text(encoding="utf-8"))
 
@@ -70,16 +84,27 @@ def diff(old_path: Path, new_path: Path) -> int:
     print(f"基线(base) : {old_path.name}  {len(ko)} 条")
     print(f"现状(now)  : {new_path.name}  {len(kn)} 条")
 
-    if lost or added:
-        print("\nURL 契约漂移：")
+    if lost:
+        print(f"\n❌ 既有 URL 丢失/改路径 {len(lost)} 处（违反协调书 R1，不可接受）：")
         for item in lost:
             print(f"  [丢失于现状] {item[0]}  {item[1]}")
+        if added:
+            print(f"  （另有 {len(added)} 处新增，一并列出供人工确认）")
+            for item in added:
+                print(f"  [现状新增]   {item[0]}  {item[1]}")
+        return len(lost)
+
+    if added:
+        print(f"\n✅ 既有 URL 契约零丢失：{len(ko)} 条 (rule, methods) 逐字保留")
+        print(f"ℹ 另有 {len(added)} 处**新增**端点 —— 不违反 R1，默认不判失败。")
         for item in added:
             print(f"  [现状新增]   {item[0]}  {item[1]}")
-        return len(lost) + len(added)
+        if fail_on_added:
+            print("\n❌ --fail-on-added 已开启：本次存在新增端点，判定失败。")
+            return len(added)
+        return 0
 
-    print(f"\n✅ URL 契约一致：{len(ko)} 条 (rule, methods) 无丢失、无改路径")
-    print("   （新增端点请另行确认是有意新增）")
+    print(f"\n✅ URL 契约一致：{len(ko)} 条 (rule, methods) 无丢失、无改路径、无新增")
     return 0
 
 
@@ -88,10 +113,12 @@ def main() -> int:
     ap.add_argument("out", nargs="?", help="输出 JSON 路径")
     ap.add_argument("--diff", metavar="NOW",
                     help="与基线比对。第一个位置参数是基线(base)，--diff 是现状(now)")
+    ap.add_argument("--fail-on-added", action="store_true",
+                    help="把「新增端点」也算作失败（默认只对丢失/改路径失败，见 diff() 注释）")
     args = ap.parse_args()
 
     if args.diff:
-        return 1 if diff(Path(args.out), Path(args.diff)) else 0
+        return 1 if diff(Path(args.out), Path(args.diff), args.fail_on_added) else 0
 
     import app as app_mod  # noqa: PLC0415  必须在设好环境变量之后
 
