@@ -183,6 +183,13 @@ export const Play = (p: IconProps) => (
   </Svg>
 );
 
+/** 暂停（托管暂停用；与 Play 成对，线性描边同款） */
+export const Pause = (p: IconProps) => (
+  <Svg {...p}>
+    <path d="M9 4.5v15M15 4.5v15" />
+  </Svg>
+);
+
 /** 下载 */
 export const Download = (p: IconProps) => (
   <Svg {...p}>

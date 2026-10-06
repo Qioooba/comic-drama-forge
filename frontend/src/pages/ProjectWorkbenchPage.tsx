@@ -6,7 +6,7 @@ import { Button, ConfirmDialog, Input, EmptyState, ErrorState, Loading, Skeleton
 // tab 图标統一走线性 SVG（方案 P2-10）：此前是 emoji，字号受系统字体影响且观感与全站割裂
 import {
   AlertTriangle, BarChart3, Box, Check, CheckCircle2, Clapperboard, ClipboardCheck, ClipboardList, FileText,
-  FolderOpen, ImageIcon, MessageSquare, Mountain, Music, Network, Share2, Target, Upload, User, X, ZoomIn,
+  FolderOpen, ImageIcon, MessageSquare, Mountain, Music, Network, Play, Share2, Target, Upload, User, X, ZoomIn,
 } from '@/components/ui/icons';
 import { useToast } from '@/components/ui/toast';
 import { Markdown } from '@/components/Markdown';
@@ -16,6 +16,7 @@ import { GridPage } from '@/pages/GridPage';
 import { RelationGraphTab } from '@/components/RelationGraphTab';
 import { OutputReviewTab } from '@/components/OutputReviewTab';
 import { AudioTab } from '@/components/AudioTab';
+import { AutopilotPanel } from '@/components/AutopilotPanel';
 import type { Project, Deliverable, UpscaleEnv, UpscaleSource, UpscaleTask, UpscaleArtifact, AgentStep, AutopilotCurrent, CharacterOutfit, ShotGridStatusResponse, ShotGridTaskState } from '@/types';
 
 // 焦点环：与 components/ui/index.tsx 里的 FOCUS_RING 逐字一致。
@@ -26,7 +27,7 @@ const FOCUS_RING =
 
 // ========== Workbench Tab Types ==========
 // 注意：'chat' 已移除 —— AI 总控改成了右侧常驻面板，不再是标签页（见 ChatPanel）
-type WorkbenchTab = 'overview' | 'storyboard' | 'qc' | 'upscale' | 'relation' | 'audio' | 'output';
+type WorkbenchTab = 'overview' | 'autopilot' | 'storyboard' | 'qc' | 'upscale' | 'relation' | 'audio' | 'output';
 
 interface AssetItem {
   name: string;
@@ -114,7 +115,12 @@ export function ProjectWorkbenchPage({ projectKey }: ProjectWorkbenchPageProps) 
 
   const tabs: { id: WorkbenchTab; icon: React.ReactNode; label: string }[] = [
     { id: 'overview', icon: <BarChart3 className="h-4 w-4" />, label: t('wb.overview') },
-    // 自动生产已移除独立标签页 —— 改为 AI总控 内的子功能，启动前AI会先与用户沟通风格
+    // 托管生产（2026-10-07 恢复独立标签页）：这是系统**唯一**的 24/7 无人值守生产主路径。
+    // 后端 autopilot.py 的守护线程 / 断点续跑 / 失败隔离 / 自检门禁本就完整，端点也全在，
+    // 但前端一个调用点都没有（「自动生产」此前被移进 AI总控 聊天面板，等于主路径在界面上
+    // 彻底消失）—— 用户不知道可以配置好计划后交给机器跑一夜，只能全程手动。
+    // 放在概览之后：它是「生产方式」层面的选择，先于分镜/质检/导出这些具体环节。
+    { id: 'autopilot', icon: <Play className="h-4 w-4" />, label: t('wb.autopilot') },
     // 分镜管理：合并 九宫格构图 + 关键帧生成 + 分镜序列 三个子标签（见 StoryboardHubTab）
     { id: 'storyboard', icon: <Clapperboard className="h-4 w-4" />, label: t('wb.storyboardHub') },
     { id: 'qc', icon: <CheckCircle2 className="h-4 w-4" />, label: t('wb.qc') },
@@ -232,6 +238,9 @@ export function ProjectWorkbenchPage({ projectKey }: ProjectWorkbenchPageProps) 
                 novelId={project.novel_id}
                 onRefreshAssets={reloadAssets}
               />
+            )}
+            {activeTab === 'autopilot' && (
+              <AutopilotPanel projectKey={projectKey} />
             )}
             {activeTab === 'storyboard' && (
               <StoryboardHubTab projectKey={projectKey} novelId={project.novel_id} />
