@@ -30,6 +30,7 @@ import urllib.request
 from typing import Callable, Dict, List, Optional, Tuple
 
 from config import COMFYUI_URL, MODELS_DIR, PROJECT_ROOT_DIR, TTS_DEFAULT_PARAMS, KEEP_MODEL_LOADED
+import performance_metrics  # P2-11：TTS 批量合成耗时/显存采样
 from dialogue_utils import (
     normalize_lines as _norm_dlg_lines, dialogue_text as _dlg_text,
     dialogue_speaker as _dlg_speaker,
@@ -924,10 +925,26 @@ class QwenTTSClient:
             raise TTSError(f"ComfyUI 未返回 prompt_id：{json.dumps(r, ensure_ascii=False)[:300]}")
         if r.get("node_errors"):
             raise TTSError(f"工作流校验失败：{json.dumps(r['node_errors'], ensure_ascii=False)[:400]}")
+        performance_metrics.begin(r["prompt_id"], context={
+            "workflow_file": "tts_batch", "node_count": len(prompt or {}),
+        })
         return r["prompt_id"]
 
     def _wait(self, prompt_id: str, timeout: int,
               progress_cb: Optional[Callable[[str], None]] = None) -> Dict:
+        """等待 TTS；所有退出路径都结束性能采样。"""
+        aborted = False
+        performance_metrics.begin(prompt_id)
+        try:
+            return self._wait_inner(prompt_id, timeout, progress_cb)
+        except BaseException:
+            aborted = True
+            raise
+        finally:
+            performance_metrics.finish(prompt_id, success=False if aborted else None)
+
+    def _wait_inner(self, prompt_id: str, timeout: int,
+                    progress_cb: Optional[Callable[[str], None]] = None) -> Dict:
         t0 = time.time()
         while time.time() - t0 < timeout:
             try:
@@ -939,16 +956,20 @@ class QwenTTSClient:
                 entry = h[prompt_id]
                 status = entry.get("status") or {}
                 if status.get("status_str") == "error" or not status.get("completed", True):
+                    performance_metrics.attach_history(prompt_id, entry)
                     msgs = status.get("messages") or []
                     detail = ""
                     for m in msgs:
                         if isinstance(m, list) and m and m[0] in ("execution_error", "execution_interrupted"):
                             detail = json.dumps(m[1] if len(m) > 1 else m, ensure_ascii=False)[:400]
                     raise TTSError(f"ComfyUI 执行失败：{detail or status.get('status_str')}")
+                performance_metrics.attach_history(prompt_id, entry)
                 return entry
             if progress_cb:
                 progress_cb(f"ComfyUI 合成中（{int(time.time() - t0)}s）")
             time.sleep(3)
+        performance_metrics.attach_history(
+            prompt_id, {"status": {"status_str": "timeout", "completed": False}})
         raise TTSError(f"配音超时（>{timeout}s），prompt_id={prompt_id}")
 
     def _download_and_convert(self, item: dict, raw_info: dict,

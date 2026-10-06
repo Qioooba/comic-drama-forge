@@ -30,6 +30,7 @@ import requests
 import cancellation  # S9：远端任务取消（中止信号贯穿 ComfyUI 轮询，与 pipeline/llm_client 同一套）
 import comfyui_job_store as job_store  # 崩溃免重渲检查点（2026-09-29：台账复用 + 重连，不重复提交）
 import actual_params  # P0-5：提交时记录“最终生效参数”快照
+import performance_metrics  # P2-11：任务期真实性能采样（只采数，不调参）
 import asset_library  # 跨项目角色资产库（2026-09-29：形象指纹命中即零渲染复用）
 from typing import Dict, List, Optional, Any, Tuple, Sequence
 # ⚠️ Sequence 曾被漏导入：类级注解 `_LIGHT_KEYWORDS: Sequence[...]` 在类创建时**不求值**，
@@ -1300,10 +1301,12 @@ class ComfyUIClient:
             raise RuntimeError(f"ComfyUI 队列错误: {result['error']}")
         _bump("prompt_submitted")
         prompt_id = str(result.get("prompt_id", "") or "")
-        # P0-5：拿到 prompt_id 立即落最终参数快照；失败只 warning，不影响提交。
+        # P0-5/P2-11：拿到 prompt_id 后同时启动最终参数快照与性能采样。
+        perf_context = {}
         try:
             snapshot = actual_params.extract(
                 api_prompt, workflow_meta=workflow_meta, prompt_id=prompt_id)
+            perf_context = snapshot
             snapshot_path = actual_params.save(snapshot)
             logger.info("[actual_params] %s", json.dumps(
                 {k: snapshot.get(k) for k in (
@@ -1315,6 +1318,7 @@ class ComfyUIClient:
                 logger.debug("[actual_params] path=%s", snapshot_path)
         except Exception as exc:  # noqa: BLE001
             logger.warning("实际参数快照写入失败（不影响生成）：%s", exc)
+        performance_metrics.begin(prompt_id, context=perf_context)
         return prompt_id
 
     def get_history(self, prompt_id: str) -> dict:
@@ -1388,6 +1392,18 @@ class ComfyUIClient:
                 "ok": True}
 
     def wait_for_completion(self, prompt_id: str, timeout: int = 1800) -> dict:
+        """轮询远端任务；无论成功/失败/取消/超时都在退出时结束性能采样。"""
+        aborted = False
+        performance_metrics.begin(prompt_id)
+        try:
+            return self._wait_for_completion_inner(prompt_id, timeout=timeout)
+        except BaseException:
+            aborted = True
+            raise
+        finally:
+            performance_metrics.finish(prompt_id, success=False if aborted else None)
+
+    def _wait_for_completion_inner(self, prompt_id: str, timeout: int = 1800) -> dict:
         """轮询远端任务直到完成。
 
         S9 增强（不改变返回契约——超时仍返回 `{}`，避免 ripple 到 6 处调用方）：
@@ -1424,10 +1440,12 @@ class ComfyUIClient:
                     entry = history[prompt_id]
                     status = entry.get("status", {}) or {}
                     if status.get("completed") or status.get("status_str") == "success":
+                        performance_metrics.attach_history(prompt_id, entry)
                         _bump("completed")
                         _bump("waited_seconds", round(time.time() - start, 2))
                         return entry
                     if status.get("status_str") == "error":
+                        performance_metrics.attach_history(prompt_id, entry)
                         logger.error(f"生成出错: {status}")
                         _bump("waited_seconds", round(time.time() - start, 2))
                         # B-21 P1-13：error 态也定向 interrupt（清理本 prompt 的残留队列项）
@@ -1452,6 +1470,8 @@ class ComfyUIClient:
         # ③ 超时（非中止）：仍清理远端，避免本地判超时而远端白跑
         # B-21 P1-13：超时 interrupt 定向到指定 prompt_id（不再误伤队列中其他任务）
         logger.warning(f"等待超时: {prompt_id}（清理远端队列）")
+        performance_metrics.attach_history(
+            prompt_id, {"status": {"status_str": "timeout", "completed": False}})
         self.interrupt(prompt_id)
         _bump("waited_seconds", round(time.time() - start, 2))
         return {}

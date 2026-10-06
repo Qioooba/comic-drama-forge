@@ -66,6 +66,7 @@ KIND_LABELS = {
     "final": "成片合成",
     "consistency": "一致性校验",
     "export": "导出",
+    "performance": "性能采样",
     "other": "其他",
 }
 

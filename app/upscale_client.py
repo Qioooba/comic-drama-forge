@@ -27,6 +27,7 @@ from typing import Dict, List, Optional
 
 import requests
 import cancellation  # S9：远端任务取消（中止信号贯穿超分轮询，与 pipeline/llm_client 同一套）
+import performance_metrics  # P2-11：超分任务同样纳入真实性能采样
 
 from config import (
     COMFYUI_URL, COMFYUI_OUTPUT_DIR, PROJECT_OUTPUT_DIR, UPSCALE_DIR,
@@ -703,6 +704,18 @@ class VideoUpscaler:
     # ---------- 轮询 ----------
 
     def _wait(self, prompt_id: str, timeout: int, step, t0: float) -> dict:
+        """等待超分完成；所有退出路径都结束性能采样。"""
+        aborted = False
+        performance_metrics.begin(prompt_id)
+        try:
+            return self._wait_inner(prompt_id, timeout, step, t0)
+        except BaseException:
+            aborted = True
+            raise
+        finally:
+            performance_metrics.finish(prompt_id, success=False if aborted else None)
+
+    def _wait_inner(self, prompt_id: str, timeout: int, step, t0: float) -> dict:
         deadline = t0 + timeout
         last_note = 0.0
         while time.time() < deadline:
@@ -722,8 +735,10 @@ class VideoUpscaler:
                 entry = hist[prompt_id]
                 st = (entry.get("status") or {}).get("status_str")
                 if st == "success":
+                    performance_metrics.attach_history(prompt_id, entry)
                     return entry
                 if st == "error":
+                    performance_metrics.attach_history(prompt_id, entry)
                     logger.error(f"超分执行出错: {_history_error(entry)}")
                     return entry
             now = time.time()
@@ -753,6 +768,8 @@ class VideoUpscaler:
             cancellation.sleep(3)
         # S9：超时（非中止）也清理远端队列，避免本地判超时而远端白跑
         logger.warning("超分等待超时，清理远端队列: %s", prompt_id)
+        performance_metrics.attach_history(
+            prompt_id, {"status": {"status_str": "timeout", "completed": False}})
         self.client.interrupt(prompt_id)
         raise UpscaleError(
             f"超分等待超时（>{timeout}s，prompt_id={prompt_id}）。"
