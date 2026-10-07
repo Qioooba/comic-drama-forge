@@ -26,7 +26,8 @@ AI 成片是起点而不是终点，专业创作者需要在自己的时间线�
 设计约束
 --------
 - 只读既有产物（剧本 + 视频片段 + 配音），不修改任何原始文件；
-- 导出结果统一落在 output/export/<项目>/；
+- 导出结果统一落在 output/export/<项目>/；开启 ``episode_scope`` 时进一步分集到
+  output/export/<项目>/epNN/（**默认关闭**，见 :func:`project_export_dir`）；
 - 所有时间单位内部用秒，输出时按各格式要求换算（剪映用微秒）。
 """
 from __future__ import annotations
@@ -57,10 +58,48 @@ JY_VERSION = 360000
 
 # ===================== 通用工具 =====================
 
-def _out_dir(project: str, sub: str = "") -> str:
-    d = os.path.join(EXPORT_DIR, project, sub) if sub else os.path.join(EXPORT_DIR, project)
+def _episode_tag(episode) -> str:
+    """集号 → 分集目录标签（``ep07``）。
+
+    空 / 非法 / 非正整数一律返回 ``""``，也就是「不分集」。
+    """
+    try:
+        n = int(episode)
+    except (TypeError, ValueError):
+        return ""
+    return "ep{:02d}".format(n) if n > 0 else ""
+
+
+def project_export_dir(project: str, episode=None) -> str:
+    """导出根目录（**纯路径计算，不建目录**）。
+
+    - ``episode`` 为空 → ``EXPORT_DIR/<项目>/``，与分集功能引入前**逐字相同**；
+    - ``episode`` 为正整数 → ``EXPORT_DIR/<项目>/epNN/``。
+
+    这是「导出写在哪」与「交付扫哪」的**唯一口径来源**：:func:`_out_dir` 与
+    ``pipeline.export_dir`` 都走这里。两侧一旦各写各的，就会出现「导出按集分目录、
+    交付还从项目根递归扫」的组合 —— 那样第 2 集的交付包会把第 1 集的产物一起收进去。
+    """
+    tag = _episode_tag(episode)
+    return os.path.join(EXPORT_DIR, project, tag) if tag else os.path.join(EXPORT_DIR, project)
+
+
+def _out_dir(project: str, sub: str = "", episode=None) -> str:
+    base = project_export_dir(project, episode)
+    d = os.path.join(base, sub) if sub else base
     os.makedirs(d, exist_ok=True)
     return d
+
+
+def _scope_episode(episode, episode_scope: bool):
+    """把「开不开分集目录」折成 :func:`_out_dir` 认的集号。
+
+    ``episode_scope`` 为假 → 返回 ``None`` → 落回项目级目录（既有行为）。
+    它必须与 ``episode`` **分开**成一个开关：``episode`` 早已用于「按集号过滤
+    视频素材」，手动端点 ``api_export_run`` 一直在传它；让它顺带改变落盘位置，
+    等于不打招呼就改掉了手动导出的路径。
+    """
+    return episode if episode_scope else None
 
 
 def _sec_to_us(sec: float) -> int:
@@ -208,7 +247,8 @@ def _jy_id(prefix: str, n: int, salt: str = "") -> str:
 
 def export_jianying(project: str, script: dict, videos: list = None,
                     audio: str = None, timeline: dict = None,
-                    draft_name: str = None, episode: int = None) -> dict:
+                    draft_name: str = None, episode: int = None,
+                    episode_scope: bool = False) -> dict:
     """导出剪映草稿（draft_content.json + draft_meta_info.json + 素材引用）
 
     轨道布局：
@@ -216,19 +256,25 @@ def export_jianying(project: str, script: dict, videos: list = None,
       音频轨：配音合并音轨（若存在）
       字幕轨：每镜台词（若存在）
     B-17 P2-13：episode 参数可选；提供时按集号过滤视频目录。
+    episode_scope（2026-10-07）：为真时按集落盘到 ``<项目>/epNN/jianying/``，
+    且草稿名与 draft_id 带集号 —— 否则两集的 draft_id 完全相同，导入剪映后互相顶掉。
     """
     tl = timeline or build_timeline(script, project, videos, episode=episode)
     rows = tl.get("shots") or []
     if not rows:
         return {"ok": False, "error": "没有可导出的镜头（剧本为空或无视频片段）"}
 
-    name = _safe_filename(draft_name or f"{project}_draft")
-    draft_dir = _out_dir(project, f"jianying/{name}")
+    ep = _scope_episode(episode, episode_scope)
+    tag = _episode_tag(ep)
+    name = _safe_filename(draft_name or (f"{project}_{tag}_draft" if tag else f"{project}_draft"))
+    draft_dir = _out_dir(project, f"jianying/{name}", episode=ep)
+    # draft_id 的盐：分集时带上集号，两集的草稿 ID 必须不同
+    salt = "{}{}".format(project, "#" + tag if tag else "")
     total_us = _sec_to_us(tl.get("total_sec") or 0)
 
     materials_videos, video_segments = [], []
     for i, r in enumerate(rows):
-        mid = _jy_id("mat-v", i, project)
+        mid = _jy_id("mat-v", i, salt)
         mats = {
             "id": mid, "type": "video",
             "path": os.path.abspath(r["video"]) if r["video"] else "",
@@ -239,7 +285,7 @@ def export_jianying(project: str, script: dict, videos: list = None,
         }
         materials_videos.append(mats)
         video_segments.append({
-            "id": _jy_id("seg-v", i, project),
+            "id": _jy_id("seg-v", i, salt),
             "material_id": mid,
             "target_timerange": {"start": _sec_to_us(r["start"]),
                                  "duration": _sec_to_us(r["duration"])},
@@ -255,7 +301,7 @@ def export_jianying(project: str, script: dict, videos: list = None,
     materials_audios, audio_segments = [], []
     audio_path = audio or _find_dub_audio(project)
     if audio_path and os.path.isfile(audio_path):
-        aid = _jy_id("mat-a", 0, project)
+        aid = _jy_id("mat-a", 0, salt)
         aud_dur = _probe_duration(audio_path) or tl.get("total_sec") or 0
         materials_audios.append({
             "id": aid, "type": "audio",
@@ -278,13 +324,13 @@ def export_jianying(project: str, script: dict, videos: list = None,
         if not r["text"]:
             continue
         label = f"{r['speaker']}：{r['text']}" if r["speaker"] else r["text"]
-        tid = _jy_id("mat-t", ti, project)
+        tid = _jy_id("mat-t", ti, salt)
         materials_texts.append({
             "id": tid, "type": "text", "content": json.dumps(
                 {"text": label}, ensure_ascii=False),
         })
         text_segments.append({
-            "id": _jy_id("seg-t", ti, project),
+            "id": _jy_id("seg-t", ti, salt),
             "material_id": tid,
             "target_timerange": {"start": _sec_to_us(r["start"]),
                                  "duration": _sec_to_us(r["duration"])},
@@ -305,7 +351,7 @@ def export_jianying(project: str, script: dict, videos: list = None,
         "duration": total_us,
         "fps": JY_FPS,
         "version": JY_VERSION,
-        "id": _jy_id("draft", 0, project),
+        "id": _jy_id("draft", 0, salt),
         "create_time": int(datetime.now().timestamp()),
         "update_time": int(datetime.now().timestamp()),
         "materials": {
@@ -319,7 +365,7 @@ def export_jianying(project: str, script: dict, videos: list = None,
         "draft_id": draft_content["id"],
         "draft_name": name,
         "draft_fold_path": draft_dir.replace("\\", "/"),
-        "draft_root_path": _out_dir(project, "jianying").replace("\\", "/"),
+        "draft_root_path": _out_dir(project, "jianying", episode=ep).replace("\\", "/"),
         "draft_removable_storage_device": "",
         "draft_duration": total_us,
         "draft_fps": JY_FPS,
@@ -358,7 +404,7 @@ def export_jianying(project: str, script: dict, videos: list = None,
         "note": ("剪映草稿为私有格式，若导入后识别异常，"
                  "优先调整 draft_content.json 的 version 字段（JY_VERSION）"),
     }
-    _write_manifest(project, "jianying_manifest.json", manifest)
+    _write_manifest(project, "jianying_manifest.json", manifest, episode=ep)
     return {"ok": True, "draft_dir": draft_dir,
             "draft_content": os.path.join(draft_dir, "draft_content.json"),
             "draft_meta": os.path.join(draft_dir, "draft_meta_info.json"),
@@ -369,16 +415,21 @@ def export_jianying(project: str, script: dict, videos: list = None,
 
 def export_fcpxml(project: str, script: dict, videos: list = None,
                   audio: str = None, timeline: dict = None,
-                  fps: int = 30, episode: int = None) -> dict:
+                  fps: int = 30, episode: int = None,
+                  episode_scope: bool = False) -> dict:
     """导出 FCPXML（Premiere Pro / Final Cut Pro 可导入）
     B-17 P2-13：episode 参数可选；提供时按集号过滤视频目录。
+    episode_scope（2026-10-07）：为真时落到 ``<项目>/epNN/fcpxml/``，库/项目名带集号
+    （否则两集在 Premiere 里是同名项目）。
     """
     tl = timeline or build_timeline(script, project, videos, episode=episode)
     rows = tl.get("shots") or []
     if not rows:
         return {"ok": False, "error": "没有可导出的镜头"}
 
-    out_dir = _out_dir(project, "fcpxml")
+    ep = _scope_episode(episode, episode_scope)
+    tag = _episode_tag(ep)
+    out_dir = _out_dir(project, "fcpxml", episode=ep)
     out_path = os.path.join(out_dir, f"{_safe_filename(project)}.fcpxml")
     audio_path = audio or _find_dub_audio(project)
 
@@ -422,6 +473,7 @@ def export_fcpxml(project: str, script: dict, videos: list = None,
             f'role="dialogue"/>')
 
     total = f"{int(round((tl.get('total_sec') or 0) * fps))}/{fps}s"
+    lib_name = "{}_{}".format(project, tag) if tag else str(project or "")
     xml = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<!DOCTYPE fcpxml>\n'
@@ -434,8 +486,8 @@ def export_fcpxml(project: str, script: dict, videos: list = None,
         + (audio_asset + "\n" if audio_asset else "")
         + '  </resources>\n'
         '  <library>\n'
-        f'    <event name="{_e(project)}">\n'
-        f'      <project name="{_e(project)}">\n'
+        f'    <event name="{_e(lib_name)}">\n'
+        f'      <project name="{_e(lib_name)}">\n'
         f'        <sequence format="r1" duration="{total}" tcStart="0s" tcFormat="NDF">\n'
         '          <spine>\n'
         + "\n".join(clips) + "\n"
@@ -453,10 +505,11 @@ def export_fcpxml(project: str, script: dict, videos: list = None,
         return {"ok": False, "error": f"FCPXML 写入失败：{e}"}
 
     manifest = {"format": "fcpxml", "project": project, "path": out_path,
+                "episode": int(episode) if tag else None,
                 "shot_count": len(rows), "total_sec": tl.get("total_sec"),
                 "fps": fps, "audio_source": audio_path or "",
                 "exported_at": datetime.now().isoformat(timespec="seconds")}
-    _write_manifest(project, "fcpxml_manifest.json", manifest)
+    _write_manifest(project, "fcpxml_manifest.json", manifest, episode=ep)
     return {"ok": True, **manifest}
 
 
@@ -472,7 +525,8 @@ def _fmt_srt_time(sec: float) -> str:
 
 
 def export_srt(project: str, script: dict, timeline: dict = None,
-               videos: list = None, episode: int = None) -> dict:
+               videos: list = None, episode: int = None,
+               episode_scope: bool = False) -> dict:
     """导出 SRT 字幕（逐镜台词，按镜头时间轴对齐）
     B-17 P2-13：episode 参数可选；提供时按集号过滤视频目录。
     """
@@ -487,7 +541,8 @@ def export_srt(project: str, script: dict, timeline: dict = None,
         label = f"{r['speaker']}：{r['text']}" if r["speaker"] else r["text"]
         lines.append(f"{idx}\n{_fmt_srt_time(r['start'])} --> {_fmt_srt_time(r['end'])}\n{label}\n")
 
-    out_dir = _out_dir(project, "subtitle")
+    ep = _scope_episode(episode, episode_scope)
+    out_dir = _out_dir(project, "subtitle", episode=ep)
     out_path = os.path.join(out_dir, f"{_safe_filename(project)}.srt")
     try:
         with open(out_path, "w", encoding="utf-8") as f:
@@ -495,8 +550,9 @@ def export_srt(project: str, script: dict, timeline: dict = None,
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": f"字幕写入失败：{e}"}
     manifest = {"format": "srt", "project": project, "path": out_path,
+                "episode": int(episode) if _episode_tag(ep) else None,
                 "entries": len(rows), "exported_at": datetime.now().isoformat(timespec="seconds")}
-    _write_manifest(project, "srt_manifest.json", manifest)
+    _write_manifest(project, "srt_manifest.json", manifest, episode=ep)
     return {"ok": True, **manifest}
 
 
@@ -504,7 +560,7 @@ def export_srt(project: str, script: dict, timeline: dict = None,
 
 def export_frames(project: str, script: dict, timeline: dict = None,
                   videos: list = None, copy_files: bool = False,
-                  episode: int = None) -> dict:
+                  episode: int = None, episode_scope: bool = False) -> dict:
     """导出关键帧清单：列出每镜的分镜图与视频片段路径 + 时间轴信息
     B-17 P2-13：episode 参数可选；提供时按集号过滤视频目录。
     """
@@ -520,7 +576,8 @@ def export_frames(project: str, script: dict, timeline: dict = None,
                 if m:
                     sb_map[str(int(m.group()))] = os.path.join(sb_dir, fn)
 
-    out_dir = _out_dir(project, "frames")
+    ep = _scope_episode(episode, episode_scope)
+    out_dir = _out_dir(project, "frames", episode=ep)
     items = []
     for r in rows:
         m = re.search(r"\d+", str(r["shot_id"]))
@@ -535,6 +592,7 @@ def export_frames(project: str, script: dict, timeline: dict = None,
 
     manifest = {
         "format": "frames", "project": project, "output_dir": out_dir,
+        "episode": int(episode) if _episode_tag(ep) else None,
         "shot_count": len(items), "total_sec": tl.get("total_sec"),
         "fps": JY_FPS, "canvas": JY_CANVAS,
         "exported_at": datetime.now().isoformat(timespec="seconds"),
@@ -548,15 +606,15 @@ def export_frames(project: str, script: dict, timeline: dict = None,
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": f"帧清单写入失败：{e}"}
     manifest["path"] = path
-    _write_manifest(project, "frames_manifest.json", manifest)
+    _write_manifest(project, "frames_manifest.json", manifest, episode=ep)
     return {"ok": True, **manifest}
 
 
 # ===================== 清单与列表 =====================
 
-def _write_manifest(project: str, name: str, data: dict) -> None:
+def _write_manifest(project: str, name: str, data: dict, episode=None) -> None:
     try:
-        path = os.path.join(_out_dir(project), name)
+        path = os.path.join(_out_dir(project, episode=episode), name)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:  # noqa: BLE001
@@ -596,11 +654,18 @@ def list_exports(project: str = None) -> list:
 
 def export_all(project: str, script: dict, videos: list = None,
                audio: str = None, formats: list = None,
-               episode: int = None) -> dict:
+               episode: int = None, episode_scope: bool = False) -> dict:
     """一键导出（默认全部格式；formats 可指定子集）
 
     formats 可选值：jianying / fcpxml / srt / frames
     B-17 P2-13：episode 参数可选；提供时按集号过滤视频目录。
+
+    episode_scope（2026-10-07）：**默认关闭**，关闭时落盘位置与文件名
+    与本参数引入前**逐字相同**（项目级目录 + 不带集号的文件名），手动端点
+    ``POST /api/export/run`` 因此完全不受影响。
+    打开后产物落到 ``EXPORT_DIR/<项目>/epNN/``（清单也一起），多集互不覆盖；
+    交付侧必须同步按集扫描，否则递归扫描会把兄弟集的产物收进本集交付包
+    （见 ``app/infrastructure/delivery_repo.py`` 与 ``pipeline.step_delivery``）。
     """
     tl = build_timeline(script, project, videos, episode=episode)
     results = {"timeline": {"shot_count": len(tl.get("shots") or []),
@@ -608,13 +673,17 @@ def export_all(project: str, script: dict, videos: list = None,
     want = None
     if isinstance(formats, list) and formats:
         want = {str(f).strip().lower() for f in formats if str(f).strip()}
+    kw = {"episode": episode, "episode_scope": episode_scope}
     if want is None or "jianying" in want:
-        results["jianying"] = export_jianying(project, script, videos, audio, timeline=tl, episode=episode)
+        results["jianying"] = export_jianying(project, script, videos, audio, timeline=tl, **kw)
     if want is None or "fcpxml" in want:
-        results["fcpxml"] = export_fcpxml(project, script, videos, audio, timeline=tl, episode=episode)
+        results["fcpxml"] = export_fcpxml(project, script, videos, audio, timeline=tl, **kw)
     if want is None or "srt" in want:
-        results["srt"] = export_srt(project, script, timeline=tl, episode=episode)
+        results["srt"] = export_srt(project, script, timeline=tl, **kw)
     if want is None or "frames" in want:
-        results["frames"] = export_frames(project, script, timeline=tl, episode=episode)
+        results["frames"] = export_frames(project, script, timeline=tl, **kw)
+    ep = _scope_episode(episode, episode_scope)
     return {"ok": any(v.get("ok") for v in results.values() if isinstance(v, dict)),
-            "project": project, "output_dir": _out_dir(project), "results": results}
+            "project": project, "episode": int(episode) if _episode_tag(ep) else None,
+            "episode_scope": bool(episode_scope),
+            "output_dir": _out_dir(project, episode=ep), "results": results}

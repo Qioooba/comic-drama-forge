@@ -11,6 +11,10 @@
 SRT / 剪映草稿 / FCPXML / 帧清单，只做「登记 + 算 SHA-256」。
 这样既不会重复造导出逻辑，也不会因为重新导出而把用户刚导出的文件改掉。
 
+分集（2026-10-07）：``build_package(..., episode_scope=True)`` 时根目录收窄到
+该集目录 ``output/export/<项目>/epNN/``（口径见 :func:`artifact_root_for`）。
+默认 ``episode_scope=False`` ⇒ 仍从项目根扫，与本功能引入前**逐字相同**。
+
 数据库位置
 ----------
 ``output/delivery/delivery.db``（与 ``output/export`` 平级）。
@@ -55,6 +59,7 @@ __all__ = [
     "DB_PATH",
     "SCHEMA_VERSION",
     "safe_project",
+    "artifact_root_for",
     "open_readonly",
     "collect_artifacts",
     "build_package",
@@ -210,12 +215,39 @@ def open_readonly():
 # 产物收集（复用 nle_export，不重新导出）
 # --------------------------------------------------------------------------
 
-def collect_artifacts(project: str) -> List[Dict[str, Any]]:
+def artifact_root_for(project: str, episode_no: Optional[int] = None) -> str:
+    """交付包的**产物根目录**（纯路径计算，不建目录）。
+
+    - ``episode_no`` 为空 → ``EXPORT_DIR/<项目>/``，与分集交付引入前**逐字相同**；
+    - ``episode_no`` 为正整数 → ``EXPORT_DIR/<项目>/epNN/``。
+
+    为什么根目录必须按集收窄
+    ----------------------
+    :func:`domain.delivery.iter_root_files` 是**递归** ``os.walk``。只要根目录是
+    项目根，分集导出后的 ``ep01/``、``ep02/`` 会被一起扫进来 —— 第 2 集的交付包
+    会**同时**收进第 1 集的 SRT/FCPXML/帧清单，而且机器校验会**通过**（文件确实
+    在磁盘上、哈希确实对得上），人工批准签下去，交付方收到错的字幕。
+
+    所以「按集分目录」必须**两侧同时**做：导出写到 ``epNN/``，交付也从 ``epNN/``
+    扫（见 :func:`build_package` 的 ``episode_scope``）。只做一侧比不做更糟。
+
+    ``episode_no`` 与 ``episode_scope`` 分开传而不是复用同一个参数，是为了不动
+    ``POST /api/delivery/packages``（它一直传 ``episode_no``，语义是「登记给第几集」，
+    不是「按集扫目录」）。
+    """
+    parts = [p for p in safe_project(project).split("/") if p]
+    return nle_export.project_export_dir(os.path.join(*parts) if parts else "",
+                                         episode=episode_no)
+
+
+def collect_artifacts(project: str,
+                      episode_no: Optional[int] = None) -> List[Dict[str, Any]]:
     """扫描既有导出产物，为每个文件算 SHA-256。
 
     只读扫描：不创建目录、不写任何文件。目录不存在时返回空列表。
+    ``episode_no`` 给出时只扫该集的目录（见 :func:`artifact_root_for`）。
     """
-    root = os.path.join(nle_export.EXPORT_DIR, *safe_project(project).split("/"))
+    root = artifact_root_for(project, episode_no)
     entries: List[Dict[str, Any]] = []
     for rel, abs_path in delivery_domain.iter_root_files(root):
         try:
@@ -263,12 +295,24 @@ def refresh_disk_state(pkg: Dict[str, Any]) -> Dict[str, Any]:
 def build_package(project: str, preset_id: str,
                   requirement: Optional[Dict[str, Any]] = None,
                   licensing_gate: Optional[Dict[str, Any]] = None,
-                  episode_no: Optional[int] = None) -> Dict[str, Any]:
+                  episode_no: Optional[int] = None,
+                  episode_scope: bool = False) -> Dict[str, Any]:
     """登记一个交付包（不触发任何导出动作）。
 
     ``package_hash`` 在这里算一次并落库；之后每一次校验/批准都跟它比。
+
+    ``episode_scope``（2026-10-07，**默认关闭**）为真且给了 ``episode_no`` 时，
+    产物根目录收窄到该集目录 ``<项目>/epNN/``，清单里的 ``rel_path`` 也随之
+    以该集目录为基准。默认关闭时与引入本参数前**逐字相同**。
+
+    ⚠ 批准绑定（ADR-0006）：``package_hash`` 是「preset_id + 每个文件的
+    ``rel_path:sha256``」的摘要。根目录变了 ⇒ ``rel_path`` 变了 ⇒ 同一批文件的
+    摘要也变了 ⇒ **此前按旧摘要签下的批准对新的分集包一律不匹配**，读出来就是
+    ``approval_invalidated``。这是**有意的**：交付物定义（哪些文件在范围内）变了，
+    就必须重新人工批准，不允许旧批准顺延到新范围上。
     """
-    entries = collect_artifacts(project)
+    ep = episode_no if episode_scope else None
+    entries = collect_artifacts(project, episode_no=ep)
     preset = delivery_domain.get_preset(preset_id)
     pkg_hash = delivery_domain.compute_package_hash(preset["preset_id"], entries)
     gate = dict(licensing_gate or {})
@@ -276,6 +320,7 @@ def build_package(project: str, preset_id: str,
         "package_id": uuid.uuid4().hex,
         "project": project,
         "episode_no": episode_no,
+        "episode_scope": bool(episode_scope) and ep is not None,
         "preset": preset,
         "preset_id": preset["preset_id"],
         "package_hash": pkg_hash,
@@ -289,7 +334,7 @@ def build_package(project: str, preset_id: str,
         "verified_ok": False,
         "verified_at": "",
         "created_at": delivery_domain.now_iso(),
-        "artifact_root": os.path.join(nle_export.EXPORT_DIR, *safe_project(project).split("/")),
+        "artifact_root": artifact_root_for(project, ep),
     }
 
 
@@ -484,6 +529,7 @@ def export_manifest(pkg: Dict[str, Any]) -> Dict[str, Any]:
         "package_id": pkg["package_id"],
         "project": pkg["project"],
         "episode_no": pkg.get("episode_no"),
+        "artifact_root": pkg.get("artifact_root") or "",
         "preset": pkg.get("preset") or delivery_domain.get_preset(pkg.get("preset_id")),
         "package_hash": pkg.get("package_hash"),
         "generated_at": delivery_domain.now_iso(),
