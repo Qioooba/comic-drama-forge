@@ -167,6 +167,12 @@ module.exports = {
         'control-compact': 'var(--control-h-compact)', // 36px 紧凑
         'hit-target': 'var(--hit-target)',   // 44×44 纯图标触达区
       },
+      // ⚠️ 这里**必须**有 width：只配 height 时 `w-hit-target` 根本不生成类，
+      //    纯图标按钮就只有 44px 高、宽度由内容撑开（触达区实际是个窄条）。
+      //    使用方见 layouts/EpisodeContextBar.tsx 的 `h-hit-target w-hit-target`。
+      width: {
+        'hit-target': 'var(--hit-target)',
+      },
       minWidth: {
         'hit-target': 'var(--hit-target)',
       },

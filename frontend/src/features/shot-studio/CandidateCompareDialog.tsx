@@ -44,7 +44,11 @@ export function CandidateCompareDialog({
   shotKey,
   onPick,
 }: CandidateCompareDialogProps): JSX.Element | null {
-  const q = useMediaVersions(intentId);
+  // ⚠️ 必须按 isOpen 传 intentId：`if (!isOpen) return null` 写在 hook **之后**，
+  //    hooks 不会因为提前 return 被跳过 —— 改造前每次父组件重新渲染（包括每次
+  //    切换选中镜头）都会拿 intentId 打一次候选列表接口，而对话框是关着的。
+  //    传 undefined 即 `enabled: false`，关闭期间完全不发请求（见 useMediaVersions）。
+  const q = useMediaVersions(isOpen ? intentId : undefined);
   const items = mediaVersionsOf(q.data);
 
   if (!isOpen) return null;

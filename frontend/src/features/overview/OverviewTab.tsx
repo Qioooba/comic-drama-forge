@@ -661,7 +661,10 @@ function OverviewTab({
           {(episodeDetail.shots && episodeDetail.shots.length > 0) ? (
             <div className="space-y-4">
               {episodeDetail.shots.map((shot: any, idx: number) => (
-                <div key={idx} className="border-l-4 border-brand pl-4 py-2">
+                // 用 shot_id 作 key：剧本重新生成会改镜数与顺序（列表**可增删可重排**），
+                // 用 idx 会让已渲染的节点被复用成另一镜。shot_id 缺失时退回 idx，
+                // 行为与改前一致（这里的 shots 是 any，取不到 id 时不能凭空造一个）。
+                <div key={shot.shot_id ?? idx} className="border-l-4 border-brand pl-4 py-2">
                   <div className="flex items-center gap-2 mb-1 flex-wrap">
                     <span className="px-2 py-0.5 bg-brand-subtle text-brand text-xs font-medium rounded">
                       {t('wb.shotN', { n: shot.shot_id ?? idx + 1 })}

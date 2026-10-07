@@ -1,6 +1,8 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { Link, useNavigate } from 'react-router-dom';
 import { useApp } from '@/context/AppContext';
 import { projectsApi, novelsApi } from '@/api/client';
+import { workbenchPath } from '@/routes/workbenchTabs';
 import { Button, Input, Modal, Badge, ConfirmDialog, Select, Skeleton, EmptyState, ErrorState } from '@/components/ui';
 import { AlertTriangle, Check, Clapperboard, FileText, FolderOpen, ImageIcon, Pencil, Plus, Trash2 } from '@/components/ui/icons';
 import { useToast } from '@/components/ui/toast';
@@ -53,6 +55,7 @@ const ACCEPT_EXTS = '.txt,.docx,.pdf,.epub,.md';
 export function ProjectsPage() {
   const { t } = useApp();
   const toast = useToast();
+  const navigate = useNavigate();
   const [projects, setProjects] = useState<Project[]>([]);
   const [novels, setNovels] = useState<Novel[]>([]);
   const [loading, setLoading] = useState(true);
@@ -221,7 +224,9 @@ export function ProjectsPage() {
       resetForm();
 
       if (key) {
-        window.location.hash = `/?p=${encodeURIComponent(key)}`;
+        // 走 router 而不是写 `window.location.hash` —— 后者写出的 `/?p=<key>`
+        // 还得靠 `LegacyRouteRedirect` 在 hash 层 301 一次才落到工作台。
+        navigate(workbenchPath(key));
       }
       // 上传路径成功后反馈解析出的章节数（"选择已有小说"路径无此信息）。
       if (parsedChapters !== null) {
@@ -386,49 +391,33 @@ export function ProjectsPage() {
         )
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-          {projects.map((proj) => (
+          {projects.map((proj) => {
+            // 封面地址与「有无封面」同时被封面图和「生成封面」按钮使用，提到 map 作用域
+            const coverKey = proj.dir_key || proj.id;
+            const coverSrc = coverUrls[proj.id]
+              || (proj.has_cover ? projectsApi.coverUrl(coverKey) : '');
+            const hasCover = Boolean(coverSrc);
+            return (
             <div
               key={proj.id}
-              className="group bg-surface rounded-xl border border-line p-4 hover:shadow-lg transition-shadow"
+              className="group relative bg-surface rounded-xl border border-line p-4 hover:shadow-lg transition-shadow"
             >
-              <div
-                role="button"
-                tabIndex={0}
-                className="cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 focus-visible:ring-offset-2"
-                onClick={() => { window.location.hash = `/?p=${encodeURIComponent(proj.dir_key || proj.id)}`; }}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' || e.key === ' ') {
-                    e.preventDefault();
-                    window.location.hash = `/?p=${encodeURIComponent(proj.dir_key || proj.id)}`;
-                  }
-                }}
+              {/* 整卡 = 真正的 <Link>。
+                  改造前是 `role="button" tabIndex={0}` 的 div + 手写 Enter/Space：
+                  ① 模拟语义 —— 读屏把它念成「按钮」，可它做的是导航；
+                  ② 手写键盘处理是原生元素行为的重复品（换原生元素后必须删，否则双触发）；
+                  ③ 跳转写的是 `window.location.hash = '/?p=…'`，绕过 router，
+                     要等 LegacyRouteRedirect 在 hash 层 301 一次才落到工作台。
+                  「生成封面」按钮改为与 <Link> **平级**：<a> 内不允许嵌套交互元素，
+                  平级之后它点自己时不会触发卡片跳转，原来的 stopPropagation 也就不需要了。 */}
+              <Link
+                to={workbenchPath(coverKey)}
+                className="block rounded-lg focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 focus-visible:ring-offset-2"
               >
                 <div className="relative aspect-video bg-surface-2 rounded-lg mb-4 flex items-center justify-center overflow-hidden group-hover:scale-105 transition-transform">
-                  {(() => {
-                    const key = proj.dir_key || proj.id;
-                    const coverSrc = coverUrls[proj.id]
-                      || (proj.has_cover ? projectsApi.coverUrl(key) : '');
-                    const hasCover = Boolean(coverSrc);
-                    return (
-                      <>
-                        {hasCover
-                          ? <img src={coverSrc} alt={proj.name} className="h-full w-full object-cover" />
-                          : <Clapperboard className="h-10 w-10 text-ink-3" />}
-                        {/* 生成/换封面：stopPropagation 防止触发整卡跳工作台 */}
-                        <button
-                          type="button"
-                          disabled={coverBusy === proj.id}
-                          onClick={(e) => { e.stopPropagation(); handleGenCover(proj); }}
-                          className="absolute right-2 top-2 inline-flex items-center gap-1 rounded-md bg-black/45 px-2 py-1 text-xs font-medium text-white hover:bg-black/65 disabled:opacity-60 focus:outline-none focus-visible:ring-2 focus-visible:ring-white/70"
-                        >
-                          <ImageIcon className="h-3.5 w-3.5" />
-                          {coverBusy === proj.id
-                            ? t('project.coverGenerating')
-                            : hasCover ? t('project.coverRedo') : t('project.coverGen')}
-                        </button>
-                      </>
-                    );
-                  })()}
+                  {hasCover
+                    ? <img src={coverSrc} alt={proj.name} className="h-full w-full object-cover" />
+                    : <Clapperboard className="h-10 w-10 text-ink-3" />}
                 </div>
                 <h3 className="font-semibold text-ink-1 mb-1">{proj.name}</h3>
                 <p className="text-sm text-ink-2 mb-3">
@@ -438,7 +427,21 @@ export function ProjectsPage() {
                   <Badge variant="info">{proj.episode_count} {t('ep.suffix')}</Badge>
                   <span className="text-ink-3">{new Date(proj.created_at).toLocaleDateString()}</span>
                 </div>
-              </div>
+              </Link>
+
+              {/* 生成/换封面：绝对定位回封面图右上角（卡片 p-4 + 图内 right-2 = right-6）。
+                  与 <Link> 平级 → 点击它只生成封面，不会跳工作台。 */}
+              <button
+                type="button"
+                disabled={coverBusy === proj.id}
+                onClick={() => handleGenCover(proj)}
+                className="absolute right-6 top-6 inline-flex items-center gap-1 rounded-md bg-black/45 px-2 py-1 text-xs font-medium text-white hover:bg-black/65 disabled:opacity-60 focus:outline-none focus-visible:ring-2 focus-visible:ring-white/70"
+              >
+                <ImageIcon className="h-3.5 w-3.5" />
+                {coverBusy === proj.id
+                  ? t('project.coverGenerating')
+                  : hasCover ? t('project.coverRedo') : t('project.coverGen')}
+              </button>
 
               {/* 操作按钮 */}
               <div className="flex gap-2 mt-3 pt-3 border-t border-line">
@@ -464,7 +467,8 @@ export function ProjectsPage() {
                 </Button>
               </div>
             </div>
-          ))}
+            );
+          })}
         </div>
       )}
 

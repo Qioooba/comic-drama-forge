@@ -32,7 +32,7 @@
  * 三条硬约束（不可违反）
  * ----------------------
  * 1. **状态不得只靠颜色**（MASTER §4.2 三重律）。每态必须同时给出
- *    色 + 中文状态词 + 图标/形状，缺一即为违规。
+ *    色 + 状态词（取自语言包）+ 图标/形状，缺一即为违规。
  * 2. **`approved` 永不由 `selected` 推导**。映射表按后端 `state` 精确取值，
  *    `selected` 只可能落到青档，任何分支都不会把它画成绿。
  * 3. **未识别状态一律降级为「已采用·未批准」**，绝不 fail-open 成「已批准」。
@@ -41,16 +41,17 @@
 import React from 'react';
 import type { ProductionDecisionState, ProductionDecisionStateName } from '@/types';
 import { normalizeDecisionState } from '@/api/queries';
+import { t } from '@/i18n';
 
 interface BadgePresentation {
-  /** 中文状态词 —— 用户实际读到的那句话，必须与后端 state 语义逐字对应 */
-  label: string;
+  /** i18n key：用户实际读到的那句状态词，必须与后端 state 语义逐字对应 */
+  labelKey: string;
+  /** i18n key：读屏用户拿不到颜色，必须有完整描述 */
+  titleKey: string;
   /** 形状/图标字符（与色共同构成第二、第三重表达） */
   glyph: string;
   /** Tailwind 类，全部走设计令牌，不写字面量 */
   cls: string;
-  /** 无障碍标题：读屏用户拿不到颜色，必须有完整描述 */
-  title: string;
 }
 
 /**
@@ -59,47 +60,52 @@ interface BadgePresentation {
  * ⚠️ 用 `Record<ProductionDecisionStateName, BadgePresentation>` 而不是
  *    `Partial<Record<...>>`：新增一个后端取值时，这里会**编译失败**，
  *    逼着作者补一条明确措辞 —— 而不是静默落到 default 分支显示错误状态。
+ *
+ * 文案走语言包（`state.*` / `decision.*`），不在组件里写死中文：
+ * 硬编码文案切英文时这几档状态词会留在中文，且与状态色一起构成
+ * 「色+文」两重表达，漏译一处就等于让读屏用户拿到半截信息。
+ * 徽标用模块级 t()（同 ErrorBoundary）——组件不依赖 AppProvider 的存在。
  */
 const PRESENTATION: Record<ProductionDecisionStateName, BadgePresentation> = {
   none: {
-    label: '未采用',
+    labelKey: 'state.none',
+    titleKey: 'state.noneTitle',
     glyph: '○',
     cls: 'bg-surface-2 text-ink-2 border-line',
-    title: '未采用：这一版尚未被选为工作版本',
   },
   // ---- 采用档（青）：创作决定 ----
   selected: {
-    label: '已采用',
+    labelKey: 'state.selected',
+    titleKey: 'state.selectedTitle',
     glyph: '●',
     cls: 'bg-selected-subtle text-selected-strong border-selected',
-    title: '已采用：创作决定，这版被选为工作版本（尚未批准）',
   },
   selected_not_approved: {
     // ⚠️ 必须写「未批准」。不得写成「已完成」/「已通过」/「OK」——
     //    那些措辞会被读成放行，而 ADR-0002 的全部意义就是禁止这一读法。
-    label: '已采用·未批准',
+    labelKey: 'state.selectedNotApproved',
+    titleKey: 'state.selectedNotApprovedTitle',
     glyph: '●○',
     cls: 'bg-selected-subtle text-selected-strong border-selected ring-1 ring-selected/60',
-    title: '已采用·未批准：有人选了这一版，但**没有人批准放行**，不可交付',
   },
   // ---- 批准档（绿）：放行决定 ----
   approved: {
-    label: '已批准',
+    labelKey: 'state.approved',
+    titleKey: 'state.approvedTitle',
     glyph: '✓',
     cls: 'bg-approved-subtle text-approved-strong border-approved',
-    title: '已批准：人工放行决定，可进入交付',
   },
   approved_stale: {
-    label: '批准已失效',
+    labelKey: 'state.approvedStale',
+    titleKey: 'state.approvedStaleTitle',
     glyph: '✓!',
     cls: 'bg-approved-subtle text-approved-strong border-approved ring-1 ring-warning/70',
-    title: '批准已失效：产物内容已变（哈希失配），必须重新批准才能交付',
   },
   approved_unverified: {
-    label: '无法验证',
+    labelKey: 'state.approvedUnverified',
+    titleKey: 'state.approvedUnverifiedTitle',
     glyph: '✓?',
     cls: 'bg-approved-subtle text-approved-strong border-approved opacity-70',
-    title: '无法验证：取不到磁盘现状（无路径 / 文件缺失 / 不可读），按未验证处理',
   },
 };
 
@@ -124,11 +130,13 @@ export function DecisionStateBadge({
   // 契约破裂时降级成保守态（见 normalizeDecisionState 注释）
   const safe = normalizeDecisionState(decision);
   const p = PRESENTATION[safe.state];
+  const label = t(p.labelKey);
+  const title = t(p.titleKey);
 
   return (
     <span
-      title={p.title}
-      aria-label={p.title}
+      title={title}
+      aria-label={title}
       data-decision-state={safe.state}
       data-selected={safe.selected ? 'true' : 'false'}
       data-approved={safe.approved ? 'true' : 'false'}
@@ -140,8 +148,8 @@ export function DecisionStateBadge({
       <span aria-hidden="true" className="font-mono leading-none">
         {p.glyph}
       </span>
-      {/* 文本：明确的中文状态词（第二重） */}
-      <span className="whitespace-nowrap">{p.label}</span>
+      {/* 文本：明确的状态词（第二重），来自语言包 */}
+      <span className="whitespace-nowrap">{label}</span>
     </span>
   );
 }
@@ -160,7 +168,7 @@ export function NotApprovedNotice({ className = '' }: { className?: string }): J
       className={`flex items-start gap-2 rounded-md border border-selected bg-selected-subtle px-2.5 py-1.5 text-xs text-selected-strong ${className}`}
     >
       <span aria-hidden="true" className="font-mono leading-none">●○</span>
-      <span>已采用但尚未批准：采用是创作决定，批准是人工放行。未经批准的产物不可交付。</span>
+      <span>{t('decision.notApprovedNotice')}</span>
     </div>
   );
 }

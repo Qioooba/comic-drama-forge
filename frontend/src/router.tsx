@@ -3,15 +3,20 @@
  *
  * 为什么用 **HashRouter** 而不是 BrowserRouter
  * ------------------------------------------
- * 改造前 `App.tsx:28-41` 是手写 hash 解析。本轮直接换 BrowserRouter 会留下
- * 三类**仍在生效**的旧写入方（它们不在本轮可改文件清单里）：
- *   - `pages/ProjectsPage.tsx:224,398,402` 写 `location.hash = '/?p=<key>'`
- *   - `pages/OverviewPage.tsx:156,160`      同上
- *   - `components/ErrorBoundary.tsx:71`     写 `location.hash = '#/'`
- * BrowserRouter 下 hash 不是路由源，这三处写入不会触发路由变化，表现为
- * 「点了没反应」；HashRouter 下 hash 即路由源，它们继续可用。
+ * 改造前 `App.tsx:28-41` 是手写 hash 解析，换 BrowserRouter 会被仍在写
+ * `location.hash` 的旧代码挡住。那三处写入
+ * （`pages/ProjectsPage.tsx`、`pages/OverviewPage.tsx`、`components/ErrorBoundary.tsx`）
+ * **现已全部改为 `useNavigate()`**，不再直接写 hash —— 所以「它们会挡住换路由」
+ * 这个理由已经失效。
+ *
+ * 仍然保留 HashRouter 的理由是另一条：**旧书签与外部文档里的链接**仍是
+ * `#ai` / `#projects?p=<key>` 这类 hash 形态（见 `routes/legacyRedirect.tsx` 的
+ * 301 层）。保持 hash 为唯一事实源，这些链接继续可见地跳转而不是静默 404。
+ * 若将来要换 BrowserRouter，必须同时给旧链接安排一层**服务端/入口层**的重定向，
+ * 否则外部链接会全部失效 —— 那不是一次前端重构能覆盖的范围。
+ *
  * 桌面端 `electron-app/main.js` 亦以 `http://127.0.0.1:<port>/` 起本地服务，
- * 与浏览器同构。**hash 保持唯一事实源**是本轮风险最低的选择。
+ * 与浏览器同构。
  *
  * 路由表
  * ------

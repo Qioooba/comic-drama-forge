@@ -40,11 +40,18 @@ export const queryClient = new QueryClient({
     queries: {
       staleTime: DEFAULT_STALE_TIME,
       refetchInterval: false,
-      refetchOnWindowFocus: true,
+      // 关掉窗口聚焦时的整页重取：工作台自身已有显式轮询，
+      // 与 focus 重取叠加会在切回窗口时打两遍后端。
+      //
+      // ⚠️ 这里原本是 `true` —— 与上面这段注释承诺的行为**相反**（注释描述的
+      //    意图是关闭，实现却是打开）。已按注释改成 `false`：工作台数据靠
+      //    各查询自己的轮询节奏刷新，不需要再叠一层隐式的全局重取。
+      //    也不会因此显示陈旧数据：`staleTime` 为 0，组件重新挂载（切 tab 回来）
+      //    时本来就会重取。
+      refetchOnWindowFocus: false,
       // 只读接口失败重试 1 次；查询函数里抛的业务错误（409/403）不该被重试掩盖
       retry: 1,
-      // 关掉窗口聚焦时的整页重取噪声：工作台自身已有显式轮询，
-      // 与 focus 重取叠加会在切窗口时打两遍后端。
+      // 断线重连后重取真值（与 focus 不同：网络恢复后必须重新确认状态）。
       refetchOnReconnect: true,
       gcTime: 5 * 60_000,
     },

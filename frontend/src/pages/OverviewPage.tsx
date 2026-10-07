@@ -1,6 +1,8 @@
 import React, { useCallback, useEffect, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { useApp } from '@/context/AppContext';
 import { projectsApi, tasksApi } from '@/api/client';
+import { workbenchPath } from '@/routes/workbenchTabs';
 import { Card, EmptyState, Badge, Skeleton, ErrorState } from '@/components/ui';
 import { BarChart3, ClipboardList, Clapperboard, FolderOpen, Play, ZoomIn } from '@/components/ui/icons';
 import type { IconProps } from '@/components/ui/icons';
@@ -149,18 +151,15 @@ export function OverviewPage() {
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
             {projects.slice(0, 6).map((proj) => (
-              <div
+              /* 整卡就是一个 <Link>：卡片内没有任何交互元素，不存在「<a> 里套 button」
+                 的问题，可以直接换成原生链接语义。
+                 改造前是 `role="button"` + 手写 Enter/Space + `window.location.hash`
+                 三件套：读屏念成按钮、键盘处理与原生行为重复、跳转绕过 router
+                 （还得靠 LegacyRouteRedirect 301 一次才落到工作台）。 */
+              <Link
                 key={proj.id}
-                role="button"
-                tabIndex={0}
-                onClick={() => { window.location.hash = `/?p=${encodeURIComponent(proj.dir_key || proj.id)}`; }}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' || e.key === ' ') {
-                    e.preventDefault();
-                    window.location.hash = `/?p=${encodeURIComponent(proj.dir_key || proj.id)}`;
-                  }
-                }}
-                className="p-4 border border-line rounded-lg hover:border-brand transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 focus-visible:ring-offset-2"
+                to={workbenchPath(proj.dir_key || proj.id)}
+                className="block p-4 border border-line rounded-lg hover:border-brand transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 focus-visible:ring-offset-2"
               >
                 <div className="flex items-start justify-between mb-2">
                   <h4 className="font-medium text-ink-1">{proj.name}</h4>
@@ -168,7 +167,7 @@ export function OverviewPage() {
                 </div>
                 <p className="text-xs text-ink-2">{t('canvas.style')}: {proj.config.style}</p>
                 <p className="text-xs text-ink-3 mt-1">{new Date(proj.created_at).toLocaleDateString()}</p>
-              </div>
+              </Link>
             ))}
           </div>
         )}

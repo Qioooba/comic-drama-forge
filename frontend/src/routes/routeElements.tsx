@@ -27,7 +27,11 @@ export function ProjectWorkbenchRoute(): JSX.Element {
   if (!isWorkbenchTab(tab)) {
     return <Navigate to={workbenchPath(projectKey, WORKBENCH_TABS[0])} replace />;
   }
-  return <ProjectWorkbenchPage key={projectKey} projectKey={projectKey} />;
+  // `tab` 已被上面的 isWorkbenchTab 收窄为 WorkbenchTab，必须**往下传**：
+  // 页面自己再解一次 URL 就会出现两个真源，而这里解出来的值才是路由认定的值。
+  // 不传的后果是 `/projects/<key>/qc` 与 `/projects/<key>/overview` 渲染出同一个页面
+  // （页面内部 state 恒为 overview），深链静默失效。
+  return <ProjectWorkbenchPage key={projectKey} projectKey={projectKey} tab={tab} />;
 }
 
 /** `/projects/:projectKey` —— 缺 tab 时补默认段，让 URL 始终是完整深链。 */
