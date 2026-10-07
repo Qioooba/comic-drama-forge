@@ -331,12 +331,14 @@ class NeedsHumanError(PipelineError):
 
 
 def _A():
-    """取宿主模块 app（延迟访问，避开循环导入）"""
-    import sys as _sys
-    mod = _sys.modules.get("app")
-    if mod is None:
-        raise PipelineError("宿主模块 app 尚未加载，无法运行流水线")
-    return mod
+    """取宿主视图（延迟访问，避开循环导入）。
+
+    2026-10-07 蓝图拆分后 ``app/app.py`` 不再持有 212 个共用 helper，只返回它会
+    让下面 90 处 ``A.<name>`` 全部 AttributeError。改为返回 ``app`` 与
+    ``api._shared`` 的合并视图，调用点无需改动。详见 ``app/host_view.py``。
+    """
+    from host_view import host_view  # noqa: PLC0415
+    return host_view()
 
 
 def _now() -> str:
@@ -1009,6 +1011,13 @@ def _record_pipeline_facts(ctx, kind: str, shots, paths) -> dict:
 
     生成事实是 Shot Studio「候选对比 / 采用 / 批准」的唯一数据源；登记失败必须
     留在日志与步骤详情里，但不让已通过质检的产物因数据库瞬时故障整集回滚。
+
+    实现已收敛到 :mod:`app.production_recording` 单一适配层，这里只负责把
+    托管上下文（project / episode / shot）翻译成登记上下文。收敛的原因：
+    早先这里每次都 ``create_intent`` 新建一条意图，于是「同一镜重渲 N 次」
+    会在事实库里堆出 N 条**参数完全相同**的意图 —— 候选对比界面看到的
+    是「这一镜被决定过 N 次」，而真实语义是「这一镜有 N 个候选」（决策 1）。
+    改由适配层按 intent_hash 复用意图后，重跑才会落到同一条意图下。
     """
     rows = list(shots or [])
     items = list(paths or [])
@@ -1016,39 +1025,36 @@ def _record_pipeline_facts(ctx, kind: str, shots, paths) -> dict:
         return {"registered": 0, "errors": []}
     try:
         try:
-            from application.production import ProductionService, sha256_file
+            import production_recording
         except ImportError:  # pragma: no cover - 脚本方式导入兜底
-            from app.application.production import ProductionService, sha256_file
-        svc = ProductionService()
-        existing = {}
-        for mv in svc.list_media_versions():
-            if mv.get("path"):
-                existing[(str(mv.get("path")), str(mv.get("media_sha256") or ""))] = True
+            from app import production_recording  # type: ignore
         registered, errors = 0, []
         media_kind = "image" if kind == "storyboard" else kind
         episode = str(ctx.get("episode_no") or 1)
+        project = str(ctx.get("project_name") or "")
         for idx, (shot, path) in enumerate(zip(rows, items), 1):
             if not path or not os.path.isfile(path):
                 continue
+            shot = shot if isinstance(shot, dict) else {}
             shot_key = str(shot.get("shot_id") or f"shot_{idx}")
             prompt = str(shot.get("prompt_h3") or shot.get("prompt")
-                        or shot.get("description") or "")
-            digest = sha256_file(path)
-            if not digest or (str(path), digest) in existing:
-                continue
-            try:
-                intent = svc.create_intent(
-                    project=str(ctx.get("project_name") or ""),
-                    episode=episode, shot_key=shot_key, prompt=prompt,
-                    kind=media_kind, seed=int(shot.get("seed") or -1),
-                    workflow_version=str(ctx.get("episode_tag") or "pipeline"),
-                    created_by="autopilot")
-                svc.register_media(intent["intent_id"], path=path,
-                                   media_sha256=digest,
-                                   attempt_id=f"{kind}:{episode}:{shot_key}")
-                registered += 1
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"{shot_key}: {exc}")
+                         or shot.get("description") or "")
+            refs = shot.get("reference_images")
+            res = production_recording.record_generation(production_recording.RenderContext(
+                kind=media_kind, project=project, episode=episode,
+                shot_key=shot_key, prompt=prompt,
+                seed=(shot.get("seed") if shot.get("seed") is not None else None),
+                ref_paths=tuple(refs) if isinstance(refs, (list, tuple)) else (),
+                workflow_version=str(ctx.get("episode_tag") or "pipeline"),
+                artifacts=(path,),
+                attempt_id=f"{kind}:{episode}:{shot_key}",
+                source="pipeline:%s" % kind,
+                created_by="autopilot",
+            ))
+            if res.get("media_version_ids"):
+                registered += len(res["media_version_ids"])
+            elif res.get("skipped"):
+                errors.append("%s: %s" % (shot_key, "; ".join(res["skipped"])[:200]))
         if errors:
             logger.warning("版本化生产事实登记部分失败（不影响产物）：%s",
                            "；".join(errors[:5]))
@@ -1133,6 +1139,33 @@ def step_keyframe(ctx) -> dict:
     _kf_verify, _kf_vretries = A._keyframe_qc_verifier(ctx["project_name"], script=ctx.get("script"))
     # 尾帧提示词预检（生成前质检）：与手动链路保持同一覆盖（能自愈先自愈，成批不阻断）
     _kf_pre, _kf_pre_on = A._keyframe_prompt_preflight(ctx["project_name"])
+
+    def _kf_facts(sid):
+        """尾帧逐镜的「生产事实」身份工厂（2026-10-07 补线）。
+
+        与 ``app/api/storyboard.py`` 的 ``_kf_facts`` 同口径：托管上下文 ``ctx``
+        里才有真实的 project / episode，而 keyframe 模块只看得到 ``sb_map`` 与
+        文件名 —— 身份只在这里问，绝不从路径反推。
+
+        刻意**不**复用 ``A._facts_identity``：``A()`` 返回的是宿主模块 app.py，
+        api 拆分后它不再持有 ``_shared`` 的名字（实测 ``A._shot_seq`` 直接
+        AttributeError，属既有缺陷、不在本轮范围）。登记是**旁路**，绝不能因为
+        取身份失败就让已烧了 GPU 的尾帧白跑，所以这里就地组装并兜住异常。
+
+        尾帧是**逐镜**产物，故 ``shot_key`` 逐镜给（不做归一化，与既有 7 处
+        ``_facts_identity`` 调用同口径）。整集口径 ``EPISODE_SCOPE_SHOT_KEY``
+        在此**不适用** —— 尾帧不属于整集级产物。
+        """
+        try:
+            return {
+                "project": str(ctx.get("project_name") or ""),
+                "episode": str(ctx.get("episode_no") or ""),
+                "shot_key": str(sid if sid is not None else ""),
+            }
+        except Exception as exc:  # noqa: BLE001 身份组装失败绝不阻断尾帧生成
+            logger.warning("尾帧生产事实身份组装失败（本镜跳过登记，不影响生成）：%s", exc)
+            return {}
+
     with gpu_task_gate.run_gpu_task(
             f"pipe_kf_{int(time.time() * 1000)}", "托管·尾帧"):
         report = A.keyframe.generate_keyframes(
@@ -1141,7 +1174,10 @@ def step_keyframe(ctx) -> dict:
             only_missing=True, progress_cb=_cb,
             chain_mode=ctx["config"].get("keyframe_chain_mode") or "auto",
             verify_cb=_kf_verify, max_verify_retries=_kf_vretries,
-            preflight_cb=_kf_pre)
+            preflight_cb=_kf_pre,
+            # 逐镜登记为 GenerationIntent + MediaVersion；keyframe.py 内部会按
+            # 链式/非链式补 ref_slot_role（start_frame / end_frame）。
+            facts_cb=_kf_facts)
     recheck = probe_keyframe(ctx)
     if not recheck.get("done"):
         return {"ok": False, "detail": {"report": report, "probe": recheck},

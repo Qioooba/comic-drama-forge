@@ -68,6 +68,8 @@ import type {
   PendingUnitListResponse,
   PreflightReport,
   PreflightResponse,
+  RecordingFailure,
+  RecordingFailureListResponse,
   RegisterMediaRequest,
   ReleaseCheckRequest,
   ReleaseCheckResponse,
@@ -80,6 +82,8 @@ import type {
   RevokeApprovalRequest,
   RevokeDeliveryApprovalRequest,
   SelectMediaRequest,
+  ShotGenerationStatus,
+  ShotGenerationStatusResponse,
   StyleEntry,
   StyleListResponse,
   StyleResolveResponse,
@@ -158,7 +162,7 @@ function qs(params: Record<string, string | number | boolean | undefined | null>
 
 
 /**
- * contracts —— 契约版本 2026-10-07.2（spec 4c0774a9aeeb…）
+ * contracts —— 契约版本 2026-10-07.2（spec 5ba89a7f699a…）
  */
 export const contractsApi = {
   /**
@@ -185,7 +189,7 @@ export const contractsApi = {
 };
 
 /**
- * delivery —— 契约版本 2026-10-07.2（spec 4c0774a9aeeb…）
+ * delivery —— 契约版本 2026-10-07.2（spec 5ba89a7f699a…）
  */
 export const deliveryApi = {
   /**
@@ -254,7 +258,7 @@ export const deliveryApi = {
 };
 
 /**
- * jobs —— 契约版本 2026-10-07.2（spec 4c0774a9aeeb…）
+ * jobs —— 契约版本 2026-10-07.2（spec 5ba89a7f699a…）
  */
 export const jobsApi = {
   /**
@@ -330,7 +334,7 @@ export const jobsApi = {
 };
 
 /**
- * licensing —— 契约版本 2026-10-07.2（spec 4c0774a9aeeb…）
+ * licensing —— 契约版本 2026-10-07.2（spec 5ba89a7f699a…）
  */
 export const licensingApi = {
   /**
@@ -364,7 +368,7 @@ export const licensingApi = {
 };
 
 /**
- * production_facts —— 契约版本 2026-10-07.2（spec 4c0774a9aeeb…）
+ * production_facts —— 契约版本 2026-10-07.2（spec 5ba89a7f699a…）
  */
 export const productionfactsApi = {
   /**
@@ -465,10 +469,24 @@ export const productionfactsApi = {
    */
   selectMediaVersion: (media_version_id: string, body: SelectMediaRequest) =>
     request<DecisionResponse>(`/api/production_facts/media/${encodeURIComponent(String(media_version_id))}/select`, { method: 'POST', body: JSON.stringify(body) }),
+  /**
+   * 登记失败台账（生成路径永不因登记失败中断，因此失败必须不读日志也能发现）
+   *
+   * `GET /api/production_facts/recording-failures`
+   */
+  listRecordingFailures: (limit?: string, project?: string, episode?: string, shot_key?: string) =>
+    request<RecordingFailureListResponse>(`/api/production_facts/recording-failures${qs({ limit, project, episode, shot_key })}`, { method: 'GET' }),
+  /**
+   * 这一镜/这一集到底有没有东西可看（三态，不是一个含糊空态）
+   *
+   * `GET /api/production_facts/shot-status`
+   */
+  getShotGenerationStatus: (project?: string, episode?: string, shot_key?: string, kind?: string, paths?: string) =>
+    request<ShotGenerationStatusResponse>(`/api/production_facts/shot-status${qs({ project, episode, shot_key, kind, paths })}`, { method: 'GET' }),
 };
 
 /**
- * styles —— 契约版本 2026-10-07.2（spec 4c0774a9aeeb…）
+ * styles —— 契约版本 2026-10-07.2（spec 5ba89a7f699a…）
  */
 export const stylesApi = {
   /**
@@ -495,7 +513,7 @@ export const stylesApi = {
 };
 
 /**
- * timeline —— 契约版本 2026-10-07.2（spec 4c0774a9aeeb…）
+ * timeline —— 契约版本 2026-10-07.2（spec 5ba89a7f699a…）
  */
 export const timelineApi = {
   /**

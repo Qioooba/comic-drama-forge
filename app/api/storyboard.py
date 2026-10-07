@@ -13,6 +13,11 @@ from flask import Blueprint
 # __all__ 里显式列出了下划线开头的名字，故这里能整体取到。
 from api._shared import *  # noqa: F401,F403
 
+# ``_facts_identity`` 不在 ``_shared.__all__`` 里（星号导入拿不到），故显式取一次。
+# 复用共享实现而不是在这里重写一遍：整集级 shot_key 口径（EPISODE_SCOPE_SHOT_KEY）
+# 与「组装失败即返回 {}、绝不阻断生成」这条纪律只有一份。
+from api._shared import _facts_identity
+
 bp = Blueprint("storyboard", __name__)
 DOMAIN = "storyboard"
 
@@ -67,6 +72,15 @@ def api_keyframes_generate():
         return _g
     _kf_ep = _ep_of_script(script, data.get('episode_no'))
     kf_dir = _keyframes_dir(project, _kf_ep)
+
+    def _kf_facts(sid):
+        """尾帧「生产事实」身份工厂：本层才看得到真实的 project / episode / 镜号。
+
+        尾帧是**逐镜**产物，故身份必须逐镜给（一个工厂而不是一个 dict）。
+        shot_id 原样传（与 ``_facts_identity`` 的既有 7 处调用同口径，不另做归一化）。
+        组装失败由 ``_facts_identity`` 内部吞掉并返回 {} → 该镜不登记，生成不受影响。
+        """
+        return _facts_identity(project, _kf_ep, sid)
     sb_map = _keyframe_sb_map(project, script, data.get('storyboards'), episode_no=_kf_ep)
     only_missing = bool(data.get('only_missing', True))
     seed = data.get('seed')
@@ -134,6 +148,9 @@ def api_keyframes_generate():
                 qc_stop_cb=_qc_retry_hopeless,  # G1：尾帧连续两次缺陷相同 → 止损
                 recall_cb=_keyframe_recall_cb(project),  # T03a：尾帧质检重试召回历史教训
                 project_name=project,  # A-16：尾帧达标落盘时写旁路 .meta.json 用
+                # 2026-10-07：尾帧逐镜登记为 GenerationIntent + MediaVersion。
+                # 身份只在这里问 app 层要（_kf_facts），keyframe.py 不从路径反推。
+                facts_cb=_kf_facts,
             )
             with lock:
                 generation_state[task_id].update({

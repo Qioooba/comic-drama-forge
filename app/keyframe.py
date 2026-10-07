@@ -272,11 +272,18 @@ def start_frame_link_path(keyframes_dir: str, shot_id) -> str:
 
 def generate_end_frame(start_frame: str, prompt: str, out_path: str,
                        seed: Optional[int] = None, timeout: int = 900,
-                       client=None) -> dict:
+                       client=None, facts: dict = None) -> dict:
     """以首帧为参考图，生成该镜头尾帧（Qwen Edit 2511 图像编辑链路）
 
     S-04：client 参数支持注入全局 ComfyUIClient（避免每镜新建实例、连接不复用）。
     未传时退回新建（向后兼容）。
+
+    facts（2026-10-07）：可选「生产事实登记上下文」``{"project","episode","shot_key",...}``，
+        原样透传给 ``comfyui_client.generate_storyboard(facts=...)``（尾帧走的就是
+        分镜工作流，故登记接缝与分镜图同一条）。**由调用方提供** —— 本函数只看得到
+        ``out_path``，从 ``comic_drama_kf/<prefix>`` 反推 project/episode/shot_key
+        必然是编的，编出来的血缘比没有血缘更糟（见 ``app/production_recording.py``）。
+        传 None / {} → 登记层整体跳过，尾帧生成逐字不变。
     """
     try:
         import comfyui_client
@@ -288,7 +295,8 @@ def generate_end_frame(start_frame: str, prompt: str, out_path: str,
     try:
         result = client.generate_storyboard(
             prompt_zh=prompt, ref_images=[start_frame],
-            filename_prefix=f"comic_drama_kf/{prefix}", seed=seed, timeout=timeout)
+            filename_prefix=f"comic_drama_kf/{prefix}", seed=seed, timeout=timeout,
+            facts=facts)
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": f"尾帧生成失败：{e}"}
     files = (result or {}).get("files") or []
@@ -437,6 +445,7 @@ def generate_keyframes(shots: List[dict], sb_map: Dict[str, str], keyframes_dir:
                        qc_stop_cb: Optional[Callable[[list], Tuple[bool, str]]] = None,
                        client=None,
                        project_name: str = None,
+                       facts_cb: Optional[Callable[[object], dict]] = None,
                        ) -> dict:
     """批量生成尾帧（串行；单镜失败不影响其它镜）
 
@@ -470,6 +479,13 @@ def generate_keyframes(shots: List[dict], sb_map: Dict[str, str], keyframes_dir:
         ``qc_client.qc_retry_hopeless``）。连续两次缺陷特征完全相同即提前停止本镜
         尾帧重画（尾帧在链式模式下是下一镜首帧，最贵的一处，换 seed 只是换骰子）。
     progress_cb(done, total, item) —— 每个镜头完成后回调一次
+    facts_cb(shot_id) -> dict（2026-10-07）：可选的**生产事实身份工厂**，由 app 层注入
+        ``_facts_identity`` 闭包（那里才看得到真实的 project/episode/shot）。
+        本模块只看得到 ``keyframes_dir`` 与 ``comic_drama_kf/`` 前缀，命名约定不统一，
+        **绝不从路径反推身份**（编出来的血缘比没有血缘更糟 —— 生产事实喂的是人工批准闸门）。
+        每镜调用一次（重试复用同一身份 → 换 seed 只是多一个候选，不换意图）；
+        返回 None/{} 或回调缺失 → 该镜不登记，尾帧生成逐字不变。
+        ⚠️ 回调异常按「本镜不登记」处理，绝不冒泡打断成批尾帧生成。
     recall_cb(orig_prompt, shot, item) -> str：质检不达标**重试时**改写的提示词回调
         （由 app.py 注入 prompt_memory.learned_prompt，召回 kind="keyframe" 的历史教训）。
         仅 attempt>0 时调用；返回空串/None 时保持原 prompt，默认 None → 整段跳过、
@@ -581,6 +597,20 @@ def generate_keyframes(shots: List[dict], sb_map: Dict[str, str], keyframes_dir:
                     logger.debug("进度回调异常（忽略，不阻断尾帧生成）：%s", e)
             continue
 
+        # 生产事实身份（2026-10-07）：只问调用方要，绝不从路径反推。
+        # 组装失败 = 本镜不登记，绝不影响尾帧交付（下面所有登记都是旁路）。
+        # 参考图角色是本层**真知**：非链式 = 本镜分镜图/首帧镜像（start_frame），
+        # 链式 = 上一镜尾帧（end_frame）。角色进意图哈希，锚点换了就该是另一条意图。
+        _facts = None
+        if facts_cb is not None:
+            try:
+                _f = facts_cb(sid)
+                if isinstance(_f, dict) and _f:
+                    _facts = dict(_f, ref_slot_role="end_frame" if chained else "start_frame")
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"尾帧生产事实身份组装异常（本镜跳过登记，不影响生成）：{e}")
+                _facts = None
+
         _mirror(start, start_frame_link_path(keyframes_dir, seq))
         prompt = build_end_frame_prompt(shot, chained=chained)
         # 原始提示词：必须在 preflight 自愈**之前**捕获（作为教训库稳定 phash 键）。
@@ -632,7 +662,8 @@ def generate_keyframes(shots: List[dict], sb_map: Dict[str, str], keyframes_dir:
                     prompt = _recalled
             # S7：尾帧先写暂存区 scratch_end，质检通过才 move 到正式 keyframes/
             r = generate_end_frame(start, prompt, scratch_end,
-                                   seed=_seed, timeout=timeout, client=client)
+                                   seed=_seed, timeout=timeout, client=client,
+                                   facts=_facts)
             if not r.get("ok") or verify_cb is None:
                 # verify_cb 未注入时无质检门（旧行为），保持"生成成功即落地"以兼容
                 # 无质检部署；但仍落正式目录（scratch → end_p 一致路径时直接生成）。

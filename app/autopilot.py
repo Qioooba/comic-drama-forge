@@ -214,12 +214,17 @@ PLAN_DEFAULTS = {
 
 
 def _A():
-    """延迟取宿主模块 app（避开循环导入：app 在加载期就会 import 本模块）"""
-    import sys as _sys
-    mod = _sys.modules.get("app")
-    if mod is None:
-        raise RuntimeError("宿主模块 app 尚未加载")
-    return mod
+    """延迟取宿主视图（避开循环导入：app 在加载期就会 import 本模块）。
+
+    2026-10-07 蓝图拆分后 ``app/app.py`` 不再持有共用 helper，只返回它会让
+    ``A.<name>`` 全部 AttributeError；改为 ``app`` + ``api._shared`` 合并视图。
+    详见 ``app/host_view.py``。
+    """
+    from host_view import host_view  # noqa: PLC0415
+    try:
+        return host_view()
+    except RuntimeError as e:
+        raise RuntimeError("宿主模块 app 尚未加载") from e
 
 
 def _now() -> str:

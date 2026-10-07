@@ -1671,6 +1671,64 @@ class ComfyUIClient:
                          [f for f in files if f not in existing][:5])
         return existing
 
+    # ---------- 版本化生产事实登记（2026-10-07） ----------
+
+    def _record_production_facts(self, facts, *, kind: str, prompt_zh: str,
+                                 artifacts: List[str], seed=None,
+                                 ref_images=None, filename_prefix: str = "",
+                                 workflow_version: str = "", api_prompt: dict = None,
+                                 source: str = "", episode: str = "",
+                                 shot_key: str = "", resumed: bool = False) -> None:
+        """把刚渲染出来的产物登记为 GenerationIntent + MediaVersion。
+
+        「生成 → 采用 → 批准」此前在真实项目上是断的：领域模型、仓储、路由、
+        界面全在，但没有任何生成路径调用过 ``create_intent`` / ``register_media``，
+        于是 Shot Studio 永远拿不到真实候选。本方法就是那条接缝。
+
+        三条硬约束（见 ``app/production_recording.py`` 模块文档）：
+
+        1. **不猜身份** —— ``facts`` 为空就直接跳过。本层只看得到
+           ``filename_prefix``，而各调用方的命名约定不统一（cover / keyframe /
+           shotgrid / episode 各自为政），从文件名反推 project/episode/shot_key
+           必然有一半是编的。宁可这一镜没有候选，也不给界面塞来路不明的意图。
+        2. **登记失败绝不阻断生成** —— 适配层内部吞掉全部异常并落失败台账，
+           这里再兜一层，保证任何返回值都不影响上面那几行真正在做的事。
+        3. **登记 ≠ 采用 ≠ 批准** —— 本方法只调 ``record_generation``，
+           它内部只写 intent / media 两张表。采用与批准必须由人工在界面上显式触发。
+
+        画幅不在参数里：``style_kit.apply_latent_size`` 已把尺寸写进
+        ``api_prompt`` 的尺寸节点，而意图身份取自 api_prompt 的去种子指纹 ——
+        再单独传一遍 size 只会造成「两个来源、可能不一致」。
+        """
+        if not facts:
+            logger.debug("[生产事实] 调用方未提供身份上下文，跳过登记（source=%s）", source)
+            return
+        if not artifacts:
+            return
+        try:
+            import production_recording
+            ctx = production_recording.RenderContext(
+                kind=str(kind or "image"),
+                project=str(facts.get("project") or ""),
+                episode=str(facts.get("episode") or episode or ""),
+                shot_key=str(facts.get("shot_key") or shot_key or ""),
+                prompt=str(facts.get("prompt") or prompt_zh or ""),
+                negative_prompt=str(facts.get("negative_prompt") or ""),
+                seed=seed,
+                ref_paths=tuple(ref_images or ()),
+                ref_slot_role=str((facts or {}).get("ref_slot_role") or ""),
+                workflow_version=str(facts.get("workflow_version") or workflow_version or ""),
+                api_prompt=api_prompt,
+                artifacts=tuple(artifacts),
+                attempt_id=str(facts.get("attempt_id") or filename_prefix or ""),
+                resumed=bool(facts.get("resumed") or resumed),
+                source=str(source or facts.get("source") or ""),
+            )
+            production_recording.record_generation(ctx)
+        except Exception as e:                   # noqa: BLE001 登记永不阻断生成
+            logger.warning("[生产事实] 登记调用异常（已忽略，不影响生成）：%s: %s",
+                           type(e).__name__, e)
+
     # ---------- 路径工具（P0-4：HTTP 资源路径 → 本地绝对路径） ----------
 
     @staticmethod
@@ -1852,7 +1910,8 @@ class ComfyUIClient:
                              asset_type: str = None, seed: int = None,
                              style: str = "", size=None,
                              filename_prefix: str = None,
-                             prompt_extra: str = "") -> List[str]:
+                             prompt_extra: str = "",
+                             facts: dict = None) -> List[str]:
         """通用基础图生成：更新正向提示词节点
 
         P0 修复（同轮补充）：
@@ -1876,6 +1935,14 @@ class ComfyUIClient:
           · 在 sanitize 之前 —— 这样机位句也过一遍去人清洗（机位句本身不含人物词，
             只是让清洗成为**唯一入口**，避免出现「绕过清洗的提示词片段」）。
         为空时整条路径与旧实现逐字一致。
+
+        facts（2026-10-07）：可选「生产事实登记上下文」，由**上层调用方**提供
+            ``{"project","episode","shot_key",...}``。产物路径在这里才第一次确凿存在，
+            且 api_prompt 在此定型（去种子工作流指纹的唯一来源）→ 登记就落在这里，
+            与 ``generate_storyboard`` 同一接缝口径。**本方法自己不猜身份**：
+            ``filename_prefix`` 各链路命名约定不统一（``comic_drama/<项目>_asset_*`` /
+            ``comic_drama/<项目>/<类型>/<名>/<机位>`` / ``comic_drama/<项目>_cover``），
+            从里面反推 project/episode/shot_key 必有一半是编的。传 None → 完全不登记。
         """
         api_prompt, meta = self.load_workflow(workflow_file, return_meta=True)
         node_id = self._find_positive_text_node(api_prompt)
@@ -1949,6 +2016,13 @@ class ComfyUIClient:
         prompt_id = self.queue_prompt(api_prompt)
         history = self.wait_for_completion(prompt_id)
         files = self.get_output_files(history, ".png")
+        # 版本化生产事实登记（2026-10-07）：基础图 / 场景图的**唯一**登记接缝。
+        # 登记的是「登记」——只写 intent / media 两张表，采用与批准仍由人工在界面触发。
+        self._record_production_facts(
+            facts, kind="image", prompt_zh=prompt_zh, artifacts=files,
+            seed=seed, filename_prefix=filename_prefix or "",
+            workflow_version=workflow_file, api_prompt=api_prompt,
+            source=str((facts or {}).get("source") or "asset_base_image"))
         if _fp and files:
             try:
                 asset_library.store(_fp, files, meta={
@@ -2177,7 +2251,8 @@ class ComfyUIClient:
     def generate_scene_base(self, prompt_zh: str, seed: int = None,
                             style: str = "", size=None,
                             filename_prefix: str = None,
-                            view_key: str = None) -> List[str]:
+                            view_key: str = None,
+                            facts: dict = None) -> List[str]:
         """生成场景图（T2I）
 
         view_key（2026-09-29 新增）：场景**机位档**（``config.SCENE_VIEW_KEYS``）。
@@ -2198,6 +2273,12 @@ class ComfyUIClient:
         跨档内容一致性由调用方保证（app 层用**同一颗 seed**逐档出图）：
         同 seed 下各档共享同一初始噪声，只有机位句不同 → 结构高度相关，
         细节差异被限制在陈设层面，不会让分镜「换个机位就换了场地」。
+
+        facts（2026-10-07）：可选「生产事实登记上下文」``{"project","episode","shot_key",...}``
+            （见 app/production_recording.py），原样透传给 ``_generate_base_image``
+            在产物落定的那一处登记。口径与 :meth:`generate_storyboard` 的 ``facts`` 完全一致：
+            **只有调用方真的知道 project/episode/shot_key 时才登记** —— 本方法自己不知道
+            （只看得到 filename_prefix），猜一个比不登记更糟。传 None → 逐字不变的旧行为。
         """
         logger.info(f"生成场景图（机位档={view_key or 'base'}）: {prompt_zh[:50]}...")
         # 基础图同样必须去人（2026-09-29 补齐原先的不对称）：
@@ -2212,7 +2293,7 @@ class ComfyUIClient:
             WORKFLOW_TEMPLATE["scene_gen"], prompt_zh,
             asset_type="scene", seed=seed, style=style, size=size,
             filename_prefix=filename_prefix,
-            prompt_extra=scene_view_prompt_suffix(view_key))
+            prompt_extra=scene_view_prompt_suffix(view_key), facts=facts)
 
     # ===================== 第二阶段：多视角生成 =====================
 
@@ -3202,7 +3283,7 @@ class ComfyUIClient:
     def generate_storyboard(self, prompt_zh: str, ref_images: List[str],
                             filename_prefix: str = "comic_drama_sb/shot",
                             seed: int = None, timeout: int = 900,
-                            size=None) -> dict:
+                            size=None, facts: dict = None) -> dict:
         """使用 分镜生成_Qwen21.json（QwenImage2.1 参考图编辑）生成单张分镜图
 
         ref_images: 参考图列表（本地绝对路径或 /api/... HTTP 资源路径）。
@@ -3214,6 +3295,11 @@ class ComfyUIClient:
                     多余槽位必须留空，塞无关图片会让模型分不清哪张该优先。
         seed:       可选随机种子（质检不达标重生成时传入，保证产出与上一次不同）。
         size:       可选 (宽, 高)，按用户敲定的画幅覆写尺寸节点（竖屏 9:16 落地）。
+        facts:      可选「生产事实登记上下文」``{"project","episode","shot_key",...}``
+                    （见 app/production_recording.py）。**只有调用方真的知道
+                    project/episode/shot_key 时才登记** —— 本方法自己不知道这三个
+                    身份（它只看得到 filename_prefix），猜一个比不登记更糟：
+                    界面会显示一条来路不明的意图，比空列表更难排查。
         """
         wf_name = WORKFLOW_TEMPLATE["storyboard_gen"]
         api_prompt, _meta = self.load_workflow(wf_name, return_meta=True)
@@ -3321,6 +3407,14 @@ class ComfyUIClient:
         prompt_id = self.queue_prompt(api_prompt)
         history = self.wait_for_completion(prompt_id, timeout=timeout)
         files = self.get_output_files(history, ".png")
+        # 版本化生产事实登记（2026-10-07）：分镜图的**唯一**登记接缝 ——
+        # 产物路径在这里才第一次确凿存在。一次调用登记本镜全部候选，
+        # 不散落进 QC 重试循环（重试会再次走到这里，适配层按内容指纹去重）。
+        self._record_production_facts(
+            facts, kind="image", prompt_zh=prompt_zh, artifacts=files,
+            seed=seed, ref_images=uploaded,
+            filename_prefix=filename_prefix, workflow_version=wf_name,
+            api_prompt=api_prompt, source="storyboard")
         return {"prompt_id": prompt_id, "files": files, "history": history,
                 "refs_used": uploaded, "prompt_node": node_id, "seed": seed,
                 "slot_duplicates": slot_duplicates, "slot_cleared": slot_cleared,
@@ -3354,6 +3448,7 @@ class ComfyUIClient:
         common_prompt: str = None,
         build_only: bool = False,
         save_build_to: str = None,
+        facts: dict = None,
     ) -> dict:
         """H3 整集视频生成（N 段一个工作流，原生 H3ContinuousSeamlessJoinV14 衔接）
         + 整片 QC 门控。
@@ -3432,6 +3527,10 @@ class ComfyUIClient:
                     common_refs=common_refs,
                     common_ref_audios=common_ref_audios,
                     common_prompt=common_prompt,
+                    # 事实上下文只在整集入口收一次，逐次重试**不重新收集**：
+                    # 登记发生在 generate_h3_sequence 内部（产物落盘那一刻），
+                    # 每次重试自然成为同一条意图下的又一个候选（决策 1）。
+                    facts=facts,
                 )
             except RuntimeError as e:
                 # S12：确定性输入错误（如某段无可用参考图被拒绝提交）——
@@ -3551,7 +3650,8 @@ class ComfyUIClient:
                              audio_mode: str = None,
                              common_refs: List[str] = None,
                              common_ref_audios: List[str] = None,
-                             common_prompt: str = None) -> dict:
+                             common_prompt: str = None,
+                             facts: dict = None) -> dict:
         """H3 多段一次生成：**工作流段数 = len(segments)**，一个分镜对应一段。
 
         两条实现路径（按**模板结构**自动分流，见 `_use_director_builder`）：
@@ -3595,7 +3695,7 @@ class ComfyUIClient:
                 seg_audios=seg_audios, audio_mode=audio_mode,
                 common_refs=common_refs,
                 common_ref_audios=common_ref_audios,
-                common_prompt=common_prompt)
+                common_prompt=common_prompt, facts=facts)
 
         if common_refs:
             # 旧连续拼接路径按段重建子图、没有「公共参数」概念（global.refs 零引用）。
@@ -3730,6 +3830,16 @@ class ComfyUIClient:
         if resumed:
             logger.info("H3(旧连续拼接路径) 本次为**免重渲复用**（未消耗 GPU）")
         files = self.get_output_files(history, ".mp4")
+
+        # 版本化生产事实登记（2026-10-07）：旧连续拼接路径的成片登记接缝。
+        # 决策 2：整集级 H3 **一条意图一集**，不编造 shot 身份。
+        self._record_production_facts(
+            facts, kind="video",
+            prompt_zh="\n".join(str(s.get("prompt") or "") for s in segs),
+            artifacts=files, seed=seed,
+            ref_images=[r for s in segs for r in (s.get("reference_images") or [])],
+            filename_prefix=filename_prefix, workflow_version=tpl_name,
+            api_prompt=api_prompt, source="h3_episode_legacy")
 
         audio_check = []
         if files:
@@ -3984,7 +4094,8 @@ class ComfyUIClient:
         audio_mode: str = None,
         common_refs: Optional[List[str]] = None,
         common_ref_audios: Optional[List[str]] = None,
-        common_prompt: Optional[str] = None) -> dict:
+        common_prompt: Optional[str] = None,
+        facts: dict = None) -> dict:
         """Director 路径实现：一条 ``timeline_data`` 承载 N 段，返回结构对齐旧路径。
 
         与旧连续拼接路径的**语义差异（务必知道）**：
@@ -4325,6 +4436,18 @@ class ComfyUIClient:
         if resumed:
             logger.info("H3(Director) 本次为**免重渲复用**（未消耗 GPU）")
         files = self.get_output_files(history, ".mp4")
+
+        # 版本化生产事实登记（2026-10-07）：Director 路径的成片登记接缝。
+        # 决策 2：整集级 H3 **一条意图一集**，不编造 shot 身份；
+        # ``resumed=True``（崩溃免重渲）时产物文件依然在磁盘上，照常登记为候选。
+        self._record_production_facts(
+            facts, kind="video",
+            prompt_zh="\n".join(str(s.get("prompt") or "") for s in segs),
+            artifacts=files, seed=seed,
+            ref_images=[r for s in segs for r in (s.get("reference_images") or [])],
+            filename_prefix=filename_prefix, workflow_version=tpl_name,
+            api_prompt=api_prompt, source="h3_episode_director",
+            resumed=bool(resumed))
 
         audio_check = []
         if files:

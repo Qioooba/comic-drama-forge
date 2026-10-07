@@ -23,7 +23,7 @@ export {
 
 /** 契约版本与规格摘要 —— 前端启动闸门拿它判断客户端是否过期 */
 export const CONTRACT_VERSION = '2026-10-07.2';
-export const SPEC_HASH = '4c0774a9aeeb4d02b3b575f8feaab6e81de804aedc0785a44a1d846a45e6c2b9';
+export const SPEC_HASH = '5ba89a7f699ae804bf261fe4fa35aa2a1d52d03d80caefe02de799d97406048c';
 
 /** 生成物内可用的类型名（供泛型标注与测试引用） */
 export type GeneratedTypeName =
@@ -85,6 +85,8 @@ export type GeneratedTypeName =
   | 'PendingUnitListResponse'
   | 'PreflightReport'
   | 'PreflightResponse'
+  | 'RecordingFailure'
+  | 'RecordingFailureListResponse'
   | 'RegisterMediaRequest'
   | 'ReleaseCheckRequest'
   | 'ReleaseCheckResponse'
@@ -97,6 +99,8 @@ export type GeneratedTypeName =
   | 'RevokeApprovalRequest'
   | 'RevokeDeliveryApprovalRequest'
   | 'SelectMediaRequest'
+  | 'ShotGenerationStatus'
+  | 'ShotGenerationStatusResponse'
   | 'StyleEntry'
   | 'StyleListResponse'
   | 'StyleResolveResponse'
