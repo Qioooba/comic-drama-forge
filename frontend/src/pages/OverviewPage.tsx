@@ -19,7 +19,7 @@ const STAT_TONE: Record<string, string> = {
   amber: 'bg-warning-subtle text-warning-strong',
   yellow: 'bg-warning-subtle text-warning-strong',
   red: 'bg-danger-subtle text-danger-strong',
-  purple: 'bg-brand-subtle text-brand',
+  purple: 'bg-brand-subtle text-brand-hover',
 };
 
 /** 任务类型 → 图标（此前是 emoji，与线性图标集观感割裂） */
@@ -159,7 +159,7 @@ export function OverviewPage() {
               <Link
                 key={proj.id}
                 to={workbenchPath(proj.dir_key || proj.id)}
-                className="block p-4 border border-line rounded-lg hover:border-brand transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 focus-visible:ring-offset-2"
+                className="block p-4 border border-line rounded-lg hover:border-brand transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 focus-visible:ring-offset-2 focus-visible:ring-offset-canvas"
               >
                 <div className="flex items-start justify-between mb-2">
                   <h4 className="font-medium text-ink-1">{proj.name}</h4>

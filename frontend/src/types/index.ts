@@ -125,14 +125,33 @@ export interface Character {
  * 产物目录 output/assets/characters/<项目>/<角色名>/outfits/<outfit_key>/，
  * 内部布局与主设定目录一致（base.png + 切分档位图）。
  */
+export interface CharacterAssetCompleteness {
+  sheet_ready: boolean;
+  identity_ready: boolean;
+  body_ready: boolean;
+  framing_ready: boolean;
+  outfit_ready?: boolean;
+  complete: boolean;
+  ready: boolean;
+  missing: string[];
+  anchors: Record<string, string>;
+  sources?: Record<string, string>;
+  legacy_sheet_fallback?: boolean;
+  status?: string;
+  strict_error?: string;
+}
+
 export interface CharacterOutfit {
   outfit_key: string;
   /** 服装描述（outfit.json 档案优先，回落 meta sidecar 提示词里的服装段） */
   desc: string;
   /** base.png 已就绪且非空 */
   ready: boolean;
-  /** 各切分档位是否已生成（与主设定目录同名的 sheet_split 产物） */
+  /** 旧切分档位（保留兼容，不再代表生产资产全集） */
   views: { front: boolean; left: boolean; back: boolean; half: boolean };
+  sheet?: string;
+  anchors?: Record<string, string>;
+  completeness?: CharacterAssetCompleteness;
 }
 
 export interface CharacterOutfitsResponse {
@@ -615,6 +634,18 @@ export interface QCResponse {
     failed: number;
     retry_count: number;
   };
+}
+
+/** POST /api/qc/config 的响应。`config` 是保存**后**的真实值，页面据此刷新草稿。
+ *  `warning` / `vision_warning`：开关开了但接口不全 / 视觉自检未过 —— 此时生成流程会
+ *  **静默跳过**质检，必须原样透出，否则又是一个「以为在质检其实没检」。 */
+export interface QCConfigSaveResponse {
+  success: boolean;
+  config: QCConfig;
+  config_path?: string;
+  message?: string;
+  warning?: string;
+  vision_warning?: string;
 }
 
 // --- Episodes ---

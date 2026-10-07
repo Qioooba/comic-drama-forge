@@ -19,6 +19,7 @@
 
 import logging
 import os
+import re
 import sys
 import time
 
@@ -72,7 +73,18 @@ _MAX_SCAN_BYTES = 8 * 1024 * 1024
 # since 增量读取的单次上限
 _MAX_FOLLOW_BYTES = 1024 * 1024
 
-LEVELS = ("ERROR", "WARNING", "INFO", "DEBUG")
+LEVELS = ("CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG")
+
+# 2026-10-07：统一格式由 log_setup 定死，时间戳后紧跟 `[级别]`：
+#   2026-10-07 14:05:37.123 [ERROR] serve | serve.py:390 | MainThread | 启动被拦截
+# 只在前 64 字符内找方括号级别，避免把消息正文里的 "[ERROR]" 误判成级别。
+_BRACKET_LEVEL_RE = re.compile(
+    r"\[(CRITICAL|FATAL|ERROR|WARNING|WARN|INFO|DEBUG)\]", re.IGNORECASE)
+# 级别归一：WARN→WARNING、FATAL→CRITICAL（前端徽标只认 LEVELS 里的名字）
+_LEVEL_ALIAS = {"WARN": "WARNING", "FATAL": "CRITICAL"}
+
+# 级别只可能在行首附近（新格式 25 字符 / 旧格式 8 字符）
+_LEVEL_SCAN_WINDOW = 64
 
 __all__ = ["LOG_SOURCES", "tail_lines", "available_sources", "DEFAULT_SOURCE",
            "DEFAULT_TAIL", "MAX_TAIL", "LEVELS"]
@@ -173,12 +185,25 @@ def _read_since_bytes(path, since):
 
 
 def _level_of(line):
-    """从 logging 默认格式（如 ``INFO:app:...``）里取级别；无法识别时返回 None。"""
-    head = line.split(":", 1)[0].strip().upper()
-    if head in LEVELS:
-        return head
+    """从日志行里取级别；无法识别时返回 None。
+
+    依次尝试三种形态（2026-10-07 随统一日志格式扩展）：
+      1. **新格式** ``<时间戳> [ERROR] ...`` —— 在行首窗口内取方括号里的级别，
+         这是确定性解析，不再靠「正文里有没有 ERROR 字样」碰运气；
+      2. **旧格式** ``INFO:app:...``（``%(levelname)s:%(name)s:%(message)s``）——
+         历史日志文件仍有大量这种行，必须继续认；
+      3. 兜底：在行首窗口内找任一级别词（裸 print、Flask 启动横幅等无级别行）。
+    """
+    head = line[:_LEVEL_SCAN_WINDOW]
+    m = _BRACKET_LEVEL_RE.search(head)
+    if m:
+        lv = m.group(1).upper()
+        return _LEVEL_ALIAS.get(lv, lv)
+    first = head.split(":", 1)[0].strip().upper()
+    if first in LEVELS:
+        return first
     for lv in LEVELS:
-        if lv in line[:64]:
+        if lv in head:
             return lv
     return None
 
@@ -213,7 +238,8 @@ def tail_lines(source=DEFAULT_SOURCE, tail=DEFAULT_TAIL, since=0,
         tail:   最多返回多少行（上限 MAX_TAIL）；since>0 时该值用于限制增量行数；
         since:  >0 时只返回该字节偏移之后的新内容，并返回新的 offset；
         query:  关键字过滤（大小写不敏感）；
-        level:  ERROR / WARNING / INFO / DEBUG 之一，仅保留该级别。
+        level:  CRITICAL / ERROR / WARNING / INFO / DEBUG 之一，仅保留该级别
+                （ERROR 视图连带 CRITICAL，且**带上该行的 traceback 续行**）。
 
     返回的 dict 里 ``lines`` 已是纯文本列表（已按实际编码解码）。
     """
@@ -259,18 +285,29 @@ def tail_lines(source=DEFAULT_SOURCE, tail=DEFAULT_TAIL, since=0,
     wanted = level.strip().upper() or ""
     kw = (query or "").strip().lower()
     filtered = []
+    # 2026-10-07：按级别过滤时必须**带上续行**。ERROR 的 traceback、以及多行消息的
+    # 后续行都没有级别前缀（`_level_of` 返回 None）；原实现遇到「无级别」就一律
+    # 丢弃，于是「只看 ERROR」里只剩光秃秃一行「xxx 失败：{e}」——堆栈全没了，
+    # 恰好把「报错要详细」的意义抵消掉。改成：命中 wanted 的行之后的连续无级别行
+    # 一并保留。级别计数 counts 只算真带级别的行，续行不重复计数。
+    cont = False
     for ln in lines:
         lv = _level_of(ln)
         if lv:
             counts[lv] = counts.get(lv, 0) + 1
         if wanted:
-            # 指定了级别：无级别行（如 python -u 的裸 print）一律排除，
-            # 否则「只看 ERROR」里会混进一堆无法归类的裸输出。
-            if lv != wanted:
-                continue
-        if kw and kw not in ln.lower():
-            continue
-        filtered.append(ln)
+            if lv:
+                # ERROR 视图连带展示 CRITICAL（CRITICAL 是 ERROR 的子集，分开看反而漏）
+                cont = lv == wanted or (wanted == "ERROR" and lv == "CRITICAL")
+                keep = cont
+            else:
+                keep = cont
+        else:
+            keep = True
+        if keep and kw and kw not in ln.lower():
+            keep = False
+        if keep:
+            filtered.append(ln)
 
     if len(filtered) > tail:
         filtered = filtered[-tail:]

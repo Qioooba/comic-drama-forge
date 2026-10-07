@@ -273,8 +273,8 @@ export function AudioTab({ projectKey }: AudioTabProps) {
               onClick={() => setActiveStep(step.id as 1 | 2 | 3)}
               className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 focus-visible:ring-offset-2 focus-visible:ring-offset-canvas ${
                 activeStep === step.id
-                  ? 'bg-brand text-white shadow-lg'
-                  : 'bg-surface-2 text-ink-2 hover:bg-line'
+                  ? 'bg-brand text-on-brand shadow-lg'
+                  : 'bg-surface-2 text-ink-2 hover:bg-line active:opacity-90'
               }`}
             >
               <span>{step.icon}</span>
@@ -388,7 +388,11 @@ export function AudioTab({ projectKey }: AudioTabProps) {
                 <Button
                   onClick={handleGenerateTTS}
                   disabled={ttsGenerating || !ttsEnv?.available}
-                  className="w-full bg-success py-3 text-white hover:bg-success-strong"
+                  // 白字压 emerald-500 只有 2.54:1 —— emerald 是浅色相，实底上
+                  // 必须用深墨字（--on-success，6.90:1）。hover 不再换底色
+                  // （原先转 --success-strong 会变成更浅的薄荷绿，文字直接消失），
+                  // 改用 brightness 微调。
+                  className="w-full bg-success py-3 text-on-success hover:brightness-110"
                 >
                   {ttsGenerating ? t('common.generating') : t('tts.generate')}
                 </Button>
@@ -532,8 +536,8 @@ export function AudioTab({ projectKey }: AudioTabProps) {
                     onClick={() => setQcSource(s.id)}
                     className={`px-3 py-1.5 rounded text-sm border transition focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 focus-visible:ring-offset-2 focus-visible:ring-offset-canvas ${
                       qcSource === s.id
-                        ? 'bg-brand text-white border-brand'
-                        : 'bg-surface text-ink-2 border-line hover:border-brand'
+                        ? 'bg-brand text-on-brand border-brand'
+                        : 'bg-surface text-ink-2 border-line hover:border-brand active:opacity-90'
                     }`}
                   >
                     {s.label}
@@ -709,7 +713,7 @@ export function AudioTab({ projectKey }: AudioTabProps) {
                   </div>
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
                     {qcResult.visuals.map((src: string, i: number) => (
-                      <div key={i} className="bg-black/5 rounded p-1">
+                      <div key={i} className="bg-surface-2 rounded p-1">
                         <img src={src} alt={i === 0 ? t('audio.spectrogram') : t('audio.waveform')} className="w-full rounded" />
                       </div>
                     ))}
@@ -748,7 +752,7 @@ export function AudioTab({ projectKey }: AudioTabProps) {
                       {p.visuals && p.visuals.length > 0 && (
                         <div className="mt-2 grid grid-cols-2 gap-2">
                           {p.visuals.map((src: string, k: number) => (
-                            <img key={k} src={src} alt={t('audio.qcImage')} className="w-full rounded bg-black/5" />
+                            <img key={k} src={src} alt={t('audio.qcImage')} className="w-full rounded bg-surface-2" />
                           ))}
                         </div>
                       )}

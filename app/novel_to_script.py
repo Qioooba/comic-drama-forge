@@ -22,7 +22,8 @@ import re
 import time
 from datetime import datetime
 
-from llm_client import LLMError, LLMTruncatedError, LLMGatewayUnavailable
+from llm_client import (LLMError, LLMTruncatedError, LLMGatewayUnavailable,
+                       model_max_output, model_spec)
 from dialogue_utils import (dialogue_text as _dlg_text, normalize_lines as _dlg_lines,
                             extract_quoted_dialogue as _extract_quoted_dialogue,
                             split_quoted_dialogue as _split_quoted_dialogue,
@@ -1112,12 +1113,26 @@ def build_shots_for_chunk(client, bible: dict, outline: dict, chunk: dict, shots
         # 在本任务的思考量实测 ≈16K token（见 llm_client.REASONING_ONLY_TOKEN_FLOOR 注释）。
         # 此前按 shots_target*300+1200 给（12 镜 → 4800），低于思考水位 → 正文恒为空，
         # 表现为「模型只吐思考内容」并把整集卡死。这里按「思考预留 + 每镜正文」给足。
-        _budget = SHOTS_THINKING_RESERVE + int(shots_target) * SHOTS_TOKENS_PER_SHOT
+        # ⚠️ 2026-10-07：额度上限改为**按模型取**（llm_client.MODEL_SPECS）。
+        # 原来这里写死「min(24000, 预算)」+ 阶梯顶到 32768，是照着 agnes/GLM 标的；
+        # mimo-v2.6-* 官方能吃 131072，被按 32768 封顶后提额自救直接撞墙
+        # （现场：32768 仍只吐思考 → 分镜整步失败）。
+        _model = getattr(client, "model", "") or ""
+        _ceiling = model_max_output(_model)
+        # 思考预留同样按模型取：只有 MODEL_SPECS 里**实测过**水位的模型才用自己的值
+        # （GLM/agnes ≈16K）；没实测过的回落到 SHOTS_THINKING_RESERVE，与改动前一致，
+        # 不拿猜的数字替它多要额度。
+        _floor = model_spec(_model).get("thinking_floor") or SHOTS_THINKING_RESERVE
+        _budget = int(_floor) + int(shots_target) * SHOTS_TOKENS_PER_SHOT
         data = _robust_json(client, prompt, system=SYSTEM_BIBLE, temperature=0.6,
-                            max_tokens=max(8192, min(24000, _budget)),
+                            # min 里多带一个 _ceiling：万一日后换成上限更小的模型，
+                            # 首次请求也不会超过它能接受的长度。
+                            max_tokens=max(8192, min(_ceiling, 24000, _budget)),
                             events=events, label=label,
                             max_attempts=4,
-                            token_ladder=(16384, 24576, 32768))
+                            # 阶梯补到 65536，让「截断 → 提额」在 MiMo 上能爬满 131072；
+                            # 超出部分由 chat_json_robust 里的 min(t, ceiling) 兜住。
+                            token_ladder=(16384, 24576, 32768, 65536))
     except (LLMTruncatedError, LLMError) as _e:
         # ⚠️ 不只截断要二分：**超时/网关故障也要**。
         # 实测坑：一次要 49 镜 → 网关 ReadTimeout 1200s，抛的是 LLMError（非截断）

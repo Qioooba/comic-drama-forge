@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import logging
+import log_setup  # 统一日志（时间戳/行号/线程/ERROR 带堆栈）
 import shutil
 import time
 from pathlib import Path
@@ -14,7 +15,7 @@ import json
 from config import COMFYUI_URL, PROJECT_OUTPUT_DIR, VIDEOS_DIR, FINAL_DIR
 import subtitle_track  # 字幕轨单一事实源（2026-10-07：与 pipeline.step_final 共用）
 
-logging.basicConfig(level=logging.INFO)
+log_setup.setup_logging()
 logger = logging.getLogger(__name__)
 
 # ===================== 集号 / 片段目录（审计 S4：与 app._ep_dir 同口径） =====================

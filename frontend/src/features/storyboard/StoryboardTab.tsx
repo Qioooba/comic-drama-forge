@@ -64,12 +64,12 @@ function EpisodeSwitcher({
               key={e.episode_no}
               onClick={() => onChange(e.episode_no)}
               title={`${e.episode_title || e.title || ''}${e.chapter_index ? ` · ${t('sb.chapterN', { n: e.chapter_index })}` : ''}`}
-              className={`px-2.5 py-1 rounded-md text-xs transition-colors ${FOCUS_RING} ${
-                active ? 'bg-brand text-white shadow' : 'bg-surface text-ink-2 hover:bg-line hover:text-ink-1 border border-line'
+              className={`px-2.5 py-1 rounded-md text-xs transition-colors active:opacity-90 ${FOCUS_RING} ${
+                active ? 'bg-brand text-on-brand shadow' : 'bg-surface text-ink-2 hover:bg-line hover:text-ink-1 border border-line'
               }`}
             >
               {t('sb.episodeN', { n: e.episode_no })}
-              <span className={active ? ' text-white/80' : ' text-ink-3'}>{` · ${shots}`}</span>
+              <span className={active ? ' text-on-brand/80' : ' text-ink-3'}>{` · ${shots}`}</span>
             </button>
           );
         })}
@@ -92,6 +92,7 @@ function EpisodeSwitcher({
 function ShotPromptEditor({ shot, novelId, episodeNo, onSaved }: {
   shot: any; novelId?: string; episodeNo: number; onSaved: () => void;
 }) {
+  const { t } = useApp();
   const [editing, setEditing] = useState(false);
   const [desc, setDesc] = useState(shot.description || '');
   const [motion, setMotion] = useState(shot.motion || '');
@@ -152,11 +153,11 @@ function ShotPromptEditor({ shot, novelId, episodeNo, onSaved }: {
         }
       );
       const d = await r.json();
-      if (!d.success) throw new Error(d.error || '保存失败');
-      toast.success(`镜头 ${shot.shot_id} 提示词已保存`);
+      if (!d.success) throw new Error(d.error || t('sb.saveFailed'));
+      toast.success(t('sb.promptSaved', { seq: shot.shot_id }));
       onSaved();
     } catch (e: any) {
-      toast.error(e.message || '保存失败');
+      toast.error(e.message || t('sb.saveFailed'));
     } finally {
       setSaving(false);
     }
@@ -178,12 +179,12 @@ function ShotPromptEditor({ shot, novelId, episodeNo, onSaved }: {
       if (d.task_id) {
         setLive(null);
         startPoll(d.task_id);
-        toast.info(`分镜 ${shot.shot_id} 重新生成任务已启动（提示词随质检实时刷新）`);
+        toast.info(t('sb.regenStarted', { seq: shot.shot_id }));
       } else {
-        throw new Error(d.error || '启动失败');
+        throw new Error(d.error || t('sb.startFailed'));
       }
     } catch (e: any) {
-      toast.error(e.message || '重新生成失败');
+      toast.error(e.message || t('sb.regenFailed'));
     } finally {
       setRegenerating(false);
     }
@@ -195,8 +196,13 @@ function ShotPromptEditor({ shot, novelId, episodeNo, onSaved }: {
       <div className="flex items-center gap-2 text-xs">
         <span className={`font-medium ${live.done ? 'text-success' : 'text-brand'}`}>
           {live.done
-            ? '定稿提示词（本轮出图实际使用）'
-            : `QC 实时改写 · 第 ${(live.attempt ?? 0) + 1} 次尝试 · ${live.phase === 'regenerating' ? '改写后重新生成中' : live.phase === 'checking' ? '质检判定中' : '生成中'}`}
+            ? t('sb.finalPrompt')
+            : t('sb.qcLive', {
+              n: (live.attempt ?? 0) + 1,
+              phase: live.phase === 'regenerating' ? t('sb.phaseRegenerating')
+                : live.phase === 'checking' ? t('sb.phaseChecking')
+                  : t('sb.generating'),
+            })}
         </span>
         {!live.done && <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-brand" />}
       </div>
@@ -210,10 +216,10 @@ function ShotPromptEditor({ shot, novelId, episodeNo, onSaved }: {
         <div className="flex items-start gap-2">
           <p className="text-sm text-ink-1 flex-1">{shot.description}</p>
           <button
-            className="text-xs text-brand hover:underline shrink-0 cursor-pointer"
+            className="text-xs text-brand hover:underline active:opacity-90 shrink-0 cursor-pointer"
             onClick={() => { setDesc(shot.description || ''); setMotion(shot.motion || ''); setEditing(true); }}
           >
-            编辑
+            {t('sb.edit')}
           </button>
         </div>
         {shot.motion && <p className="text-xs text-ink-3 ml-2">{shot.motion}</p>}
@@ -224,31 +230,31 @@ function ShotPromptEditor({ shot, novelId, episodeNo, onSaved }: {
 
   return (
     <div className="mt-2 bg-surface rounded border border-line p-3 space-y-2">
-      <label className="text-xs font-medium text-ink-2 block">镜头描述（提示词）</label>
+      <label className="text-xs font-medium text-ink-2 block">{t('sb.descLabel')}</label>
       <textarea
         value={desc}
         onChange={(e) => setDesc(e.target.value)}
         rows={2}
         className="w-full text-sm bg-surface border border-line rounded p-2 text-ink-1 resize-y"
-        placeholder="中近景（腰部以上取景），赵天霸右手食指伸出指向右前方…"
+        placeholder={t('sb.descPlaceholder')}
       />
-      <label className="text-xs font-medium text-ink-2 block">画面内动作（motion）</label>
+      <label className="text-xs font-medium text-ink-2 block">{t('sb.motionLabel')}</label>
       <textarea
         value={motion}
         onChange={(e) => setMotion(e.target.value)}
         rows={2}
         className="w-full text-sm bg-surface border border-line rounded p-2 text-ink-1 resize-y"
-        placeholder="【摄影机】无；【画面内】赵天霸右手食指前伸，左手丹丸位于胸前"
+        placeholder={t('sb.motionPlaceholder')}
       />
       {livePanel}
       <div className="flex items-center gap-2">
         <Button size="sm" onClick={save} disabled={saving || !desc.trim()}>
-          {saving ? '保存中…' : '保存提示词'}
+          {saving ? t('common.saving') : t('sb.savePrompt')}
         </Button>
         <Button size="sm" variant="secondary" onClick={regenerate} disabled={regenerating || !desc.trim()}>
-          {regenerating ? '生成中…' : '重新生成分镜'}
+          {regenerating ? t('common.generating') : t('sb.regenStoryboard')}
         </Button>
-        <button className="text-xs text-ink-3 hover:text-ink-1 cursor-pointer" onClick={() => setEditing(false)}>取消</button>
+        <Button variant="ghost" size="sm" onClick={() => setEditing(false)}>{t('common.cancel')}</Button>
       </div>
     </div>
   );
@@ -290,9 +296,9 @@ function StoryboardHubTab({ projectKey, novelId }: { projectKey: string; novelId
             key={s.id}
             onClick={() => setSub(s.id)}
             title={s.hint}
-            className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm transition-colors ${FOCUS_RING} ${
+            className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm transition-colors active:opacity-90 ${FOCUS_RING} ${
               sub === s.id
-                ? 'bg-brand text-white shadow'
+                ? 'bg-brand text-on-brand shadow'
                 : 'bg-surface-2 text-ink-2 hover:bg-line hover:text-ink-1'
             }`}
           >
@@ -378,7 +384,12 @@ function KeyframesTab({ projectKey, episodeNo }: { projectKey: string; episodeNo
     <div className="space-y-6">
       <div className="flex justify-between items-center">
         <h3 className="text-lg font-semibold">{t('keyframes.title')}</h3>
-        <Button size="sm" onClick={fetchPlan} disabled={loading}>{t('common.refresh')}</Button>
+        {/* ⚠️ variant="secondary" 不是可选装饰：Button 的 primary 是**品牌色实心主 CTA**，
+            不传 variant 就落进默认 primary。此前这里（和下方分镜画布那处）漏传，
+            「刷新」这种纯只读动作穿上了全屏最重的实心底色，和旁边的生成动作同形，
+            整行失去主次。全站其余 5 处刷新（QcTab / UpscaleTab / OutputReviewTab /
+            MemoryPage）都是 secondary —— 此处是漏写，按同一约定补齐。 */}
+        <Button size="sm" variant="secondary" onClick={fetchPlan} disabled={loading}>{t('common.refresh')}</Button>
       </div>
 
       {/* stale 标识（MASTER invariant 9 + ADR-0010）：keepPreviousData 期间屏幕上
@@ -441,7 +452,10 @@ function KeyframesTab({ projectKey, episodeNo }: { projectKey: string; episodeNo
           // stale 期间禁用：MASTER invariant 6（disabled 必须配相邻原因）
           disabled={generating || isStale}
           title={isStale ? '正在切换到本集数据，暂不能生成' : undefined}
-          className="w-full bg-warning hover:bg-warning-strong"
+          // ⚠️ 文字色必须覆盖 Button 基带的 text-on-brand：白字压 amber-500 只有
+          //    1.80:1。amber 是浅色相，实底上要用深墨字（--on-warning，8.61:1）。
+          //    hover 同理不能转 --warning-strong（更浅的白），改用亮度微调。
+          className="w-full bg-warning text-on-warning hover:bg-warning hover:brightness-105"
         >
           {generating ? t('common.generating') : t('keyframes.generate')}
         </Button>
@@ -889,9 +903,18 @@ function StoryboardTab({ projectKey, episodeNo, novelId }: { projectKey: string;
 
   return (
     <div className="space-y-6">
-      <div className="flex justify-between items-center">
-        <h3 className="text-lg font-semibold">{t('wb.storyboardHub')}</h3>
-        <div className="flex items-center gap-2">
+      {/* 工具栏换行策略：本 Tab 所在左列是 `flex-1 min-w-0`，右侧常驻聊天面板固定 340px
+          （可拖宽），<lg 时左列只剩 ~311px。原先标题与控件行都**不换行**，5 个控件
+          （含一个 w-40 的 select）必然被压扁、文字截断。两处都补 flex-wrap，
+          控件组 ml-auto 让折行后仍靠右，与宽屏下的工具栏位置一致。 */}
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h3 className="text-lg font-semibold min-w-0">{t('wb.storyboardHub')}</h3>
+        <div className="flex flex-wrap items-center gap-2 ml-auto">
+          {/* 本行唯一的实心主 CTA（Button 规范：primary/brand 一屏唯一）。
+              「生成视频」是整集出片的第二步，与「批量重生成」（部分返工）同级用
+              secondary —— 它原先用 className 手搓了 bg-brand/text-on-brand 硬凑品牌色，
+              与本按钮同形，整行三个实心按钮（生成分镜 / 生成视频 / 刷新）互相抢主次。
+              要改层级请改 variant，不要再往 className 里塞颜色。 */}
           <Button
             size="sm"
             variant="brand"
@@ -905,20 +928,30 @@ function StoryboardTab({ projectKey, episodeNo, novelId }: { projectKey: string;
           >
             {generateAllBusy ? t('common.generating') : t('sb.generateAll')}
           </Button>
-          {/* 视频生成方式（项目级）：默认取「新建项目」时选的值，这里可改并即刻落盘 */}
+          {/* 视频生成方式（项目级）：默认取「新建项目」时选的值，这里可改并即刻落盘。
+              ⚠️ 它是配置项而非动作，不套 Button 的视觉层级；aria-label 补无障碍名
+              （工具栏里没有 FieldLabel 的竖排 label 兜底）。w-40 是让「整集一次生成」
+              这类长文案不截断的下限，别再往下压。
+              ⚠️⚠️ 这里**必须**写 `!w-40` 而不是 `w-40`：Select 的基线 FIELD_BASE 里
+              带了 `w-full`，而 Tailwind 产物里 `.w-40` 排在 `.w-full` **之前**
+              （同特异性下后者胜），class 属性里的书写顺序不参与优先级计算。
+              写成 `w-40` 会被静默吞掉 → select 变成 width:100% → 控件组 min-content
+              撑爆 → 外层 flex-wrap 把整组控件折到第二行，「生成本集全部分镜」独占一行、
+              select 横贯整行、其余按钮被推到右下角。1920×1080 下必现。 */}
           <Select
             value={projectVideoMode}
             onChange={handleProjectVideoModeChange}
             options={PROJECT_VIDEO_MODE_OPTIONS.map(o => ({ value: o.value, label: t(o.labelKey) }))}
             disabled={loading || episodeGenerating}
-            className="w-40"
+            aria-label={t('project.videoMode')}
+            className="!w-40 shrink-0"
           />
           <Button
             size="sm"
+            variant="secondary"
             onClick={handleGenerateEpisode}
             disabled={loading || episodeGenerating || isCanvasStale || episodeNo == null}
             title={episodeNo == null ? t('sb.generateVideoNoEpisode') : isCanvasStale ? '正在切换到本集数据，暂不能生成' : undefined}
-            className="bg-brand hover:bg-brand-strong"
           >
             {episodeGenerating ? t('common.generating') : t('sb.generateVideo')}
           </Button>
@@ -938,7 +971,8 @@ function StoryboardTab({ projectKey, episodeNo, novelId }: { projectKey: string;
           >
             {batchRunning ? t('video.batchRetry.running') : t('video.batchRetry.button')}
           </Button>
-          <Button size="sm" onClick={fetchCanvas} disabled={loading}>{t('common.refresh')}</Button>
+          {/* 同上：只读动作必须是 secondary，不能落进默认 primary 的品牌色实底 */}
+          <Button size="sm" variant="secondary" onClick={fetchCanvas} disabled={loading}>{t('common.refresh')}</Button>
         </div>
       </div>
 
@@ -1107,7 +1141,7 @@ function StoryboardTab({ projectKey, episodeNo, novelId }: { projectKey: string;
                         alt={t('sb.imageAlt', { seq: card.seq })}
                         className="w-full h-full object-cover"
                       />
-                      <span className="absolute inset-x-0 bottom-0 bg-brand/85 text-white text-[10px] leading-4 text-center">
+                      <span className="absolute inset-x-0 bottom-0 bg-brand/85 text-on-brand text-[10px] leading-4 text-center">
                         {t('sb.generating')}
                       </span>
                     </div>
@@ -1289,7 +1323,7 @@ function StoryboardTab({ projectKey, episodeNo, novelId }: { projectKey: string;
                   aria-pressed={gridCell === n}
                   title={t('sb.grid.cellN', { n })}
                   onClick={() => setGridCell(n)}
-                  className={`relative cursor-pointer transition-colors ${FOCUS_RING} ${
+                  className={`relative cursor-pointer transition-colors active:opacity-90 ${FOCUS_RING} ${
                     gridCell === n
                       ? 'border-2 border-brand bg-brand/25'
                       : 'border border-transparent hover:border-brand/70 hover:bg-brand/10'
@@ -1297,7 +1331,7 @@ function StoryboardTab({ projectKey, episodeNo, novelId }: { projectKey: string;
                 >
                   <span
                     className={`absolute left-1 top-1 rounded px-1.5 py-0.5 text-[10px] font-medium ${
-                      gridCell === n ? 'bg-brand text-white' : 'bg-slate-900/70 text-white'
+                      gridCell === n ? 'bg-brand text-on-brand' : 'bg-slate-900/70 text-white'
                     }`}
                   >
                     {n}

@@ -5,14 +5,20 @@ services:
     build: .
     container_name: comic-drama-app
     # B-24 F-08：端口只绑 127.0.0.1（localhost-only），避免暴露到所有网卡
+    # 端口默认值见 app/ports.py（2026-10-07 由 5000 改为 45871）。
+    # 容器内监听端口由下面的 APP_PORT 决定：Dockerfile 是 CMD python app/serve.py，
+    # 而 .env 被 .dockerignore 排除、不会进镜像，所以这里必须显式声明 APP_PORT，
+    # 且与端口映射的容器侧一致，否则映射的是 45871→5000 而应用听在 45871，直接连不上。
     ports:
-      - "127.0.0.1:5000:5000"
+      - "127.0.0.1:45871:45871"
     volumes:
       - ./output:/app/output
       - ./novels:/app/novels
       - ./app/config:/app/app/config
     environment:
       - FLASK_ENV=production
+      - APP_HOST=127.0.0.1
+      - APP_PORT=45871
       - COMFYUI_URL=http://host.docker.internal:8188
     # 审计 P2-27（2026-09-29）：Linux 宿主机上 host.docker.internal 默认不存在，
     # 必须指向宿主网关（Win/Mac Docker Desktop 内置该名称，此行无副作用）
@@ -20,7 +26,7 @@ services:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5000/"]
+      test: ["CMD", "curl", "-f", "http://localhost:45871/"]
       interval: 30s
       timeout: 10s
       retries: 3

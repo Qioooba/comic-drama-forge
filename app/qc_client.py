@@ -808,6 +808,36 @@ CONFIG_KEYS = (
     "vision_status", "vision_checked_at", "vision_error", "vision_endpoint_key",
 )
 
+#: `save_config` 认得的请求体键。`_probe_vision` 不在 CONFIG_KEYS 里，但被
+#: `_save_config_impl` 单独读（强制视觉自检），故一并放行。
+ACCEPTED_PATCH_KEYS = frozenset(CONFIG_KEYS) | {"_probe_vision"}
+
+
+def normalize_config_patch(data) -> dict:
+    """把一个「可能形状不对」的请求体归一成 `save_config` 认得的**扁平** patch。
+
+    为什么不直接 `save_config(path, request.json)`（2026-10-07 的 Q1 修的就是这个）：
+    `save_config` 按 CONFIG_KEYS 白名单**静默跳过**其余键，所以只要请求体形状对不上，
+    接口就会回 ``success: True`` +「质检配置已保存」，而磁盘上一个字节没变 —— 正是
+    「以为在质检其实没检」那一类假成功。实测：前端 `qcApi.updateConfig` 发的是
+    ``{"config": {...}}``，后端按顶层读，于是**质检页与音频页的保存全部静默失效**。
+
+    两种形状都收：
+
+    - 扁平 ``{"pass_score": 80}`` —— 后端契约 / 命令行脚本 / 测试口径，**权威形状**；
+    - 包裹 ``{"config": {"pass_score": 80}}`` —— 前端历史形状，且已发布的
+      ``app/static`` 产物就是这个形状；只改前端的话得先重建产物才生效。
+
+    两者同时出现时以顶层为准（顶层是权威形状），嵌套部分不丢。最终返回**只含白名单键**
+    的 dict，故调用方可用「结果是否为空」判定「这请求一个字段都没认出来」。
+    """
+    if not isinstance(data, dict):
+        return {}
+    nested = data.get("config")
+    patch = dict(nested) if isinstance(nested, dict) else {}
+    patch.update(data)
+    return {k: v for k, v in patch.items() if k in ACCEPTED_PATCH_KEYS}
+
 
 def _empty_config() -> dict:
     return {
@@ -1230,7 +1260,78 @@ def load_config_dict(raw: dict) -> dict:
     return _normalize(base)
 
 
-def pick_best_candidate(scores: list) -> int:
+def build_structured_checks(shot_desc: str = "", verdict: dict = None,
+                            blocking_spec: str = "", ref_labels=None) -> dict:
+    """把通用图片 QC 结论拆成 identity / outfit / spatial 三类硬门槛。
+
+    第一版不依赖专用视觉模型：从 issues、blocking 规格与参考图标签做确定性
+    结构化判定；后续可把 identity score 换成 ArcFace/InsightFace embedding，
+    接口保持不变。``hard_pass=False`` 的任一维度都不得被总分覆盖。
+    """
+    import re as _re
+    verdict = verdict or {}
+    issues = [str(x) for x in (verdict.get("issues") or [])]
+    critical = [str(x) for x in (verdict.get("critical_issues") or [])]
+    all_issues = list(dict.fromkeys(issues + critical))
+
+    identity_re = _re.compile(
+        r"角色(?:变形|换脸|混脸|串味|不符|不一致)|换脸|混脸|串味|"
+        r"身份(?:不符|不一致)|不像设定|wrong character|identity mismatch|"
+        r"face mismatch|character swap", _re.I)
+    outfit_re = _re.compile(
+        r"服装(?:不符|不一致|错误|漂移|变形)|衣服(?:不符|不一致)|"
+        r"衣着(?:不符|不一致)|服化道(?:不符|不一致)|"
+        r"outfit mismatch|costume mismatch|wrong outfit", _re.I)
+    spatial_re = _re.compile(
+        r"人数(?:不符|错误)|左右(?:颠倒|互换|错误|反了|不符)|"
+        r"站位(?:不符|错误|颠倒)|构图(?:不符|错误|严重偏差)|"
+        r"前后层次(?:错乱|不符)|spatial mismatch|wrong position|"
+        r"left/right (?:swap|mismatch)", _re.I)
+    if str(blocking_spec or "").strip():
+        # 有 blocking 规格时，负面构图片语仍然按 spatial 硬门槛处理；
+        # “左右站位正确/构图基本一致”等肯定句不会命中 negative regex。
+        spatial_re = _re.compile(spatial_re.pattern + r"|构图偏差|景别(?:严重|明显)不符",
+                                 _re.I)
+
+    identity_hits = [x for x in all_issues if identity_re.search(x)]
+    outfit_hits = [x for x in all_issues if outfit_re.search(x)]
+    spatial_hits = [x for x in all_issues if spatial_re.search(x)]
+
+    identity = {"pass": not identity_hits, "score": 0 if identity_hits else None,
+                "issues": identity_hits[:5]}
+    outfit = {"pass": not outfit_hits, "score": 0 if outfit_hits else None,
+              "issues": outfit_hits[:5]}
+    spatial = {"pass": not spatial_hits, "score": 0 if spatial_hits else None,
+               "issues": spatial_hits[:5]}
+    hard_pass = bool(identity["pass"] and outfit["pass"] and spatial["pass"])
+    return {"identity": identity, "outfit": outfit, "spatial": spatial,
+            "hard_pass": hard_pass,
+            "blocking_spec_used": bool(str(blocking_spec or "").strip()),
+            "ref_labels": list(ref_labels or [])}
+
+
+def _merge_structured_checks(verdict: dict, shot_desc: str = "",
+                             blocking_spec: str = "", ref_labels=None) -> dict:
+    """把结构化结果并入 verdict；任一硬门槛失败强制 passed/accepted=False。"""
+    if not isinstance(verdict, dict):
+        return verdict
+    checks = build_structured_checks(shot_desc, verdict, blocking_spec, ref_labels)
+    verdict["structured_checks"] = checks
+    if not checks.get("hard_pass"):
+        verdict["passed"] = False
+        verdict["accepted"] = False
+        verdict["blocked"] = True
+        crit = list(verdict.get("critical_issues") or [])
+        for key in ("identity", "outfit", "spatial"):
+            if not checks[key].get("pass"):
+                msg = f"结构化硬门槛失败：{key}"
+                if msg not in crit:
+                    crit.append(msg)
+        verdict["critical_issues"] = crit
+    return verdict
+
+
+def pick_best_candidate(scores: list, hard_gates: list = None) -> int:
     """best-of-N 选最佳候选（2026-09-29，借 ViMax ``best_image_selector``）：返回**最高分**索引。
 
     - 分数为 ``None`` / 非数值 → 视为最低（不参与竞争）；
@@ -1242,14 +1343,16 @@ def pick_best_candidate(scores: list) -> int:
     """
     if not scores:
         return -1
-    best_i, best_s = len(scores) - 1, None
-    for i, s in enumerate(scores):
+    gates = list(hard_gates or [])
+    best_i, best_s, best_gate = len(scores) - 1, None, None
+    for i, score in enumerate(scores):
         try:
-            v = float(s)
+            v = float(score)
         except (TypeError, ValueError):
             continue
-        if best_s is None or v >= best_s:
-            best_i, best_s = i, v
+        gate = bool(gates[i]) if i < len(gates) else True
+        if best_gate is None or (gate and not best_gate) or (gate == best_gate and (best_s is None or v >= best_s)):
+            best_i, best_s, best_gate = i, v, gate
     return best_i
 
 
@@ -2494,6 +2597,10 @@ def check_image(image_path: str, shot_desc: str = "", cfg: dict = None,
     if not _image_verdict_accepted(verdict) and cfg.get("image_qc_recheck", True):
         verdict = _recheck_image_verdict(ep, prompt, image_paths, cfg, verdict,
                                          image_path, style_norm)
+    verdict = _merge_structured_checks(
+        verdict, shot_desc=shot_desc, blocking_spec=blocking_spec,
+        ref_labels=[str(x.get("label") if isinstance(x, dict) else x[0])
+                    for x in (ref_list or []) if x])
     return verdict
 
 

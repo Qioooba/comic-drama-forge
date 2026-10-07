@@ -39,6 +39,7 @@ import binascii
 import hashlib
 import json
 import logging
+import log_setup  # 统一日志（时间戳/行号/线程/ERROR 带堆栈）
 import os
 import shutil
 import subprocess
@@ -852,7 +853,8 @@ def shutdown() -> None:
 
 def _cli(argv: List[str]) -> int:      # pragma: no cover - 手工诊断入口
     """``python te_3d_render.py <shot_json_file> <out_dir> [aspect]``：单张渲染诊断。"""
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    # 原先硬写 format="%(levelname)s %(message)s"（无时间戳），改为统一配置
+    log_setup.setup_logging()
     if len(argv) < 3:
         print(__doc__)
         return 2

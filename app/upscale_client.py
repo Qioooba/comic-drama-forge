@@ -22,6 +22,7 @@ import json
 import time
 import shutil
 import logging
+import log_setup  # 统一日志（时间戳/行号/线程/ERROR 带堆栈）
 import subprocess
 from typing import Dict, List, Optional
 
@@ -37,7 +38,7 @@ from config import (
 )
 from comfyui_client import ComfyUIClient
 
-logging.basicConfig(level=logging.INFO)
+log_setup.setup_logging()
 logger = logging.getLogger(__name__)
 
 # ===== 引擎 A：TE-Speed-flashVSR 加速链路（默认）=====

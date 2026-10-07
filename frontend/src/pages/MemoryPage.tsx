@@ -334,9 +334,9 @@ export function MemoryPage() {
         <div className="flex flex-wrap items-center gap-2 mb-3">
           <button
             onClick={() => setLessonKinds([])}
-            className={`px-3 py-1 rounded-full text-xs border transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 focus-visible:ring-offset-2 focus-visible:ring-offset-canvas ${
+            className={`px-3 py-1 rounded-full text-xs border transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 focus-visible:ring-offset-2 focus-visible:ring-offset-canvas active:opacity-90 ${
               lessonKinds.length === 0
-                ? 'bg-brand text-white border-brand'
+                ? 'bg-brand text-on-brand border-brand'
                 : 'bg-surface-2 text-ink-2 border-line hover:bg-line'
             }`}
           >
@@ -348,9 +348,9 @@ export function MemoryPage() {
               <button
                 key={k}
                 onClick={() => toggleKind(k)}
-                className={`px-3 py-1 rounded-full text-xs border transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 focus-visible:ring-offset-2 focus-visible:ring-offset-canvas ${
+                className={`px-3 py-1 rounded-full text-xs border transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 focus-visible:ring-offset-2 focus-visible:ring-offset-canvas active:opacity-90 ${
                   active
-                    ? 'bg-brand text-white border-brand'
+                    ? 'bg-brand text-on-brand border-brand'
                     : 'bg-surface-2 text-ink-2 border-line hover:bg-line'
                 }`}
               >
@@ -463,11 +463,11 @@ export function MemoryPage() {
                       >
                         {isExpanded ? t('common.collapse') : t('common.details')}
                       </Button>
-                      {/* text-danger 覆盖 link 变体的 text-brand：
+                      {/* text-danger-strong 覆盖 link 变体的 text-brand：
                           Tailwind 按 theme.colors 键序产出，danger 在 brand 之后，同属性后者胜出 */}
                       <Button
                         variant="link"
-                        className="text-xs whitespace-nowrap text-danger hover:text-danger-strong"
+                        className="text-xs whitespace-nowrap text-danger-strong hover:text-danger-strong"
                         onClick={() => setDeleteTarget(l)}
                       >
                         {t('common.delete')}
@@ -630,7 +630,7 @@ function StatCard({ label, value, color }: { label: string; value: number; color
     blue: 'bg-info-subtle text-brand',
     yellow: 'bg-warning-subtle text-warning-strong',
     green: 'bg-success-subtle text-success-strong',
-    purple: 'bg-brand-subtle text-brand',
+    purple: 'bg-brand-subtle text-brand-hover',
     gray: 'bg-surface-2 text-ink-2',
   };
   return (

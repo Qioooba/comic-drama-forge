@@ -232,7 +232,19 @@ def _render_operation(path: str, method: str, op: Dict[str, Any]) -> str:
     query_names: List[str] = []
 
     # 路径参数：在模板字符串里就地替换 `{name}`
-    path_literal = path
+    #
+    # ⚠️ 必须剥掉 OpenAPI 路径里的 '/api' 前缀：生成的 request() 内部是
+    # `fetch(`${API_BASE}${path}`)` 且 API_BASE === '/api'。不剥就会拼成
+    # '/api/api/contracts/version' → 404，契约闸门横幅恒红、生成客户端整体不可用
+    # （2026-10-07 实测：ApiCompatibilityGate 一直显示 contract.unavailable）。
+    # 下方注释里展示的仍是真实完整路径，便于人对着规格查。
+    _API_BASE = "/api"
+    if path == _API_BASE:
+        path_literal = "/"
+    elif path.startswith(_API_BASE + "/"):
+        path_literal = path[len(_API_BASE):]
+    else:
+        path_literal = path
     for param in op.get("parameters") or []:
         if param.get("in") != "path":
             continue

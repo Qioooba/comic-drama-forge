@@ -25,6 +25,7 @@ import { StagingBoard, type StagedCharacter } from './StagingBoard';
 import { FrameBridgeControls } from './FrameBridgeControls';
 import { CandidateCompareDialog } from './CandidateCompareDialog';
 import { DecisionStateBadge } from './DecisionStateBadge';
+import { t } from '@/i18n';
 import type { ProductionDecisionState } from '@/types';
 
 /**
@@ -118,21 +119,21 @@ export function EpisodeShotBoard(props: EpisodeShotBoardProps): JSX.Element {
           <div className="flex min-h-0 flex-col gap-3">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <h2 className="font-serif text-lg text-ink-1">
-                {current?.description || '选择一个镜头'}
+                {current?.description || t('studio.selectShot')}
               </h2>
               <button
                 onClick={() => setCompareOpen(true)}
                 disabled={!intentId}
-                title={intentId ? '并排比较候选' : '本镜尚无生成意图'}
-                className="control-compact rounded border border-line px-2 py-1 text-xs text-ink-2 hover:border-brand hover:text-brand disabled:cursor-not-allowed disabled:opacity-60"
+                title={intentId ? t('studio.compareHint') : t('studio.noIntent')}
+                className="control-compact rounded border border-line px-2 py-1 text-xs text-ink-2 hover:border-brand hover:text-brand active:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
               >
-                候选对比
+                {t('studio.compare')}
               </button>
             </div>
             <FrameBridgeControls
               startFrameUrl={startFrameUrl}
               endFrameUrl={endFrameUrl}
-              disabledReason={current ? undefined : '请先选择镜头'}
+              disabledReason={current ? undefined : t('studio.selectShotFirst')}
             />
           </div>
         }

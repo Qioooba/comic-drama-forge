@@ -195,7 +195,8 @@ def _json_call(client, prompt: str, label: str, system: str = None,
     if robust is None:
         return client.chat_json(prompt, system=system, temperature=temperature, max_tokens=max_tokens)
 
-    max_tokens = _thinking_token_floor(max_tokens, getattr(client, "reasoning_effort", ""))
+    max_tokens = _thinking_token_floor(max_tokens, getattr(client, "reasoning_effort", ""),
+                                      getattr(client, "model", ""))
 
     def _on_event(h):
         if events is not None and int(h.get("attempt") or 1) > 1:

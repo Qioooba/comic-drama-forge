@@ -14,7 +14,7 @@ import type {
   StoryboardShot,
   TTSEnv, TTSPlanResponse, TTSTask,
   MixEnv, MixPlanResponse, MixTask, MixStatusResponse,
-  QCConfig, QCResponse,
+  QCConfig, QCResponse, QCConfigSaveResponse,
   Episode, EpisodeDetail, EpisodeListResponse, NovelSplitPlanResponse, ComfyUIModelsResponse,
   TrtEngineCheckResponse,
   ActualParamsResponse,
@@ -853,10 +853,14 @@ export interface QCAudioResult {
 
 export const qcApi = {
   config: () => request<QCResponse>('/qc/config'),
+  /** ⚠️ 请求体必须**扁平**。后端按顶层字段读（`qc_client.CONFIG_KEYS` 白名单），曾经这里
+   *  包成 `JSON.stringify({ config })`，而 `save_config` 会**静默跳过**不认识的键 → 接口回
+   *  「已保存」但磁盘零改动（Q1，2026-10-07）。后端 `app/api/qc.py::_qc_config_patch` 现在也
+   *  兼容包裹形状兜底，但权威形状是扁平，改这里前先读那段注释。 */
   updateConfig: (config: QCConfig) =>
-    request<{ success: boolean }>('/qc/config', {
+    request<QCConfigSaveResponse>('/qc/config', {
       method: 'POST',
-      body: JSON.stringify({ config }),
+      body: JSON.stringify(config),
     }),
   clearConfig: () => request<{ success: boolean }>('/qc/config/clear', { method: 'POST' }),
   resetEndpoint: () => request<{ success: boolean }>('/qc/config/reset-endpoint', { method: 'POST' }),
@@ -1258,7 +1262,60 @@ export const characterOutfits = {
     }),
 };
 
+// --- Character Machine Anchors ---
+export interface CharacterAnchorsResponse {
+  success: boolean;
+  project_name: string;
+  character: string;
+  outfit_key?: string;
+  dir: string;
+  sheet: string;
+  anchors: Record<string, string>;
+  sources?: Record<string, string>;
+  manifest?: Record<string, any>;
+  completeness: CharacterAssetCompleteness;
+  layout_version: string;
+  required: string[];
+}
+
+export const characterAnchors = {
+  get: (projectName: string, character: string, outfitKey?: string) => {
+    const qs = new URLSearchParams({ project_name: projectName, character });
+    if (outfitKey) qs.set('outfit_key', outfitKey);
+    return request<CharacterAnchorsResponse>(
+      `/assets/character/anchors?${qs.toString()}`);
+  },
+  /** 单独重生成一个 Machine Anchor；进度继续走 generationApi.status(task_id)。 */
+  regenerate: (data: {
+    project_name: string;
+    character: string;
+    anchor: string;
+    outfit_key?: string;
+    style?: string;
+    seed?: number;
+  }) =>
+    request<{ success: boolean; task_id: string; status: string; anchor: string }>(
+      '/assets/character/anchor/regenerate', {
+        method: 'POST',
+        body: JSON.stringify(data),
+      }),
+};
+
 // --- 上传角色形象图 → 三视图（本地切分，零 GPU）---
+export interface CharacterAssetCompleteness {
+  sheet_ready: boolean;
+  identity_ready: boolean;
+  body_ready: boolean;
+  framing_ready: boolean;
+  outfit_ready?: boolean;
+  complete: boolean;
+  ready: boolean;
+  missing: string[];
+  anchors: Record<string, string>;
+  legacy_sheet_fallback?: boolean;
+  status?: string;
+}
+
 export interface UploadSheetResponse {
   success: boolean;
   /** true = 已落 base.png 但版式不符、未能切分（下游回落整图） */
@@ -1270,6 +1327,10 @@ export interface UploadSheetResponse {
   base?: string;
   views?: Record<string, string>;
   view_files?: Record<string, string>;
+  anchors?: Record<string, string>;
+  completeness?: CharacterAssetCompleteness;
+  asset_role?: string;
+  path?: string;
   message?: string;
   error?: string;
   /** 期望的版式说明（切分失败时给用户看） */
@@ -1288,6 +1349,8 @@ export const characterSheetUpload = {
     file: File;
     outfit_key?: string;
     overwrite?: boolean;
+    /** sheet=Master Character Sheet；其余值上传独立 Machine Anchor */
+    asset_role?: 'sheet' | 'face_front' | 'full_front' | 'half_front' | 'bust_front' | 'full_back';
   }) => {
     const fd = new FormData();
     fd.append('file', data.file);
@@ -1295,6 +1358,7 @@ export const characterSheetUpload = {
     fd.append('character', data.character);
     if (data.outfit_key) fd.append('outfit_key', data.outfit_key);
     if (data.overwrite) fd.append('overwrite', '1');
+    if (data.asset_role) fd.append('asset_role', data.asset_role);
     // 不手写 Content-Type：浏览器需自行补 multipart boundary
     return request<UploadSheetResponse>('/assets/character/upload-sheet', {
       method: 'POST',

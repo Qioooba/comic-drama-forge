@@ -966,6 +966,8 @@ MULTIVIEW_CONFIG = {
 #     `<image1>` 是主画布，而近方形全身立绘 cover 到 9:16 竖屏要左右各裁一半 →
 #     模型为保「全身」把人物缩小 → 系统性偏全景/远景，近景/特写被反向拉回。
 #   业界通行做法即「按景别分档出图」（正脸特写/半身/全身），本改造补齐**半身档**。
+#: 旧版可切分 sheet 的**legacy 常量**；当前中文四区 Master Sheet 不再据此切分。
+#: 生产选择以 CHARACTER_ANCHOR_KEYS / character_asset_manifest.json 为准。
 CHARACTER_SHEET_LAYOUT_ZH = "上排正面、左侧面、背面三张全身视图横排，下排一格正面半身胸像"
 CHARACTER_SHEET_VIEWS = ("front", "left", "back", "half")
 
@@ -989,7 +991,28 @@ CHARACTER_HALF_VIEWS = ("half",)
 #: sheet_split.prune_stale_views 只在这个白名单内清理陈旧文件（不递归、不通配），
 #: 用于清掉旧实现遗留的 right.png（右侧半侧面，新实现不再产出）。
 #: 2026-09-25 增补 "half"（正面半身胸像，景别对档用）。
+#: 旧扁平视角白名单（legacy 文件保留供兼容；**不再代表当前生产资产全集**）。
 ASSET_VIEW_STEMS = ("front", "left", "right", "back", "half")
+
+# ---------------------------------------------------------------------------
+# 双层角色资产：Master Character Sheet + Machine Anchors（2026-10-07 架构改造）
+# ---------------------------------------------------------------------------
+#: Sheet 只用于人工审阅；生产链路最低机器锚点门槛。
+CHARACTER_REQUIRED_ANCHORS = ("face_front", "full_front", "half_front")
+#: 机器锚点全部可选档位（新增视角只需扩展此表 + manifest，不改 selector 核心）。
+CHARACTER_ANCHOR_KEYS = (
+    "face_front", "face_left45", "face_right45", "profile_left", "profile_right",
+    "full_front", "full_left45", "full_right45", "full_back",
+    "bust_front", "half_front",
+)
+#: Character Sheet 布局版本；带 regions 的 meta 才允许确定性裁切。
+CHARACTER_SHEET_LAYOUT_VERSION = "cn_four_zone_v1"
+#: 正式生产 strict：缺指定服装/最低锚点或首帧未过结构化 QC 时阻断，绝不静默回退。
+CHARACTER_REFERENCE_STRICT = _env_bool("MJSCXT_CHARACTER_REFERENCE_STRICT", False)
+#: 新项目是否在基础图后补生成独立机器锚点（GPU 路径；失败 fail-open 并记 incomplete）。
+CHARACTER_ANCHOR_GENERATION = _env_bool("MJSCXT_CHARACTER_ANCHOR_GENERATION", True)
+#: 机器锚点缺失时是否允许旧 sheet fail-open（预演/旧项目兼容）。
+CHARACTER_SHEET_FALLBACK = _env_bool("MJSCXT_CHARACTER_SHEET_FALLBACK", True)
 
 # ===================== 场景「按机位出图」（2026-09-29 恢复） =====================
 # 需求：场景资产要能被分镜按**镜头机位**取图 —— 俯拍镜头给俯视档、斜侧镜头给斜侧档。

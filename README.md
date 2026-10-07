@@ -151,17 +151,24 @@
 
 ## 📦 图片资产三类规范
 
-### 1. 角色 Characters（多视图）
-| 视图 | 文件名 | 说明 |
-|------|--------|------|
-| 基础图 | `base.png` | QwenImage2.1 文生图，含完整外貌描述，**纯白背景** |
-| 正面 | `front.png` | 全身正面，eye-level |
-| 左侧 | `left.png` | 左侧半侧面全身 |
-| 右侧 | `right.png` | 右侧半侧面全身 |
-| 背面 | `back.png` | 背面全身 |
+### 1. 角色 Characters（双层资产）
 
-**用途**：H3 视频生成的角色锁定参考图（Ref2VA 模式）
-**画幅**：三视图横排拼版，**基础图/多视图均 1:1 方形**（避免横排贴边粘连）
+| 层 | 文件 | 用途 |
+|----|------|------|
+| Master Sheet | `base.png` / `sheet.png` | 完整四区 Character Sheet，仅供人工审阅、母版与可靠 regions 派生；**不默认送分镜/H3** |
+| Identity | `identity/face_front.png` 等 | 单人物、单视角、无文字的身份锚点 |
+| Body | `body/full_front.png`、`full_back.png` | 全身/背面生产锚点 |
+| Framing | `framing/half_front.png`、`bust_front.png` | 中景/近景生产锚点 |
+| Manifest | `character_asset_manifest.json` | 记录 role/view/framing/outfit/source/seed/prompt/QC/version |
+
+镜头由 `_select_character_reference()` 按 `shot_type/camera/outfit_key` 动态选 **1 张** Machine Anchor；
+完整 Character Sheet 只在旧项目 `legacy_sheet_fallback` 时最后兜底，并写 warning。
+
+相关 API：
+
+- `GET /api/assets/character/anchors`：查看 Master Sheet、全部机器锚点、manifest 与 completeness。
+- `POST /api/assets/character/anchor/regenerate`：只重生成指定 `anchor`，不覆盖其他已通过档位。
+- `POST /api/assets/character/upload-sheet` 新增 `asset_role`：可直接上传独立 `face_front/full_front/half_front/...`。
 
 ### 2. 物品 Items（3D 多视角）
 | 视图 | 文件名 | 说明 |
@@ -194,11 +201,13 @@ output/
 │   ├── characters/             # 角色资产
 │   │   └── {项目名}/
 │   │       └── {角色名}/
-│   │           ├── base.png    # 基础图
-│   │           ├── front.png   # 正面
-│   │           ├── left.png    # 左侧
-│   │           ├── right.png   # 右侧
-│   │           └── back.png    # 背面
+│   │           ├── base.png                         # Master Character Sheet
+│   │           ├── character_asset_manifest.json    # 机器锚点 manifest
+│   │           ├── identity/face_front.png          # 身份锚点
+│   │           ├── body/full_front.png              # 全身锚点
+│   │           ├── body/full_back.png               # 背面锚点（按需）
+│   │           ├── framing/half_front.png           # 中景锚点
+│   │           └── outfits/{outfit_key}/...         # 当前服装状态锚点
 │   ├── items/                  # 物品资产
 │   │   └── {项目名}/
 │   │       └── {物品名}/
@@ -298,11 +307,14 @@ python app.py
 或直接双击 `run_app.bat`
 
 ### 3. 访问 Web 界面
-打开 **http://localhost:5210**（默认端口；可用环境变量 `APP_PORT` 覆盖）
+打开 **http://localhost:45871**（默认端口；可用环境变量 `APP_PORT` 覆盖）
+
+> 端口默认值的唯一事实源是 `app/ports.py`。后端 45871、Electron 桌面版 45872
+> （两者刻意错开，避免两个实例共用数据根串档）、前端 dev server 47311。
 
 ### 4. 操作流程
 1. 输入故事主题 → 点击"生成剧本"（云端 LLM）
-2. 点击"生成角色资产" → 自动生成角色多视图
+2. 点击"生成角色资产" → 生成 Master Sheet，并补齐 face/full/half Machine Anchors
 3. 点击"生成物品资产" → 自动生成物品 3D 多视角
 4. 点击"生成场景资产" → 自动生成场景 3D 多视角
 5. 点击"开始生成视频" → H3 批量生成视频片段
@@ -411,7 +423,7 @@ python build_exe.py
 ```
 
 **运行要求**：
-- 双击 `msjcxt.exe`，后端自动起在 `http://127.0.0.1:5210`
+- 双击 `msjcxt.exe`，后端自动起在 `http://127.0.0.1:45871`
 - 浏览器手动打开或脚本自动拉起（策略允许时）
 - 数据根建议设为纯 ASCII（如 `D:\mjscxt_data`），`datadir.txt` 写入该路径
 
@@ -437,8 +449,9 @@ cd D:\build\mjscxt\electron-app
 # 4. 安装依赖
 npm install
 
-# 5. 关键：修改 main.js 端口为 5210（与 PyInstaller 版后端端口一致）
-#    const DEFAULT_PORT = 5210;  (原为 5000)
+# 5. 关键：确认 main.js 的 DEFAULT_PORT（默认值见 main.js，无需改动）
+#    const DEFAULT_PORT = 45872;  ← 必须与 PyInstaller 版后端端口 45871 错开，
+#    否则桌面版会把浏览器版已在跑的后端当成可复用，两个实例共用一份数据根。
 
 # 6. 执行打包
 npm run build:win
@@ -452,8 +465,8 @@ npm run build:win
 **运行要求**：
 - 首次运行前建议清理残留锁：`Remove-Item -Recurse -Force "$env:APPDATA\mjscxt-desktop"`
 - 双击 `comic-drama-forge-Portable-1.1.0.exe` 或 `win-unpacked/漫剧工坊.exe`
-- 自动检测 5210 端口：若已有后端则复用，否则自动启动内置 Python 后端
-- 主窗口加载 `http://127.0.0.1:5210`，无需浏览器
+- 自动检测 45872 端口：若已有后端则复用，否则自动启动内置 Python 后端
+- 主窗口加载 `http://127.0.0.1:45872`，无需浏览器
 
 ---
 
@@ -461,10 +474,10 @@ npm run build:win
 
 | 特性 | PyInstaller (msjcxt.exe) | Electron (便携版/安装版) |
 |------|--------------------------|---------------------------|
-| **前端形态** | 浏览器访问 5210 端口 | 自带 Chromium 窗口，无需浏览器 |
+| **前端形态** | 浏览器访问 45871 端口 | 自带 Chromium 窗口，无需浏览器 |
 | **体积** | ~52 MB | ~132 MB (便携) / ~180 MB (解压版) |
 | **启动速度** | ~5 秒 | ~30 秒 (首次自解压/播种资源镜像) |
-| **后端复用** | 固定 5210，单实例 | 复用 5210 或自启内置 Python |
+| **后端复用** | 固定 45871，单实例 | 复用 45872 或自启内置 Python（与前者错开） |
 | **适用场景** | 服务器/无人值守/远程桌面 | 本地桌面交互、演示、离线使用 |
 | **更新机制** | 手动替换 EXE | 内置自动更新（资源增量/整包） |
 | **路径要求** | 纯 ASCII 部署目录 + datadir.txt | 纯 ASCII 构建目录 + 输出目录 |

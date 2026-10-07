@@ -61,18 +61,38 @@
   /* ---- 描边 ---- */
   --border: 51 65 85;         /* #334155 slate-700 */
   --border-strong: 71 85 105; /* #475569 slate-600 */
+  /* 输入控件专用描边：--border 在 surface 上仅 1.72:1、--border-strong 2.36:1，
+     两者都低于 WCAG 1.4.11 对「识别控件所需视觉信息」要求的 3:1 —— 空 Input
+     在深色下等于一片看不见的暗色块。取 slate-500 → on surface 3.75:1。 */
+  --border-input: 100 116 139; /* #64748B slate-500 */
 
   /* ---- 文字 ---- */
   --text-primary: 226 232 240;   /* #E2E8F0 slate-200 */
   --text-secondary: 148 163 184; /* #94A3B8 slate-400 */
-  --text-tertiary: 100 116 139;  /* #64748B slate-500 */
+  /* 原 slate-500 #64748B：canvas 4.24 / surface 3.75 / surface-2 3.07 ——
+     三档全部低于正文 4.5:1，surface-2 上连 UI 元件的 3:1 都不够。
+     提到 #8694A7 → 6.79 / 5.99 / 4.75。 */
+  --text-tertiary: 134 148 167;  /* #8694A7 */
 
   /* ---- 品牌 / 强调 / 主动作 ---- */
   --brand: 99 102 241;        /* #6366F1 indigo-500（双职责折中，见上方说明） */
   --brand-hover: 129 140 248; /* #818CF8 indigo-400：深色下 hover 提亮 */
   --brand-subtle: 30 27 75;   /* #1E1B4B indigo-950 */
+  /* ⚠️ 「实底 + 白字」与「文字色」是**两个方向相反**的职责，深色下同一个值
+     满足不了两者：brand-hover 提亮到 indigo-400 后，白字压上去只剩 2.98:1
+     （悬停即崩）。所以把两种职责拆成两个 token，不要试图靠调 --brand 解决：
+     深一档会让 20+ 处 `bg-brand-subtle text-brand-hover` 一起塌到 3.58:1。 */
+  --on-brand: 255 255 255;    /* #FFFFFF 压在实心底上的反白字（两套主题同值） */
+  --brand-press: 79 70 229;   /* #4F46E5 indigo-600：hover/按下时的实心底，白字 6.29:1 */
+  /* ⚠️ 浅色相（amber-500 / emerald-500）**不能**配白字：白压 warning 只有 2.15:1、
+      压 success 2.54:1，都远低于 4.5:1。这类实底按钮一律用深墨字：
+      压 warning 8.61:1、压 success 6.90:1。值取 zinc-900，两套主题同值
+      （因为它服务的永远是浅色相底，与当前主题深浅无关）。 */
+  --on-warning: 28 25 23;     /* #1C1917 zinc-900 */
+  --on-success: 28 25 23;     /* #1C1917 zinc-900 */
   --accent: 6 182 212;        /* #06B6D4 不变，深底上依旧醒目 */
   --accent-subtle: 8 51 68;   /* #083344 cyan-950 */
+  --accent-strong: 103 232 249; /* #67E8F9 cyan-300：accent-subtle 上的文字色 */
   --action: 51 65 85;         /* #334155 slate-700：主按钮转中性色阶，白字对比度充足 */
 
   /* ---- 通用语义色（主档不动，subtle/strong 反转） ---- */
@@ -180,6 +200,12 @@
   --control-h: 40px;
   --control-h-compact: 36px;
   --hit-target: 44px;
+  /* 常驻 chrome 的总高（Navbar + main 上内边距 + 上下文条），工作台右侧常驻
+     面板按「视口高 − 这个值」与左列等高。此前是 `calc(100vh - 7rem)` 写死
+     三处（骨架 / 收起的竖条 / 聊天面板），改 chrome 高度要同时改三处，
+     漏一处就错位。收成一个 token 后只有这一处需要维护。
+     7rem = 112px 保留原视觉值（Navbar ~57 + main padding 24 + 上下文条 ~31）。 */
+  --chrome-h: 112px;
   --control-max: 640px;
   --control-field: 320px;
   --control-field-lg: 520px;
@@ -254,18 +280,32 @@
   /* ---- 描边 ---- */
   --border: 226 232 240;        /* #E2E8F0 常规描边 */
   --border-strong: 203 213 225; /* #CBD5E1 强调描边 / 悬停描边 */
+  /* 浅色下「控件边界」的根因是双重的：--border 在白 surface 上只有 1.23:1，
+     而 --bg-surface(#FFF) 与 --bg-canvas(#F7F8FA) 之间也只有 1.10:1 ——
+     控件的**填充本身**不提供任何边界信息。这里给输入类控件一条真正到 3:1
+     的描边（on white 3.18:1）。 */
+  --border-input: 138 145 155;  /* #8A919B */
 
   /* ---- 文字 ---- */
   --text-primary: 15 23 42;     /* #0F172A 标题与正文 */
   --text-secondary: 71 85 105;  /* #475569 说明文字 */
-  --text-tertiary: 148 163 184; /* #94A3B8 占位、禁用 */
+  /* 原 #94A3B8：canvas 2.41 / surface 2.57 / surface-2 2.34 —— 全站最严重的一处，
+     它同时就是深色主题的 ink-2，等于浅色下三级文字与二级文字同色，
+     而 FIELD_BASE 的 placeholder 用的就是它（空输入框提示语 2.57:1）。
+     提到 #5A697E → 5.26 / 5.59 / 5.10。 */
+  --text-tertiary: 90 105 126;  /* #5A697E */
 
   /* ---- 品牌 / 强调 / 主动作 ---- */
   --brand: 79 70 229;           /* #4F46E5 */
   --brand-hover: 67 56 202;     /* #4338CA */
   --brand-subtle: 238 242 255;  /* #EEF2FF */
+  --on-brand: 255 255 255;      /* #FFFFFF 压在实心底上的反白字（两套主题同值） */
+  --brand-press: 67 56 202;     /* #4338CA 浅色下 hover 压深，白字 7.90:1 */
+  --on-warning: 28 25 23;       /* #1C1917 浅色相实底上的深墨字（与主题深浅无关） */
+  --on-success: 28 25 23;       /* #1C1917 同上 */
   --accent: 6 182 212;          /* #06B6D4 */
   --accent-subtle: 236 254 255; /* #ECFEFF */
+  --accent-strong: 14 116 144;  /* #0E7490 cyan-700：accent-subtle 上的文字色 5.15:1 */
   --action: 15 23 42;           /* #0F172A 主按钮实心深色底 */
 
   /* ---- 通用语义色（主档不动，subtle/strong 反转回浅色语义） ---- */
@@ -363,6 +403,9 @@ body {
 
 #root {
   height: 100vh;
+  /* dvh 兜底：移动端 / 浏览器地址栏收起时 100vh ≠ 可见高度，底部会永远够不到。
+     写在 vh 之后作为渐进增强，不支持 dvh 的浏览器继续用 vh。 */
+  height: 100dvh;
 }
 
 /* ==========================================================================

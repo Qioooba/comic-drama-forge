@@ -24,7 +24,7 @@
 | G4 | **`check_ref_layout` 只查图、不查音频**：音频静默错位无自检 | `h3_director_builder.check_ref_layout` | G1/G2 无阻断，只能靠线上听感发现 |
 | G5 | **subject lock 未把 `<Audio N>` 绑到角色**：现文案只列 `<Audio 1>…<Audio M>`，未写「哪支音色是谁」 | `app.py:_h3_common_subject_lock` | generate 模式下多角色同场，模型无 speaker↔音色映射 → 音色串味 |
 | G6 | **audio_mode 语义分歧**：team-lead 口径写「source/fully_copy」，但官方 `docs/r2v-source-audio.md` 明确 source = 参考 wav **原样 mux**、台词须与音频一致 | `comfyui_client.py:4028-4043`（工程已选 `generate`） | 若按 source 实现，**同一句参考音频会被灌进每一段**（台词全错配）。**必须 generate**，见 §5 风险 R1 |
-| G7 | **公共池角色路径与服装变体解耦**：`_h3_shot_ref_components` 供公共池规划时未传 `outfit_map`（=base.png），段级在 `comps_map` 缺失时才挂变体；两条路径口径需**显式归一** | `app.py:_h3_shot_ref_components` / `h3_common_refs.asset_key` | 若某路径下段级挂变体、公共判据用 base.png → 同角色**一图两槽**，`<Picture N>` 整体右移 |
+| G7 | **公共池必须按实际 path/state 判交集**：角色现在按镜头选择不同 Machine Anchor / outfit；同名但 path 不同绝不能合并 | `app/api/_shared.py:_h3_shot_ref_components` / `h3_common_refs.asset_key` | 若只按角色名合并，会把某一镜的服装/景别锚点焊死给全集 |
 
 > `_shot_segment` 的切段契约 `return _segs, sb_local` 是**真契约**（`app.py:8000`），不得改；`_ensure_voice_bank_refs` 的自动补音色走 `all_characters=char_idx`，**不可**把公共池角色之外的角色也塞进 `global.refAudios`（公共池 ≠ 全角色）。
 
@@ -34,7 +34,7 @@
 
 | 文件 | 相对路径 | 改什么 |
 |---|---|---|
-| 公共池判据 | `app/h3_common_refs.py` | 新增「角色路径归一」：把 `outfits/<key>/base.png` 归一为主设定 `base.png`，使服装变体不劈开同角色身份键；`asset_key` 保持不变（kind,name,path）语义，仅对角色做归一 |
+| 公共池判据 | `app/h3_common_refs.py` | `asset_key` 同时纳入 `common_key` 与实际 path；同名角色不同 outfit/Machine Anchor 不进入公共池 |
 | 构建器 | `app/h3_director_builder.py` | ① `_ref_audio_items` 增 `start` 形参（音频版错位保护）；② `build()` 新增「`common_ref_audios` 非空 → 清空段级 `seg_audio_lists`」分支（取代逐段配音）；③ 音频总预算 M+seg ≤ `MAX_REFERENCE_AUDIOS` 守卫；④ `check_ref_layout` 扩到音频槽；⑤ `layout` 增 `common_ref_audios` 报表字段 |
 | 客户端 | `app/comfyui_client.py` | ① `audio_mode` 推导确认：`common_audio_names` 非空 → **generate**（非 source），显式传入优先；② `common_audio_names` 非空时**不再**上传/安放段级 `seg_audio_names`（双保险清空）；③ `_drop_missing_director_refs` 一并校验 `global.refAudios` 已落地；④ `layout["common_ref_audios"]` |
 | 装配层 | `app/app.py` | ① `_h3_common_subject_lock` 把 `<Audio N>` 绑定到「角色名 + reference 关键词」；② episode/per_shot 两调用点传 `common_ref_audios=_common_audios`（已接）并**确保不传段级 `seg_audios`**；③ `_h3_plan_common_refs` 传 `project_name`/归一后组件（已接，需配 G7）；④ 保留 `_shot_segment` 的 `return _segs, sb_local` |

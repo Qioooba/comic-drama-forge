@@ -30,7 +30,18 @@ def api_qc_config_get():
 def api_qc_config_save():
     data = request.json or {}
     data.pop("reuse_llm", None)   # 旧字段：质检不再复用文本分析 LLM，直接忽略
-    cfg = qc_client.save_config(QC_CONFIG_PATH, data)
+    # Q1（2026-10-07）：此前直接把 request.json 丢给 save_config，而前端发的是
+    # {"config": {...}} —— save_config 按 CONFIG_KEYS 白名单**静默跳过**不认识的键，
+    # 于是接口回「质检配置已保存」而磁盘零改动（质检页 + 音频页保存全废）。
+    # 归一化 + fail-loud 的口径见 qc_client.normalize_config_patch 的 docstring。
+    patch = qc_client.normalize_config_patch(data)
+    if not patch:
+        # 空补丁一律**拒收**，不再回「已保存」：走到这里说明请求体形状又不对了。
+        return jsonify({"success": False,
+                        "error": "未识别到任何可保存的质检配置字段：请求体需要是扁平字段"
+                                 "（如 {\"pass_score\": 80}）或 {\"config\": {...}}",
+                        "accepted_keys": sorted(qc_client.ACCEPTED_PATCH_KEYS)}), 400
+    cfg = qc_client.save_config(QC_CONFIG_PATH, patch)
     view = qc_client.public_view(cfg)
     visual_requested = bool(view.get("enabled") and
                             (view.get("image_enabled") or view.get("video_enabled")))

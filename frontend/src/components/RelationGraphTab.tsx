@@ -93,16 +93,32 @@ export function RelationGraphTab({ projectKey }: RelationGraphTabProps) {
       });
   }, [projectKey, reloadTick]);
 
-  // 简单的力导向布局模拟
-  const simulateLayout = useCallback(() => {
-    if (nodes.length === 0) return;
+  /** 收敛阈值：整图最大单帧位移（px 之和）低于它即视为静止。 */
+  const REST_EPSILON = 0.15;
+
+  // ⚠️ simulateLayout 必须以**稳定引用**运行，否则它与下面的 rAF effect 构成正反馈。
+  //   原实现是 useCallback(..., [nodes, edges]) 且每帧 setNodes(新数组)：
+  //     setNodes → nodes 变 → simulateLayout 引用变 → 依赖它的 effect 重跑
+  //     → 同时 animate() 自己又无条件续下一帧
+  //   于是每秒 60 次 setNodes + 整图重渲染 + 一次 O(n²) 斥力计算，**永不停止**，
+  //   而画面早已收敛、一动不动（纯烧 CPU）。把 nodes 收进 ref 后 deps 为空，引用恒定。
+  const nodesRef = useRef<GraphNode[]>(nodes);
+  useEffect(() => { nodesRef.current = nodes; }, [nodes]);
+
+  /**
+   * 跑一步力导向布局。
+   * @returns 是否还在运动。false = 已收敛，调用方应停帧。
+   */
+  const simulateLayout = useCallback((): boolean => {
+    const current = nodesRef.current;
+    if (current.length === 0) return false;
 
     const alpha = 0.3;
     const centerX = 400;
     const centerY = 300;
-    
+
     // 初始化位置（如果没有）
-    let updatedNodes = nodes.map(n => ({
+    let updatedNodes = current.map(n => ({
       ...n,
       x: n.x ?? centerX + (Math.random() - 0.5) * 200,
       y: n.y ?? centerY + (Math.random() - 0.5) * 200,
@@ -182,23 +198,48 @@ export function RelationGraphTab({ projectKey }: RelationGraphTabProps) {
       };
     });
 
-    setNodes(updatedNodes);
-  }, [nodes, edges]);
+    // 收敛判定：单帧位移已低于阈值时**不调 setNodes**。
+    // 这是省 CPU 的关键 —— 只要还调 setNodes，React 就必然重渲染整张关系图，
+    // 哪怕画面上一个像素都没动。
+    let maxDelta = 0;
+    for (let i = 0; i < updatedNodes.length; i++) {
+      const d = Math.abs(updatedNodes[i].x - current[i].x)
+              + Math.abs(updatedNodes[i].y - current[i].y);
+      if (d > maxDelta) maxDelta = d;
+    }
+    if (maxDelta < REST_EPSILON) return false;
 
-  // 动画循环
+    setNodes(updatedNodes);
+    return true;
+    // ⚠️ deps 刻意为空：本函数读的是 nodesRef.current。写 [nodes, edges] 会让引用
+    //    每帧变化 → 下面的 effect 每帧重跑 → 回到「60fps 重渲染」的老问题。
+  }, []);
+
+  // 拖拽结束后要重新唤醒布局（拖拽会直接 setNodes 移动节点，但 edges 没变，
+  // 靠 edges 依赖重启不了）。用一个自增计数器做显式的「重新布局」信号。
+  const [layoutEpoch, setLayoutEpoch] = useState(0);
+
+  // 动画循环：**只在还在运动时续帧**。
+  //  - simulateLayout 返回 false（已收敛）即停 —— 静止后 CPU 占用归零；
+  //  - 标签页不可见（document.hidden）即停 —— 后台标签每帧做 O(n²) 纯属烧电；
+  //  - 三个来源各自会重启它：edges 变化（数据重载）、layoutEpoch 自增（拖拽结束）、
+  //    以及首次挂载。
   useEffect(() => {
+    let running = true;
     const animate = () => {
-      simulateLayout();
-      animationRef.current = requestAnimationFrame(animate);
+      if (!running) return;
+      if (document.hidden) { animationRef.current = 0; return; }
+      animationRef.current = simulateLayout() ? requestAnimationFrame(animate) : 0;
     };
-    
     animationRef.current = requestAnimationFrame(animate);
     return () => {
+      running = false;
       if (animationRef.current) {
         cancelAnimationFrame(animationRef.current);
+        animationRef.current = 0;
       }
     };
-  }, [simulateLayout]);
+  }, [simulateLayout, edges, layoutEpoch]);
 
   // SVG 事件处理
   const handleMouseDown = (e: React.MouseEvent, node: GraphNode) => {
@@ -234,6 +275,9 @@ export function RelationGraphTab({ projectKey }: RelationGraphTabProps) {
   const handleMouseUp = () => {
     isDragging.current = false;
     draggedNode.current = null;
+    // 拖拽直接改了节点坐标但 edges 没变，靠 [edges] 重启不了布局 ——
+    // 显式自增一次让力导向重新跑起来，把被拖开的节点重新松弛回平衡态。
+    setLayoutEpoch((e) => e + 1);
   };
 
   // 加载态：沿用「标题行 + 画布高度 + 底部统计」的形态，避免画布区空白跳变
@@ -440,7 +484,7 @@ export function RelationGraphTab({ projectKey }: RelationGraphTabProps) {
               <button
                 onClick={() => setSelectedNode(null)}
                 aria-label={t('relation.closeDetails')}
-                className="text-ink-3 hover:text-ink-2 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 focus-visible:ring-offset-2"
+                className="text-ink-3 hover:text-ink-2 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 focus-visible:ring-offset-2 focus-visible:ring-offset-canvas"
               >
                 <X className="h-4 w-4" />
               </button>

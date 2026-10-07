@@ -20,6 +20,24 @@ import type {
  *
  * 因此这里直接向 ComfyUI 查询权威候选值，由用户手动指定，并即时生效于后续提交。
  */
+/**
+ * `/api/trt/engine/check` 返回的 `status` 枚举。
+ *
+ * ⚠️ 这三个常量是**匹配值**：前端要按它们给徽标分色、请求失败时也要落一个状态，
+ *    所以必须与后端返回的字符串逐字一致，不能翻译成展示文案。
+ * 展示文案走 `TRT_STATUS_LABEL_KEYS` + `t()`。
+ */
+const TRT_STATUS_AVAILABLE = '可用';
+const TRT_STATUS_INCOMPATIBLE = '不兼容';
+const TRT_STATUS_NOT_TESTED = '未测试';
+
+/** 后端 status → 展示文案 i18n 键；未登记的取值原样回显（不静默隐藏未知枚举）。 */
+const TRT_STATUS_LABEL_KEYS: Record<string, string> = {
+  [TRT_STATUS_AVAILABLE]: 'wb.cm.trtStatusOk',
+  [TRT_STATUS_INCOMPATIBLE]: 'wb.cm.trtStatusIncompatible',
+  [TRT_STATUS_NOT_TESTED]: 'wb.cm.trtNotTested',
+};
+
 export function ComfyUIPage() {
   const { t } = useApp();
   const [data, setData] = useState<ComfyUIModelsResponse | null>(null);
@@ -48,7 +66,7 @@ export function ComfyUIPage() {
     } catch (e) {
       setTrt({
         success: false,
-        status: '未测试',
+        status: TRT_STATUS_NOT_TESTED,
         reason: e instanceof Error ? e.message : String(e),
       });
     } finally {
@@ -106,6 +124,11 @@ export function ComfyUIPage() {
 
   const slots = data?.slots || [];
   const offline = data ? !data.success : false;
+  // TRT 状态：分色用后端原始值，展示用语言包
+  const trtStatusKey = trt ? TRT_STATUS_LABEL_KEYS[trt.status] : undefined;
+  const trtStatusLabel = trt
+    ? (trtStatusKey ? t(trtStatusKey) : trt.status)
+    : '';
 
   return (
     <div className="space-y-6 p-6">
@@ -152,8 +175,8 @@ export function ComfyUIPage() {
 
       {/* ===== Error / Offline ===== */}
       {(error || offline) && (
-        <div className="flex items-start gap-3 rounded-lg border border-amber-500/40 bg-amber-500/10 p-4">
-          <AlertTriangle className="mt-0.5 h-5 w-5 flex-shrink-0 text-amber-500" />
+        <div className="flex items-start gap-3 rounded-lg border border-warning/40 bg-warning-subtle p-4">
+          <AlertTriangle className="mt-0.5 h-5 w-5 flex-shrink-0 text-warning-strong" />
           <div className="text-sm">
             <p className="font-medium text-warning-strong">
               {t('wb.cm.offline')}
@@ -173,10 +196,10 @@ export function ComfyUIPage() {
           <div className="flex items-center gap-2">
             {trt && (
               <Badge variant={
-                trt.status === '可用' ? 'success'
-                  : trt.status === '不兼容' ? 'danger' : 'warning'
+                trt.status === TRT_STATUS_AVAILABLE ? 'success'
+                  : trt.status === TRT_STATUS_INCOMPATIBLE ? 'danger' : 'warning'
               }>
-                {trt.status}
+                {trtStatusLabel}
               </Badge>
             )}
             <Button
@@ -197,7 +220,7 @@ export function ComfyUIPage() {
         )}
         <div className="mt-3 grid gap-2 sm:grid-cols-2">
           {(trt?.static?.engines || []).map(engine => (
-            <div key={engine.key} className="rounded border border-border px-3 py-2 text-xs">
+            <div key={engine.key} className="rounded border border-line-input px-3 py-2 text-xs">
               <div className="flex items-center justify-between gap-2">
                 <span className="font-mono text-ink-2">{engine.key}</span>
                 <Badge variant={engine.ok ? 'success' : 'danger'}>
@@ -249,7 +272,7 @@ export function ComfyUIPage() {
               </Badge>
             </div>
             <div className="grid gap-2 text-xs sm:grid-cols-2">
-              <div className="rounded border border-border px-3 py-2">
+              <div className="rounded border border-line-input px-3 py-2">
                 <p className="font-medium text-ink-2">{t('wb.cm.actualRefine')}</p>
                 <p className="mt-1 text-ink-3">
                   {t('wb.cm.actualTemplate')}: {actual.workflow_file || '-'}
@@ -267,7 +290,7 @@ export function ComfyUIPage() {
                       : t('wb.cm.actualRefineOff')}
                 </p>
               </div>
-              <div className="rounded border border-border px-3 py-2">
+              <div className="rounded border border-line-input px-3 py-2">
                 <p className="font-medium text-ink-2">{t('wb.cm.actualDlss')}</p>
                 <p className="mt-1 text-ink-3">
                   {t('wb.cm.actualTemplate')}:
@@ -289,7 +312,7 @@ export function ComfyUIPage() {
                 </p>
               </div>
             </div>
-            <div className="rounded border border-border px-3 py-2 text-[11px]">
+            <div className="rounded border border-line-input px-3 py-2 text-[11px]">
               <p className="truncate font-mono text-ink-2">{actual.workflow_path || '-'}</p>
               <p className="mt-1 truncate font-mono text-ink-3">
                 {t('wb.cm.actualWorkflowHash')}: {actual.workflow_hash || '-'}
@@ -383,7 +406,7 @@ export function ComfyUIPage() {
               {data.plugins!.map(p => (
                 <li
                   key={p.id}
-                  className="flex items-center justify-between gap-3 rounded border border-border px-3 py-1.5 text-sm"
+                  className="flex items-center justify-between gap-3 rounded border border-line-input px-3 py-1.5 text-sm"
                 >
                   <span className="truncate font-mono text-xs text-ink-2">{p.id}</span>
                   <span className="flex-shrink-0 text-xs text-ink-3">

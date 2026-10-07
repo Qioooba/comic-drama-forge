@@ -59,7 +59,7 @@ const MODULE_CONFIG: Record<ModuleKey, {
     descKey: 'vault.module.text.desc',
     placeholderUrl: 'https://api.deepseek.com/v1',
     placeholderModel: 'deepseek-chat',
-    tone: 'bg-brand-subtle text-brand',
+    tone: 'bg-brand-subtle text-brand-hover',
   },
   qc: {
     icon: Search,
@@ -68,7 +68,7 @@ const MODULE_CONFIG: Record<ModuleKey, {
     placeholderUrl: 'https://api.openai.com/v1',
     placeholderModel: 'gpt-4o-mini',
     probe: 'vision',
-    tone: 'bg-accent-subtle text-accent',
+    tone: 'bg-accent-subtle text-accent-strong',
   },
   chat: {
     icon: Network,
@@ -407,7 +407,7 @@ export function AIVaultPage() {
   const handleTestFallback = async (module: ModuleKey, index: number) => {
     const key = `${module}#${index}`;
     const fb = (fallbacks[module] || [])[index];
-    const label = fb?.label || `备用${index + 1}`;
+    const label = fb?.label || t('vault.fallbackName', { n: index + 1 });
     const typedKey = (fb?.api_key || '').trim();
     const canTestByIndex = !typedKey && typeof fb?.index === 'number';
     setFbTesting(key);
@@ -605,7 +605,7 @@ export function AIVaultPage() {
               type="checkbox"
               checked={sysSettings.watermark_enabled}
               onChange={e => updateSysField('watermark_enabled', e.target.checked)}
-              className="w-5 h-5 rounded border-line-strong text-brand focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 focus-visible:ring-offset-2"
+              className="w-5 h-5 rounded border-line-strong text-brand focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 focus-visible:ring-offset-2 focus-visible:ring-offset-canvas"
             />
             <span className="text-ink-2 font-medium">{t('vault.watermarkEnabled')}</span>
           </div>
@@ -634,7 +634,7 @@ export function AIVaultPage() {
                 type="checkbox"
                 checked={pe.enhance}
                 onChange={e => setPe(p => ({ ...p, enhance: e.target.checked }))}
-                className="w-5 h-5 rounded border-line-strong text-brand focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 focus-visible:ring-offset-2"
+                className="w-5 h-5 rounded border-line-strong text-brand focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 focus-visible:ring-offset-2 focus-visible:ring-offset-canvas"
               />
               <span className="text-ink-2 font-medium">{t('vault.promptEnhanceOn')}</span>
             </div>
@@ -643,7 +643,7 @@ export function AIVaultPage() {
                 type="checkbox"
                 checked={pe.review}
                 onChange={e => setPe(p => ({ ...p, review: e.target.checked }))}
-                className="w-5 h-5 rounded border-line-strong text-brand focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 focus-visible:ring-offset-2"
+                className="w-5 h-5 rounded border-line-strong text-brand focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 focus-visible:ring-offset-2 focus-visible:ring-offset-canvas"
               />
               <span className="text-ink-2 font-medium">{t('vault.promptReviewOn')}</span>
             </div>
@@ -703,7 +703,7 @@ export function AIVaultPage() {
                   <button
                     type="button"
                     onClick={() => handleClear(moduleKey)}
-                    className="rounded-md p-2 text-ink-3 transition-colors hover:bg-surface-2 hover:text-danger focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 focus-visible:ring-offset-2"
+                    className="rounded-md p-2 text-ink-3 transition-colors hover:bg-surface-2 hover:text-danger-strong active:opacity-90 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 focus-visible:ring-offset-2 focus-visible:ring-offset-canvas"
                     title={t('vault.clearConfig')}
                     aria-label={t('vault.clearConfig')}
                   >
@@ -745,7 +745,7 @@ export function AIVaultPage() {
                         type="button"
                         onClick={() => handleToggleVisible(moduleKey)}
                         disabled={revealing === moduleKey}
-                        className="rounded-sm p-1.5 text-ink-3 transition-colors hover:text-ink-1 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 disabled:cursor-not-allowed disabled:opacity-50"
+                        className="rounded-sm p-1.5 text-ink-3 transition-colors hover:text-ink-1 active:opacity-90 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 disabled:cursor-not-allowed disabled:opacity-50"
                         title={t(visibleKeys[moduleKey] ? 'vault.hideApiKey' : 'vault.showApiKey')}
                         aria-label={t(visibleKeys[moduleKey] ? 'vault.hideApiKey' : 'vault.showApiKey')}
                         aria-pressed={!!visibleKeys[moduleKey]}
@@ -806,7 +806,7 @@ export function AIVaultPage() {
                         <div className="flex items-center gap-2">
                           <div className="flex-1 min-w-0">
                             <div className="font-mono text-xs text-ink-1 truncate">
-                              {fb.label || `备用${i + 1}`}
+                              {fb.label || t('vault.fallbackName', { n: i + 1 })}
                               <span className="ml-2 text-ink-3">{fb.model}</span>
                             </div>
                             <div className="font-mono text-[11px] text-ink-3 truncate">{fb.base_url}</div>
@@ -826,7 +826,7 @@ export function AIVaultPage() {
                             type="button"
                             onClick={() => handleTestFallback(moduleKey, i)}
                             disabled={fbTesting === `${moduleKey}#${i}`}
-                            className="shrink-0 flex items-center gap-1 px-2 py-1 rounded border border-line text-[11px] text-ink-2 hover:text-brand hover:border-brand transition-colors disabled:opacity-40"
+                            className="shrink-0 flex items-center gap-1 px-2 py-1 rounded border border-line text-[11px] text-ink-2 hover:text-brand hover:border-brand active:opacity-90 transition-colors disabled:opacity-40"
                             title={t('vault.fallbackTest')}
                           >
                             <RefreshCw className={`h-3 w-3 ${fbTesting === `${moduleKey}#${i}` ? 'animate-spin' : ''}`} />
@@ -835,7 +835,7 @@ export function AIVaultPage() {
                           <button
                             type="button"
                             onClick={() => openFbEditor(moduleKey, i)}
-                            className="shrink-0 flex items-center gap-1 px-2 py-1 rounded border border-line text-[11px] text-ink-2 hover:text-brand hover:border-brand transition-colors"
+                            className="shrink-0 flex items-center gap-1 px-2 py-1 rounded border border-line text-[11px] text-ink-2 hover:text-brand hover:border-brand active:opacity-90 transition-colors"
                             title={t('vault.fallbackEdit')}
                           >
                             <Pencil className="h-3 w-3" />
@@ -855,7 +855,7 @@ export function AIVaultPage() {
                               // 删完立刻落盘，不用再点下面的「保存配置」
                               persistFallbacks(moduleKey, next, t('vault.fallbackDeleted'));
                             }}
-                            className="shrink-0 flex items-center gap-1 px-2 py-1 rounded border border-line text-[11px] text-ink-2 hover:text-danger hover:border-danger transition-colors"
+                            className="shrink-0 flex items-center gap-1 px-2 py-1 rounded border border-line text-[11px] text-ink-2 hover:text-danger-strong hover:border-danger active:opacity-90 transition-colors"
                             title={t('vault.fallbackRemove')}
                           >
                             <X className="h-3 w-3" />
@@ -873,7 +873,7 @@ export function AIVaultPage() {
                           return (
                             <div className={`mt-1 text-[11px] ${r.success ? (partial ? 'text-warning-strong' : 'text-success-strong') : 'text-danger-strong'}`}>
                               {r.success
-                                ? (partial ? t('vault.fallbackTestPartial') : t('vault.fallbackTestOk', { label: fb.label || `备用${i + 1}` }))
+                                ? (partial ? t('vault.fallbackTestPartial') : t('vault.fallbackTestOk', { label: fb.label || t('vault.fallbackName', { n: i + 1 }) }))
                                 : `${t('vault.fallbackTestFail')}：${String(r.error || '').slice(0, 180)}`}
                             </div>
                           );

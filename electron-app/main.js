@@ -52,8 +52,12 @@ const DEFAULT_PROJECT_ROOT = path.resolve(__dirname, '..');
 // 已知 venv python（用户机上的默认解释器）
 const KNOWN_PYTHON =
   'C:\\Users\\liujianghua\\.workbuddy\\binaries\\python\\envs\\mjscxt\\Scripts\\python.exe';
-// 桌面版专用端口：避免与浏览器版/PyInstaller 版共用 5210 时串数据根
-const DEFAULT_PORT = 5211;
+// 桌面版专用端口：**必须与浏览器版/PyInstaller 版的后端端口错开**（45871）——
+// 共用端口会让两个实例同时在监听时，Electron 的 resolvePort() 直接判定
+// 「端口已有健康后端」并复用它，于是桌面版的项目数据被写进另一个进程的数据根。
+// 反向的那条约束同样成立：默认值不能和 BACKEND_PORT 相同。
+// 2026-10-07：原 5211 → 45872（与后端 45871 保持同段高位号但彼此错开一位）
+const DEFAULT_PORT = 45872;
 
 // 环形缓冲：子进程 stdout/stderr 最多保留 500 行
 const LOG_RING_MAX = 500;
@@ -75,6 +79,15 @@ function defaultConfig() {
   return { projectRoot: DEFAULT_PROJECT_ROOT, pythonExe: KNOWN_PYTHON, port: DEFAULT_PORT };
 }
 
+// 端口合法性校验。存在的原因：backend.json 是**跨版本持久化**的，老版本桌面版
+// 把 5211 写进了磁盘上的配置。改端口后若只改 DEFAULT_PORT，这些老配置会被
+// loadConfig 原样读回来，桌面版又落回旧端口 —— 且 resolvePort() 看到 5211 被
+// 占（正是本项目另一个实例）时还会主动顺延，白白绕开我们想要的端口。
+// 所以凡是「从磁盘读回的端口」都必须过这道校验，非法即回落默认值。
+function isValidPort(p) {
+  return Number.isInteger(p) && p > 0 && p < 65536;
+}
+
 function loadConfig() {
   const def = defaultConfig();
   try {
@@ -83,7 +96,7 @@ function loadConfig() {
       return {
         projectRoot: typeof raw.projectRoot === 'string' ? raw.projectRoot : def.projectRoot,
         pythonExe: typeof raw.pythonExe === 'string' ? raw.pythonExe : def.pythonExe,
-        port: Number.isFinite(raw.port) ? raw.port : def.port,
+        port: isValidPort(raw.port) ? raw.port : def.port,
       };
     }
   } catch {
@@ -477,7 +490,7 @@ function scheduleAutoChecks() {
 
 const backend = {
   child: null,      // 我们 spawn 的 python 子进程；复用实例时为 null
-  reused: false,    // 是否复用了 5000 上已有的 Flask（例如浏览器版已在跑）
+  reused: false,    // 是否复用了 DEFAULT_PORT 上已有的 Flask（例如浏览器版已在跑）
   port: null,
   starting: false,
   shuttingDown: false,

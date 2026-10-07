@@ -25,6 +25,7 @@ import shutil
 import random
 import hashlib
 import logging
+import log_setup  # 统一日志（时间戳/行号/线程/ERROR 带堆栈）；只依赖标准库，不构成循环依赖
 import threading
 import requests
 import cancellation  # S9：远端任务取消（中止信号贯穿 ComfyUI 轮询，与 pipeline/llm_client 同一套）
@@ -67,7 +68,10 @@ import comfyui_models
 import style_kit
 import h3_prompt_kit
 
-logging.basicConfig(level=logging.INFO)
+# ⭐ 2026-10-07：原先这里是 `logging.basicConfig(level=logging.INFO)`（不带 format），
+# 它抢在 serve.py 的 basicConfig 之前装上默认格式 `LEVEL:name:msg`，
+# 导致 **所有日志都没有时间戳**。改为幂等的统一配置：谁先调用谁生效，格式一致。
+log_setup.setup_logging()
 logger = logging.getLogger(__name__)
 
 
@@ -2069,9 +2073,9 @@ class ComfyUIClient:
     #:   ② 特征标签**不写死**：`_extract_trait_labels` 从角色设定文本自动提取
     #:      （如「冰蓝色眼眸，黑发微乱，哑光黑短外套…」→ 逐条标签），换角色不用改模板。
     #:
-    #: ⚠️ 版式仍是**四区不对称布局**，无法做行列投影切分 → 沿用「角色图不裁剪」
-    #:    配套（`_pick_char_view` 取整图 base.png、`_generate_asset_task` 角色分支
-    #:    不切分）。改版式时两者必须同批考虑。
+    #: ⚠️ 该版式只生成 **Master Character Sheet**（人工审阅/母版）。
+    #:    生产镜头由 character_assets selector 选择独立 Machine Anchor；
+    #:    只有 meta 提供可靠 regions 时才允许从 sheet 确定性裁切。
     #:
     #: ⚠️ 幂等：marker 子串 = "人物设定表"（本串字面子串，见 2026-09-25 教训：
     #:    marker 必须是 suffix 字面子串）。质检对「画面内容文字」的口径（qc_client
@@ -2089,6 +2093,36 @@ class ComfyUIClient:
         "同一角色在所有视图与特写中必须完全一致（五官/发型/服装/配色/体型）。"
         "布料褶皱自然，自然光照，高清纹理，细节丰富，纯白背景，无场景无道具。"
     )
+
+    def generate_character_anchor(self, anchor_key: str, prompt_zh: str,
+                                  seed: int = None, style: str = "", size=None,
+                                  filename_prefix: str = None) -> List[str]:
+        """生成一张独立、干净的 Machine Anchor（单人物/单视角/无文字）。
+
+        与 ``generate_character_base`` 分开是刻意的：master sheet 允许中文标注和
+        多视图拼版，机器锚点必须是单一职责的生产参考图。此方法复用 character T2I
+        工作流，但不注入 Character Sheet 版式，也不依赖旧“正面图→Edit→背面”的
+        不可靠多视角链路。
+        """
+        specs = {
+            "face_front": "正面面部特写，单人物，肩部以上，干净浅色背景，无文字、无标签、无配色板、无拼版",
+            "bust_front": "正面半身胸像，单人物，腰部以上，干净浅色背景，无文字、无标签、无多视角拼版",
+            "half_front": "正面半身人物参考图，单人物，腰部以上，干净浅色背景，无文字、无标签、无多视角拼版",
+            "full_front": "正面全身人物参考图，单人物，从头到脚，干净浅色背景，无文字、无标签、无多视角拼版",
+            "full_back": "背面全身人物参考图，单人物，从头到脚，干净浅色背景，无文字、无标签、无多视角拼版",
+            "full_left45": "左前45度全身人物参考图，单人物，从头到脚，干净浅色背景，无文字、无标签、无多视角拼版",
+            "full_right45": "右前45度全身人物参考图，单人物，从头到脚，干净浅色背景，无文字、无标签、无多视角拼版",
+            "face_left45": "左前45度面部特写，单人物，肩部以上，干净浅色背景，无文字、无标签、无多视角拼版",
+            "face_right45": "右前45度面部特写，单人物，肩部以上，干净浅色背景，无文字、无标签、无多视角拼版",
+        }
+        spec = specs.get(str(anchor_key or "").strip(),
+                         "单人物干净参考图，单一视角，无文字、无标签、无多视角拼版")
+        text = str(prompt_zh or "").strip().rstrip("。;； ")
+        prompt = f"{text}。{spec}。同一角色身份、发型、体型与服装保持一致。"
+        return self._generate_base_image(
+            WORKFLOW_TEMPLATE["character_gen"], prompt,
+            asset_type="character", seed=seed, style=style, size=size,
+            filename_prefix=filename_prefix)
 
     def generate_character_base(self, prompt_zh: str, seed: int = None,
                                 style: str = "", size=None,
@@ -2113,9 +2147,9 @@ class ComfyUIClient:
         从设定文本自动提取的**角色特征标签**，如「冰蓝眼眸」「哑光黑短外套」）。
         2026-10-02 的英文版式（结尾 "no text"）与该需求相反，已整段替换。
 
-        ⚠️ 配套改动（勿只改这一半）：「四区」版式无法再被 `sheet_split` 的
-        行列投影切分 → `_pick_char_view` 只取整图 base.png、`_generate_asset_task`
-        角色分支不再切分（见 app.py 同批改动）。
+        ⚠️ 该版式是 Master Sheet，不再被当作生产万能参考图。生产链路会
+        在基础图后补齐 face/full/half Machine Anchors；只有可靠 regions
+        才走 sheet_split 显式 bbox 切分。
 
         幂等：marker = "人物设定表"（suffix 字面子串，见 2026-09-25 的教训——
         marker 必须能被二次调用识别，否则无限追加）。
@@ -2977,6 +3011,7 @@ class ComfyUIClient:
         # 「参考图1（<image1>）是角色「X」的身份锚点：…」）直接落成官方句式。
         if ref_labels:
             identity_lines = []
+            identity_map = []     # (name, image_position) → 屏幕站位绑定
             role_lines = []
             blocking_pos = 0      # <imageN> 里「3D 导演台构图基准图」的位置（0 = 没带）
             # ⚠️ **必须按位置重新编号**：官方协议里 ``<imageN>`` 的 N 就是「输入顺序」
@@ -2996,6 +3031,9 @@ class ComfyUIClient:
                     continue
                 # 身份锚点：官方句式 “Preserve the exact identity from <imageN>.”
                 if "身份锚点" in lab:
+                    _mname = re.search(r"角色「([^」]+)」", lab)
+                    if _mname:
+                        identity_map.append((_mname.group(1), pos))
                     identity_lines.append(
                         f"Preserve the exact identity from <image{pos}>: "
                         f"{_ref_label_purpose(lab)}. "
@@ -3005,8 +3043,17 @@ class ComfyUIClient:
                 else:
                     role_lines.append(
                         f"Use <image{pos}> only for {_ref_label_purpose(lab)}.")
+            first_body = _ref_label_body(ref_labels[0], 1) if ref_labels else ""
+            first_is_identity = "身份锚点" in first_body
             body = [f"PRIMARY CANVAS: Use <image1> as the primary canvas"
-                    f"{' and identity anchor' if identity_lines and not blocking_pos else ''}."]
+                    f"{' and identity anchor' if identity_lines and not blocking_pos and first_is_identity else ''}."]
+            if identity_lines and not blocking_pos and not first_is_identity:
+                # 2026-10-07：image1 现在优先是场景/构图画布，只负责输出画幅与空间基线；
+                # 若仍追加 “and identity anchor”，会把场景图误绑定成人物身份。
+                body[0] += (
+                    " It defines the output aspect and spatial baseline only; "
+                    "it must not define any character's identity or appearance."
+                )
             if blocking_pos:
                 # 构图基准在最前时，<image1> 是**构图基准图**、不是身份锚点 —— 必须显式
                 # 声明，否则模型会把人偶当成「要保留身份的人」。
@@ -3022,6 +3069,32 @@ class ComfyUIClient:
                 body.append(
                     "Each referenced character must keep its own individual identity; "
                     "do not merge facial features, hairstyles or costumes between them.")
+            # 身份/站位职责拆分：Blocking 决定 A/B 的屏幕左右，identity ref 只决定
+            # 这个人是谁、穿什么。没有显式 blocking 时按 characters_in_shot 顺序，
+            # 两人默认左→右，与 te_3d_director.block_annotation 同口径。
+            if identity_map:
+                _block = shot.get("blocking") if isinstance(shot.get("blocking"), list) else []
+                _side_by_name = {}
+                for _bi, _b in enumerate(_block):
+                    if isinstance(_b, dict) and _b.get("name"):
+                        _x = str(_b.get("x") or _b.get("side") or "").lower()
+                        _side_by_name[str(_b["name"])] = (
+                            "screen-left" if _x in ("left", "左") else
+                            "screen-right" if _x in ("right", "右") else "center-frame")
+                if not _side_by_name:
+                    for _ii, (_n, _ip) in enumerate(identity_map):
+                        if len(identity_map) == 2:
+                            _side_by_name[_n] = "screen-left" if _ii == 0 else "screen-right"
+                        else:
+                            _side_by_name[_n] = "center-frame"
+                _bind = []
+                for _n, _ip in identity_map:
+                    _side = _side_by_name.get(_n, "center-frame")
+                    _bind.append(
+                        f"The character occupying {_side} must preserve identity "
+                        f"and current outfit from <image{_ip}> ({_n}); "
+                        "do not swap these bindings between characters.")
+                body.append("POSITION BINDINGS: " + " ".join(_bind))
             sections.append("\n".join(body))
             if blocking_pos:
                 sections.append(COMPOSITION_BASELINE_SECTION.format(pos=blocking_pos))
@@ -4537,13 +4610,23 @@ class ComfyUIClient:
         def _next_label() -> str:
             return f"<Picture {len(picture_defs) + 1}>"
 
-        def _char_desc(name: str) -> str:
-            # 有分镜图时角色是「三视图独立锚点」（2026-09-27 策略）；无分镜图时它同时
-            # 承担构图锚点，措辞不同（两句都与历史逐字一致，零回归）。
+        def _char_desc(name: str, ref: dict | None = None) -> str:
+            # H3 只接收单人物 Machine Anchor；完整 Character Sheet 只允许 legacy fallback。
+            ref = ref or {}
+            role = str(ref.get("asset_role") or "").strip()
+            view = str(ref.get("view") or ref.get("framing") or "").strip()
+            outfit = str(ref.get("outfit_key") or "").strip()
+            if role == "sheet":
+                return (f"{name} 的 legacy Character Sheet（缺少专用机器锚点），"
+                        f"仅作最后兜底的身份参考")
+            suffix = f"，当前服装状态：{outfit}" if outfit else ""
+            view_txt = f"，视角/景别：{view}" if view else ""
             if storyboard_ref:
-                return (f"{name} 的三视图设定图，定义其面部身份、发型、体型、服装与画风，"
+                return (f"{name} 的干净单人物机器锚点{view_txt}{suffix}，"
+                        f"定义其面部身份、发型、体型、服装与画风，"
                         f"并作为其出场镜头的身份锚点")
-            return (f"{name} 的外观参考，定义其五官、发型、服装与画风，"
+            return (f"{name} 的干净单人物外观锚点{view_txt}{suffix}，"
+                    f"定义其五官、发型、服装与画风，"
                     f"并作为其出场镜头的构图锚点")
 
         # ---- 0) 公共参考图（H3 Director 公共参数）：必须排在段级图之前 ----
@@ -4575,7 +4658,7 @@ class ComfyUIClient:
                 picture_defs.append((label, _it_txt))
             else:
                 # character（kind 缺省也走这里：公共池主体就是角色锚点）
-                _ch_txt = _char_desc(name)
+                _ch_txt = _char_desc(name, ref)
                 if _note and _ap:
                     _ch_txt += f"；本集设定：{_ap}"
                 picture_defs.append((label, _ch_txt))
@@ -4593,7 +4676,7 @@ class ComfyUIClient:
             for ref in (char_refs or []):
                 name = ref.get("name", f"角色{len(subjects) + 1}")
                 label = _next_label()
-                picture_defs.append((label, _char_desc(name)))
+                picture_defs.append((label, _char_desc(name, ref)))
                 subjects.append({"name": name, "appearance": _appearance(ref),
                                  "picture": label})
             # 本镜物品：形状/材质/配色锚点（Subject 归属，走「材质/配色」保留语义）。
@@ -4624,7 +4707,7 @@ class ComfyUIClient:
         for ref in (char_refs or []):
             name = ref.get("name", f"角色{len(subjects) + 1}")
             label = _next_label()
-            picture_defs.append((label, _char_desc(name)))
+            picture_defs.append((label, _char_desc(name, ref)))
             subjects.append({"name": name, "appearance": _appearance(ref),
                              "picture": label})
         for ref in (item_refs or []):

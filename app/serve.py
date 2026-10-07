@@ -30,6 +30,8 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
+import log_setup  # noqa: E402  依赖上面刚把 _HERE 放进 sys.path
+
 
 def _load_flask_app():
     """按文件路径稳健加载 app/app.py 里的 Flask 实例。
@@ -261,6 +263,12 @@ def _redirect_process_logs() -> None:
 # 导入期立即生效：必须在 `app = _load_flask_app()` 之前（见上方说明）。
 _redirect_process_logs()
 
+# ⭐ 2026-10-07：日志格式在此**一次性**定死，且必须早于任何业务模块 import。
+#   原因见 log_setup 模块文档：以前时间戳那行 basicConfig 写在 __main__ 里，
+#   跑在 comfyui_client 等模块的 basicConfig 之后 → 从未生效（日志全是
+#   `INFO:serve:xxx`，没有时间戳）。setup_logging 幂等且会接管，谁先到都对。
+#   放在 _redirect_process_logs() 之后 → handler 直接绑到 tee 上。
+log_setup.setup_logging()
 
 app = _load_flask_app()
 
@@ -287,6 +295,7 @@ def _env_int(key: str, default: int) -> int:
 from host_guard import (        # noqa: E402
     _LOOPBACK_HOSTS, _ALLOW_NON_LOOPBACK_ENV,
     _is_loopback_host, _guard_host)
+from ports import backend_port  # noqa: E402  端口唯一事实源（默认值曾在此处硬编码为 5210）
 
 
 
@@ -294,7 +303,7 @@ def _safe_run():
     """安全运行主服务，崩溃后返回 False"""
     try:
         host = (os.getenv("APP_HOST") or "127.0.0.1").strip()
-        port = _env_int("APP_PORT", 5210)
+        port = backend_port()  # 默认值来自 ports.BACKEND_PORT（环境变量 APP_PORT 仍可覆盖）
         threads = _env_int("APP_THREADS", 8)
         channel_timeout = _env_int("APP_CHANNEL_TIMEOUT", 1800)
 
@@ -417,7 +426,7 @@ def main() -> int:
 
 if __name__ == "__main__":
     _redirect_process_logs()
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    # 幂等兜底：导入期那次已配好，这里只保底（例如有人把上面的调用挪走了）
+    log_setup.setup_logging()
     raise SystemExit(main())
 

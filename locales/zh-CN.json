@@ -104,7 +104,8 @@
     "statusComfyOffline": "ComfyUI 离线",
     "statusChecking": "检测中…",
     "statusLastCheck": "上次检测 {time}",
-    "preview": "预览"
+    "preview": "预览",
+    "backend": "后端"
   },
   "mode": {
     "per_shot": "逐镜头生成（每镜一段）",
@@ -968,7 +969,10 @@
     "cm.switchOff": "关",
     "cm.actualRefineSelectedOff": "已选模板但关闭，未执行",
     "cm.actualDlssTemplateOn": "二采模板包含",
-    "cm.actualDlssTemplateOff": "现役单采模板不包含"
+    "cm.actualDlssTemplateOff": "现役单采模板不包含",
+    "cm.trtNotTested": "未测试",
+    "cm.trtStatusOk": "可用",
+    "cm.trtStatusIncompatible": "不兼容"
   },
   "settings": {
     "title": "设置",
@@ -1592,6 +1596,7 @@
     "fallbackSave": "添加",
     "fallbackNoKey": "未填密钥",
     "fallbackLabelPh": "名称（可选，如 备用-DeepSeek）",
+    "fallbackName": "备用{n}",
     "fallbackUrlPh": "https://api.example.com/v1",
     "fallbackModelPh": "模型名",
     "fallbackKeyPh": "sk-...",
@@ -1716,7 +1721,23 @@
     "generateAllDone": "本集分镜首跑已完成（{total} 镜）",
     "generateAllFailed": "本集分镜首跑失败",
     "generateAllTimeout": "本集分镜首跑轮询超时",
-    "generateAllPartial": "本集分镜首跑完成但有失败镜头（成功 {ok}/{total}）"
+    "generateAllPartial": "本集分镜首跑完成但有失败镜头（成功 {ok}/{total}）",
+    "saveFailed": "保存失败",
+    "promptSaved": "镜头 {seq} 提示词已保存",
+    "regenStarted": "分镜 {seq} 重新生成任务已启动（提示词随质检实时刷新）",
+    "startFailed": "启动失败",
+    "regenFailed": "重新生成失败",
+    "finalPrompt": "定稿提示词（本轮出图实际使用）",
+    "qcLive": "QC 实时改写 · 第 {n} 次尝试 · {phase}",
+    "phaseRegenerating": "改写后重新生成中",
+    "phaseChecking": "质检判定中",
+    "edit": "编辑",
+    "descLabel": "镜头描述（提示词）",
+    "descPlaceholder": "中近景（腰部以上取景），赵天霸右手食指伸出指向右前方…",
+    "motionLabel": "画面内动作（motion）",
+    "motionPlaceholder": "【摄影机】无；【画面内】赵天霸右手食指前伸，左手丹丸位于胸前",
+    "savePrompt": "保存提示词",
+    "regenStoryboard": "重新生成分镜"
   },
   "video": {
     "batchRetry": {
@@ -1835,5 +1856,120 @@
     "previewBanner": "该集存在预演产物（低分辨率、不可交付），批准预演后才生产正式成片",
     "approvePreview": "批准预演",
     "close": "关闭"
+  },
+  "ctx": {
+    "navLabel": "项目上下文",
+    "collapseNavigator": "收起镜头导航",
+    "expandNavigator": "展开镜头导航",
+    "season": "季",
+    "noEpisode": "未选集",
+    "shotN": "第 {n} 镜",
+    "noShot": "未选镜",
+    "queue": "队列",
+    "gpuBusy": "忙碌",
+    "gpuBusyNamed": "忙碌（{gpu}）",
+    "gpuIdle": "空闲",
+    "disk": "磁盘"
+  },
+  "shell": {
+    "collapseInspector": "收起检查器",
+    "expandInspector": "展开检查器"
+  },
+  "update": {
+    "button": "检查更新",
+    "buttonTitle": "检查更新（GitHub 最新版）",
+    "busy": "更新中…",
+    "checkFailed": "检查更新失败",
+    "checking": "正在检查 GitHub 最新版本…",
+    "modalTitle": "软件更新",
+    "modalDesc": "来自 GitHub 公开发布仓库（xianjing2000/comic-drama-forge）",
+    "resource": "资源增量",
+    "full": "整包更新",
+    "resourceDone": "资源已更新到 {version}，正在重载应用…",
+    "resourceDoneShort": "资源已更新，正在重载",
+    "resourceFailed": "资源更新失败",
+    "latestFallback": "最新版",
+    "fullDeferred": "整包已下载完成，可再次点击「整包更新」立即应用，或稍后重启生效。",
+    "fullDone": "整包已应用，新进程即将接管并重启。",
+    "fullFailed": "整包更新失败",
+    "currentVersion": "当前版本",
+    "latestVersion": "最新版本",
+    "resourceDesc": "只更新工作流/前端/后端代码，体积小，保留密钥与数据；重启后端后生效。",
+    "fullDesc": "下载完整 Portable 应用（含 Python 运行时），约 200MB+；下载后由 bootstrapper 接管替换并重启整个应用。",
+    "shaNote": "两种方式都会自动做 SHA256 校验。",
+    "applyingResource": "正在下载并应用资源增量（可能需数十秒到数分钟）…",
+    "applyingFull": "正在下载整包（约 200MB+，可能需数分钟）…",
+    "upToDate": "当前已是最新版本（{version}）。"
+  },
+  "studio": {
+    "intentTitle": "导演意图",
+    "frozen": "已冻结",
+    "frozenHint": "意图已冻结，不能就地修改。改动会派生一条新意图并保留完整血缘。",
+    "cameraMove": "运镜",
+    "emotion": "情绪",
+    "gaze": "视线",
+    "promptLabel": "画面描述",
+    "promptPlaceholder": "例如：雨夜天台，女主背对镜头转身，视线落在楼下车流",
+    "promptHint": "留空则回退到剧本原文描述。",
+    "derive": "派生新意图",
+    "unspecified": "（未指定）",
+    "stagingTitle": "站位",
+    "noCharacters": "这一镜没有出场角色。",
+    "readOnly": "只读模式",
+    "moveTo": "移到{stage}侧",
+    "gazePrefix": "视线：",
+    "stage": {
+      "left": "左",
+      "center": "中",
+      "right": "右"
+    },
+    "bridgeTitle": "首尾帧桥接",
+    "startFrame": "首帧",
+    "endFrame": "尾帧",
+    "commitBridge": "确认桥接",
+    "regenerate": "重生成",
+    "regenerateTitle": "重生成{label}",
+    "cannotRegenerate": "当前不可重生成",
+    "notGenerated": "未生成{label}",
+    "navigatorLabel": "镜头导航",
+    "virtualized": "（已虚拟化渲染）",
+    "compareTitle": "候选并排对比",
+    "compareLoading": "加载候选中…",
+    "compareLoadFailed": "候选列表加载失败：{err}",
+    "noCandidates": "这一轮还没有候选版本。",
+    "pick": "选中",
+    "selectShot": "选择一个镜头",
+    "compare": "候选对比",
+    "compareHint": "并排比较候选",
+    "noIntent": "本镜尚无生成意图",
+    "selectShotFirst": "请先选择镜头",
+    "enum": {
+      "camera": {
+        "static": "固定",
+        "pushIn": "推近",
+        "pullOut": "拉远",
+        "panLeft": "左摇",
+        "panRight": "右摇",
+        "tiltUp": "上摇",
+        "tiltDown": "下摇",
+        "handheld": "手持",
+        "tracking": "跟拍"
+      },
+      "emotion": {
+        "calm": "平静",
+        "tense": "紧张",
+        "warm": "温暖",
+        "cold": "冷",
+        "melancholy": "怅惘",
+        "urgent": "急切"
+      },
+      "gaze": {
+        "camera": "看镜头",
+        "subject": "看对手",
+        "offScreen": "看画外",
+        "down": "低头",
+        "up": "抬头"
+      }
+    }
   }
 }

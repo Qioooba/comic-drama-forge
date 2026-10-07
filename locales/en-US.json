@@ -104,7 +104,8 @@
     "statusComfyOffline": "ComfyUI offline",
     "statusChecking": "Checking...",
     "statusLastCheck": "Last checked {time}",
-    "preview": "Preview"
+    "preview": "Preview",
+    "backend": "Backend"
   },
   "mode": {
     "per_shot": "Per-shot (one segment each)",
@@ -968,7 +969,10 @@
     "cm.switchOff": "Off",
     "cm.actualRefineSelectedOff": "Template selected but disabled; not executed",
     "cm.actualDlssTemplateOn": "Included by refine template",
-    "cm.actualDlssTemplateOff": "Not in active single-pass template"
+    "cm.actualDlssTemplateOff": "Not in active single-pass template",
+    "cm.trtNotTested": "Not tested",
+    "cm.trtStatusOk": "Available",
+    "cm.trtStatusIncompatible": "Incompatible"
   },
   "settings": {
     "title": "Settings",
@@ -1624,6 +1628,7 @@
     "fallbackSave": "Add",
     "fallbackNoKey": "No key",
     "fallbackLabelPh": "Label (optional)",
+    "fallbackName": "Fallback {n}",
     "fallbackUrlPh": "https://api.example.com/v1",
     "fallbackModelPh": "Model name",
     "fallbackKeyPh": "sk-...",
@@ -1716,7 +1721,23 @@
     "generateAllDone": "Storyboard first-run completed ({total} shots)",
     "generateAllFailed": "Storyboard first-run failed",
     "generateAllTimeout": "Storyboard first-run polling timed out",
-    "generateAllPartial": "Storyboard first-run completed with failed shots ({ok}/{total} succeeded)"
+    "generateAllPartial": "Storyboard first-run completed with failed shots ({ok}/{total} succeeded)",
+    "saveFailed": "Save failed",
+    "promptSaved": "Prompt saved for shot {seq}",
+    "regenStarted": "Storyboard regeneration started for shot {seq} (the prompt refreshes live as QC runs)",
+    "startFailed": "Failed to start",
+    "regenFailed": "Regeneration failed",
+    "finalPrompt": "Final prompt (used for this render)",
+    "qcLive": "QC live rewrite · attempt {n} · {phase}",
+    "phaseRegenerating": "Regenerating after rewrite",
+    "phaseChecking": "QC verdict in progress",
+    "edit": "Edit",
+    "descLabel": "Shot description (prompt)",
+    "descPlaceholder": "Medium close-up (framed from the waist up); Zhao Tianba points toward the front right with his right index finger…",
+    "motionLabel": "Action in frame (motion)",
+    "motionPlaceholder": "[Camera] none; [In frame] Zhao Tianba reaches forward with his right index finger, a pill held at chest height in his left hand",
+    "savePrompt": "Save prompt",
+    "regenStoryboard": "Regenerate storyboard"
   },
   "video": {
     "batchRetry": {
@@ -1835,5 +1856,120 @@
     "previewBanner": "This episode has a preview render (low-res, non-deliverable). Approve it to start final production.",
     "approvePreview": "Approve preview",
     "close": "Close"
+  },
+  "ctx": {
+    "navLabel": "Project context",
+    "collapseNavigator": "Collapse shot navigator",
+    "expandNavigator": "Expand shot navigator",
+    "season": "Season",
+    "noEpisode": "No episode selected",
+    "shotN": "Shot {n}",
+    "noShot": "No shot selected",
+    "queue": "Queue",
+    "gpuBusy": "Busy",
+    "gpuBusyNamed": "Busy ({gpu})",
+    "gpuIdle": "Idle",
+    "disk": "Disk"
+  },
+  "shell": {
+    "collapseInspector": "Collapse inspector",
+    "expandInspector": "Expand inspector"
+  },
+  "update": {
+    "button": "Check for updates",
+    "buttonTitle": "Check for updates (latest GitHub release)",
+    "busy": "Updating…",
+    "checkFailed": "Update check failed",
+    "checking": "Checking the latest GitHub release…",
+    "modalTitle": "Software update",
+    "modalDesc": "From the public GitHub release repo (xianjing2000/comic-drama-forge)",
+    "resource": "Resource update",
+    "full": "Full update",
+    "resourceDone": "Resources updated to {version}. Reloading the app…",
+    "resourceDoneShort": "Resources updated, reloading",
+    "resourceFailed": "Resource update failed",
+    "latestFallback": "the latest version",
+    "fullDeferred": "The full package finished downloading. Click “Full update” again to apply it now, or restart later.",
+    "fullDone": "Full package applied. A new process takes over and restarts shortly.",
+    "fullFailed": "Full update failed",
+    "currentVersion": "Current version",
+    "latestVersion": "Latest version",
+    "resourceDesc": "Only updates workflows, frontend and backend code — small download, keeps your keys and data. Takes effect after the backend restarts.",
+    "fullDesc": "Downloads the complete portable app (including the Python runtime), around 200MB+. The bootstrapper replaces the app and restarts it.",
+    "shaNote": "Both methods run a SHA-256 checksum automatically.",
+    "applyingResource": "Downloading and applying the resource update (may take from seconds to minutes)…",
+    "applyingFull": "Downloading the full package (around 200MB+, may take a few minutes)…",
+    "upToDate": "You are already on the latest version ({version})."
+  },
+  "studio": {
+    "intentTitle": "Director intent",
+    "frozen": "Frozen",
+    "frozenHint": "The intent is frozen and cannot be edited in place. Any change derives a new intent and keeps the full lineage.",
+    "cameraMove": "Camera move",
+    "emotion": "Emotion",
+    "gaze": "Gaze",
+    "promptLabel": "Shot description",
+    "promptPlaceholder": "e.g. On a rooftop in the rain, the heroine turns away from the camera, her gaze falling on the traffic below",
+    "promptHint": "Leave empty to fall back to the description in the script.",
+    "derive": "Derive new intent",
+    "unspecified": "(not set)",
+    "stagingTitle": "Blocking",
+    "noCharacters": "No characters appear in this shot.",
+    "readOnly": "Read-only",
+    "moveTo": "Move to the {stage} side",
+    "gazePrefix": "Gaze: ",
+    "stage": {
+      "left": "Left",
+      "center": "Center",
+      "right": "Right"
+    },
+    "bridgeTitle": "Frame bridge",
+    "startFrame": "First frame",
+    "endFrame": "Last frame",
+    "commitBridge": "Confirm bridge",
+    "regenerate": "Regenerate",
+    "regenerateTitle": "Regenerate {label}",
+    "cannotRegenerate": "Cannot regenerate right now",
+    "notGenerated": "{label} not generated",
+    "navigatorLabel": "Shot navigator",
+    "virtualized": " (virtualized)",
+    "compareTitle": "Compare candidates side by side",
+    "compareLoading": "Loading candidates…",
+    "compareLoadFailed": "Failed to load candidates: {err}",
+    "noCandidates": "This run has no candidate versions yet.",
+    "pick": "Pick",
+    "selectShot": "Select a shot",
+    "compare": "Compare candidates",
+    "compareHint": "Compare candidates side by side",
+    "noIntent": "This shot has no generation intent yet",
+    "selectShotFirst": "Select a shot first",
+    "enum": {
+      "camera": {
+        "static": "Static shot",
+        "pushIn": "Push in",
+        "pullOut": "Pull out",
+        "panLeft": "Pan left",
+        "panRight": "Pan right",
+        "tiltUp": "Tilt up",
+        "tiltDown": "Tilt down",
+        "handheld": "Handheld",
+        "tracking": "Tracking"
+      },
+      "emotion": {
+        "calm": "Calm",
+        "tense": "Tense",
+        "warm": "Warm",
+        "cold": "Cold",
+        "melancholy": "Melancholy",
+        "urgent": "Urgent"
+      },
+      "gaze": {
+        "camera": "To camera",
+        "subject": "At the other party",
+        "offScreen": "Off screen",
+        "down": "Looking down",
+        "up": "Looking up"
+      }
+    }
   }
 }

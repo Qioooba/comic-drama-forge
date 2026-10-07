@@ -119,6 +119,86 @@ REASONING_EFFORT_STYLE = "chat_template_kwargs"
 # 不注入档位会被网关按默认（通常是最高档）解析，反而更烧 token；low 才是最短思考档。
 REASONING_EFFORT_DOWNGRADE_ORDER = ("max", "high", "low")
 
+# ===================== 模型规格表（2026-10-07）=====================
+# 为什么要这张表：`MAX_TOKENS_CEILING` 原先是写死的 32768，对**所有**模型一视同仁。
+# 32768 是照着 agnes-3.0-flash / GLM 系定的（实测思考水位 ≈16K），对那些模型够用；
+# 但对能吃 128K 输出的模型，等于人为砍掉 75% 额度 —— 「思考重 + 正文长」的分镜任务
+# 会被卡在「只吐思考、正文为空」，而且「提额自救」永远提不过 32768 这道墙。
+# 现场实证（2026-10-07，《测灵根》第 1 集）：mimo-v2.6-flash 在 low 档、32768 上限下
+# 连续两次只返回 reasoning_content，分镜整步失败。
+#
+# ⚠️ 填表纪律：数值必须可追溯，**不要凭印象填**。
+#   - max_output 只填**官方文档**写明的值，没查到就**不要填**（留空 → 回落到 32768，
+#     行为与本次改动前完全一致，绝不因为加了张表就让未知模型变得更激进）；
+#   - thinking_floor 是**本地实测**水位。没实测过的留 None（同样回落全局默认），
+#     宁可低估也不要瞎填 —— 填高了会让所有调用无谓地多要额度。
+MODEL_SPECS = {
+    # ---- 小米 MiMo ----
+    "mimo-v2.6": {
+        # 官方文档（mimo.mi.com/docs 模型列表）：上下文 1M tokens / 最大输出 128K tokens。
+        # 与 Novita / Requesty / TokenLab 三家目录交叉核对一致（均记 131072）。
+        "max_output": 131072,
+        # ⚠️ 刻意留空：**未实测**。
+        # 已知事实只有「32768 仍只吐思考」这一条负向证据，说明本业务的思考量 >32768，
+        # 但具体水位未知。填一个猜的数字（如 65536）会让每次调用都无谓索要 6 万额度。
+        # 正确做法是先把 ceiling 放开到 131072，让既有的「提额自救」去够真正的水位；
+        # 等某次成功调用把 usage 打出来，再回来把这个值填上。
+        "thinking_floor": None,
+        "note": "全模态 MoE；思考与正文共享同一份输出额度",
+    },
+    # ---- GLM 系 ----
+    # 只记实测水位，**不填 max_output**：本次没有查到 GLM-5.3-Flash 的官方输出上限，
+    # 留空 → 回落 32768，与改动前一致。
+    "glm-5.3": {
+        "thinking_floor": REASONING_ONLY_TOKEN_FLOOR,
+        "note": "always-on reasoning，只能调 reasoning_effort 档位；水位实测 ≈16K",
+    },
+    # ---- agnes 系 ----
+    # 同上：不填未查证的 max_output。
+    "agnes-3.0": {
+        "thinking_floor": REASONING_ONLY_TOKEN_FLOOR,
+        "note": "always-on reasoning；水位实测 ≈16K（见 REASONING_ONLY_TOKEN_FLOOR 注释）",
+    },
+}
+
+#: 未收录模型的兜底上限。刻意等于旧常量：保证未知模型的行为不比本次改动前更激进。
+DEFAULT_MODEL_MAX_OUTPUT = MAX_TOKENS_CEILING
+
+
+def model_spec(model: str = "") -> dict:
+    """按 model id 解析模型规格；未命中返回 {}（调用方回落到全局默认）。
+
+    匹配方式：对 model id 做**小写子串匹配**，多条命中时取 key 最长的那条（最具体），
+    这样 `mimo-v2.6-flash`、`xiaomi/mimo-v2.6-flash`、带日期后缀的变体都能命中同一条。
+    """
+    m = str(model or "").strip().lower()
+    if not m:
+        return {}
+    best_key, best = "", {}
+    for key, spec in MODEL_SPECS.items():
+        if key in m and len(key) > len(best_key):
+            best_key, best = key, spec
+    return best
+
+
+def model_max_output(model: str = "") -> int:
+    """该模型的输出上限（token）；未收录或未填 max_output 则回落 32768。"""
+    try:
+        val = int(model_spec(model).get("max_output") or 0)
+    except (TypeError, ValueError):
+        val = 0
+    return val or DEFAULT_MODEL_MAX_OUTPUT
+
+
+def model_thinking_floor(model: str = "") -> int:
+    """该模型的思考水位（token）；未实测过的模型回落全局 REASONING_ONLY_TOKEN_FLOOR。"""
+    spec = model_spec(model)
+    try:
+        val = int(spec.get("thinking_floor") or 0) if spec.get("thinking_floor") else 0
+    except (TypeError, ValueError):
+        val = 0
+    return val or REASONING_ONLY_TOKEN_FLOOR
+
 
 class LLMError(Exception):
     """LLM 调用失败（面向用户的友好错误）"""
@@ -363,7 +443,7 @@ def public_view(cfg: dict) -> dict:
 
 # ===================== URL 规范化 =====================
 
-def thinking_token_floor(max_tokens: int, reasoning_effort: str = "") -> int:
+def thinking_token_floor(max_tokens: int, reasoning_effort: str = "", model: str = "") -> int:
     """把 max_tokens 抬到「思考水位」之上（只抬不降）。
 
     各调用点按「正文长度」估额度（1600~7500），但 always-on reasoning 模型
@@ -373,6 +453,9 @@ def thinking_token_floor(max_tokens: int, reasoning_effort: str = "") -> int:
 
     只在「配置了思考档位」时抬 —— 未配置档位的普通模型不需要这个水位，
     抬高只会浪费配额（它们的空正文另有原因，走原重试语义）。
+
+    ``model`` 用于查该模型自己的水位（见 MODEL_SPECS）；不传则沿用全局默认值，
+    保持既有调用点（continuity 等）的行为不变。
     """
     try:
         mt = int(max_tokens or 0)
@@ -381,9 +464,10 @@ def thinking_token_floor(max_tokens: int, reasoning_effort: str = "") -> int:
     re_ = str(reasoning_effort or "").strip().lower()
     if not re_ or re_ not in REASONING_EFFORT_DOWNGRADE_ORDER:
         return mt
-    if mt >= REASONING_ONLY_TOKEN_FLOOR:
+    floor = model_thinking_floor(model)
+    if mt >= floor:
         return mt
-    return min(REASONING_ONLY_TOKEN_FLOOR, MAX_TOKENS_CEILING)
+    return min(floor, model_max_output(model))
 
 
 def build_chat_url(base_url: str) -> str:
@@ -446,6 +530,15 @@ class LLMClient:
     @property
     def configured(self) -> bool:
         return bool(self.base_url and self.api_key and self.model)
+
+    @property
+    def token_ceiling(self) -> int:
+        """本 client 生效的 max_tokens 上限 —— **按模型取**，未收录回落 32768。
+
+        刻意做成 property 而不是 __init__ 里算一次存字段：self.model 可能被重载
+        （换模型 / failover 切到备用模型），每次读都重新解析才不会用旧模型的额度。
+        """
+        return model_max_output(self.model)
 
     @staticmethod
     def gateway_circuit_state(base_url: str) -> dict:
@@ -839,9 +932,13 @@ class LLMClient:
         诊断信息写入 self.last_json_meta。
         """
         ladder = tuple(token_ladder or DEFAULT_TOKEN_LADDER)
+        # 本次调用生效的额度上限：按模型取（mimo-v2.6-* → 131072，未收录 → 32768）。
+        # 本函数内所有「还能不能加额度 / 加到多少」一律以它为准，不再读全局常量，
+        # 否则换模型后上限仍是旧的 32768，提额自救会在半路撞墙。
+        ceiling = self.token_ceiling
         # 统一抬到思考水位：各调用点按正文长度估的额度（1600~7500）没算思考开销，
         # 低于水位时正文恒为空（「模型只吐思考内容」）。集中兜住，避免逐点漏改。
-        max_tokens = thinking_token_floor(max_tokens, self.reasoning_effort)
+        max_tokens = thinking_token_floor(max_tokens, self.reasoning_effort, self.model)
         cur = int(max_tokens or 4096)
         attempts = 0
         truncated = False
@@ -860,8 +957,8 @@ class LLMClient:
         def _next_tokens(value: int) -> int:
             for t in ladder:
                 if t > value:
-                    return min(t, MAX_TOKENS_CEILING)
-            return min(value * 2, MAX_TOKENS_CEILING)
+                    return min(t, ceiling)
+            return min(value * 2, ceiling)
 
         def _raise_over_thinking_floor(value: int) -> int:
             """把额度抬到「思考水位」之上，返回提升后的值（已在上方则不降）。
@@ -872,10 +969,10 @@ class LLMClient:
             实测就是在这里卡死：low 档 + 4800 额度 → 思考恒超额度 → 正文永远为空。
             所以「只吐思考」时**先无条件越过思考水位**，再谈降档。
             """
-            floor = max(REASONING_ONLY_TOKEN_FLOOR, _thinking_floor())
+            floor = max(model_thinking_floor(self.model), _thinking_floor())
             if value >= floor:
                 return value
-            return min(floor, MAX_TOKENS_CEILING)
+            return min(floor, ceiling)
 
         def _downgrade_reasoning_effort() -> bool:
             """把 reasoning_effort 降到下一档，返回是否还有可降空间。
@@ -921,22 +1018,22 @@ class LLMClient:
                 #    **额度没用完就宣布没救了**；而 reasoning_effort 本来就是 low
                 #    （REASONING_EFFORT_DOWNGRADE_ORDER 的最低档），确实无可降。
                 #    结果是一个本可重试的额度问题被上报成模型故障，整步卡死。
-                can_raise = cur < MAX_TOKENS_CEILING
+                can_raise = cur < ceiling
                 # ③ 越过水位后仍无正文 → 压思考档位（仅在真的还有下一档时才降）。
                 downgraded = False
                 if raised <= cur and self.reasoning_effort and not can_raise:
                     downgraded = _downgrade_reasoning_effort()
                 # ④ 提额：既然还能加额度就**一次跨到上限**，而不是按 ladder 小步试探
                 #    （模块头部的实测记录已证明阶梯试探只是把用户时间烧光）。
-                nxt = MAX_TOKENS_CEILING if can_raise else cur
+                nxt = ceiling if can_raise else cur
                 nxt = max(nxt, raised)
-                nxt = min(nxt, MAX_TOKENS_CEILING)
+                nxt = min(nxt, ceiling)
                 # ⑤ 只有「额度顶到 MAX_TOKENS_CEILING 且档位也降无可降」才是真的没救了。
                 if nxt <= cur and not downgraded:
                     logger.error(
                         f"模型在思考档位 {getattr(self, 'reasoning_effort', '') or '未注入'}"
                         f"（已无可降档）下仍只吐思考内容（第 {attempts} 次，"
-                        f"max_tokens={cur} 已达 {MAX_TOKENS_CEILING} 上限），"
+                        f"max_tokens={cur} 已达 {ceiling} 上限，模型 {self.model or '未指定'}），"
                         "判定为模型/服务端异常，停止无意义提额，快速失败上浮。")
                     history.append({"attempt": attempts, "max_tokens": cur,
                                     "finish_reason": "reasoning_only", "truncated": True,
@@ -1034,7 +1131,7 @@ class LLMClient:
                            "或换一个非 reasoning 模型。")
             raise LLMError(
                 f"模型连续 {attempts} 次只返回思考内容（reasoning_content）而没有正文，"
-                f"即使已把额度提到 {MAX_TOKENS_CEILING} 上限仍无正文。这不是本任务的 JSON 格式问题"
+                f"即使已把额度提到 {ceiling} 上限仍无正文。这不是本任务的 JSON 格式问题"
                 f"（最后一次 max_tokens={detail['max_tokens']}，思考档位={_eff or '未注入'}）。"
                 + _advice)
         raise LLMError(f"连续 {attempts} 次调用均未返回合法 JSON。最后错误：{last_err}")
@@ -1259,13 +1356,20 @@ class FailoverLLMClient:
 
         ⚠️ 2026-10-07 补一条：**「只吐思考」（LLMReasoningOnlyError）立即切备用，
         不计入 _FAILOVER_THRESHOLD 的连续失败预算**。
-        原因：这类失败里，active client 自己的重试已经把「提额到 MAX_TOKENS_CEILING
-        + 降档到最低」全部试尽了 —— 实测《测灵根》就是 mimo-v2.6-flash 在 low 档、
-        32768 上限下仍然连续只返回 reasoning_content。对**同一个模型**再试 N 次
-        只是重复烧同样的失败，而换一个思考更短的模型恰恰能解决。
+        这里的「立即」是**在 active client 自己提额到本模型上限之后**才发生的：
+        到这一步时，它已经把「提到上限 + 降档到最低」全部试尽了 —— 而「上限」是
+        按模型取的（见 MODEL_SPECS），mimo-v2.6-* 会一路提到 131072 才轮到本分支。
+        对**同一个模型**再试 N 次只是重复烧同样的失败，而换一个思考更短的模型
+        恰恰能解决。
         原先本类错误走通用 LLMError 分支、要在同模型上连吃 3 次预算才切换，
         而 novel_to_script 的 chunk 二分重试又把它放大成整集降级 → 台词全丢 → 成片无声。
         实测那次正是「连续 1 次」就抛了出来，用户配了备用模型也根本没被用上。
+
+        📌 历史现场（读日志时别被误导）：当天《测灵根》失败时上限还是写死的 32768，
+        mimo-v2.6-flash 在 low 档、32768 下连续两次只返回 reasoning_content。当时
+        据此写下「32768 已试尽」的判断；加上模型规格表后 MiMo 的上限是 131072，
+        32768 那次失败**不足以证明**该模型的思考水位。若将来又在 MiMo 上看到
+        131072 也只吐思考，那才说明另有原因（此时更该怀疑模型/网关，而不是额度）。
         """
         self._try_return_to_primary()
         last_exc = None

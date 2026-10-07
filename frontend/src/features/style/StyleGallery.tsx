@@ -67,9 +67,9 @@ export function StyleGallery({
             type="button"
             onClick={() => onCatChange(c.id)}
             aria-pressed={cat === c.id}
-            className={`rounded-full px-3 py-1 text-xs font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 ${
+            className={`rounded-full px-3 py-1 text-xs font-medium transition-colors active:opacity-90 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 ${
               cat === c.id
-                ? 'bg-ink-1 text-white'
+                ? 'bg-brand-subtle text-brand-hover border border-brand'
                 : 'border border-line text-ink-2 hover:bg-surface-2'
             }`}
           >
@@ -101,7 +101,7 @@ export function StyleGallery({
             onClick={() => onSelect(CUSTOM_STYLE)}
             aria-pressed={selected === CUSTOM_STYLE}
             title={t('project.styleCustom')}
-            className={`flex aspect-[3/4] flex-col items-center justify-center gap-1.5 rounded-lg border border-dashed p-1 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 ${
+            className={`flex aspect-[3/4] flex-col items-center justify-center gap-1.5 rounded-lg border border-dashed p-1 transition-colors active:opacity-90 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 ${
               selected === CUSTOM_STYLE
                 ? 'border-brand bg-brand-subtle text-ink-1 ring-2 ring-brand/30'
                 : 'border-line-strong text-ink-3 hover:bg-surface-2'
@@ -122,7 +122,7 @@ export function StyleGallery({
                 onClick={() => onSelect(s.value)}
                 aria-pressed={isSelected}
                 title={`${s.label} · ${s.aspect_default}`}
-                className={`group relative aspect-[3/4] overflow-hidden rounded-lg border transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 ${
+                className={`group relative aspect-[3/4] overflow-hidden rounded-lg border transition-colors active:opacity-90 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 ${
                   isSelected
                     ? 'border-brand ring-2 ring-brand/40'
                     : 'border-line hover:border-line-strong'
@@ -146,7 +146,7 @@ export function StyleGallery({
                   {s.label}
                 </span>
                 {isSelected && (
-                  <span className="absolute right-1 top-1 flex h-5 w-5 items-center justify-center rounded-full bg-brand text-white">
+                  <span className="absolute right-1 top-1 flex h-5 w-5 items-center justify-center rounded-full bg-brand text-on-brand">
                     <Check className="h-3 w-3" />
                   </span>
                 )}

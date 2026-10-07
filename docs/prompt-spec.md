@@ -13,7 +13,9 @@
 1. **`<image1>…<imageN>` 显式编号是硬要求**。官方明确禁用「第一张图 / 图 A / 左边那张」
    这类自然语言指代 —— 会产生歧义。编号即输入顺序（`images.image_N` 槽位序号）。
 2. **`<image1>` 是 major canvas / edit target**。官方 ComfyUI Image Edit workflow 里
-   `image_1` 就是主编辑目标，输出画布也跟随它 → 项目里 `image1` 固定放**主角色身份锚点**。
+   `image_1` 就是主编辑目标，输出画幅也跟随它。2026-10-07 起项目改为**画布优先**：
+   `image1` 优先放 3D 构图基准或场景画布；身份锚点从后续槽位进入。只有整叠参考
+   全是人物时，才回退为身份锚点占 `image1`。这样人物身份图不再为了统一画幅被 cover 裁脸。
 3. **属性解耦（Attribute Disentanglement）**：官方结构是
    `IDENTITY → CHANGE → SOURCE → PRESERVE`，把「谁是画布 / 谁提供身份 / 这次改什么 /
    什么必须不变」拆成各自独立的句子。
@@ -44,10 +46,9 @@
 
 | 槽位 | 编号 | 职责 | 来源 |
 |------|------|------|------|
-| 1 | `<image1>` | 主角色身份锚点（兼画布/构图基线） | `characters_in_shot[0]` |
-| 2 | `<image2>` | 次角色身份（独立，禁止特征串味） | `characters_in_shot[1]` |
-| 3 | `<image3>` | 第三角色身份 | `characters_in_shot[2]` |
-| 4+ | `<image4>`+ | 场景环境与氛围，随后是道具（形状/材质/配色，最多 2 张） | `location` → 场景资产；`items_in_shot` |
+| 1 | `<image1>` | 构图画布：3D 站位基准优先；无基准时取场景。仅人物参考时才回退身份锚点 | 3D 导演台 → `location` 场景资产 → 身份回退 |
+| 2+ | `<image2>`+ | 逐角色干净身份锚点（`identity/face.png`，独立、禁止特征串味） | `characters_in_shot[*]` |
+| 后续 | `<imageN>` | 剩余场景、道具（形状/材质/配色，最多 2 张）与连续性参考 | `location` / `items_in_shot` / 上一镜 |
 
 > ⚠️ **编号必须按位置重新编号**，不能照抄 label 里的数字：label 生成时会带「预留槽位号」，
 > 但某镜若只有 1 个角色，场景实际落在第 2 槽而非第 4 槽。照抄会让提示词引用一个
@@ -84,7 +85,7 @@
 - 改任意一处 → 跑 `.workbuddy/test/verify_shot_type_registry.py`（断言各消费点与权威表
   逐字对齐 + 复合写法解析 + 端到端分镜提示词）。
 
-## 景别对档：角色参考图按镜头景别选「半身档 / 全身档」（2026-09-25）
+## 镜头级 Machine Anchor 选择（2026-10-07 架构升级）
 
 ### 根因
 
@@ -106,29 +107,36 @@ cover 到 9:16 竖屏（544×960）要**左右各裁一半** → 模型为保住
 
 ### 对策
 
-角色设定图由「三张全身横排」→ **「上排 3 全身 + 下排 1 半身胸像」两层版式**，
-新增 `half` 档；分镜端按镜头景别取对应档作 `<image1>`：
+角色资产现在分两层：`base.png` 是 Master Sheet；生产镜头由
+`character_assets.select_character_reference()` 按景别/机位/服装选择
+`face_front / bust_front / half_front / full_front / full_back` 等 Machine Anchor。
+`<image1>` 优先放构图/场景画布，身份锚点从后续槽位进入：
+
 
 | 景别 | 取哪档 | 理由 |
 |------|--------|------|
-| 大特写 / 特写 / 近景 / 中近景 / 局部 / 中景 | `half.png`（正面半身胸像） | 画幅与景别**同向**，画幅对抗消失 |
-| 全景 / 远景 / 大远景 | `front.png`（全身） | 与「拍全身」同向 |
-| **未指定**（camera 只有机位/运镜） | `front.png` | 不猜档位；全身档是画幅对抗最小的默认 |
+| 大特写 / 特写 | `face_front` → `bust_front` → `half_front` | 身份脸优先，禁止裁 Master Sheet |
+| 近景 / 中近景 / 胸像 | `bust_front` → `half_front` | 半身画幅与景别同向 |
+| 中景 | `half_front` → `bust_front` | 中景单人锚点 |
+| 全景 / 远景 / 大远景 | `full_front` → `half_front` | 全身锚点 |
+| 背面 / 背拍 | `full_back` → `full_front` | 背面优先 |
+| 左/右45° | `face/full_left45/right45` → front | 同机位优先 |
+| **未指定** | `full_front` | 不猜景别；明确全身默认 |
 
 > 判据单一口径是 `app._FRAMING_HALF_SHOT`（景别取自 `config.SHOT_TYPES`）——
 > 新增近景类景别时必须同步加进去，否则该景别静默走全身档、重新引入画幅对抗。
 
-实现见 `app._framing_wants_half` / `app._pick_char_view` / `app._allocate_storyboard_refs`。
+实现见 `character_assets.select_character_reference` /
+`app._select_character_reference` / `app._allocate_storyboard_refs`。
+`_pick_char_view` 仅为旧调用保留兼容包装。
 
 > ⚠️ **`_framing_wants_half` 必须先挡空值**：`comfyui_client.camera_key('')` 会返回
 > `'中景'`（那是给生成端用的默认档，**不是**「本镜是中景」）。直接复用会把
 > 「景别未指定」误判成中景 → 静默换档。空值必须提前 return False。
 
-> ⚠️ **`_pick_char_view` 必须优雅降级**：`half.png` 是 2026-09-25 起才有的新档，
-> 存量项目只有 `front.png`/`base.png`。找不到目标档时**逐级回退**
-> （要半身 → half → front → base；要全身 → front → base → half），
-> **绝不返回空** —— 返回空会让该镜头判成「无可用参考图」而 400，
-> 把「档位缺失」升级成「不能出图」。
+> ⚠️ selector 必须优雅回退并记录 `requested/actual/fallback/warning`；
+> 只有 `base.png` 时返回 `legacy_sheet_fallback`。strict 模式缺最低锚点或
+> 指定 outfit 时返回 error 并阻断，不得静默换人/换装。
 
 ### 切分几何（`app/sheet_split.py`）
 

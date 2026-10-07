@@ -7,7 +7,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useApp } from '@/context/AppContext';
 import { t } from '@/i18n';
-import { videoApi, autopilotApi, episodesApi, novelsSplitPlanApi, preflightApi, screenplayApi, characterOutfits, characterSheetUpload, assetPrecipitation, generationApi, assetsApi, type EpisodeScenesResponse, type ChapterPreflightResult, type AssetPrecipitationResponse, type PrecipitationStatus } from '@/api/client';
+import { videoApi, autopilotApi, episodesApi, novelsSplitPlanApi, preflightApi, screenplayApi, characterOutfits, characterSheetUpload, characterAnchors, assetPrecipitation, generationApi, assetsApi, type EpisodeScenesResponse, type ChapterPreflightResult, type AssetPrecipitationResponse, type PrecipitationStatus } from '@/api/client';
 import { Button, Input, EmptyState, ErrorState, Loading, Skeleton, Modal, Select } from '@/components/ui';
 import { useToast } from '@/components/ui/toast';
 import { useComfyProgress } from '@/hooks/useComfyProgress';
@@ -105,7 +105,7 @@ function ProductionProgress({ projectKey }: { projectKey: string }) {
                   done
                     ? 'bg-success-subtle text-success-strong'
                     : active
-                      ? 'bg-brand-subtle text-brand font-medium'
+                      ? 'bg-brand-subtle text-brand-hover font-medium'
                       : 'bg-surface-2 text-ink-3'
                 }`}
               >
@@ -666,7 +666,7 @@ function OverviewTab({
                 // 行为与改前一致（这里的 shots 是 any，取不到 id 时不能凭空造一个）。
                 <div key={shot.shot_id ?? idx} className="border-l-4 border-brand pl-4 py-2">
                   <div className="flex items-center gap-2 mb-1 flex-wrap">
-                    <span className="px-2 py-0.5 bg-brand-subtle text-brand text-xs font-medium rounded">
+                    <span className="px-2 py-0.5 bg-brand-subtle text-brand-hover text-xs font-medium rounded">
                       {t('wb.shotN', { n: shot.shot_id ?? idx + 1 })}
                     </span>
                     {shot.camera && (
@@ -914,7 +914,7 @@ function OverviewTab({
                     <p className="text-xs text-ink-3 mt-0.5">{t('wb.preflightDesc')}</p>
                   </div>
                   <button onClick={() => setPreflightOpen(false)}
-                    className={`p-1.5 rounded-md text-ink-3 hover:bg-surface-2 transition-colors ${FOCUS_RING}`}>
+                    className={`p-1.5 rounded-md text-ink-3 hover:bg-surface-2 transition-colors active:opacity-90 ${FOCUS_RING}`}>
                     <X className="h-4 w-4" />
                   </button>
                 </div>
@@ -969,9 +969,9 @@ function OverviewTab({
                     <button
                       onClick={() => (splitPlanOpen ? setSplitPlanOpen(false) : fetchSplitPlan())}
                       title={t('wb.splitPlanHint')}
-                      className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${FOCUS_RING} ${
+                      className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors active:opacity-90 ${FOCUS_RING} ${
                         splitPlanOpen
-                          ? 'bg-brand text-white'
+                          ? 'bg-brand text-on-brand'
                           : 'bg-surface-2 text-ink-2 hover:bg-line hover:text-ink-1 border border-line'
                       }`}
                     >
@@ -980,9 +980,9 @@ function OverviewTab({
                     <button
                       onClick={() => setPreflightOpen(v => !v)}
                       title={t('wb.preflightHint')}
-                      className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${FOCUS_RING} ${
+                      className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors active:opacity-90 ${FOCUS_RING} ${
                         preflightOpen
-                          ? 'bg-success text-white'
+                          ? 'bg-success text-on-success'
                           : 'bg-surface-2 text-ink-2 hover:bg-line hover:text-ink-1 border border-line'
                       }`}
                     >
@@ -1007,7 +1007,7 @@ function OverviewTab({
                       <span className="text-sm text-danger-strong">{splitPlanError}</span>
                       <button
                         onClick={fetchSplitPlan}
-                        className={`px-2.5 py-1 rounded-md text-xs bg-surface-2 text-ink-2 hover:bg-line ${FOCUS_RING}`}
+                        className={`px-2.5 py-1 rounded-md text-xs bg-surface-2 text-ink-2 hover:bg-line active:opacity-90 ${FOCUS_RING}`}
                       >
                         {t('wb.splitPlanRetry')}
                       </button>
@@ -1085,7 +1085,7 @@ function OverviewTab({
                   <li key={ep.episode_no}>
                     <button
                       onClick={() => loadEpisodeDetail(ep.episode_no)}
-                      className={`w-full p-4 hover:bg-surface-2 transition-colors text-left ${FOCUS_RING}`}
+                      className={`w-full p-4 hover:bg-surface-2 transition-colors active:opacity-90 text-left ${FOCUS_RING}`}
                     >
                       <div className="flex items-center justify-between">
                         <div className="flex items-center gap-3">
@@ -1094,13 +1094,13 @@ function OverviewTab({
                             onClick={(e) => { e.stopPropagation(); toggleScenes(ep.episode_no); }}
                             aria-expanded={scenesOpenEps.includes(ep.episode_no)}
                             title={t('wb.scenesToggle')}
-                            className={`shrink-0 rounded-md p-1 text-ink-3 transition-colors hover:bg-surface-2 hover:text-ink-1 ${FOCUS_RING}`}
+                            className={`shrink-0 rounded-md p-1 text-ink-3 transition-colors hover:bg-surface-2 hover:text-ink-1 active:opacity-90 ${FOCUS_RING}`}
                           >
                             <svg className={`w-4 h-4 transition-transform ${scenesOpenEps.includes(ep.episode_no) ? 'rotate-90' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
                               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
                             </svg>
                           </button>
-                          <span className="flex items-center justify-center w-8 h-8 rounded-full bg-brand-subtle text-brand text-sm font-semibold">
+                          <span className="flex items-center justify-center w-8 h-8 rounded-full bg-brand-subtle text-brand-hover text-sm font-semibold">
                             {ep.episode_no}
                           </span>
                           <div>
@@ -1124,7 +1124,7 @@ function OverviewTab({
                                 <button
                                   onClick={e => { e.stopPropagation(); runPreflight(ep.episode_no); }}
                                   title={t('wb.preflightRun')}
-                                  className="h-2.5 w-2.5 rounded-full bg-line border border-ink-3 cursor-pointer hover:bg-brand transition-colors"
+                                  className="h-2.5 w-2.5 rounded-full bg-line border border-ink-3 cursor-pointer hover:bg-brand active:opacity-90 transition-colors"
                                 />
                               )}
                             </div>
@@ -1141,7 +1141,7 @@ function OverviewTab({
                             onClick={(e) => { e.stopPropagation(); openScreenplay(ep.episode_no); }}
                             disabled={spGenerating && spEpisode === ep.episode_no}
                             title={t('wb.screenplayRowHint')}
-                            className={`inline-flex shrink-0 items-center gap-1 rounded-md border border-line bg-surface-2 px-2 py-1 text-xs font-medium text-ink-2 transition-colors hover:bg-line hover:text-ink-1 disabled:opacity-60 ${FOCUS_RING}`}
+                            className={`inline-flex shrink-0 items-center gap-1 rounded-md border border-line bg-surface-2 px-2 py-1 text-xs font-medium text-ink-2 transition-colors hover:bg-line hover:text-ink-1 active:opacity-90 disabled:opacity-60 ${FOCUS_RING}`}
                           >
                             <FileText className="h-3.5 w-3.5" />
                             {t('wb.screenplay')}
@@ -1208,7 +1208,7 @@ function OverviewTab({
                             <span className="text-sm text-danger-strong">{scenesErrByEp[ep.episode_no]}</span>
                             <button
                               onClick={() => fetchScenes(ep.episode_no)}
-                              className={`rounded-md bg-surface-2 px-2.5 py-1 text-xs text-ink-2 transition-colors hover:bg-line ${FOCUS_RING}`}
+                              className={`rounded-md bg-surface-2 px-2.5 py-1 text-xs text-ink-2 transition-colors hover:bg-line active:opacity-90 ${FOCUS_RING}`}
                             >
                               {t('wb.scenesRetry')}
                             </button>
@@ -1255,7 +1255,7 @@ function OverviewTab({
                                     onClick={() => redoScene(ep.episode_no, sc.scene_no)}
                                     disabled={redoBusy !== null}
                                     title={t('wb.sceneRedoHint')}
-                                    className={`ml-auto inline-flex shrink-0 items-center gap-1 rounded-md border border-line bg-surface px-2 py-1 text-xs font-medium text-ink-2 transition-colors hover:bg-line hover:text-ink-1 disabled:opacity-60 ${FOCUS_RING}`}
+                                    className={`ml-auto inline-flex shrink-0 items-center gap-1 rounded-md border border-line bg-surface px-2 py-1 text-xs font-medium text-ink-2 transition-colors hover:bg-line hover:text-ink-1 active:opacity-90 disabled:opacity-60 ${FOCUS_RING}`}
                                   >
                                     {redoBusy === redoKey && (
                                       <span className="h-3 w-3 animate-spin rounded-full border-2 border-brand border-t-transparent" />
@@ -1476,7 +1476,7 @@ function AssetCard({
     <button
       type="button"
       onClick={onClick}
-      className={`text-left bg-surface rounded-xl border border-line overflow-hidden hover:shadow-lg transition-shadow ${FOCUS_RING}`}
+      className={`text-left bg-surface rounded-xl border border-line overflow-hidden hover:shadow-lg active:opacity-90 transition-shadow ${FOCUS_RING}`}
     >
       <div className={`${thumbAspect} bg-surface-2 flex items-center justify-center overflow-hidden`}>
         {imageUrl && !broken ? (
@@ -1527,6 +1527,7 @@ function UploadSheetModal({
   const [preview, setPreview] = useState('');
   const [busy, setBusy] = useState(false);
   const [overwrite, setOverwrite] = useState(false);
+  const [assetRole, setAssetRole] = useState<'sheet' | 'face_front' | 'full_front' | 'half_front' | 'bust_front' | 'full_back'>('sheet');
   const fileRef = useRef<HTMLInputElement | null>(null);
 
   // 每次打开重置：上一次的文件/错误绝不能带进下一次（会误传给另一个角色）
@@ -1536,6 +1537,7 @@ function UploadSheetModal({
     setPreview('');
     setBusy(false);
     setOverwrite(false);
+    setAssetRole('sheet');
     setCustomName('');
     setCharacter((prev) => (prev && characters.includes(prev) ? prev : characters[0] || ''));
   }, [isOpen, characters]);
@@ -1568,6 +1570,7 @@ function UploadSheetModal({
         character: finalName,
         file,
         overwrite,
+        asset_role: assetRole,
       });
       if (r.skipped) {
         toast.info(r.message || t('uploadSheet.skipped'));
@@ -1588,7 +1591,27 @@ function UploadSheetModal({
   return (
     <Modal isOpen={isOpen} onClose={onClose} title={t('uploadSheet.title')}>
       <div className="space-y-4">
-        {/* 版式示意：这是本功能唯一的使用门槛，必须一眼看懂 */}
+        {/* 资产类型：sheet=人工 Master；其余=单人物 Machine Anchor */}
+        <div>
+          <label className="block text-sm font-medium text-ink-1 mb-1">
+            {t('uploadSheet.character')}
+          </label>
+          <Select
+            value={assetRole}
+            onChange={(v) => setAssetRole(v as typeof assetRole)}
+            options={[
+              { value: 'sheet', label: 'Master Character Sheet' },
+              { value: 'face_front', label: 'Face Anchor' },
+              { value: 'full_front', label: 'Full-body Anchor' },
+              { value: 'half_front', label: 'Half-body Anchor' },
+              { value: 'bust_front', label: 'Bust Anchor' },
+              { value: 'full_back', label: 'Back Anchor' },
+            ]}
+            className="w-full"
+          />
+        </div>
+
+        {assetRole === 'sheet' && (
         <div className="rounded-lg border border-line bg-surface-2 p-3">
           <p className="text-xs font-medium text-ink-1 mb-2">{t('uploadSheet.layoutTitle')}</p>
           <div className="flex items-center gap-2">
@@ -1610,6 +1633,7 @@ function UploadSheetModal({
             <p className="text-xs text-ink-2 flex-1">{t('uploadSheet.layoutHint')}</p>
           </div>
         </div>
+        )}
 
         {/* 角色选择 */}
         <div>
@@ -1773,6 +1797,34 @@ function AssetPreviewModal({
   };
 
   // 单点重新生成：用当前编辑后的提示词覆盖重新出图（overwrite=true）。
+  const currentAnchor = (() => {
+    const v = current?.view || '';
+    if (!v.includes('/')) return '';
+    const key = v.split('/').pop() || '';
+    return ['face_front', 'face_left45', 'face_right45', 'profile_left',
+      'profile_right', 'full_front', 'full_left45', 'full_right45',
+      'full_back', 'bust_front', 'half_front'].includes(key) ? key : '';
+  })();
+
+  const regenerateAnchor = async () => {
+    if (!preview || !item?.name || !currentAnchor || regenerating) return;
+    setRegenerating(true);
+    try {
+      const r = await characterAnchors.regenerate({
+        project_name: projectKey,
+        character: item.name,
+        anchor: currentAnchor,
+      });
+      if (!r.success) throw new Error('anchor regenerate failed');
+      toast.success(t('wb.assetRegenerateStarted'));
+      onRegenerated?.();
+    } catch {
+      toast.error(t('wb.assetRegenerateFailed'));
+    } finally {
+      setRegenerating(false);
+    }
+  };
+
   const regenerate = async () => {
     if (!preview || regenerating) return;
     const zh = promptZh.trim();
@@ -1821,14 +1873,25 @@ function AssetPreviewModal({
           <Button size="sm" variant="secondary" onClick={downloadCurrent}>
             {t('wb.downloadCurrent')}
           </Button>
-          <Button
-            size="sm"
-            variant="brand"
-            onClick={regenerate}
-            disabled={regenerating || promptLoading || !promptZh.trim()}
-          >
-            {regenerating ? t('wb.assetRegenerating') : t('wb.assetRegenerate')}
-          </Button>
+          {currentAnchor && preview?.type === 'character' ? (
+            <Button
+              size="sm"
+              variant="brand"
+              onClick={regenerateAnchor}
+              disabled={regenerating}
+            >
+              {regenerating ? t('wb.assetRegenerating') : t('wb.assetRegenerate')}
+            </Button>
+          ) : (
+            <Button
+              size="sm"
+              variant="brand"
+              onClick={regenerate}
+              disabled={regenerating || promptLoading || !promptZh.trim()}
+            >
+              {regenerating ? t('wb.assetRegenerating') : t('wb.assetRegenerate')}
+            </Button>
+          )}
           {current?.size && (
             <span className="text-xs text-ink-3">{(current.size / 1024).toFixed(0)} KB</span>
           )}
@@ -1862,7 +1925,7 @@ function AssetPreviewModal({
                     aria-label={g.view || t('wb.viewN', { n: i + 1 })}
                     onClick={() => setActive(i)}
                     className={`h-14 w-20 overflow-hidden rounded border-2 ${FOCUS_RING} ${
-                      i === active ? 'border-brand' : 'border-transparent hover:border-line-strong'
+                      i === active ? 'border-brand' : 'border-transparent hover:border-line-strong active:opacity-90'
                     }`}
                   >
                     {thumb && <img src={thumb} alt="" className="h-full w-full object-cover" />}
@@ -1974,7 +2037,7 @@ function AssetPrecipitationSection({
         type="button"
         onClick={() => setOpen((v) => !v)}
         aria-expanded={open}
-        className={`flex w-full items-center justify-between rounded text-sm font-semibold text-ink-1 hover:text-brand transition-colors ${FOCUS_RING}`}
+        className={`flex w-full items-center justify-between rounded text-sm font-semibold text-ink-1 hover:text-brand active:opacity-90 transition-colors ${FOCUS_RING}`}
       >
         <span className="flex items-center gap-2">
           <span>{t('precip.title')}</span>
@@ -1998,7 +2061,7 @@ function AssetPrecipitationSection({
               {/* 概览：质检次数 / 命中教训 / 视角数 / 是否用户上传 */}
               <div className="flex flex-wrap gap-1.5">
                 {summary?.is_user_upload && (
-                  <span className="rounded-full bg-brand-subtle px-2 py-0.5 text-[11px] font-medium text-brand-strong">
+                  <span className="rounded-full bg-brand-subtle px-2 py-0.5 text-[11px] font-medium text-brand-hover">
                     {t('precip.badge.userUpload')}
                   </span>
                 )}
@@ -2200,7 +2263,7 @@ function CharacterOutfitsSection({ projectKey, character }: { projectKey: string
         type="button"
         onClick={() => setOpen((v) => !v)}
         aria-expanded={open}
-        className={`flex w-full items-center justify-between rounded text-sm font-semibold text-ink-1 hover:text-brand transition-colors ${FOCUS_RING}`}
+        className={`flex w-full items-center justify-between rounded text-sm font-semibold text-ink-1 hover:text-brand active:opacity-90 transition-colors ${FOCUS_RING}`}
       >
         <span>{t('assets.outfit.title')}</span>
         <span className="text-xs text-ink-3">{open ? '−' : '+'}</span>

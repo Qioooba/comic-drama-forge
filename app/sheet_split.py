@@ -299,6 +299,57 @@ def prune_stale_views(asset_dir: str, keep: Iterable[str],
     return removed
 
 
+def split_regions(src_path: str, regions: dict, out_dir: str,
+                  *, layout_version: str = "", logger=None,
+                  prune: bool = False) -> dict:
+    """按 **显式 bbox 区域** 从 Master Sheet 裁出 Machine Anchors。
+
+    ``regions`` 形如 ``{"full_front": {"bbox": [x, y, w, h], "view": "front"}}``；
+    bbox 可为像素坐标，也可为 0~1 归一化坐标。只有 meta/manifest 提供了可靠
+    regions 时才走本函数 —— 不再用脆弱的行列投影猜四区不对称版式。
+    """
+    from PIL import Image
+
+    if not os.path.isfile(src_path):
+        raise SheetSplitError(f"整图不存在：{src_path}")
+    if not isinstance(regions, dict) or not regions:
+        raise SheetSplitError("未提供显式 regions，拒绝猜测 Character Sheet 布局")
+    os.makedirs(out_dir, exist_ok=True)
+    out: Dict[str, str] = {}
+    with Image.open(src_path) as raw:
+        W, H = raw.size
+        for key, spec in regions.items():
+            if not isinstance(spec, dict):
+                continue
+            bbox = spec.get("bbox") or spec.get("rect")
+            if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+                raise SheetSplitError(f"region {key} 缺少四值 bbox")
+            vals = [float(v) for v in bbox]
+            if all(0.0 <= v <= 1.0 for v in vals) and max(vals) <= 1.0:
+                x, y, w, h = vals
+                box = (int(x * W), int(y * H),
+                       int((x + w) * W), int((y + h) * H))
+            else:
+                x, y, w, h = vals
+                box = (int(x), int(y), int(x + w), int(y + h))
+            box = (max(0, box[0]), max(0, box[1]),
+                   min(W, box[2]), min(H, box[3]))
+            if box[2] <= box[0] or box[3] <= box[1]:
+                raise SheetSplitError(f"region {key} bbox 无效：{box}")
+            piece = raw.crop(box)
+            dst = os.path.join(out_dir, f"{key}.png")
+            tmp = os.path.join(out_dir, f".tmp_{key}.png")
+            piece.save(tmp, format="PNG")
+            os.replace(tmp, dst)
+            out[key] = dst
+    if logger:
+        logger.info("按显式 regions 切出 %d 个 Machine Anchor：%s（layout=%s）",
+                    len(out), "、".join(out), layout_version or "unspecified")
+    if prune:
+        prune_stale_views(out_dir, keep=out.keys(), logger=logger)
+    return out
+
+
 def split_sheet_to_files(src_path: str, out_dir: str, keys: Sequence[str],
                          logger=None, prune: bool = True,
                          cells: Optional[Sequence[Tuple[int, int]]] = None,

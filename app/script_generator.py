@@ -5,6 +5,7 @@
 import json
 import os
 import logging
+import log_setup  # 统一日志（时间戳/行号/线程/ERROR 带堆栈）
 from typing import List, Dict, Optional
 from datetime import datetime
 
@@ -13,7 +14,7 @@ from config import ANTHROPIC_API_KEY, LLM_PROVIDER, SCRIPT_DIR, PROJECT_OUTPUT_D
 # 项目根目录
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
-logging.basicConfig(level=logging.INFO)
+log_setup.setup_logging()
 logger = logging.getLogger(__name__)
 
 # Claude 模型（可用环境变量覆盖）

@@ -412,7 +412,7 @@ export function ProjectsPage() {
                   平级之后它点自己时不会触发卡片跳转，原来的 stopPropagation 也就不需要了。 */}
               <Link
                 to={workbenchPath(coverKey)}
-                className="block rounded-lg focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 focus-visible:ring-offset-2"
+                className="block rounded-lg focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 focus-visible:ring-offset-2 focus-visible:ring-offset-canvas"
               >
                 <div className="relative aspect-video bg-surface-2 rounded-lg mb-4 flex items-center justify-center overflow-hidden group-hover:scale-105 transition-transform">
                   {hasCover
@@ -435,7 +435,7 @@ export function ProjectsPage() {
                 type="button"
                 disabled={coverBusy === proj.id}
                 onClick={() => handleGenCover(proj)}
-                className="absolute right-6 top-6 inline-flex items-center gap-1 rounded-md bg-black/45 px-2 py-1 text-xs font-medium text-white hover:bg-black/65 disabled:opacity-60 focus:outline-none focus-visible:ring-2 focus-visible:ring-white/70"
+                className="absolute right-6 top-6 inline-flex items-center gap-1 rounded-md bg-black/45 px-2 py-1 text-xs font-medium text-white hover:bg-black/65 active:opacity-90 disabled:opacity-60 focus:outline-none focus-visible:ring-2 focus-visible:ring-white/70"
               >
                 <ImageIcon className="h-3.5 w-3.5" />
                 {coverBusy === proj.id
@@ -531,7 +531,7 @@ export function ProjectsPage() {
                   key={opt.value}
                   type="button"
                   onClick={() => { setVideoMode(opt.value); setFormError(''); }}
-                  className={`rounded-lg border px-3 py-2 text-left transition-colors ${
+                  className={`rounded-lg border px-3 py-2 text-left transition-colors active:opacity-90 ${
                     videoMode === opt.value
                       ? 'border-brand bg-brand/10'
                       : 'border-line-strong hover:bg-surface-2'
@@ -564,9 +564,9 @@ export function ProjectsPage() {
                   key={opt.id}
                   type="button"
                   onClick={() => { setSource(opt.id); setFormError(''); }}
-                  className={`px-4 py-2 text-sm font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 focus-visible:ring-offset-2 focus-visible:ring-offset-canvas ${
+                  className={`px-4 py-2 text-sm font-medium transition-colors active:opacity-90 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 focus-visible:ring-offset-2 focus-visible:ring-offset-canvas ${
                     source === opt.id
-                      ? 'bg-brand text-white'
+                      ? 'bg-brand text-on-brand'
                       : 'bg-transparent text-ink-2 hover:bg-surface-2'
                   }`}
                 >

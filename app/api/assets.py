@@ -201,6 +201,9 @@ def api_character_upload_sheet():
     outfit_key = _sanitize_outfit_key(
         request.form.get('outfit_key') or request.args.get('outfit_key'))
     _ow_raw = (request.form.get('overwrite') or request.args.get('overwrite') or '').strip()
+    upload_role = (request.form.get('asset_role') or request.args.get('asset_role')
+                   or request.form.get('upload_type') or request.args.get('upload_type')
+                   or 'sheet').strip().lower()
     # 宽容布尔（与 qc_client._as_bool 同口径）：表单/query 传 "1"/"true"/"on"/"yes" 都算真
     overwrite = _ow_raw.lower() not in ("", "0", "false", "no", "off")
 
@@ -214,6 +217,7 @@ def api_character_upload_sheet():
         return jsonify({"success": False,
                         "error": "outfit_key 非法（≤40 字符，剔除 \\ / : * ? \" < > |）"}), 400
 
+    from PIL import Image
     raw_name = _safe_upload_name(f.filename)
     ext = os.path.splitext(raw_name)[1].lower()
     if ext not in _UPLOAD_IMAGE_EXTS:
@@ -221,10 +225,65 @@ def api_character_upload_sheet():
                         "error": f"不支持的图片格式 {ext or '（无扩展名）'}；"
                                  f"支持 {'、'.join(_UPLOAD_IMAGE_EXTS)}"}), 400
 
+    _role_alias = {
+        "sheet": "sheet", "master": "sheet", "character_sheet": "sheet",
+        "face": "face_front", "face_front": "face_front",
+        "full": "full_front", "full_front": "full_front",
+        "half": "half_front", "half_front": "half_front",
+        "bust": "bust_front", "bust_front": "bust_front",
+        "back": "full_back", "full_back": "full_back",
+    }
+    upload_role = _role_alias.get(upload_role, upload_role)
+    if upload_role != "sheet" and upload_role not in (
+            "face_front", "full_front", "half_front", "bust_front", "full_back"):
+        return jsonify({"success": False,
+                        "error": f"asset_role 非法：{upload_role}"}), 400
     asset_dir = (_character_outfit_dir(project_name, character, outfit_key) if outfit_key
                  else os.path.join(CHARACTERS_DIR, project_name, character))
     base_dst = os.path.join(asset_dir, "base.png")
+    if upload_role != "sheet":
+        # 单角色正面/脸部图直接落语义机器锚点，不覆盖 master sheet。
+        _subdir = {"face_front": "identity", "bust_front": "framing",
+                   "half_front": "framing", "full_back": "body",
+                   "full_front": "body"}.get(upload_role, "")
+        _target_dir = os.path.join(asset_dir, _subdir) if _subdir else asset_dir
+        os.makedirs(_target_dir, exist_ok=True)
+        _target = os.path.join(_target_dir, f"{upload_role}.png")
+        if not overwrite and os.path.isfile(_target) and os.path.getsize(_target) > 0:
+            return jsonify({"success": True, "skipped": True, "character": character,
+                            "outfit_key": outfit_key, "asset_role": upload_role,
+                            "path": _target, "message": "该机器锚点已存在"})
+        try:
+            with Image.open(f.stream if hasattr(f, "stream") else f) as _im:
+                _im.convert("RGB").save(_target, format="PNG")
+        except Exception:
+            f.stream.seek(0)
+            with Image.open(f.stream) as _im:
+                _im.convert("RGB").save(_target, format="PNG")
+        character_assets.write_anchor_metadata(
+            asset_dir, upload_role, path=_target, source="user_upload",
+            role=("identity" if upload_role.startswith("face") else
+                  "body" if upload_role.startswith("full") else "framing"),
+            view="front" if "front" in upload_role else upload_role,
+            framing=("face" if upload_role.startswith("face") else
+                     "half" if upload_role == "half_front" else "full"),
+            outfit_key=outfit_key,
+            qc={"accept": True, "blocked": False, "skipped": True,
+                "label": "用户上传机器锚点", "reason": "用户上传单图，不做图片质检",
+                "critical_issues": []})
+        return jsonify({"success": True, "skipped": False, "character": character,
+                        "outfit_key": outfit_key, "asset_role": upload_role,
+                        "path": _target, "base": base_dst,
+                        "anchors": character_assets.scan_character_assets(
+                            asset_dir, asset_dir if outfit_key else "")["anchors"],
+                        "completeness": _character_asset_completeness(
+                            asset_dir, asset_dir if outfit_key else ""),
+                        "message": "已上传独立 Machine Anchor"})
     if not overwrite and os.path.isfile(base_dst) and os.path.getsize(base_dst) > 0:
+        try:
+            identity_contract.ensure_identity_assets(asset_dir, base_dst, logger=app.logger)
+        except Exception as _ide:
+            app.logger.warning("上传形象图：身份锚点派生失败（忽略）：%s", _ide)
         return jsonify({"success": True, "skipped": True, "character": character,
                         "outfit_key": outfit_key, "base": base_dst,
                         "message": "该角色已有设定图（base.png 已就绪）；"
@@ -272,11 +331,8 @@ def api_character_upload_sheet():
     # 四区不对称布局无法切分 → 上传图直接落 base.png 整图，下游取整图。
     # 并清掉旧视角图（front/left/back/half），避免 _ASSET_IMG_PRIORITY 取到旧单视角。
     views: dict = {}
-    try:
-        sheet_split.prune_stale_views(
-            asset_dir, keep=(), known=ASSET_VIEW_STEMS, logger=app.logger)
-    except Exception as _pe:  # noqa: BLE001
-        app.logger.warning("上传形象图：清理陈旧视角失败（忽略）：%s", _pe)
+    # 上传 master sheet 不删除旧 front/half/back 或新机器锚点：旧项目兼容与
+    # 单档补全都依赖它们；selector 负责按镜头选图。
 
     if _old_backup:
         try:
@@ -298,13 +354,123 @@ def api_character_upload_sheet():
     except Exception as _me:  # noqa: BLE001
         app.logger.warning("上传形象图：元数据写入失败（忽略）：%s", _me)
 
+    try:
+        identity_contract.ensure_identity_assets(asset_dir, base_dst, logger=app.logger)
+    except Exception as _ide:
+        app.logger.warning("上传形象图：身份锚点派生失败（忽略）：%s", _ide)
+
     return jsonify({"success": True, "derive_ok": True, "skipped": False,
                     "character": character, "outfit_key": outfit_key,
                     "base": base_dst,
                     "views": {},
                     "view_files": {},
-                    "layout_hint": "不裁剪：保留整图（character sheet 四区）",
-                    "message": "已上传（不裁剪：直接使用整张 character sheet 设定图）"})
+                    "anchors": character_assets.scan_character_assets(
+                        asset_dir, asset_dir if outfit_key else "")["anchors"],
+                    "completeness": _character_asset_completeness(
+                        asset_dir, asset_dir if outfit_key else ""),
+                    "layout_hint": "Master Sheet 已保存；生产镜头由 Machine Anchor selector 选图",
+                    "message": "已上传 master sheet（生产参考将按镜头选择独立 Machine Anchor）"})
+
+
+@bp.route('/api/assets/character/anchors', methods=['GET'])
+def api_character_anchors():
+    """查询角色 Master Sheet、Machine Anchors、manifest 与 completeness。"""
+    project_name, err = _project_or_400(
+        (request.args.get('project_name') or '').strip())
+    if err is not None:
+        return err
+    character = (request.args.get('character') or '').strip()
+    outfit_key = _sanitize_outfit_key(request.args.get('outfit_key'))
+    if not character or '/' in character or '\\' in character or character in ('.', '..'):
+        return jsonify({"success": False, "error": "character 非法"}), 400
+    asset_dir = (_character_outfit_dir(project_name, character, outfit_key) if outfit_key
+                 else os.path.join(CHARACTERS_DIR, project_name, character))
+    if not os.path.isdir(asset_dir):
+        return jsonify({"success": False, "error": "未找到角色资产目录"}), 404
+    scan = character_assets.scan_character_assets(asset_dir)
+    return jsonify({
+        "success": True, "project_name": project_name, "character": character,
+        "outfit_key": outfit_key, "dir": asset_dir,
+        "sheet": scan["sheet"], "anchors": scan["anchors"],
+        "sources": scan["sources"], "manifest": scan["manifest"],
+        "completeness": _character_asset_completeness(asset_dir),
+        "layout_version": CHARACTER_SHEET_LAYOUT_VERSION,
+        "required": list(CHARACTER_REQUIRED_ANCHORS),
+    })
+
+
+@bp.route('/api/assets/character/anchor/regenerate', methods=['POST'])
+def api_character_anchor_regenerate():
+    """单独重生成一个角色 Machine Anchor（不覆盖已通过的其他档位）。"""
+    data = _body()
+    project_name, err = _project_or_400((data.get('project_name') or '').strip())
+    if err is not None:
+        return err
+    character = (data.get('character') or '').strip()
+    anchor = str(data.get('anchor') or data.get('asset_role') or '').strip()
+    outfit_key = _sanitize_outfit_key(data.get('outfit_key'))
+    if not character or '/' in character or '\\' in character or character in ('.', '..'):
+        return jsonify({"success": False, "error": "character 非法"}), 400
+    if anchor not in CHARACTER_ANCHOR_KEYS:
+        return jsonify({"success": False,
+                        "error": f"anchor 非法，可选：{', '.join(CHARACTER_ANCHOR_KEYS)}"}), 400
+    asset_dir = (_character_outfit_dir(project_name, character, outfit_key) if outfit_key
+                 else os.path.join(CHARACTERS_DIR, project_name, character))
+    base_png = os.path.join(asset_dir, "base.png")
+    if not os.path.isfile(base_png):
+        return jsonify({"success": False, "error": "缺少 master base.png"}), 404
+
+    prompt = _character_base_prompt(project_name, character)
+    if outfit_key:
+        prompt = _append_outfit_prompt(prompt, _outfit_desc_of(asset_dir))
+    if not prompt:
+        meta_path = os.path.join(asset_dir, "base.png.meta.json")
+        try:
+            with open(meta_path, "r", encoding="utf-8") as _mf:
+                prompt = str((json.load(_mf) or {}).get("prompt") or "")
+        except Exception:
+            prompt = ""
+    style = str(data.get('style') or _project_style(project_name) or '')
+    _res = style_kit.resolve(style, default_ratio=style_kit.DEFAULT_RATIO)
+    _size = style_kit.aspect_size(_res["ratio"], style_kit.asset_megapixels())
+    task_id = f"character_anchor_{project_name}_{uuid.uuid4().hex[:10]}"
+    with lock:
+        generation_state[task_id] = {
+            "status": "running", "phase": f"生成角色锚点 {anchor}",
+            "project": project_name, "character": character, "anchor": anchor,
+            "progress": 0, "total": 1, "current": 0, "results": [],
+        }
+
+    def _worker():
+        try:
+            with gpu_task_gate.run_gpu_task(task_id, f"角色锚点 {character}/{anchor}"):
+                result = _generate_character_machine_anchors(
+                    asset_dir, prompt, style=_res["style"], size=_size,
+                    seed=int(data.get('seed') or random.randint(1, 2 ** 31 - 1)),
+                    qc_cfg=_qc_load_cfg(),
+                    qc_on=qc_client.image_qc_ready(_qc_load_cfg()),
+                    project_name=project_name, asset_name=character,
+                    only_keys=[anchor])
+                ok = bool(result.get("generated") or result.get("existing"))
+                with lock:
+                    generation_state[task_id].update({
+                        "status": "done" if ok else "failed",
+                        "success": ok, "progress": 100,
+                        "phase": "完成" if ok else "生成失败",
+                        "results": [result],
+                        "error": "" if ok else "；".join(result.get("errors") or []),
+                        "completeness": _character_asset_completeness(asset_dir),
+                    })
+        except Exception as exc:  # noqa: BLE001
+            with lock:
+                generation_state[task_id].update({
+                    "status": "failed", "success": False, "phase": "生成失败",
+                    "error": f"{type(exc).__name__}: {exc}"})
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return jsonify({"success": True, "task_id": task_id, "status": "started",
+                    "anchor": anchor, "character": character,
+                    "outfit_key": outfit_key})
 
 
 @bp.route('/api/assets/character/outfit', methods=['POST'])
@@ -428,6 +594,7 @@ def api_character_outfits_list():
                 continue
             _base_png = os.path.join(_od, "base.png")
             _ready = os.path.isfile(_base_png) and os.path.getsize(_base_png) > 0
+            _scan = character_assets.scan_character_assets(_od)
             _views = {}
             for _stem in _OUTFIT_VIEW_STEMS:
                 _vp = os.path.join(_od, f"{_stem}.png")
@@ -437,6 +604,9 @@ def api_character_outfits_list():
                 "desc": _outfit_desc_of(_od),
                 "ready": _ready,
                 "views": _views,
+                "sheet": _scan["sheet"],
+                "anchors": _scan["anchors"],
+                "completeness": _character_asset_completeness(_od),
             })
     except Exception as e:  # noqa: BLE001  目录枚举失败按空数组处理（fail-open）
         app.logger.warning("服装变体列表读取失败（返回空数组）：%s", e)

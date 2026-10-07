@@ -89,7 +89,7 @@ function QcTab({ projectKey }: { projectKey: string }) {
     setError('');
     setNotice('');
     try {
-      const resp: any = await qcApi.updateConfig({
+      const resp = await qcApi.updateConfig({
         enabled: !!cfgDraft.enabled,
         script_enabled: !!cfgDraft.script_enabled,
         image_enabled: !!cfgDraft.image_enabled,
@@ -303,7 +303,7 @@ function QcTab({ projectKey }: { projectKey: string }) {
             <span>{cfg.vision_error || t('qc.visionInactive')}</span>
             <button
               type="button"
-              className="ml-auto rounded border border-red-500/40 px-2 py-1 hover:bg-red-500/10"
+              className="ml-auto rounded border border-danger/40 px-2 py-1 hover:bg-danger/10 active:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
               disabled={cfgBusy === 'vision'}
               onClick={() => void doVisionTest()}
             >
@@ -322,7 +322,7 @@ function QcTab({ projectKey }: { projectKey: string }) {
             { label: t('qc.kind.audio'), on: cfg.audio_qc_active },
           ].map((k) => (
             <span key={k.label} className={`px-2 py-0.5 rounded ${
-              k.on ? 'bg-brand-subtle text-brand'
+              k.on ? 'bg-brand-subtle text-brand-hover'
                    : 'bg-surface-2 text-ink-2'
             }`}>
               {k.label}{t('qc.suffix')} {k.on ? t('qc.active') : t('qc.inactive')}

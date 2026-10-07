@@ -22,6 +22,7 @@ import { assetSrc } from '@/api/queries/assets';
 import { DecisionStateBadge, NotApprovedNotice } from './DecisionStateBadge';
 import { DirectorTakeAdoption } from './DirectorTakeAdoption';
 import { Modal } from '@/components/ui';
+import { t } from '@/i18n';
 
 export interface CandidateCompareDialogProps {
   isOpen: boolean;
@@ -54,28 +55,30 @@ export function CandidateCompareDialog({
   if (!isOpen) return null;
 
   return (
-    <Modal isOpen={isOpen} onClose={onClose} title="候选并排对比" size="xl">
+    <Modal isOpen={isOpen} onClose={onClose} title={t('studio.compareTitle')} size="xl">
       {q.isPending && (
         <div role="status" aria-live="polite" className="p-6 text-center text-sm text-ink-2">
-          加载候选中…
+          {t('studio.compareLoading')}
         </div>
       )}
 
       {/* 契约破裂 / 取不到候选：报错必须给原因 + 重试（MASTER invariant 10） */}
       {q.isError && (
         <div role="alert" className="rounded-md border border-danger bg-danger-subtle p-3 text-sm text-danger-strong">
-          <p>候选列表加载失败：{q.error instanceof Error ? q.error.message : String(q.error)}</p>
+          <p>{t('studio.compareLoadFailed', {
+            err: q.error instanceof Error ? q.error.message : String(q.error),
+          })}</p>
           <button
             onClick={() => void q.refetch()}
             className="mt-2 rounded border border-danger px-2 py-1 text-xs"
           >
-            重试
+            {t('common.retry')}
           </button>
         </div>
       )}
 
       {!q.isPending && !q.isError && items.length === 0 && (
-        <div className="p-6 text-center text-sm text-ink-2">这一轮还没有候选版本。</div>
+        <div className="p-6 text-center text-sm text-ink-2">{t('studio.noCandidates')}</div>
       )}
 
       {items.length > 0 && (
@@ -128,7 +131,7 @@ function CandidateCard({
         {src ? (
           <img src={src} alt="" className="h-full w-full object-contain" loading="lazy" />
         ) : (
-          <span className="text-xs text-ink-3">无预览</span>
+          <span className="text-xs text-ink-3">{t('storyboard.noPreview')}</span>
         )}
       </div>
 
@@ -140,9 +143,9 @@ function CandidateCard({
         {onPick && (
           <button
             onClick={() => onPick(version)}
-            className="rounded border border-line px-1.5 py-0.5 text-xs text-ink-2 hover:border-brand hover:text-brand"
+            className="rounded border border-line px-1.5 py-0.5 text-xs text-ink-2 hover:border-brand hover:text-brand active:opacity-90"
           >
-            选中
+            {t('studio.pick')}
           </button>
         )}
       </div>

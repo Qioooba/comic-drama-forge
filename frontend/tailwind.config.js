@@ -74,6 +74,8 @@ module.exports = {
         line: {
           DEFAULT: token('border'),
           strong: token('border-strong'),
+          // 输入控件专用描边（3:1，WCAG 1.4.11）。共享 Input/Select/Textarea 用它。
+          input: token('border-input'),
         },
         ink: {
           1: token('text-primary'),
@@ -84,10 +86,20 @@ module.exports = {
           DEFAULT: token('brand'),
           hover: token('brand-hover'),
           subtle: token('brand-subtle'),
+          // 按下/hover 时的**实心底**。刻意与 hover 分开：深色下 brand-hover
+          // 是提亮的 indigo-400，配白字只有 2.98:1，方向与「实底压白字」相反。
+          press: token('brand-press'),
         },
+        // 压在实心底（bg-brand / bg-action）上的反白字。
+        'on-brand': token('on-brand'),
+        // 压在**浅色相**实底（bg-warning / bg-success）上的深墨字。
+        // 白字压这两个色只有 2.15:1 / 2.54:1，必须反过来用深字。
+        'on-warning': token('on-warning'),
+        'on-success': token('on-success'),
         accent: {
           DEFAULT: token('accent'),
           subtle: token('accent-subtle'),
+          strong: token('accent-strong'),
         },
         action: token('action'),
         // ⚠️ 数据可视化专用（SVG / 图表分类色），UI 层不要引用，详见 index.css

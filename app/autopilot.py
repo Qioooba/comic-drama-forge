@@ -644,6 +644,15 @@ def project_progress(project_name: str, plan: dict = None) -> dict:
     meta = _novel_meta(project_name, plan)
     chapters, text = chapters_and_text(meta)
     units = episode_units(chapters, plan, text)
+    # ⭐ 2026-10-07：把「正在生产」的集如实标成 running。此前本接口只按**已完成集**算
+    #    （done/percent），在跑的第 1 集永远显示 `todo 0%` —— 总控 get_progress 看到
+    #    「todo 0%」就会得出「还没真正开始跑」的错误结论（实测事故）。
+    try:
+        _running = {int(r.get("episode")) for r in running_episodes(project_name)
+                    if r.get("episode") not in (None, "")}
+    except Exception as e:  # noqa: BLE001  展示增强失败不得影响进度接口
+        logger.debug("在跑集计算失败（本次不标注 running）：%s", e)
+        _running = set()
     rows = []
     done = 0
     for u in units:
@@ -652,6 +661,9 @@ def project_progress(project_name: str, plan: dict = None) -> dict:
         st = _episode_state(project_name, no, plan, chapters)
         if st["state"] == "done":
             done += 1
+        elif no in _running and st.get("state") == "todo":
+            # 只把「未开工」的标成在跑：done / pending_human（需人工）/ rejected 都不掩盖
+            st = {**st, "state": "running", "note": "正在生产（该集已被执行体占用）"}
         rows.append({"episode_no": no,
                      "chapter_index": u["chapter_index"],
                      "part": u["part"], "parts": u["parts"],
@@ -903,21 +915,131 @@ def describe_current(cur: dict) -> str:
     return f"{' · '.join(parts)} · {pct}%"
 
 
+#: 「谁在跑哪一集」的运行登记表：``"项目#集号"`` → 该次运行的 current 快照（内存）。
+#:
+#: ⭐ 2026-10-07（实测事故）：``_STATE["current"]`` 是**单一全局槽** —— 任何执行体都能写、
+#: 任何执行体都能清。托管守护线程每轮挑中「还没 done」的第 1 集时，会先 ``_set_current``
+#: 写一个「开始生产」桩值，再因集级锁返回 busy 而 ``_clear_current()`` —— run-once 正在
+#: 跑的实时进度被反复抹掉（实测 20 分钟里被清 23 次），``/api/autopilot/status`` 长期返回
+#: ``running=true, current=null``；AI 总控据此如实汇报「当前没有正在跑的环节」，用户看到的
+#: 是「任务没起来」。这里按 (项目, 集) 记账，status() 再**派生** current ——
+#: 让「槽位当时被谁占着」不再决定「这一集的进度能不能被看见」。
+_RUNS: dict = {}
+_RUNS_MAX = 64          # 上限（纯内存、不落盘；超出先淘汰最久未更新的非活跃条目）
+
+
+def _exec_id() -> str:
+    """当前执行体身份：线程名即可区分（托管守护是 `autopilot`，手动是 `runonce_项目_集`）。"""
+    try:
+        return str(threading.current_thread().name or "unknown")
+    except Exception:  # noqa: BLE001  身份取不到也不能影响生产主链路
+        return "unknown"
+
+
+def _run_key(rec: dict) -> str:
+    p = str((rec or {}).get("project") or "")
+    ep = (rec or {}).get("episode")
+    if not p or ep in (None, ""):
+        return ""
+    return f"{p}#{ep}"
+
+
+def _prune_runs() -> None:
+    """登记表超限时先淘汰最久未更新的**非活跃**条目（调用方需持 _LOCK）。"""
+    if len(_RUNS) <= _RUNS_MAX:
+        return
+    for k, v in sorted(_RUNS.items(),
+                       key=lambda kv: (bool((kv[1] or {}).get("active")),
+                                       float((kv[1] or {}).get("step_updated_at") or 0))):
+        if len(_RUNS) <= _RUNS_MAX:
+            break
+        if not (v or {}).get("active"):
+            _RUNS.pop(k, None)
+
+
+def _register_run(cur: dict) -> None:
+    """把一条 current 快照登进运行登记表（调用方需持 _LOCK）。"""
+    key = _run_key(cur)
+    if not key:
+        return
+    _RUNS[key] = {**cur, "active": True}
+    _prune_runs()
+
+
+def _mark_run_inactive(cur: dict) -> None:
+    """把某条运行标记为已结束（保留最后快照，但 status() 不再据它派生 current）。"""
+    key = _run_key(cur)
+    if key and key in _RUNS:
+        _RUNS[key] = {**_RUNS[key], "active": False}
+
+
+def _active_run_for(project: str) -> dict:
+    """登记表里该项目最近活跃的一条运行。
+
+    用途：current 槽位为空、或被**别的项目**占着时，用它派生本项目的进度。
+    """
+    with _LOCK:
+        cands = [dict(v) for v in _RUNS.values()
+                 if (v or {}).get("active")
+                 and str((v or {}).get("project") or "") == project]
+    if not cands:
+        return {}
+    return max(cands, key=lambda r: float(r.get("step_updated_at") or 0))
+
+
 def _set_current(**kw) -> None:
     with _LOCK:
-        cur = dict(_STATE.get("current") or {})
+        old = dict(_STATE.get("current") or {})
+        # ⚠️ 换项目 / 换集时**不继承**上一条的字段：旧实现无条件 `cur.update(kw)`，于是
+        #    「A 项目在跑」的 episode/title/started_at 会被 B 项目的进度更新继承下来，
+        #    前端与总控就会看到 A 的集号配 B 的百分比（与「总控拿别项目数据汇报」同源）。
+        new_p, new_e = str(kw.get("project") or ""), kw.get("episode")
+        if (new_p and new_p != str(old.get("project") or "")) or \
+                (new_e not in (None, "") and str(new_e) != str(old.get("episode"))):
+            old = {}
+        fresh = not old
+        cur = dict(old)
         cur.update(kw)
+        # 身份每次都由**调用方线程**决定，绝不用 setdefault 继承 —— 否则托管线程会顶着
+        # run-once 的身份去清别人的进度（这正是本次事故里那次清空能生效的直接原因）。
+        cur["exec_id"] = str(kw.get("exec_id") or _exec_id())
+        cur["owner"] = str(kw.get("owner") or cur["exec_id"])
         # 每次进度更新都刷新「最近推进时刻」（epoch 秒），供 status() 算停滞时长。
         # 用 epoch 而非格式化字符串：status() 要做 now - 该值 的减法。
         cur["step_updated_at"] = time.time()
+        # 起始 epoch（started_at 是给人看的字符串，算「已跑多久」要 epoch）。
+        # 只在**新建记录**时写：run-once 每次进度上报都会带 started_at，若跟着刷新，
+        # elapsed 会永远显示 0 秒。
+        if fresh or not cur.get("started_ts"):
+            cur["started_ts"] = time.time()
         # 冗余一份人话描述，前端 / 总控直接取用，不必各自维护阶段名映射表。
         cur["describe"] = describe_current(cur)
         _STATE["current"] = cur
+        _register_run(cur)
 
 
-def _clear_current() -> None:
+def _clear_current(owner: str = "", exec_id: str = "", force: bool = False) -> bool:
+    """清空「当前进度」槽位 —— 但**只清自己写的那条**。
+
+    返回 True 表示槽位已空（清掉了，或本来就是空的）；False 表示拒绝（调用方不是持有者）。
+
+    ⭐ 为什么要按身份拒绝（2026-10-07 实测）：托管轮转与 run-once 会同时存在，而旧签名
+    不接受任何身份 —— 谁调用都能把对方的实时进度清成 null。集级 busy 分支的那一行
+    ``_clear_current()`` 因此把正在跑的第 1 集进度清了 23 次，总控看到的一直是「空闲」。
+    """
+    me = str(exec_id or owner or _exec_id())
     with _LOCK:
+        cur = dict(_STATE.get("current") or {})
+        if not cur:
+            return True
+        holder = str(cur.get("exec_id") or "")
+        if not force and holder and holder != me:
+            logger.info("跳过清空进度：current 属于 %s，调用方 %s 非持有者（避免抹掉他人实时进度）",
+                        holder, me)
+            return False
         _STATE["current"] = None
+        _mark_run_inactive(cur)
+        return True
 
 
 def _last_run_path(project: str) -> str:
@@ -1182,6 +1304,27 @@ def _produce(project: str, plan: dict, pick: dict) -> None:
 
     episode_no = pick["episode_no"]
     chapter = pick["chapter"]
+
+    # ⭐ 2026-10-07（实测事故）集级忙检**前置**：旧实现把 busy 判定留在 run_episode 内部，
+    # 于是每一轮都会先 _set_current("开始生产")（把 run-once 的实时进度覆盖成桩值）、
+    # 再因返回 busy 而 _clear_current() —— 正在跑的那一集在状态接口里被反复抹成 null
+    # （实测 20 分钟 23 次）。现在：在**任何写入之前**先问一句「这集是否已有执行体」，
+    # 是就干净跳过：不写进度、不清进度、不计失败次数、不写运行记录。
+    # 位置刻意放在 _novel_meta()/_A() **之前** —— 既省掉无用的读盘，也让本判定不依赖宿主视图。
+    # ⚠️ 保留下面 run_episode 返回 busy 的兜底分支：预检与真正抢锁之间存在极短竞态窗口。
+    try:
+        import pipeline as _pl
+        if _pl.is_episode_running(project, episode_no):
+            with _LOCK:
+                # 与下方 busy 分支同一套防自旋节流：只刷新「刚试过这一集」的时间戳
+                _LAST_RUN["key"] = f"{project}#{episode_no}"
+                _LAST_RUN["at"] = time.time()
+            logger.info("第%s集正被另一个执行体生产（预检 busy），本轮跳过："
+                        "不写进度、不计失败，%ds 后重试", episode_no, MIN_RERUN_INTERVAL)
+            return
+    except Exception as e:  # noqa: BLE001  忙检自身故障不得阻断托管（下面仍有 busy 兜底）
+        logger.warning("集级忙检执行失败（按不忙继续）：%s", e)
+
     meta = _novel_meta(project, plan)
     A = _A()
     t0 = time.time()
@@ -1233,7 +1376,8 @@ def _produce(project: str, plan: dict, pick: dict) -> None:
             idx = _pl.STEP_SEQUENCE.index(base)
             _seen.extend(_pl.STEP_SEQUENCE[:idx])   # 此前的步骤都已完成
             _seen.append(base)
-        _set_current(step=base or "running", message=message, percent=int(percent or 0),
+        _set_current(project=project, episode=episode_no,
+                     step=base or "running", message=message, percent=int(percent or 0),
                      steps_done=list(dict.fromkeys(_seen)), retries=_retries[0])
 
     try:
@@ -1270,6 +1414,8 @@ def _produce(project: str, plan: dict, pick: dict) -> None:
             _LAST_RUN["at"] = time.time()
         logger.info("第%s集正被另一个执行体生产（busy），本轮跳过：不计失败次数、不写运行记录，"
                     "%ds 后重试", episode_no, MIN_RERUN_INTERVAL)
+        # 只清**自己**刚写的桩值：_clear_current 现在按 exec_id 校验持有者，
+        # 万一此刻槽位已是 run-once 的真实进度，这里会拒绝清空（不会抹掉别人的实时进度）。
         _clear_current()
         return
 
@@ -1367,7 +1513,13 @@ def purge_project(project_name: str) -> dict:
     with _LOCK:
         cur = dict(_STATE.get("current") or {})
         if str(cur.get("project") or "") == project_name:
-            _clear_current()
+            # 删项目必须**强制**清掉：进度可能属于 run-once 线程，按身份校验会被拒绝，
+            # 而「同名重建后挂上旧项目进度」正是这个函数要防的病根。
+            _clear_current(force=True)
+        # 登记表里该项目的运行记录一并摘掉（否则同名项目重建会派生到已删项目的进度）
+        for _k in [k for k, v in _RUNS.items()
+                   if str((v or {}).get("project") or "") == project_name]:
+            _RUNS.pop(_k, None)
         _STATE["last_error"] = ""
         (_STATE.get("last_runs") or {}).pop(project_name, None)
         _ATTEMPTS.pop(project_name, None)
@@ -1390,6 +1542,73 @@ def purge_project(project_name: str) -> dict:
         logger.warning("清理 attempts 失败（%s）：%s", project_name, e)
     wake()
     return {"project": project_name, "dead_letters_cleared": True}
+
+
+def running_episodes(project: str = "") -> list:
+    """「现在到底有哪些集在跑」—— 不赌任何单一内存槽，两个真值源取并集：
+
+    ① **运行登记表**（本进程写过的活跃运行）：字段最全，能给人话 `describe`；
+    ② **磁盘集级租约**（`task_lease`，跨进程 / 重启后仍有效）：心跳停超 TTL 或持有者
+       进程已死即判 stale（见 `task_lease.is_stale`），所以不会把崩溃前的残留当成在跑。
+
+    为什么要它（2026-10-07 实测）：`current` 可能因任何原因为空（历史 bug / 槽位被别的
+    项目占着 / 进程刚重启还没上报），而总控拿到 `current:null` 就会如实汇报「没有在跑」。
+    有了本字段，即使 current 为空也能回答「第 1 集正在跑（run-once，已 32 分钟）」。
+    """
+    now = time.time()
+    out, seen = [], set()
+
+    def _push(p, ep, source: str, started: float = 0.0, ping: float = 0.0,
+              owner: str = "", extra: dict = None) -> None:
+        if not p or ep in (None, ""):
+            return
+        try:
+            ep_i = int(ep)
+        except (TypeError, ValueError):
+            ep_i = ep
+        key = (str(p), str(ep))
+        if key in seen:
+            return
+        seen.add(key)
+        row = {"project": str(p), "episode": ep_i, "source": source, "owner": owner,
+               "elapsed_sec": int(max(0, now - started)) if started else 0,
+               "last_ping_sec": int(max(0, now - ping)) if ping else 0}
+        if extra:
+            row.update(extra)
+        out.append(row)
+
+    with _LOCK:
+        runs = [dict(v) for v in _RUNS.values() if (v or {}).get("active")]
+    for rec in runs:
+        p = str(rec.get("project") or "")
+        if project and p != project:
+            continue
+        _push(p, rec.get("episode"), str(rec.get("exec_id") or "in-process"),
+              started=float(rec.get("started_ts") or 0),
+              ping=float(rec.get("step_updated_at") or 0),
+              owner=str(rec.get("owner") or ""),
+              extra={"step": rec.get("step") or "", "describe": rec.get("describe") or ""})
+
+    try:
+        import task_lease
+        leases = task_lease.list_leases() or []
+    except Exception as e:  # noqa: BLE001  租约查询失败不得影响状态接口
+        logger.debug("租约列举失败（running_episodes 回落为仅内存登记表）：%s", e)
+        leases = []
+    for rec in leases:
+        if (rec or {}).get("stale"):
+            continue
+        scope = str((rec or {}).get("scope") or "")
+        if not scope.startswith("episode:"):
+            continue
+        p, _, ep = scope[len("episode:"):].rpartition("#")
+        if project and p != project:
+            continue
+        _push(p, ep, "lease",
+              started=float((rec or {}).get("acquired_at") or 0),
+              ping=float((rec or {}).get("heartbeat_at") or 0),
+              owner=str((rec or {}).get("owner") or ""))
+    return out
 
 
 def status(project: str = "", brief: bool = False) -> dict:
@@ -1434,11 +1653,16 @@ def status(project: str = "", brief: bool = False) -> dict:
     if project:
         cur = st.get("current") or {}
         cur_proj = str(cur.get("project") or "")
-        if cur_proj and cur_proj != project:
-            st["current"] = None
-            st["other_project_running"] = True
-            # last_error 无项目归属，同样可能是别的项目的报错，一并藏起来
-            st["last_error"] = ""
+        if cur_proj != project:
+            # 槽位不是本项目的（别的项目在跑，或刚被清空）→ 先用**运行登记表**派生本项目的进度。
+            # current 是单一全局槽，但「本项目第 N 集跑到哪了」不该由它当时被谁占着决定
+            # （2026-10-07 实测：run-once 的进度被托管 busy 分支清掉 → 总控汇报「没在跑」）。
+            alt = _active_run_for(project)
+            st["current"] = alt or None
+            if cur_proj:
+                st["other_project_running"] = True
+                # last_error 无项目归属，同样可能是别的项目的报错，一并藏起来
+                st["last_error"] = ""
     # 上一次真正跑完的一集（成功/失败都记，带项目归属）：current 被清空之后，
     # 这是总控/前端唯一能知道「上一集到底成没成」的口径，别省。
     st.pop("last_runs", None)          # 只回单个项目的 last_run，避免 payload 膨胀
@@ -1475,6 +1699,9 @@ def status(project: str = "", brief: bool = False) -> dict:
         # 否则模型会拿历史对话里的项目名去「对号入座」，把 A 的数据说成 B 的。
         "project": project,
         "scoped": bool(project),
+        # 真值源：谁在跑哪一集（内存登记表 ∪ 磁盘集级租约）。current 为空时它就是
+        # 「到底有没有在跑」的唯一依据 —— 别让 current:null 被读成「空闲」。
+        "running_episodes": running_episodes(project),
         "enabled_count": enabled_count,
         "plan_count": plan_count,
         "pending_review": sum(1 for d in deliveries if d.get("review") == "pending"
@@ -1487,13 +1714,14 @@ def status(project: str = "", brief: bool = False) -> dict:
     # 头部截断，不是省略中间）。所以「当前在跑什么 / 上一集成没成 / 有没有异常」
     # 必须排在最前面 —— 否则 last_run 落在 payload 尾部会被整段切掉，总控就又回到
     # 「只知道空闲、不知道上一集失败了」的老毛病。
-    _front = ("running", "paused", "current", "last_run", "last_error",
+    _front = ("running", "paused", "current", "running_episodes", "last_run", "last_error",
               "other_project_running", "exceptions", "pending_review",
               "project", "scoped", "enabled_count", "plan_count")
     _ordered = {k: st[k] for k in _front if k in st}
     _ordered.update({k: v for k, v in st.items() if k not in _front})
     if brief:
-        _brief_keys = ("running", "paused", "current", "last_run", "last_error",
+        _brief_keys = ("running", "paused", "current", "running_episodes", "last_run",
+                       "last_error",
                        "other_project_running", "exceptions", "pending_review",
                        "enabled_count", "plan_count", "project", "scoped", "pause_reason")
         return {k: _ordered[k] for k in _brief_keys if k in _ordered}

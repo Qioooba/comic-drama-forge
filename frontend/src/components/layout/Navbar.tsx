@@ -86,7 +86,7 @@ export function Navbar() {
       : status === 'offline' ? 'bg-danger'
       : 'bg-warning animate-pulse';
     const border = status === 'online' ? 'border-success/20 bg-success-subtle text-success-strong'
-      : status === 'offline' ? 'border-danger/30 bg-danger-subtle text-danger'
+      : status === 'offline' ? 'border-danger/30 bg-danger-subtle text-danger-strong'
       : 'border-warning/30 bg-warning-subtle text-ink-2';
     const tip = title + (lastCheck ? String.fromCharCode(10) + t('common.statusLastCheck', { time: lastCheck }) : '');
     return (
@@ -103,7 +103,7 @@ export function Navbar() {
   return (
     <nav className={'sticky top-0 z-sticky flex items-center justify-between gap-2 border-b border-line bg-surface/80 px-4 py-3 backdrop-blur-xl sm:px-6' + (IS_ELECTRON ? ' electron-titlebar' : '')}>
       <div className="flex min-w-0 items-center gap-2 sm:gap-3">
-        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-brand text-sm font-bold text-white shadow-sm">
+        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-brand text-sm font-bold text-on-brand shadow-sm">
           {t('brand.mark')}
         </div>
         <h1 className="truncate text-lg font-bold text-ink-1">
@@ -118,7 +118,7 @@ export function Navbar() {
           label={t('common.statusBackendOnline')}
           offlineLabel={t('common.statusBackendOffline')}
           checkingLabel={t('common.statusChecking')}
-          title="后端"
+          title={t('common.backend')}
         />
         <StatusPill
           status={comfy}
@@ -134,7 +134,7 @@ export function Navbar() {
             onClick={() => setShowThemeMenu(!showThemeMenu)}
             aria-label={t('theme.label')}
             title={t('theme.label')}
-            className={`flex shrink-0 items-center gap-2 rounded-md border border-brand/20 bg-brand-subtle px-2.5 py-1.5 text-brand transition-colors duration-200 hover:bg-brand/10 sm:px-3 ${FOCUS_RING}`}
+            className={`flex shrink-0 items-center gap-2 rounded-md border border-brand/20 bg-brand-subtle px-2.5 py-1.5 text-brand-hover transition-colors duration-200 hover:bg-brand/10 active:opacity-90 sm:px-3 ${FOCUS_RING}`}
           >
             {THEME_ICONS[themeMode]}
             <span className="hidden text-sm font-medium sm:inline">{t(`theme.${themeMode}`)}</span>
@@ -146,7 +146,7 @@ export function Navbar() {
                   key={m}
                   onClick={() => { setThemeMode(m); setShowThemeMenu(false); }}
                   aria-pressed={themeMode === m}
-                  className={`flex w-full items-center gap-2.5 px-4 py-2.5 text-left text-sm transition-colors hover:bg-brand-subtle ${
+                  className={`flex w-full items-center gap-2.5 px-4 py-2.5 text-left text-sm transition-colors hover:bg-brand-subtle active:opacity-90 ${
                     themeMode === m ? 'font-medium text-brand' : 'text-ink-1'
                   } ${FOCUS_RING}`}
                 >
@@ -167,7 +167,7 @@ export function Navbar() {
         <div className="relative">
           <button
             onClick={() => setShowLangMenu(!showLangMenu)}
-            className={`flex shrink-0 items-center gap-2 rounded-md border border-brand/20 bg-brand-subtle px-2.5 py-1.5 text-brand transition-colors duration-200 hover:bg-brand/10 sm:px-3 ${FOCUS_RING}`}
+            className={`flex shrink-0 items-center gap-2 rounded-md border border-brand/20 bg-brand-subtle px-2.5 py-1.5 text-brand-hover transition-colors duration-200 hover:bg-brand/10 active:opacity-90 sm:px-3 ${FOCUS_RING}`}
           >
             <span>{lang === 'zh-CN' ? '🇨🇳' : '🇺🇸'}</span>
             <span className="hidden text-sm font-medium sm:inline">{lang === 'zh-CN' ? t('lang.zh-CN') : 'English'}</span>
@@ -179,13 +179,13 @@ export function Navbar() {
             <div className="absolute right-0 top-full z-dropdown mt-2 w-32 overflow-hidden rounded-xl border border-line bg-surface/95 shadow-md backdrop-blur-xl">
               <button
                 onClick={() => { setLang('zh-CN'); setShowLangMenu(false); }}
-                className={`w-full px-4 py-2.5 text-left text-sm text-ink-1 transition-colors hover:bg-brand-subtle ${FOCUS_RING}`}
+                className={`w-full px-4 py-2.5 text-left text-sm text-ink-1 transition-colors hover:bg-brand-subtle active:opacity-90 ${FOCUS_RING}`}
               >
                 🇨🇳 {t('lang.simplified')}
               </button>
               <button
                 onClick={() => { setLang('en-US'); setShowLangMenu(false); }}
-                className={`w-full px-4 py-2.5 text-left text-sm text-ink-1 transition-colors hover:bg-brand-subtle ${FOCUS_RING}`}
+                className={`w-full px-4 py-2.5 text-left text-sm text-ink-1 transition-colors hover:bg-brand-subtle active:opacity-90 ${FOCUS_RING}`}
               >
                 🇺🇸 English
               </button>
@@ -200,7 +200,7 @@ export function Navbar() {
         <button
           type="button"
           aria-label={t('nav.userMenu')}
-          className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-brand text-sm font-medium text-white transition-transform hover:scale-105 hover:shadow-lg ${FOCUS_RING}`}
+          className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-brand text-sm font-medium text-on-brand transition-transform hover:scale-105 active:scale-95 hover:shadow-lg ${FOCUS_RING}`}
         >
           A
         </button>

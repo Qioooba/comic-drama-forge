@@ -4,7 +4,7 @@ import { QueryClientProvider } from '@tanstack/react-query';
 import { useApp } from '@/context/AppContext';
 import { t } from '@/i18n';
 import { projectsApi, autopilotApi, chatApi, agentApi } from '@/api/client';
-import { Button, Input, EmptyState, Skeleton } from '@/components/ui';
+import { Button, Input, EmptyState, Skeleton, FOCUS_RING } from '@/components/ui';
 import { AlertTriangle, Check, MessageSquare, X } from '@/components/ui/icons';
 import { useToast } from '@/components/ui/toast';
 import { Markdown } from '@/components/Markdown';
@@ -35,11 +35,11 @@ import { queryClient, clearProjectCache } from '@/api/queryClient';
 import type { WorkbenchTab } from '@/routes/workbenchTabs';
 import { WORKBENCH_TABS, WORKBENCH_TAB_META, workbenchPath } from '@/routes/workbenchTabs';
 
-// 焦点环：与 components/ui/index.tsx 里的 FOCUS_RING 逐字一致。
-// index.css 有全局 :focus-visible outline 兜底，这里显式加 focus:outline-none 把它压掉，
-// 否则 outline + ring 会叠成双环。凡因形状/类型原因换不成共享组件的原生控件，统一补这一串。
-const FOCUS_RING =
-  'focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 focus-visible:ring-offset-2 focus-visible:ring-offset-canvas';
+// 焦点环：直接复用 components/ui/index.tsx 导出的 FOCUS_RING，不再手抄一份。
+// 此前这个文件（以及另外 9 个文件）各自声明了一个**逐字相同**的模块级常量，
+// 副本一多就必然分叉 —— 已经出现过「某个副本忘了 ring-offset-canvas，
+// 深色主题下多出一圈 2px 纯白晕边」的情况。凡因形状/类型原因换不成共享
+// 组件的原生控件，import 这个常量即可。
 
 
 // ========== Workbench Tab Types ==========
@@ -171,7 +171,7 @@ function ProjectWorkbenchShell({ projectKey, tab: activeTab }: ProjectWorkbenchP
           </div>
           <Skeleton className="h-64 rounded-lg" />
         </div>
-        <Skeleton className="min-h-[420px] w-full rounded-xl lg:h-[calc(100vh-7rem)] lg:w-[340px] lg:shrink-0" />
+        <Skeleton className="min-h-[420px] w-full rounded-xl lg:h-[calc(100dvh-var(--chrome-h))] lg:w-[340px] lg:shrink-0" />
       </div>
     </div>
   );
@@ -260,7 +260,7 @@ function ProjectWorkbenchShell({ projectKey, tab: activeTab }: ProjectWorkbenchP
                 onClick={() => goTab(tab.id)}
                 className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors ${FOCUS_RING} ${
                   activeTab === tab.id
-                    ? 'bg-brand-subtle text-brand shadow-xs'
+                    ? 'bg-brand-subtle text-brand-hover shadow-xs'
                     : 'text-ink-2 hover:bg-surface-2 hover:text-ink-1'
                 }`}
               >
@@ -311,7 +311,7 @@ function ProjectWorkbenchShell({ projectKey, tab: activeTab }: ProjectWorkbenchP
           <button
             onClick={() => setChatOpen(true)}
             title={t('wb.expandChat')}
-            className={`sticky top-0 shrink-0 w-11 h-[calc(100vh-7rem)] min-h-[420px] flex flex-col items-center gap-3 py-4 rounded-xl border border-line bg-surface text-ink-2 hover:text-brand hover:border-brand transition-colors ${FOCUS_RING}`}
+            className={`sticky top-0 shrink-0 w-11 h-[calc(100dvh-var(--chrome-h))] min-h-[420px] flex flex-col items-center gap-3 py-4 rounded-xl border border-line bg-surface text-ink-2 hover:text-brand hover:border-brand transition-colors ${FOCUS_RING}`}
           >
             <span className="w-7 h-7 rounded-lg bg-brand-subtle flex items-center justify-center"><MessageSquare className="h-4 w-4" /></span>
             <span className="text-xs tracking-wide" style={{ writingMode: 'vertical-rl' }}>{t('wb.aiControl')}</span>
@@ -549,7 +549,8 @@ function ChatPanel({ projectKey, onClose }: { projectKey: string; onClose: () =>
   const [run, setRun] = useState<{ steps: AgentStep[]; status: string; startedAt?: number } | null>(null);
   const [toolCount, setToolCount] = useState(0);
   const [killOn, setKillOn] = useState(false);
-  const messagesEndRef = React.useRef<HTMLDivElement>(null);
+  // 消息列表自身的滚动容器（原先是「滚动哨兵 + scrollIntoView」，已废除，见下方 effect）
+  const messageListRef = React.useRef<HTMLDivElement>(null);
   // 审计 P2-35（2026-09-29）：发送路径的 trackJob 此前没传取消守卫 —— 面板卸载后
   // 轮询最长还会空转 35 分钟并对已卸载组件 setState。与「恢复跟踪」路径同一口径：
   // 卸载即让位（session 里的 job 信息保留，重挂载的新实例接手）。
@@ -659,7 +660,14 @@ function ChatPanel({ projectKey, onClose }: { projectKey: string; onClose: () =>
   };
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    // ⚠️ 必须滚动消息列表**自身**，不能对哨兵元素调 scrollIntoView()。
+    // scrollIntoView 会连带滚动路径上**所有**可滚动祖先 —— 包括外层 <main>：
+    // 历史消息到位的那一刻，整个左列被一起拽下去 ~900px，工具栏
+    // （生成本集全部分镜 / 整集一次生成 / 刷新 / 共 N 镜）直接被顶出视野，
+    // 看起来像「页面自己跳了一屏」。1920×1080 下必现。
+    // 正确口径与 LogsPage 的 boxRef.scrollTop = scrollHeight 一致。
+    const el = messageListRef.current;
+    if (el) el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
   }, [messages]);
 
   /** 轮询一个总控 job 到结束：实时刷新 run（AgentTrace 时间线），结束后把轨迹与回复落进对话。
@@ -744,14 +752,16 @@ function ChatPanel({ projectKey, onClose }: { projectKey: string; onClose: () =>
 
   return (
     <aside
-      // h-[calc(100vh-7rem)] = 视口高 −（顶栏 ~63px + main 上下 padding 48px），
+      // h-[calc(100dvh-var(--chrome-h))] = 视口高 − 常驻 chrome 总高
+      // （--chrome-h，见 index.css：Navbar + main 上内边距 + 上下文条），
       // 让面板与左列内容等高、上下贯通；sticky 使其随页面滚动保持停靠。
+      // ⚠️ 用 dvh 而非 vh：vh 不等于移动端地址栏收起后的可见高度。
       // glass-chrome：半透明 + 背景模糊，**仅限常驻 chrome**（原 `.glass` 已降级
       // 重命名，见 index.css §5.3）。长列表卡片不可用 backdrop-blur：滚动时逐帧
       // 重绘会把帧率拖垮。
       // 2026-09-29：宽度可拖拽 —— lg 宽度由 CSS 变量 --chat-w 注入（左缘手柄拖动
       // 调节，双击恢复 340，偏好落 localStorage）；小屏 <lg 仍 w-full 全宽堆叠。
-      className="glass-chrome relative flex w-full flex-col overflow-hidden rounded-xl border border-line lg:sticky lg:top-0 lg:h-[calc(100vh-7rem)] lg:w-[var(--chat-w)] lg:shrink-0 min-h-[420px]"
+      className="glass-chrome relative flex w-full flex-col overflow-hidden rounded-xl border border-line lg:sticky lg:top-0 lg:h-[calc(100dvh-var(--chrome-h))] lg:w-[var(--chat-w)] lg:shrink-0 min-h-[420px]"
       style={{ '--chat-w': `${chatW}px` } as React.CSSProperties}
     >
       {/* 拖拽调宽手柄：贴左缘 6px 竖条，hover 高亮；小屏堆叠全宽无意义 → hidden，lg 才显示 */}
@@ -778,7 +788,7 @@ function ChatPanel({ projectKey, onClose }: { projectKey: string; onClose: () =>
                 title={autoMode ? t('chat.switchToChat') : t('chat.switchToAuto')}
                 className={`text-[10px] leading-none px-1.5 py-0.5 rounded border transition-colors ${FOCUS_RING} ${
                   autoMode
-                    ? 'border-brand/30 text-brand bg-brand-subtle'
+                    ? 'border-brand/30 text-brand-hover bg-brand-subtle'
                     : 'border-line text-ink-2'
                 }`}
               >
@@ -830,7 +840,7 @@ function ChatPanel({ projectKey, onClose }: { projectKey: string; onClose: () =>
       {/* 消息区：浅色底以区别于面板头部/输入区，形成「对话」区域感。
           注意：空态与消息列表要二选一渲染 —— 若把滚动哨兵 <div> 和 h-full 的空态
           放在同一个 space-y-3 容器里，哨兵会额外吃到 12px margin 而撑出滚动条。 */}
-      <div className="flex-1 min-h-0 overflow-y-auto bg-surface-2">
+      <div ref={messageListRef} className="flex-1 min-h-0 overflow-y-auto bg-surface-2">
         {messages.length === 0 ? (
           <div className="h-full flex flex-col items-center justify-center text-center px-4">
             <EmptyState
@@ -863,7 +873,7 @@ function ChatPanel({ projectKey, onClose }: { projectKey: string; onClose: () =>
                   key={idx}
                   className={`px-3 py-2 rounded-lg text-sm ${
                     msg.role === 'user'
-                      ? 'bg-brand text-white ml-6 rounded-br-sm'
+                      ? 'bg-brand text-on-brand ml-6 rounded-br-sm'
                       : 'bg-surface border border-line text-ink-1 mr-6 rounded-bl-sm'
                   }`}
                 >
@@ -887,7 +897,6 @@ function ChatPanel({ projectKey, onClose }: { projectKey: string; onClose: () =>
                 {t('chat.thinking')}
               </div>
             )}
-            <div ref={messagesEndRef} />
           </div>
         )}
       </div>

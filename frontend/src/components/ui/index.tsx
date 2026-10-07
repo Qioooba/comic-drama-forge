@@ -15,13 +15,22 @@ import { t } from '@/i18n';
 //    但组件自己给 ring 更可控，故显式声明）。
 // ==========================================================================
 
-/** 焦点环：鼠标点击不出现，键盘 Tab 必然可见 */
-const FOCUS_RING = 'focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 focus-visible:ring-offset-2 focus-visible:ring-offset-canvas';
+/** 焦点环：鼠标点击不出现，键盘 Tab 必然可见。
+ *  ⚠️ 必须带 `ring-offset-canvas`：Tailwind v3 的 `--tw-ring-offset-color`
+ *    默认是 **#fff**，只写 `ring-offset-2` 会在深色主题上得到一圈 2px 纯白晕边。 */
+export const FOCUS_RING = 'focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 focus-visible:ring-offset-2 focus-visible:ring-offset-canvas';
 
 /** 表单控件基线：圆角、聚焦转品牌色。
  *  ⚠️ 这里**刻意不含高度**：Textarea 复用同一个基线，写死高度会把多行
  *  文本域压成单行高。高度由各控件显式声明 Input/Select → h-control-compact
- *  （36px = --control-h-compact），Textarea 随内容自适应。 */
+ *  （36px = --control-h-compact），Textarea 随内容自适应。
+ *  ⚠️⚠️ 这里的 `w-full` 会**静默压掉调用点的任何宽度类**：Tailwind 产物中
+ *    `.w-40` / `.w-24` 等排在 `.w-full` **之前**，同特异性下后者胜，而 class
+ *    属性里的书写顺序**不参与**优先级计算。所以 `<Select className="w-40" />`
+ *    实际渲染成 width:100%，没有任何报错。
+ *    要覆盖宽度必须写**重要修饰符**：`className="!w-40"`。
+ *    实测事故见 features/storyboard/StoryboardTab.tsx 的视频方式 Select ——
+ *    它把 storyboard 工具栏在 1920×1080 下挤成三行错位。 */
 const FIELD_BASE =
   'w-full rounded-md border bg-surface px-3 text-base text-ink-1 transition-colors placeholder:text-ink-3 ' +
   'disabled:cursor-not-allowed disabled:opacity-50';
@@ -29,8 +38,13 @@ const FIELD_BASE =
 /** 行内单行控件高度：36px（= --control-h-compact）。改尺寸只改这一个令牌。 */
 const FIELD_H = 'h-control-compact';
 
-const FIELD_OK = 'border-line hover:border-line-strong focus:border-brand focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/25';
-const FIELD_ERR = 'border-danger focus:border-danger focus:outline-none focus-visible:ring-2 focus-visible:ring-danger/25';
+// 描边用 `line.input`（--border-input，3:1）而不是 `line`（深色 1.72:1 / 浅色 1.23:1）：
+// WCAG 1.4.11 要求「识别控件所需的视觉信息」达到 3:1，而浅色下 --bg-surface(#FFF)
+// 与 --bg-canvas(#F7F8FA) 之间只有 1.10:1，控件的填充本身给不了任何边界信息 ——
+// 原来的空 Input 等于一片看不见的白。聚焦环与 FOCUS_RING 对齐（40% + offset），
+// 原先是 25% 且无 offset，键盘聚焦时环紧贴描边、浅底上基本看不出。
+const FIELD_OK = 'border-line-input hover:border-line-strong focus:border-brand focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 focus-visible:ring-offset-2 focus-visible:ring-offset-canvas';
+const FIELD_ERR = 'border-danger focus:border-danger focus:outline-none focus-visible:ring-2 focus-visible:ring-danger/40 focus-visible:ring-offset-2 focus-visible:ring-offset-canvas';
 
 function FieldLabel({ label, children }: { label?: string; children: React.ReactNode }) {
   if (!label) return <>{children}</>;
@@ -326,6 +340,10 @@ export function Button({
   type = 'button',
   loading = false,
   title,
+  // ⚠️ 其余原生属性（aria-label / aria-pressed / data-* / ref / onKeyDown …）一律透传。
+  //    此前 props 是逐个枚举的封闭结构，`<Button aria-label="…">` 在**类型层面**就
+  //    写不出来，纯图标按钮因此拿不到无障碍名，只能各自去手搓裸 <button> 绕开。
+  ...rest
 }: {
   children: React.ReactNode;
   onClick?: () => void;
@@ -339,26 +357,46 @@ export function Button({
   /** 提交中：自动禁用并显示转圈，避免重复点击造成重复任务 */
   loading?: boolean;
   title?: string;
-}) {
+} & Omit<
+  React.ButtonHTMLAttributes<HTMLButtonElement>,
+  // ⚠️ onClick 必须一起 omit：上面的显式 `onClick?: () => void` 与
+  //    ButtonHTMLAttributes 自带的 `onClick?: MouseEventHandler` 会求成交集
+  //    `(() => void) & MouseEventHandler`，而形参类型不兼容的处理器
+  //    （如 `(force?: boolean) => Promise<void>`）对这个交集**无法赋值**，
+  //    编译期直接报 TS2322。保留显式声明 = 维持原有宽松签名。
+  'type' | 'title' | 'className' | 'children' | 'onClick'
+>) {
   const base = `inline-flex items-center justify-center gap-2 rounded-md font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${FOCUS_RING}`;
   const variants = {
     // 主 CTA = 品牌色实底（2026-10-07 修正）：原先 primary 走 --action，
     // 深色下解析成 slate-700 中性灰、浅色下是近黑 —— 全站**唯一的主 CTA
     // 识别位是品牌色**，却让中性灰占了默认位，主次动作视觉权重一样重。
-    // 对比度：白字压 indigo-500（--brand）≈ 4.45:1，达 WCAG 正文 4.5:1 门槛。
-    // hex 取值见 index.css 的 --brand 注释（此处不写字面量，HEX001 会拦）。
-    primary: 'bg-brand text-white hover:bg-brand-hover',
-    // brand 变体与 primary 同形（历史调用点保留；新代码直接用默认 primary）
-    brand: 'bg-brand text-white hover:bg-brand-hover',
-    secondary: 'border border-line bg-surface text-ink-1 hover:bg-surface-2',
+    //
+    // ⚠️ 「实底 + 白字」与「品牌色当文字」是两个方向相反的职责，深色下同一个值
+    //    满足不了两者，所以拆成三个 token（见 index.css）：
+    //      --on-brand     压在实底上的反白字
+    //      --brand-press  hover/按下时的实心底（**压深**，不是提亮）
+    //      --brand-hover  提亮版，只用于「深底上的文字/图标」
+    //    数值：text-on-brand 压 --brand = 4.47:1（**未达** 4.5，差 0.03）；
+    //    压 --brand-press = 6.29:1 ✅。原先 hover 走 brand-hover(indigo-400)，
+    //    白字压上去只剩 2.98:1 —— 鼠标一悬停主 CTA 就崩。
+    primary: 'bg-brand text-on-brand hover:bg-brand-press active:bg-brand-press',
+    // brand = primary 的显式别名。⚠️ 全仓 14 处调用点（AIVaultPage / AudioTab /
+    // OutputReviewTab / StoryboardTab / OverviewTab / EpisodeReviewPanel /
+    // ErrorBoundary / ProjectWorkbenchPage），**不是死变体**，删掉会一次性打断这 14 处。
+    // 保留别名只为兼容既有调用；新代码直接用默认 primary。
+    brand: 'bg-brand text-on-brand hover:bg-brand-press active:bg-brand-press',
+    secondary: 'border border-line bg-surface text-ink-1 hover:bg-surface-2 active:bg-surface-2',
     // 破坏性动作：**红边红字**，不与只读动作共享轮廓（MASTER §4.1 / invariant 5）。
     // hover 只把底色推向「红 + 更淡的实底」方向，**不做整块实心填充** ——
     // 原先 `hover:bg-danger hover:text-white` 会让 danger 在 hover 后与
     // primary（实心 + 白字）完全同形，破坏性语义在悬停瞬间消失，
     // 而破坏性动作恰恰是用户最需要看清的一刻。红边红字始终保留。
-    danger: 'border border-danger bg-danger-subtle text-danger-strong hover:bg-danger/25',
-    ghost: 'bg-transparent text-ink-2 hover:bg-surface-2 hover:text-ink-1',
-    link: 'bg-transparent p-0 text-brand underline-offset-4 hover:text-brand-hover hover:underline',
+    danger: 'border border-danger bg-danger-subtle text-danger-strong hover:bg-danger/25 active:bg-danger/25',
+    ghost: 'bg-transparent text-ink-2 hover:bg-surface-2 hover:text-ink-1 active:bg-surface-2',
+    // link：静止态也必须有**非颜色**线索（WCAG 1.4.1）。原先只有 hover 才出现下划线，
+    // 静止态纯靠 text-brand 传达「这是链接」，色觉障碍用户无从分辨。
+    link: 'bg-transparent p-0 text-brand underline decoration-current/40 underline-offset-4 hover:decoration-current hover:text-brand-hover',
   };
   // 高度：sm 36 / md 40 / lg 44 —— 40px 是规范底线，纯图标触达区 44×44。
   // 原先 sm=32 / md=36 低于规范（改造前量到 86 个控件不足 24px）。
@@ -370,13 +408,17 @@ export function Button({
   const spin = { sm: 'w-3 h-3', md: 'w-3.5 h-3.5', lg: 'w-4 h-4' };
   return (
     <button
+      {...rest}
       type={type}
       onClick={onClick}
       disabled={disabled || loading}
       style={style}
       title={title}
       aria-busy={loading || undefined}
-      className={`${base} ${variants[variant]} ${variant === 'link' ? '' : sizes[size]} ${className}`}
+      // link 不给 active 底色：它是行内文字，按下时整块变色会读成「跳转中」。
+      className={`${base} ${variants[variant]} ${variant === 'link' ? '' : sizes[size]} ${
+        variant === 'link' ? 'active:opacity-80' : 'active:opacity-90'
+      } ${className}`}
     >
       {loading && (
         <span
@@ -525,6 +567,7 @@ export function Select({
   label,
   error,
   busy = false,
+  'aria-label': ariaLabel,
 }: {
   value: string;
   onChange: (v: string) => void;
@@ -536,6 +579,13 @@ export function Select({
   error?: string;
   /** 提交中：aria-busy + 右侧 spinner */
   busy?: boolean;
+  /**
+   * 无可见 label 时的无障碍名。
+   * ⚠️ 此前 props 是封闭结构、也不透传剩余原生属性，放在横向工具栏里的 Select
+   *    （没有 FieldLabel 的竖排 label 兜底）拿不到任何可访问名，读屏只会念「组合框」。
+   *    与 Button 的 `...rest` 透传同一思路：补可选的 aria-label，不动既有调用点。
+   */
+  'aria-label'?: string;
 }) {
   const errorId = React.useId();
   const select = (
@@ -543,6 +593,7 @@ export function Select({
       value={value}
       onChange={(e) => onChange(e.target.value)}
       disabled={disabled}
+      aria-label={ariaLabel}
       aria-invalid={error ? true : undefined}
       aria-describedby={error ? errorId : undefined}
       aria-busy={busy || undefined}
@@ -636,7 +687,10 @@ export function Modal({
   const node = (
     <div className="fixed inset-0 z-modal flex items-center justify-center p-4">
       <div
-        className="absolute inset-0 animate-modal-backdrop bg-slate-900/50 backdrop-blur-sm"
+        // 用 `bg-media` 而不是 `bg-slate-900`：index.css 的「组件层禁止字面量」
+        // 规则不该被共享组件自己破掉。--bg-media 两套主题同值（#05070B），
+        // 所以观感与原先的 slate-900/50 完全一致，只是回到 token 体系。
+        className="absolute inset-0 animate-modal-backdrop bg-media/50 backdrop-blur-sm"
         onClick={closeOnBackdrop && !preventClose ? onClose : undefined}
         aria-hidden="true"
       />

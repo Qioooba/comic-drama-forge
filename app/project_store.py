@@ -899,6 +899,24 @@ def _views_of(dir_path: str) -> list:
             "mtime": int(os.path.getmtime(full)),
             "url": "/api/assets/" + os.path.relpath(full, ASSETS_DIR).replace(os.sep, "/"),
         })
+    # Machine Anchor 语义目录（identity/body/framing）也进入资产画廊；
+    # view 使用 "identity/face_front" 这类复合键，前端无需猜文件职责。
+    for sub in ("identity", "body", "framing"):
+        sd = os.path.join(dir_path, sub)
+        if not os.path.isdir(sd):
+            continue
+        for fn in sorted(os.listdir(sd)):
+            ext = os.path.splitext(fn)[1].lower()
+            if ext not in (".png", ".jpg", ".jpeg", ".webp"):
+                continue
+            full = os.path.join(sd, fn)
+            views.append({
+                "view": f"{sub}/{os.path.splitext(fn)[0]}",
+                "file": full,
+                "size": os.path.getsize(full),
+                "mtime": int(os.path.getmtime(full)),
+                "url": "/api/assets/" + os.path.relpath(full, ASSETS_DIR).replace(os.sep, "/"),
+            })
     return views
 
 

@@ -1,6 +1,6 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { t } from '@/i18n';
+import { t, subscribeLocale } from '@/i18n';
 
 /**
  * 全局轻提示（Toast）
@@ -136,6 +136,14 @@ export function ToastProvider({ children, max = 5 }: { children: React.ReactNode
     dismiss,
     clear: () => setItems([]),
   }), [push, dismiss]);
+
+  // ⚠️ ToastProvider 在 AppProvider **之外**（AppContext.showError 要往这里推消息），
+  //    所以它拿不到 context，也订阅不到 AppContext 里那个 localeVersion。
+  //    模块级 t() 的引用永不变化，语言包到达后不会自动重算 → aria-label 会
+  //    永久停在字面量 "toast.regionLabel"，读屏直接把这串内部 key 念出来。
+  //    这里显式订阅一次：语言包就绪后强制重渲染，把区域名换成真正的「通知」。
+  const [, bumpOnLocaleReady] = useState(0);
+  useEffect(() => subscribeLocale(() => bumpOnLocaleReady((v) => v + 1)), []);
 
   const host = (
     <div

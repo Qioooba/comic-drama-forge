@@ -83,11 +83,12 @@ def asset_key(asset: Dict[str, Any]) -> Optional[tuple]:
     kind = str(asset.get("kind") or "").strip()
     name = str(asset.get("name") or "").strip()
     pkey = _path_key(asset.get("path"))
-    # 2026-10-02：角色按「角色级」判交集（common_key），不因服装变体（衣柜 outfits/
-    # <key>/base.png）把同一角色路径劈成多张而漏出公共池；场景/物品不设 common_key，
-    # 仍按「同一张图」判交集（档位不同不应焊死）。common_key 缺失回落路径键。
+    # common_key 允许上游表达角色语义，但**必须再并入实际 path**：
+    # 同名角色不同 outfit / Machine Anchor path 不得进入同一个公共池。
     key_id = str(asset.get("common_key") or "").strip()
-    ident = key_id if key_id else pkey
+    # 角色 common_key 现在由上游带上实际 path；为兼容旧调用方，仍把 path 并入身份键。
+    # 这样同名角色但不同 outfit/path 不会被错误提升为全集公共参考。
+    ident = f"{key_id}|{pkey}" if key_id and pkey else (key_id or pkey)
     if kind not in VALID_KINDS or not name or not (key_id or pkey):
         return None
     return (kind, name, ident)

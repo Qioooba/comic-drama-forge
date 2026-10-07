@@ -17,6 +17,7 @@
  *    连注释里的字面量都会命中，写出来等于自己给自己开一张违规单。）
  */
 import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { t } from '@/i18n';
 
 /** 虚拟化阈值：超过即只渲染可视窗口。 */
 export const VIRTUALIZE_THRESHOLD = 50;
@@ -50,7 +51,7 @@ export function ShotNavigator({
   shots,
   selectedShotId,
   onSelect,
-  label = '镜头导航',
+  label = t('studio.navigatorLabel'),
   className = '',
 }: ShotNavigatorProps): JSX.Element {
   const scrollRef = useRef<HTMLDivElement | null>(null);
@@ -98,7 +99,17 @@ export function ShotNavigator({
   const padBottom = virtualized ? (shots.length - last) * ROW_H : 0;
 
   return (
-    <div className={`flex min-h-0 flex-col ${className}`}>
+    /* ⚠️ `h-full` 不是可有可无的，是**这个组件能看见内容的前提**（2026-10-07 修复）：
+       外层是 AppShell 的 `<aside class="min-h-0">`，它作为 grid item 会被
+       `align-items:stretch` 拉到行高（实测 620px）。但本根 div 是**普通块级盒**，
+       块级盒不会填满父级高度，它只按自身内容定高 —— 而唯一的子元素是下面那个
+       `contain:strict` 的列表，`contain:strict` 含 `contain:size`，即"按没有内容
+       计算尺寸"，对父级高度贡献 0。再叠加 `lg:min-h-0`（≥1024px 生效）撤掉了
+       `min-h-[320px]` 兜底 —— 结果根 div 只剩 42px（一个头部），
+       列表 clientH = 0，**整个镜号导航在 1080p 下彻底不可见**。
+       实测：修复前 navroot=42 / navlist=0；加 h-full 后 navroot=620 / navlist=578。
+       别再删 h-full，也别以为 `min-h-[320px]` 能兜住 —— lg 下它已被覆盖。 */
+    <div className={`flex h-full min-h-0 flex-col ${className}`}>
       <div
         ref={scrollRef}
         onScroll={onScroll}
@@ -119,8 +130,8 @@ export function ShotNavigator({
               style={{ height: ROW_H }}
               className={`flex w-full items-center gap-2 border-b border-line/50 px-2.5 text-left text-sm ${
                 active
-                  ? 'bg-brand-subtle text-brand'
-                  : 'text-ink-2 hover:bg-surface hover:text-ink-1'
+                  ? 'bg-brand-subtle text-brand-hover'
+                  : 'text-ink-2 hover:bg-surface hover:text-ink-1 active:opacity-90'
               }`}
             >
               {/* 序号用等宽数字：纵向核对「第 37 镜」时数字不左右跳动 */}
@@ -139,7 +150,7 @@ export function ShotNavigator({
       </div>
       <p className="mt-1 shrink-0 text-xs tabular-nums text-ink-3">
         {shots.length} {label}
-        {virtualized && shots.length > VIRTUALIZE_THRESHOLD && '（已虚拟化渲染）'}
+        {virtualized && shots.length > VIRTUALIZE_THRESHOLD && t('studio.virtualized')}
       </p>
     </div>
   );

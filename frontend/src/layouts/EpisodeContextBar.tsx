@@ -14,6 +14,7 @@
  * Never silently fall back。
  */
 import React from 'react';
+import { t } from '@/i18n';
 
 export interface EpisodeContext {
   projectKey: string;
@@ -64,35 +65,42 @@ export function EpisodeContextBar({
   const { projectKey, season, episodeNo, shotSeq } = context;
 
   return (
+    // ⚠️ sticky 必须用负 margin 抵消父级 <main class="p-6"> 的 24px padding。
+    //   top-0 是相对**滚动容器**（main）算的，而 sticky 元素仍被父级 padding 框住，
+    //   于是它会停在距容器顶 24px 处 —— Navbar 与本条之间露出 24px 正在滚过的
+    //   内容，glass-chrome 的 backdrop-blur 会把它糊成一条脏带。
+    //   -mx-6 -mt-6 + px-6 pt-2 = 视觉上仍然对齐，但盒子铺满整个滚动宽度。
+    //   （App.tsx 的 main 已加 overflow-x-hidden 兜住横向溢出。）
     <div
-      className={`glass-chrome sticky top-0 z-sticky flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-line px-3 py-2 text-sm ${className}`}
+      className={`glass-chrome sticky -mx-6 -mt-6 top-0 z-sticky flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-line px-6 py-2 text-sm ${className}`}
     >
       {onToggleNavigator && (
         <button
+          type="button"
           onClick={onToggleNavigator}
           aria-expanded={navigatorOpen}
-          aria-label={navigatorOpen ? '收起镜头导航' : '展开镜头导航'}
+          aria-label={navigatorOpen ? t('ctx.collapseNavigator') : t('ctx.expandNavigator')}
           // 纯图标按钮触达区 ≥ 44×44（MASTER §5 无障碍）
-          className="flex h-hit-target w-hit-target shrink-0 items-center justify-center rounded text-ink-2 hover:bg-surface-2 hover:text-ink-1"
+          className="flex h-hit-target w-hit-target shrink-0 items-center justify-center rounded text-ink-2 transition-colors hover:bg-surface-2 hover:text-ink-1 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 focus-visible:ring-offset-2 focus-visible:ring-offset-canvas"
         >
           <span aria-hidden="true" className="font-mono text-sm">☰</span>
         </button>
       )}
 
       {/* 面包屑：集号 / 镜号用等宽数字，便于逐位核对 */}
-      <nav aria-label="项目上下文" className="flex min-w-0 flex-wrap items-center gap-1.5">
-        <Crumb label="项目">{projectKey}</Crumb>
-        {season != null && <><Sep /><Crumb label="季">{season}</Crumb></>}
+      <nav aria-label={t('ctx.navLabel')} className="flex min-w-0 flex-wrap items-center gap-1.5">
+        <Crumb label={t('common.project')}>{projectKey}</Crumb>
+        {season != null && <><Sep /><Crumb label={t('ctx.season')}>{season}</Crumb></>}
         <Sep />
-        <Crumb label="集">
+        <Crumb label={t('common.episode')}>
           <span className="font-mono tabular-nums">
-            {episodeNo != null ? `第 ${episodeNo} 集` : '未选集'}
+            {episodeNo != null ? t('wb.episodeNo', { n: episodeNo }) : t('ctx.noEpisode')}
           </span>
         </Crumb>
         <Sep />
-        <Crumb label="镜">
+        <Crumb label={t('common.shot')}>
           <span className="font-mono tabular-nums">
-            {shotSeq != null ? `第 ${shotSeq} 镜` : '未选镜'}
+            {shotSeq != null ? t('ctx.shotN', { n: shotSeq }) : t('ctx.noShot')}
           </span>
         </Crumb>
       </nav>
@@ -101,25 +109,27 @@ export function EpisodeContextBar({
       <div className="ml-auto flex flex-wrap items-center gap-3 text-xs">
         {actions}
         <StatusChip
-          label="队列"
-          value={status?.queueDepth != null ? String(status.queueDepth) : '未知'}
+          label={t('ctx.queue')}
+          value={status?.queueDepth != null ? String(status.queueDepth) : t('common.unknown')}
         />
         <StatusChip
           label="GPU"
           value={
             status?.gpuBusy == null
-              ? '未知'
+              ? t('common.unknown')
               : status.gpuBusy
-                ? `忙碌${status.gpuName ? `（${status.gpuName}）` : ''}`
-                : '空闲'
+                ? (status.gpuName
+                  ? t('ctx.gpuBusyNamed', { gpu: status.gpuName })
+                  : t('ctx.gpuBusy'))
+                : t('ctx.gpuIdle')
           }
           // 色 + 文本 + 图标三重表达（MASTER §4.2）：不能只靠颜色
           glyph={status?.gpuBusy == null ? '?' : status.gpuBusy ? '▲' : '○'}
           tone={status?.gpuBusy == null ? 'unknown' : status.gpuBusy ? 'busy' : 'idle'}
         />
         <StatusChip
-          label="磁盘"
-          value={status?.diskUsed ?? '未知'}
+          label={t('ctx.disk')}
+          value={status?.diskUsed ?? t('common.unknown')}
         />
       </div>
     </div>
@@ -142,9 +152,12 @@ function Sep(): JSX.Element {
 
 type Tone = 'idle' | 'busy' | 'unknown';
 
+// ⚠️ 必须用 `-strong` 档，不能用主档：主档是**饱和色相**（emerald-500 / cyan-500），
+//    浅色主题下压在白底上只有 2.54:1 / 2.43:1 —— 这是**常驻**状态条，
+//    任何语言、任何页面都会露馅。-strong 是按各主题背景配过的深字档。
 const TONE_CLS: Record<Tone, string> = {
-  idle: 'text-state-done',
-  busy: 'text-state-running',
+  idle: 'text-state-done-strong',
+  busy: 'text-state-running-strong',
   unknown: 'text-ink-3',
 };
 

@@ -22,6 +22,7 @@
  *    先在 index.css 定义变量、再把这里改成 var() 引用，而不是只在注释里承诺。
  */
 import React, { useEffect, useState } from 'react';
+import { t } from '@/i18n';
 import {
   EpisodeContextBar,
   type EpisodeContext,
@@ -94,8 +95,11 @@ export function AppShell({
         actions={actions}
       />
 
-      {/* ≥1440 三栏全展开；1280 检查器收窄；≤1024 单列 + 检查器转抽屉 */}
-      <div className="grid min-h-0 flex-1 grid-cols-1 gap-3 p-3 lg:grid-cols-[285px_1fr_350px]">
+      {/* ≥1440 三栏全展开；1280 检查器收窄；≤1024 单列 + 检查器转抽屉。
+          ⚠️ 中列必须是 minmax(0,1fr) 而不是 1fr：grid 的 1fr 隐含 min-width:auto，
+          中栏里任何内在宽度超出（长文件名、nowrap 表格）都会把整条 grid 撑破，
+          而不是把中栏压窄。minmax(0,…) 才是「允许收缩到 0」。 */}
+      <div className="grid min-h-0 flex-1 grid-cols-1 gap-3 p-3 lg:grid-cols-[285px_minmax(0,1fr)_350px]">
         {/* 左：导航器 */}
         <aside className={`min-h-0 ${navOpen ? '' : 'hidden lg:block'}`}>
           {navOpen && navigator}
@@ -116,11 +120,15 @@ export function AppShell({
         {!wide && (
           <div className="fixed inset-x-0 bottom-0 z-drawer border-t border-line bg-surface p-2">
             <button
+              type="button"
               onClick={() => setInspectorOpen((v) => !v)}
               aria-expanded={inspectorOpen}
-              className="control-compact w-full rounded border border-line text-sm text-ink-1"
+              // ⚠️ 这条是全仓唯一漏写 hover 的按钮：没有 hover 反馈时它看起来像块
+              //    静态文本而不是可点控件。type="button" 也必须显式写 —— 默认
+              //    type 是 submit，一旦将来被挪进 <form> 就会误提交。
+              className="control-compact w-full rounded border border-line-input bg-surface text-sm text-ink-1 transition-colors hover:bg-surface-2 hover:border-line-strong focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 focus-visible:ring-offset-2 focus-visible:ring-offset-canvas"
             >
-              {inspectorOpen ? '收起检查器' : '展开检查器'}
+              {inspectorOpen ? t('shell.collapseInspector') : t('shell.expandInspector')}
             </button>
           </div>
         )}

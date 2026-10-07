@@ -15,10 +15,16 @@ from pathlib import Path
 # 确保app目录在路径中
 sys.path.insert(0, str(Path(__file__).parent / 'app'))
 
+import log_setup  # noqa: E402  依赖上面刚把 app/ 放进 sys.path
+from ports import backend_port  # noqa: E402  端口唯一事实源（app/ports.py）
+
 def parse_args():
     parser = argparse.ArgumentParser(description='漫剧工坊 - 全自动AI漫剧生产平台')
     parser.add_argument('--desktop', action='store_true', help='启动桌面模式（内置浏览器）')
-    parser.add_argument('--port', type=int, default=5210, help='Web服务器端口')
+    # 端口默认值来自 ports.backend_port()（原为硬编码 5210）。注意必须用
+    # default= 而非在这里写死：argparse 总会把默认值传给 run_web_mode，
+    # 它内部的 `port or backend_port()` 永远走不到兜底分支。
+    parser.add_argument('--port', type=int, default=backend_port(), help='Web服务器端口')
     parser.add_argument('--host', default='127.0.0.1', help='Web服务器地址')
     return parser.parse_args()
 
@@ -128,9 +134,10 @@ def run_web_mode(port, host):
     现在改为先把参数写进环境变量，再调用无参 `main()`。
     """
     import serve
+    from ports import backend_port  # 端口唯一事实源：默认值不再硬编码 5000
     host = str(host or "127.0.0.1")
     os.environ["APP_HOST"] = host
-    os.environ["APP_PORT"] = str(int(port or 5000))
+    os.environ["APP_PORT"] = str(int(port or backend_port()))
     print(f"🚀 漫剧工坊启动: http://{host}:{os.environ['APP_PORT']}")
     print("按 Ctrl+C 停止服务")
     return serve.main()
@@ -186,7 +193,11 @@ def main():
     # 打包版：① 先把 stdout/stderr 镜像到 exe 同级 logs/（Web 日志页可读到）
     #           放在最前面，后面数据根等启动诊断才能落进这份日志。
     _redirect_frozen_logs()
-    #        ② 可写数据根指到 exe 同级 data/（勿在只读 _MEIPASS 上 mkdir）
+    #        ② 日志格式定死（时间戳 + 行号 + 线程、ERROR 自动带 traceback）。
+    #           必须在 run_*_mode import 任何业务模块之前，否则那些模块的
+    #           logging 配置会抢先装上默认格式，时间戳又没了。见 log_setup 文档。
+    log_setup.setup_logging()
+    #        ③ 可写数据根指到 exe 同级 data/（勿在只读 _MEIPASS 上 mkdir）
     _setup_frozen_datadir()
 
     # 创建输出目录（frozen 时 MJSCXT_DATA_DIR 已指向可写 data/，源码树时指向 __file__ 上级）

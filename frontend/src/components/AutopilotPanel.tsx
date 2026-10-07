@@ -284,7 +284,7 @@ export function AutopilotPanel({ projectKey }: { projectKey: string }) {
       <label className="flex items-start gap-2 cursor-pointer">
         <input
           type="checkbox"
-          className="mt-1 accent-[var(--color-brand)]"
+          className="mt-1 accent-[rgb(var(--brand))]"
           checked={on}
           disabled={busy !== null}
           onChange={(e) => void savePlan({ [key]: e.target.checked }, key)}

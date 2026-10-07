@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useApp } from '@/context/AppContext';
 import { Badge, Button, Card, Input, Select } from '@/components/ui';
 import { logsApi } from '@/api/client';
@@ -15,14 +15,64 @@ function fmtSize(n: number): string {
   return `${(n / 1024 / 1024).toFixed(2)} MB`;
 }
 
-function lineClass(line: string): string {
-  if (line.startsWith('ERROR') || line.includes('ERROR:')) {
-    return 'text-danger-strong';
+/**
+ * 取日志级别，判据与后端 `log_viewer._level_of` 一致。
+ *
+ * ⚠️ 这里**不能**用 `startsWith('WARNING')` / `includes('WARNING:')` 这类写法：
+ * 2026-10-07 统一日志格式后，行首变成了时间戳、级别被方括号包住：
+ *   `2026-10-07 14:13:57.386 [WARNING] script_generator | ...`
+ * `startsWith('WARNING')` 因行首是数字而永不成立，`includes('WARNING:')` 又匹配不到
+ * `[WARNING] ` 的形态 → 所有行都落到默认灰，整页日志看起来「全是一个颜色」。
+ * （旧格式 `WARNING:app:msg` 仍需认，因为历史日志文件里大量存在，故保留第 2 条兜底。）
+ *
+ * 另外，判据**只扫行首窗口**，不全文搜索级别词 —— 正文里出现「ERROR:」字样的普通
+ * INFO 行不应被染成红色。
+ */
+const LEVEL_SCAN_WINDOW = 64;
+const BRACKET_LEVEL_RE = /\[(CRITICAL|FATAL|ERROR|WARNING|WARN|INFO|DEBUG)\]/i;
+/** 旧格式 `LEVEL:name:message`；`WARN`/`FATAL` 归一到 `WARNING`/`CRITICAL` */
+const LEVEL_ALIAS: Record<string, string> = { WARN: 'WARNING', FATAL: 'CRITICAL' };
+
+function levelOf(line: string): string | null {
+  const head = line.slice(0, LEVEL_SCAN_WINDOW);
+  const m = BRACKET_LEVEL_RE.exec(head);
+  if (m) return LEVEL_ALIAS[m[1].toUpperCase()] ?? m[1].toUpperCase();
+  const legacy = head.split(':', 1)[0].trim().toUpperCase();
+  if (legacy === 'CRITICAL' || legacy === 'ERROR' || legacy === 'WARNING'
+    || legacy === 'INFO' || legacy === 'DEBUG') {
+    return LEVEL_ALIAS[legacy] ?? legacy;
   }
-  if (line.startsWith('WARNING') || line.includes('WARNING:')) {
-    return 'text-warning-strong';
+  return null;
+}
+
+/**
+ * 行着色。
+ *
+ * `inherit` 是**上一行已识别出的级别**：ERROR 的 traceback、多行消息的后续行本身不带
+ * 级别前缀，各自都返回 null，若一律按「无级别 → 灰」处理，堆栈就会与错误首行断开、
+ * 读起来像另一条无关信息。子日志行跟住父行的颜色才符合阅读预期 —— 仅对错误级
+ * 生效，WARNING 的续行仍回落默认色，避免长告警把整屏染黄。
+ */
+function lineClass(line: string, inherit?: string | null): string {
+  const lv = levelOf(line);
+  if (lv) {
+    switch (lv) {
+      case 'CRITICAL':
+      case 'ERROR':
+        return 'text-danger-strong';
+      case 'WARNING':
+        return 'text-warning-strong';
+      case 'DEBUG':
+        return 'text-ink-3';
+      default:
+        return 'text-ink-2';
+    }
   }
-  if (line.startsWith('DEBUG')) return 'text-ink-3';
+  // 续行（无级别前缀）：仅在**错误级**下跟住父行的红色系，但降一档。
+  // 实测一个 HTTPConnectionPool 的 traceback 就带 34~75 行，若续行也用
+  // danger-strong，4767 行日志里会有 1500+ 行标红，真正需要一眼定位的
+  // ERROR 首行反而被淹没；WARNING 的续行则一律回落默认色，避免长告警染黄整屏。
+  if (inherit === 'CRITICAL' || inherit === 'ERROR') return 'text-danger';
   return 'text-ink-2';
 }
 
@@ -118,6 +168,19 @@ export function LogsPage() {
   const cur = sources.find(s => s.key === source);
   const counts = meta?.counts || {};
 
+  // 逐行定色：需要「上一行的级别」，故在渲染前一次算完（顺带保住原来的 React key）
+  const rendered = useMemo(() => {
+    const out: { key: string; text: string; cls: string }[] = [];
+    let prev: string | null = null;
+    lines.forEach((ln, i) => {
+      const lv = levelOf(ln);
+      const cls = lineClass(ln, lv ? null : prev);
+      if (lv) prev = lv;
+      out.push({ key: `${i}-${ln.slice(0, 24)}`, text: ln, cls });
+    });
+    return out;
+  }, [lines]);
+
   return (
     <div className="space-y-6 p-6">
       <div className="flex flex-wrap items-start justify-between gap-4">
@@ -206,14 +269,14 @@ export function LogsPage() {
         <div
           ref={boxRef}
           onScroll={onScroll}
-          className="max-h-[60vh] min-h-[320px] overflow-auto bg-black/40 p-4 font-mono text-[12px] leading-relaxed"
+          className="max-h-[60vh] min-h-[320px] overflow-auto bg-surface-2 p-4 font-mono text-[12px] leading-relaxed"
         >
           {lines.length === 0 && !loading && (
             <p className="text-ink-3">{t('wb.logs.empty')}</p>
           )}
-          {lines.map((ln, i) => (
-            <div key={`${i}-${ln.slice(0, 24)}`} className={`whitespace-pre-wrap break-all ${lineClass(ln)}`}>
-              {ln}
+          {rendered.map(({ key, text, cls }) => (
+            <div key={key} className={`whitespace-pre-wrap break-all ${cls}`}>
+              {text}
             </div>
           ))}
         </div>

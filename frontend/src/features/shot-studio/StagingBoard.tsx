@@ -10,6 +10,7 @@
  */
 import React from 'react';
 import { assetSrc } from '@/api/queries';
+import { t } from '@/i18n';
 
 export interface StagedCharacter {
   /** 角色 id */
@@ -31,10 +32,11 @@ export interface StagingBoardProps {
   readOnly?: boolean;
 }
 
-const STAGES: { id: NonNullable<StagedCharacter['stage']>; label: string }[] = [
-  { id: 'left', label: '左' },
-  { id: 'center', label: '中' },
-  { id: 'right', label: '右' },
+/** 站位档位：id 是存回后端的取值（不翻译），labelKey 是展示文案 */
+const STAGES: { id: NonNullable<StagedCharacter['stage']>; labelKey: string }[] = [
+  { id: 'left', labelKey: 'studio.stage.left' },
+  { id: 'center', labelKey: 'studio.stage.center' },
+  { id: 'right', labelKey: 'studio.stage.right' },
 ];
 
 /** 站位 → 网格列（1/3、2/3、3/3），用 grid 而不是绝对定位，便于响应式 */
@@ -52,14 +54,14 @@ export function StagingBoard({
   if (characters.length === 0) {
     return (
       <div className="rounded-lg border border-line bg-surface p-4 text-center text-sm text-ink-2">
-        这一镜没有出场角色。
+        {t('studio.noCharacters')}
       </div>
     );
   }
 
   return (
     <div className="space-y-2 rounded-lg border border-line bg-surface p-3">
-      <h3 className="text-sm font-semibold text-ink-1">站位</h3>
+      <h3 className="text-sm font-semibold text-ink-1">{t('studio.stagingTitle')}</h3>
       <ul className="space-y-2">
         {characters.map((c) => {
           const src = assetSrc(c.portraitUrl, c.portraitVersion);
@@ -87,20 +89,22 @@ export function StagingBoard({
                         disabled={readOnly}
                         onClick={() => onChange(c.characterId, { stage: s.id })}
                         aria-pressed={active}
-                        title={readOnly ? '只读模式' : `移到${s.label}侧`}
+                        title={readOnly
+                          ? t('studio.readOnly')
+                          : t('studio.moveTo', { stage: t(s.labelKey) })}
                         className={`min-w-hit-target rounded px-2 py-0.5 text-xs ${
                           active
-                            ? 'bg-brand-subtle text-brand'
-                            : 'text-ink-3 hover:bg-surface hover:text-ink-1'
+                            ? 'bg-brand-subtle text-brand-hover'
+                            : 'text-ink-3 hover:bg-surface hover:text-ink-1 active:opacity-90'
                         } disabled:cursor-not-allowed disabled:opacity-60`}
                       >
-                        {s.label}
+                        {t(s.labelKey)}
                       </button>
                     );
                   })}
                   {c.gaze && (
                     <span className="rounded bg-surface px-1.5 py-0.5 text-xs text-ink-2">
-                      视线：{c.gaze}
+                      {t('studio.gazePrefix')}{c.gaze}
                     </span>
                   )}
                 </div>
@@ -119,7 +123,7 @@ export function StagingBoard({
               key={s.id}
               className={`flex min-h-[72px] flex-col items-center justify-center gap-1 rounded border border-line/60 ${STAGE_COL[s.id]}`}
             >
-              <span className="text-xs text-ink-3">{s.label}</span>
+              <span className="text-xs text-ink-3">{t(s.labelKey)}</span>
               {here.length === 0 ? (
                 <span className="text-xs text-ink-3">—</span>
               ) : (

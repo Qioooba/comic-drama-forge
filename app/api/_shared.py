@@ -66,6 +66,9 @@ from config import (
     TASKS_DB_PATH, TASK_QUEUE_CONCURRENCY, TASK_UNIT_MIN_BYTES,
     KEYFRAME_CHAIN_MODE, WORKFLOW_TEMPLATE,
     ASSET_VIEW_STEMS,
+    CHARACTER_REQUIRED_ANCHORS, CHARACTER_ANCHOR_KEYS,
+    CHARACTER_SHEET_LAYOUT_VERSION, CHARACTER_REFERENCE_STRICT,
+    CHARACTER_ANCHOR_GENERATION, CHARACTER_SHEET_FALLBACK,
     SCENE_VIEW_KEYS, SCENE_VIEW_LABELS, SCENE_VIEW_ANGLE_ZH,
     SCENE_ANGLE_TO_VIEW, SCENE_VIEWS_ENABLED, SCENE_VIEW_MAX_RETRIES,
     SCENE_VIEW_DUP_PHASH_MAX,
@@ -88,6 +91,8 @@ import comfyui_job_store  # 崩溃免重渲检查点（2026-09-29）：种子沿
 import preview_gate  # 两级生产（2026-09-29）：预演不可交付 + 预演批准
 
 from production_recording import EPISODE_SCOPE_SHOT_KEY  # 整集级视频的 shot_key 口径
+
+from ports import backend_port  # 端口唯一事实源（app/ports.py，默认 45871，可用 APP_PORT 覆盖）
 
 import novel_screenplay  # 文学剧本层（2026-10-03 两段式生产：文学剧本→改写为分镜表）
 
@@ -188,6 +193,8 @@ import style_kit
 import asset_prompt_kit
 
 import sheet_split
+import identity_contract
+import character_assets
 
 import task_store
 
@@ -262,7 +269,10 @@ _norm_shot_key = shot_key.norm_shot_key
 
 APP_HOST = os.getenv("APP_HOST", "127.0.0.1")
 
-APP_PORT = int(os.getenv("APP_PORT", "5000"))
+# 端口默认值走 ports.backend_port()，与 serve.py 的 _safe_run 共用同一事实源。
+# 此前这里是硬编码 "5000"、serve.py 是硬编码 5210 —— `python app/app.py` 与
+# `python app/serve.py` 会落到不同端口，探活/代理/Electron 复用检测因此对不上。
+APP_PORT = backend_port()
 
 APP_DEBUG = os.getenv("APP_DEBUG", "0").lower() in ("1", "true", "yes", "on")
 
@@ -1535,7 +1545,20 @@ def _collect_asset_refs(project: str) -> tuple:
             if not ref:
                 ref = _first_nonempty_image(d)
             if ref:
-                out.append({"name": name, "front": ref, "base": ref})
+                # 角色优先返回 Machine Anchor；完整 sheet 只留 base 兜底，
+                # 这样 H3/Picture 槽位默认不会拿到四区设定图。
+                if root == CHARACTERS_DIR:
+                    scan = character_assets.scan_character_assets(d)
+                    ref = (scan["anchors"].get("full_front")
+                           or scan["anchors"].get("face_front")
+                           or scan["anchors"].get("half_front")
+                           or ref)
+                    out.append({"name": name, "front": ref,
+                                "base": scan["sheet"] or ref,
+                                "anchors": scan["anchors"],
+                                "completeness": _character_asset_completeness(d)})
+                else:
+                    out.append({"name": name, "front": ref, "base": ref})
         return out
 
     return _scan(CHARACTERS_DIR), _scan(SCENES_DIR)
@@ -1806,9 +1829,13 @@ def _storyboard_retry_shot_impl():
     _rs_size = style_kit.aspect_size(
         style_kit.aspect_ratio(_rs_style) or style_kit.DEFAULT_RATIO,
         style_kit.storyboard_megapixels())
+    # 单镜重跑同样遵守“画布优先”：先把场景/非身份图提升到 image1，
+    # 再做画幅归一；身份锚点保持原尺寸，最后才生成提示词。
+    refs = _promote_storyboard_canvas(refs)
+    refs = _unify_ref_canvas(refs, _rs_size, project)
+    labels = [r[1] for r in refs]
     prompt = comfyui_client.build_storyboard_prompt(
         shot, labels, has_characters=_shot_has_on_screen(shot))
-    refs = _unify_ref_canvas(refs, _rs_size, project)
     # ---- 提示词预检（生成前质检）：先判 → 确定性自愈 → 再出图 ----
     # 目的：把 GPU 花在有问题的提示词上是纯浪费，且出图后质检才发现就已经晚了。
     qc_cfg = _qc_load_cfg()
@@ -2029,6 +2056,11 @@ def _video_retry_shot_impl():
     _rs_sub = f"ep{int(_rs_ep):02d}/" if _rs_ep and int(_rs_ep) > 1 else ""
     sb_map = _keyframe_sb_map(project, script, episode_no=_rs_ep)
     sb_local = sb_map.get(_shot_num_key(shot_id))
+    if CHARACTER_REFERENCE_STRICT:
+        _ff_ok, _ff_reason = _first_frame_hard_gate(project, _rs_ep, shot_id)
+        if not _ff_ok:
+            return jsonify({"success": False, "first_frame_blocked": True,
+                            "error": "strict 模式禁止未经 QC 的首帧进入 H3；" + _ff_reason}), 409
     _r_end_ref = None  # keyframe 模式的尾帧声明（<Picture 2>），非 keyframe 恒 None
 
     if mode == 'keyframe':
@@ -2195,8 +2227,117 @@ def _video_retry_shot_impl():
 
 # ===== 步骤2/3/4：资产生成（角色/物品/场景 + 多视角） =====
 
+def _generate_character_machine_anchors(asset_dir: str, base_prompt: str, *,
+                                        style: str = "", size=None, seed: int = None,
+                                        qc_cfg: dict = None, qc_on: bool = False,
+                                        project_name: str = "", asset_name: str = "",
+                                        only_keys: Sequence[str] | None = None) -> dict:
+    """补齐角色 Machine Anchors（face/full/half），只补缺失项，不覆盖已通过的好图。
+
+    这是新项目的主路径：master sheet 通过质检后，独立生成单人物、单视角、无文字的
+    生产锚点。生成失败/质检失败只记录 ``errors``，不把整个人物资产判失败；下游
+    completeness 会显示缺项，strict 模式才阻断镜头。
+    """
+    result = {"generated": {}, "existing": {}, "errors": []}
+    if not CHARACTER_ANCHOR_GENERATION:
+        return result
+    try:
+        comp = character_assets.asset_completeness(asset_dir, strict=False)
+    except Exception as exc:  # noqa: BLE001
+        result["errors"].append(f"completeness: {exc}")
+        comp = {"missing": list(CHARACTER_REQUIRED_ANCHORS), "anchors": {}}
+    if only_keys:
+        missing = [str(k) for k in only_keys if k not in (comp.get("anchors") or {})]
+    else:
+        missing = [k for k in (comp.get("missing") or [])
+                   if k in CHARACTER_REQUIRED_ANCHORS]
+    if not missing:
+        return result
+    # face_front 可由已通过的 master sheet 纯 CPU 派生；full/half 需要独立 T2I。
+    try:
+        identity_contract.ensure_identity_assets(asset_dir, logger=app.logger)
+    except Exception as exc:  # noqa: BLE001
+        result["errors"].append(f"identity derive: {exc}")
+    # 重新扫描，优先使用 CPU 派生的脸。
+    try:
+        comp2 = character_assets.asset_completeness(asset_dir, strict=False)
+        missing = [k for k in missing if k not in (comp2.get("anchors") or {})]
+        if only_keys:
+            missing = [k for k in missing if k in set(map(str, only_keys))]
+    except Exception:
+        pass
+    for key in missing:
+        try:
+            out_dir = {"face_front": "identity", "full_front": "body",
+                       "half_front": "framing"}.get(key, "")
+            dst_dir = os.path.join(asset_dir, out_dir) if out_dir else asset_dir
+            os.makedirs(dst_dir, exist_ok=True)
+            dst = os.path.join(dst_dir, f"{key}.png")
+            if os.path.isfile(dst) and os.path.getsize(dst) > 0:
+                result["existing"][key] = dst
+                continue
+            anchor_seed = (int(seed or random.randint(1, 2 ** 31 - 1)) + sum(ord(c) for c in key)) % (2 ** 31)
+            files = comfyui_client.generate_character_anchor(
+                key, base_prompt, seed=anchor_seed, style=style, size=size,
+                filename_prefix=f"comic_drama/{project_name}/character_anchor/{asset_name}/{key}")
+            if not files:
+                result["errors"].append(f"{key}: 生成失败")
+                continue
+            staged = _ingest_comfy_output(files, os.path.join(
+                QC_DIR, project_name or "default", "assets_scratch",
+                f"anchor_{asset_name}_{key}.png"), logger=app.logger)
+            # 身份锚点：优先采用已有 CPU 派生脸，避免二次生成造成脸漂。
+            if key == "face_front":
+                # 服装变体不重复生成脸：优先复用主角色 identity，保证“谁”不随衣服变。
+                _main_dir = asset_dir
+                _parts = os.path.normpath(asset_dir).replace("\\", "/").split("/")
+                if "outfits" in _parts:
+                    _idx = _parts.index("outfits")
+                    _main_dir = os.path.join(*_parts[:_idx]) if _idx else asset_dir
+                    if not os.path.isdir(_main_dir):
+                        _main_dir = os.path.dirname(os.path.dirname(asset_dir))
+                cpu_face = (identity_contract.identity_anchor_path(_main_dir)
+                            or identity_contract.identity_anchor_path(asset_dir))
+                if cpu_face and os.path.isfile(cpu_face):
+                    shutil.copy2(cpu_face, dst)
+                else:
+                    shutil.copy2(staged, dst)
+            else:
+                shutil.copy2(staged, dst)
+            qc = {"accept": True, "blocked": False, "skipped": True,
+                  "label": "Machine Anchor 继承 master QC",
+                  "reason": "独立锚点已生成；身份/服装需由下游 Structured QC 复核",
+                  "critical_issues": []}
+            if qc_on and key != "face_front":
+                try:
+                    v = qc_client.check_image(
+                        dst, f"资产类型：character_anchor；资产名称：{asset_name}；"
+                             f"锚点：{key}；资产设定：{str(base_prompt)[:400]}",
+                        qc_cfg, style=style)
+                    qc = _qc_gate(v)
+                except Exception as exc:  # noqa: BLE001
+                    result["errors"].append(f"{key} qc: {exc}")
+            character_assets.write_anchor_metadata(
+                asset_dir, key, path=dst, source="independent_t2i",
+                role="identity" if key.startswith("face") else (
+                    "body" if key.startswith("full") else "framing"),
+                view="front" if "front" in key else key,
+                framing="face" if key.startswith("face") else (
+                    "half" if key == "half_front" else "full"),
+                seed=anchor_seed, prompt=base_prompt,
+                workflow="character_gen", qc=qc)
+            result["generated"][key] = dst
+        except Exception as exc:  # noqa: BLE001
+            result["errors"].append(f"{key}: {type(exc).__name__}: {exc}")
+    if result["errors"]:
+        app.logger.warning("角色 %s Machine Anchor 补齐存在失败（不阻断 master 入库）：%s",
+                           asset_name, "；".join(result["errors"]))
+    return result
+
+
 def _generate_asset_task(task_id: str, assets: list, asset_type: str, project_name: str,
-                         style: str = "", overwrite: bool = False, sub_dir: str = ""):
+                         style: str = "", overwrite: bool = False, sub_dir: str = "",
+                         progress_cb=None):
     """后台资产生成任务：基础图 + （角色）由整图本地切分派生的视角单图
 
     P0 修复（④⑤）：全链路接入 AI 质检——基础图必须送检；不达标自动重生成（换 seed），
@@ -2289,6 +2430,16 @@ def _generate_asset_task(task_id: str, assets: list, asset_type: str, project_na
                 generation_state[task_id]["phase"] = phase
                 if qc_phase:
                     generation_state[task_id]["qc_phase"] = qc_phase
+            # 可选外发（流水线托管/手动单步都会传）：把「第几个资产 / 哪个机位档」
+            # 同步给上层进度（autopilot.current）。⭐ 2026-10-07：资产整步几十分钟、
+            # 此前只上报三次，状态接口看起来像卡住。
+            # ⚠️ 纯展示：失败静默降级，绝不因进度上报拖垮资产生成（phase 可能出现在
+            #   循环变量 i 绑定之前，取值异常同样被这里吞掉）。
+            if progress_cb is not None:
+                try:
+                    progress_cb(str(phase), i + 1, len(assets))
+                except Exception:  # noqa: BLE001
+                    app.logger.debug("资产进度外发失败（忽略）", exc_info=True)
 
         for i, asset in enumerate(assets):
             name = asset.get('name', f'{asset_type}_{i+1}')
@@ -2300,13 +2451,41 @@ def _generate_asset_task(task_id: str, assets: list, asset_type: str, project_na
                 # ⚠️ 只在「已就绪」时提前 continue；未就绪项继续走下面的重要性过滤
                 #    与完整生成链路，临时道具的 skip 路径不受影响。
                 if not overwrite:
-                    _ready_img = _first_existing_asset_image(_asset_full_dir(name))
+                    _ready_dir = _asset_full_dir(name)
+                    _ready_img = _first_existing_asset_image(_ready_dir)
                     if _ready_img:
-                        app.logger.info("资产已达标入库，断点续跑跳过：%s（%s）",
-                                        name, _ready_img)
-                        results.append({"name": name, "status": "skipped",
-                                        "reason": "已达标入库，断点续跑跳过"})
-                        continue
+                        _ready_complete = True
+                        if asset_type == "character":
+                            _ready_comp = _character_asset_completeness(_ready_dir)
+                            # master sheet 已存在但 Machine Anchors 不齐时不能跳过：
+                            # 这正是旧项目“永远只有一张 base”的断点续跑死角。
+                            _ready_complete = bool(_ready_comp.get("complete"))
+                            if not _ready_complete:
+                                app.logger.info(
+                                    "角色资产锚点不完整，原地补齐（不重画 master）：%s missing=%s",
+                                    name, _ready_comp.get("missing"))
+                                _anchor_prompt = str(
+                                    asset.get("reference_prompt_zh")
+                                    or asset.get("prompt_zh")
+                                    or asset.get("appearance") or "")
+                                _anchor_res = _generate_character_machine_anchors(
+                                    _ready_dir, _anchor_prompt, style=gen_style,
+                                    size=gen_size, seed=random.randint(1, 2 ** 31 - 1),
+                                    qc_cfg=qc_cfg, qc_on=qc_on,
+                                    project_name=project_name, asset_name=name)
+                                results.append({
+                                    "name": name, "status": "anchors_filled",
+                                    "reason": "master 已存在，仅补齐 Machine Anchors",
+                                    "machine_anchors": _anchor_res,
+                                    "completeness": _character_asset_completeness(_ready_dir),
+                                })
+                                continue
+                        if _ready_complete:
+                            app.logger.info("资产已达标入库，断点续跑跳过：%s（%s）",
+                                            name, _ready_img)
+                            results.append({"name": name, "status": "skipped",
+                                            "reason": "已达标入库，断点续跑跳过"})
+                            continue
 
                 # 物品过滤：只生成重要道具的参考图
                 if asset_type == 'item':
@@ -2534,6 +2713,53 @@ def _generate_asset_task(task_id: str, assets: list, asset_type: str, project_na
                     qc=base_gate, asset_name=name,
                     extra={"asset_type": asset_type, "style": gen_style or None})
 
+                # 角色身份资产：完整 base.png 保持不裁剪，另派生 identity/face.png。
+                # 派生为纯 CPU 且 fail-open：失败时仍回落完整设定图，不阻断资产生成。
+                if asset_type == "character":
+                    try:
+                        identity_contract.ensure_identity_assets(
+                            asset_dir, base_dst, logger=app.logger)
+                    except Exception as _ide:
+                        app.logger.warning(
+                            "角色身份锚点派生失败（回退完整设定图，不影响入库）：%s: %s",
+                            type(_ide).__name__, _ide)
+                    # 若 master meta 带机器可读 regions，则按明确 bbox 确定性切分；
+                    # 没有 regions 绝不猜测四区不对称布局，交给独立 T2I 补锚点。
+                    try:
+                        _meta_path = base_dst + ".meta.json"
+                        if os.path.isfile(_meta_path):
+                            with open(_meta_path, "r", encoding="utf-8") as _mf:
+                                _bm = json.load(_mf) or {}
+                            _regions = ((_bm.get("extra") or {}).get("regions")
+                                        or _bm.get("regions") or {})
+                            if _regions:
+                                _cut = sheet_split.split_regions(
+                                    base_dst, _regions, asset_dir,
+                                    layout_version=str(
+                                        ((_bm.get("extra") or {}).get("sheet_layout_version")
+                                         or CHARACTER_SHEET_LAYOUT_VERSION)),
+                                    logger=app.logger)
+                                for _k, _p in _cut.items():
+                                    character_assets.write_anchor_metadata(
+                                        asset_dir, _k, path=_p,
+                                        source="crop_from_sheet",
+                                        role=("identity" if _k.startswith("face")
+                                              else "body" if _k.startswith("full")
+                                              else "framing"),
+                                        view=_k, framing=_k,
+                                        qc=_bm.get("qc"))
+                    except Exception as _re:  # noqa: BLE001
+                        app.logger.warning("Character Sheet regions 切分失败（继续独立锚点）：%s", _re)
+                    try:
+                        _anchor_result = _generate_character_machine_anchors(
+                            asset_dir, orig_asset_prompt, style=gen_style,
+                            size=gen_size, seed=seed, qc_cfg=qc_cfg, qc_on=qc_on,
+                            project_name=project_name, asset_name=name)
+                        results_anchor = _anchor_result
+                    except Exception as _aie:  # noqa: BLE001
+                        app.logger.warning("角色 Machine Anchor 生成失败（不阻断 master）：%s", _aie)
+                        results_anchor = {"generated": {}, "existing": {}, "errors": [str(_aie)]}
+
                 # ---------- 阶段2：视角单图（本地切分，不再走 GPU 多视角编辑） ----------
                 # 2026-09-24 改造，机制与实测见 app/sheet_split.py 模块头 + config 同名注释：
                 #   旧实现在这里调 `comfyui_client.generate_multiview` 逐视角**重渲染** —— 实测
@@ -2562,13 +2788,10 @@ def _generate_asset_task(task_id: str, assets: list, asset_type: str, project_na
                     # （即旧发型图继续被用作参考的老坑，见下方原注释）。
                     _derived = {}
                     derive_error = None
-                    app.logger.info("角色「%s」不裁剪：保留整图 %s（不再切分单视角）",
+                    app.logger.info("角色「%s」保留 Master Sheet，并补齐 Machine Anchors：%s",
                                     name, os.path.basename(base_dst))
-                    try:
-                        sheet_split.prune_stale_views(
-                            asset_dir, keep=(), known=ASSET_VIEW_STEMS, logger=app.logger)
-                    except Exception as _pe:  # noqa: BLE001
-                        app.logger.warning("清理陈旧视角文件失败（不影响入库）：%s", _pe)
+                    # 不再删除旧 front/half/back：旧项目兼容映射由 selector 处理；
+                    # 新锚点写入语义目录，避免把用户已有的机器资产误删。
                 elif asset_type == "scene" and SCENE_VIEWS_ENABLED:
                     # ---------- 场景：按机位逐档出图（2026-09-29 新增） ----------
                     # 动机：场景此前只有一张 base.png，分镜不论什么机位都拿它当参考图 ——
@@ -2818,6 +3041,9 @@ def _generate_asset_task(task_id: str, assets: list, asset_type: str, project_na
                     # 逐档质检结论（角色档是「本地派生·继承基础图质检」，场景机位档是
                     # 真跑质检的结论）。前端此前未消费该字段，这里填实数据不改形状。
                     "qc_views": {k: dict(v) for k, v in view_gate.items()},
+                    "machine_anchors": results_anchor if asset_type == "character" else {},
+                    "completeness": (_character_asset_completeness(asset_dir)
+                                     if asset_type == "character" else {}),
                 })
 
             except cancellation.Cancelled as _cancelled:
@@ -3223,6 +3449,11 @@ def _build_asset_index(assets: list, project_name: str, kind: str) -> dict:
         )
         entry = {"name": name, "image": local, "_dir": asset_dir_for_name,
                  "url": f"/api/assets/{kind}s/{project_name}/{name}/front.png"}
+        if kind == "character":
+            # 机器锚点扫描只读磁盘 + manifest；让 selector/UI/质检共享同一份索引。
+            entry["anchors"] = character_assets.scan_character_assets(asset_dir_for_name)["anchors"]
+            entry["completeness"] = _character_asset_completeness(asset_dir_for_name)
+            entry["sheet"] = character_assets.scan_character_assets(asset_dir_for_name)["sheet"]
         # 2026-09-25 景别对档：把**逐视角**路径也挂进来，供 `_pick_char_view`
         # 按镜头景别取「半身档 / 全身档」。角色资产自 sheet_split 改造后是
         # front/left/right/back/half 五个独立文件（少任何一个都合法）。
@@ -3539,43 +3770,117 @@ def _framing_wants_half_shot(shot: dict) -> bool:
         return False
     return _camera_key(_raw) in _FRAMING_HALF_SHOT
 
+def _select_character_reference(char_payload: dict, shot: dict, outfit_dir: str = "",
+                                 *, strict: bool = None, character_name: str = "") -> dict:
+    """镜头级角色 Machine Anchor 选择器（统一入口）。
+
+    返回 ``character_assets.select_character_reference`` 的结构；调用方只消费
+    ``path``，同时保留 requested/actual/fallback/warning/error 供日志、UI 与 QC 使用。
+    ``strict=None`` 时读取 ``CHARACTER_REFERENCE_STRICT``；旧项目可显式传 False。
+    """
+    payload = dict(char_payload or {})
+    shot = dict(shot or {})
+    name = character_name or str(payload.get("name") or "")
+    if strict is None:
+        strict = bool(CHARACTER_REFERENCE_STRICT)
+    result = character_assets.select_character_reference(
+        payload, shot, outfit_dir=outfit_dir, strict=bool(strict), character_name=name)
+    log = getattr(app, "logger", None)
+    if result.get("warning") and log:
+        log.warning("[角色参考选择] %s：%s（requested=%s actual=%s）",
+                    name or "角色", result["warning"],
+                    result.get("requested"), result.get("actual") or "base")
+    if result.get("error") and log:
+        log.error("[角色参考选择] %s：%s", name or "角色", result["error"])
+    return result
+
+
+def _character_asset_completeness(asset_dir: str, outfit_dir: str = "",
+                                   *, strict: bool = False) -> dict:
+    """角色资产完整性（新 manifest + 旧 front/half/back 映射 + legacy sheet）。"""
+    try:
+        return character_assets.asset_completeness(
+            asset_dir, outfit_dir, strict=bool(strict))
+    except Exception as exc:  # noqa: BLE001 - completeness 不能阻断旧项目
+        log = getattr(app, "logger", None)
+        if log:
+            log.warning("角色资产完整性检查失败（按 legacy sheet 处理）：%s", exc)
+        return {"sheet_ready": bool(asset_dir), "identity_ready": False,
+                "body_ready": False, "framing_ready": False, "outfit_ready": False,
+                "complete": False, "ready": bool(asset_dir), "missing": list(CHARACTER_REQUIRED_ANCHORS),
+                "anchors": {}, "sources": {}, "legacy_sheet_fallback": True,
+                "status": "legacy_sheet_fallback", "strict_error": ""}
+
+
 def _pick_char_view(char_payload: dict, want_half: bool, outfit_dir: str = "") -> str:
-    """取角色参考图：**始终返回整张设定图 base.png**（2026-10-02 起不裁剪）。
+    """兼容包装：按 want_half 构造最小 shot 后走镜头级 selector。
 
-    ⚠️⚠️ **2026-10-02 用户指定「角色图不用裁剪，给整个图片就行」** —— 本函数
-    从「按景别对档挑 half/front/back」退化为「**只取整图 base.png**」。动机与配套：
-      · 角色设定图已改为**英文四区 character sheet**（Top 三视图 / Left 面部+配色 /
-        Bottom 细节 / Right 比例参照，见 `comfyui_client._CHARACTER_SHEET_EN_LAYOUT`），
-        四区不对称布局**无法再做行列投影切分** → 单视角切分（front/left/back/half）
-        失去产出依据；
-      · 用户要「整图给模型自己取视角」，不再由我们按景别裁单视角。
-    ⚠️ 取舍（风险已向用户说明）：取消「景别对档」会**重新引入画幅对抗**（全景/近景
-    参考图同用一张整图，近景/特写的构图牵引变弱）——这是 2026-09-25 那套「半身档」
-    要解决的问题。用户明确选择「不裁剪」，故此处按要求退化；`want_half`/`outfit_dir`
-    参数**保留签名**（调用方不破），但不再影响取图结果（仅整图）。
-    ⚠️ 回滚点：如需恢复景别对档，改回 order 的 half/front 分支即可。
+    新代码应直接调用 :func:`_select_character_reference` 并传完整 shot；
+    旧调用（视频公共池、部分兼容路径）仍只有 bool，故这里保留行为但不再
+    无条件返回 ``base.png``。默认偏半身/中景，``want_half=False`` 偏全景。
+    """
+    payload = dict(char_payload or {})
+    synthetic_shot = {"shot_type": "中景" if want_half else "全景"}
+    result = _select_character_reference(
+        payload, synthetic_shot, outfit_dir, strict=False,
+        character_name=str(payload.get("name") or ""))
+    return str(result.get("path") or "")
 
-    服装变体（衣柜，2026-10-02）：``outfit_dir`` 非空时**仍优先**在该变体目录里取
-    整图（base.png），变体目录没有 / 异常 → 回落主设定图（fail-open，零回归）。
+
+def _pick_char_identity_anchor(char_payload: dict, outfit_dir: str = "") -> str:
+    """取人物**身份锚点**：优先 identity/face.png，失败才回退完整设定图。
+
+    与 :func:`_pick_char_view` 分开是刻意的：
+      · 视频/公共参考仍可能需要完整服装与全身信息 → 继续用整图；
+      · 分镜身份槽位需要干净、不参与画幅裁剪的单主体脸 → 用身份锚点。
+    旧项目没有 identity 目录时，这里按需做一次纯 CPU 派生；失败 fail-open 回退整图。
     """
     payload = char_payload or {}
-    # 只取整图：base.png →（兜底）front.png（存量资产可能只有 front）
-    order = ("base", "front")
+    _log = getattr(app, "logger", None)
+    dirs = []
     if outfit_dir:
         try:
-            _od = comfyui_client.resolve_local_path(outfit_dir) or outfit_dir
-            if os.path.isdir(_od):
-                _hit = _first_existing(*[os.path.join(_od, f"{k}.png") for k in order])
-                if _hit:
-                    return _hit
-        except Exception as _oe:  # noqa: BLE001  变体取图失败绝不拖垮参考图链
-            app.logger.debug("服装变体取图失败（回落主设定图）：%s", _oe)
-    cands = [comfyui_client.resolve_local_path(payload.get(k) or "") for k in order]
-    # 资产目录约定路径兜底（前端未上报时）
+            dirs.append(comfyui_client.resolve_local_path(outfit_dir) or outfit_dir)
+        except Exception:
+            dirs.append(str(outfit_dir or ""))
     d = payload.get("_dir")
-    if d and os.path.isdir(d):
-        cands += [os.path.join(d, f"{k}.png") for k in order]
-    return _first_existing(*cands) or ""
+    if d:
+        try:
+            dirs.append(comfyui_client.resolve_local_path(d) or d)
+        except Exception:
+            dirs.append(str(d))
+    seen = set()
+    for directory in dirs:
+        if not directory or directory in seen:
+            continue
+        seen.add(directory)
+        if not os.path.isdir(directory):
+            continue
+        try:
+            identity_contract.ensure_identity_assets(directory, logger=_log)
+        except Exception as _iae:
+            if _log:
+                _log.debug("身份锚点按需派生失败（回退整图）：%s", _iae)
+        face = identity_contract.identity_anchor_path(directory)
+        if face:
+            return face
+    # 前端可能只上报 front/base URL 而没有 _dir：先解析现有整图，再从其目录派生。
+    for key in ("base", "front"):
+        path = comfyui_client.resolve_local_path(payload.get(key) or "")
+        if path and os.path.isfile(path):
+            directory = os.path.dirname(path)
+            try:
+                identity_contract.ensure_identity_assets(
+                    directory, path, logger=_log)
+            except Exception as _iae:
+                if _log:
+                    _log.debug("身份锚点按需派生失败（回退整图）：%s", _iae)
+            face = identity_contract.identity_anchor_path(directory)
+            if face:
+                return face
+            return path
+    return _pick_char_view(payload, False, outfit_dir) or ""
+
 
 def _shot_outfit_dir(shot: dict, character_name: str, char_dir: str) -> str:
     """解析「本镜服装提示」→ 该角色**已生成**的服装变体目录（outfits/<key>/）。
@@ -3730,7 +4035,7 @@ def _h3_shot_ref_components(shot: dict, char_idx: dict, item_idx: dict, scene_id
         return []
     out: list = []
 
-    # ---- 本镜角色：每人一张（按景别对档），去重保序 ----
+    # ---- 本镜角色：每人一张镜头级 Machine Anchor，去重保序 ----
     # outfit_map（2026-10-02 服装变体）：「角色名 → outfits/<key>/ 目录」的可选映射，
     # 由调用方解析本镜服装提示（shot.outfit / shot.character_outfits）后传入；
     # None（默认）/ 缺该角色 → 走主设定图，与旧行为逐字一致（视频 worker 调用点
@@ -3743,12 +4048,27 @@ def _h3_shot_ref_components(shot: dict, char_idx: dict, item_idx: dict, scene_id
         if outfit_map:
             _od = str(outfit_map.get(_mc)
                       or outfit_map.get(_normalize_char_alias(_mc)) or "")
-        _p = _pick_char_view(_entry, _want_half, _od)
+        if not _od:
+            # episode 公共池规划可能没带 outfit_map；逐镜按 shot 状态解析，
+            # 避免公共池和段级 refs 对同一镜头选到不同服装/档位。
+            _od = _shot_outfit_dir(shot, _mc, _entry.get("_dir") or "")
+        _selection = _select_character_reference(
+            _entry, shot, _od, strict=bool(CHARACTER_REFERENCE_STRICT), character_name=_mc)
+        _p = str(_selection.get("path") or "")
         if not _p or _p in _seen_paths:
+            if _p:
+                shot.setdefault("_h3_ref_warnings", {})[_mc] = "重复参考路径"
             continue
         _seen_paths.add(_p)
         out.append({"kind": "character", "name": _mc, "path": _p,
-                    "common_key": f"char:{_mc}",
+                    # common_key 必须包含实际 path/state：同名角色不同服装/档位
+                    # 不能被公共池错误合并。
+                    "common_key": f"char:{_mc}:{os.path.normcase(os.path.normpath(_p))}",
+                    "asset_role": _selection.get("asset_role", ""),
+                    "view": _selection.get("actual", ""),
+                    "framing": _selection.get("requested", ""),
+                    "outfit_key": _selection.get("outfit_key", ""),
+                    "selection": _selection,
                     "appearance": _entry.get("appearance")
                     or _entry.get("description") or ""})
 
@@ -4163,6 +4483,11 @@ def _allocate_storyboard_refs(shot: dict, char_idx: dict, item_idx: dict, scene_
 
     只填**实际需要**的前 N 个：未用到的尾部槽位在生成端被留空
     （见 generate_storyboard 的 slot_cleared），不会塞重复图。
+
+    ⚠️ 上面是**分配阶段**的逻辑顺序，不等于最终 ``<imageN>`` 顺序：
+    工作线程随后调用 ``_promote_storyboard_canvas``，把 3D 构图基准或场景画布
+    提升到 ``<image1>``，身份锚点从后续槽位进入；``_unify_ref_canvas`` 只裁画布，
+    绝不裁身份锚点。
     """
     chars_in = _match_shot_chars(shot, char_idx)
     # ⭐ 2026-10-05：把「本镜画面内可见角色」以**单一权威口径**挂回 shot，供调用点的
@@ -4213,19 +4538,35 @@ def _allocate_storyboard_refs(shot: dict, char_idx: dict, item_idx: dict, scene_
         # 2026-10-02 服装变体：本镜服装提示（shot.outfit 优先，其次
         # shot.character_outfits 按角色名查）能解析出已生成的 outfit_key →
         # 参考图优先取 outfits/<key>/ 的同档位图；解析不出/未生成回落主设定图。
-        img = _pick_char_view(payload, _want_half,
-                              _shot_outfit_dir(shot, name, payload.get("_dir") or ""))
+        _outfit_dir = _shot_outfit_dir(shot, name, payload.get("_dir") or "")
+        _selection = _select_character_reference(
+            payload, shot, _outfit_dir,
+            strict=bool(CHARACTER_REFERENCE_STRICT), character_name=name)
+        shot.setdefault("_char_ref_selections", {})[name] = _selection
+        img = str(_selection.get("path") or "")
+        if _selection.get("error"):
+            shot.setdefault("_char_ref_errors", {})[name] = _selection["error"]
+            if CHARACTER_REFERENCE_STRICT:
+                # 正式 strict 模式：明确阻断该镜，不静默换人/换装。
+                shot["_no_reference"] = True
+                shot["_ref_error"] = _selection["error"]
+                return []
         if not img or img in used_paths:
+            if img and img in used_paths:
+                shot.setdefault("_char_ref_warnings", {})[name] = "两个角色解析到同一参考路径"
             continue
         used_paths.add(img)
-        _zoom = "半身近景" if _want_half else "全身"
+        # 身份槽位使用镜头级 selector 选出的干净机器锚点；景别由镜头/构图控制，
+        # 不再把“全身/半身”写进身份职责，避免文字描述覆盖参考图。
+        _zoom = str(_selection.get("actual") or "machine_anchor")
+        _slot = len(refs) + 1
         if i == 0:
             refs.append(("主角色",
-                         f"参考图1（<image1>）是角色「{name}」的身份锚点（{_zoom}视图）："
+                         f"参考图{_slot}（<image{_slot}>）是角色「{name}」的身份锚点（{_zoom}视图）："
                          f"保持其面部身份、发型与体型不变", img))
         else:
             refs.append(("次角色",
-                         f"参考图{i + 1}（<image{i + 1}>）是角色「{name}」的身份锚点（{_zoom}视图）："
+                         f"参考图{_slot}（<image{_slot}>）是角色「{name}」的身份锚点（{_zoom}视图）："
                          f"独立保持其面部身份与发型，不得与其他角色特征混用", img))
 
     # ---- <imageN>：场景（角色之后，作为环境锚点）----
@@ -4306,13 +4647,39 @@ def _allocate_storyboard_refs(shot: dict, char_idx: dict, item_idx: dict, scene_
 CLOSEUP_CHAR_CROP_TOP = (0.32, 0.02, 0.68, 0.28)   # 头部条带（x0, y0, x1, y1）
 
 def _closeup_char_crop(img_path: str, project_name: str, shot_id) -> str:
-    """把角色正视/半身图裁剪为头部特写图，作为特写镜头的构图锚点（失败则回退原图）。"""
+    """把**已验证的单人物 front/half 图**裁为头部特写；复杂 sheet 绝不硬裁。
+
+    旧固定坐标只允许作用于 ``front.png`` / ``half.png`` / 语义 Machine Anchor；
+    ``base.png`` / ``sheet.png`` 是多视图+文字拼版，必须先找 sibling identity，
+    找不到就回退原图并记录 warning，禁止把侧脸/配色板当脸。
+    """
     try:
         from PIL import Image
+        path = str(img_path or "")
+        base_name = os.path.basename(path).lower()
+        parent = os.path.dirname(path)
+        if base_name in ("base.png", "sheet.png", "base.jpg", "sheet.jpg"):
+            for cand in (
+                os.path.join(parent, "identity", "face_front.png"),
+                os.path.join(parent, "identity", "face.png"),
+                os.path.join(parent, "face_front.png"),
+            ):
+                if os.path.isfile(cand) and os.path.getsize(cand) > 0:
+                    log = getattr(app, "logger", None)
+                    if log:
+                        log.info("特写参考图改用独立 face anchor：%s", os.path.basename(cand))
+                    return cand
+            log = getattr(app, "logger", None)
+            if log:
+                log.warning("特写镜头拒绝裁切复杂 Character Sheet：%s；回退原图", path)
+            return path
+        if base_name in ("face_front.png", "face.png", "bust_front.png", "half_front.png"):
+            # 语义锚点本身已是肩部/半身单图，保持原始尺寸，不做二次固定裁切。
+            return path
         out_dir = os.path.join(QC_DIR, str(project_name or "default"), "closeup_refs")
         os.makedirs(out_dir, exist_ok=True)
         dst = os.path.join(out_dir, f"char_closeup_shot{_shot_seq(shot_id, 1):02d}.png")
-        with Image.open(img_path) as im:
+        with Image.open(path) as im:
             im = im.convert("RGB")
             w, h = im.size
             x0, y0, x1, y1 = CLOSEUP_CHAR_CROP_TOP
@@ -4325,8 +4692,11 @@ def _closeup_char_crop(img_path: str, project_name: str, shot_id) -> str:
             crop.save(dst, format="PNG")
         return dst
     except Exception as e:  # 裁剪失败不影响主流程，回退原图
-        app.logger.warning(f"特写参考图裁剪失败，回退原图: {e}")
+        log = getattr(app, "logger", None)
+        if log:
+            log.warning("特写参考图裁剪失败，回退原图: %s", e)
         return img_path
+
 
 def _apply_closeup_ref_strategy(refs: list, shot: dict, project_name: str = None) -> list:
     """特写镜头：只保留「角色头部特写」单一锚点。
@@ -4393,6 +4763,32 @@ def _cap_storyboard_refs(refs: list, shot: dict) -> list:
     return ordered[:MAX_STORYBOARD_REFS]
 
 # --------------------------------------------------------------------------- #
+# 分镜参考图「画布优先」（2026-10-07 身份契约重构）
+# --------------------------------------------------------------------------- #
+def _promote_storyboard_canvas(refs: list, blocking_ref: str = "") -> list:
+    """把画布型参考图放到 ``<image1>``；身份锚点后移。
+
+    Qwen-Image-2.1 的输出 latent 继承第一张参考图尺寸。旧链路让整张人物设定图
+    占据 ``<image1>``，于是统一画幅时只能 cover 裁人；现在优先级为：
+    3D构图基准 > 场景 > 其他非身份参考 > 仅人物时维持旧序。
+    """
+    ordered = identity_contract.promote_canvas_reference(
+        refs,
+        blocking_ref=blocking_ref or "",
+        blocking_label=_BLOCKING_REF_MARK,
+    )
+    if len(ordered) == len(refs or []) and ordered and refs and ordered[0] is refs[0]:
+        return ordered
+    _log = getattr(app, "logger", None)
+    if _log:
+        _log.info(
+            "[分镜画布] image1 已提升为 %s；身份锚点使用后续槽位",
+            str((ordered[0][0] if ordered else ""))[:40] or "无",
+        )
+    return ordered
+
+
+# --------------------------------------------------------------------------- #
 # 分镜参考图「统一画幅」（2026-09-24）
 #   ⚠️ 为什么必须做：分镜模板 `分镜生成_Qwen21.json` 是「参考图编辑」型，**没有尺寸
 #      节点** → style_kit.apply_latent_size 返回空 → 输出画幅**继承第一张参考图**。
@@ -4448,16 +4844,23 @@ def _unify_ref_canvas(refs: list, size, project_name: str = "") -> list:
     if not tgt or not refs:
         return refs
     out_dir = os.path.join(QC_DIR, str(project_name or "default"), "ref_canvas")
+    _log = getattr(app, "logger", None)
     try:
         os.makedirs(out_dir, exist_ok=True)
     except OSError as e:
-        app.logger.warning("参考图统一画幅：缓存目录不可建，本次沿用原图（%s）", e)
+        if _log:
+            _log.warning("参考图统一画幅：缓存目录不可建，本次沿用原图（%s）", e)
         return refs
     unified, changed = [], 0
     for item in refs:
         try:
             kind, label, path = item[0], item[1], item[2]
         except (TypeError, IndexError, KeyError):
+            unified.append(item)
+            continue
+        # 身份锚点绝不参与输出画幅 cover 裁剪：1:1 人脸/半身图裁到 16:9 会直接
+        # 丢掉头顶、发际线和面部特写，这正是旧链路“分镜不像设定图”的根因之一。
+        if not identity_contract.should_unify_reference(item):
             unified.append(item)
             continue
         newp = path
@@ -4501,17 +4904,20 @@ def _unify_ref_canvas(refs: list, size, project_name: str = "") -> list:
             if newp != path:
                 changed += 1
         except Exception as e:  # noqa: BLE001 —— 单张失败不影响整镜
-            app.logger.warning("参考图统一画幅失败，该张沿用原图（%s: %s）",
-                               type(e).__name__, e)
+            if _log:
+                _log.warning("参考图统一画幅失败，该张沿用原图（%s: %s）",
+                             type(e).__name__, e)
             newp = path
         unified.append((kind, label, newp))
-    app.logger.info("[分镜参考图画幅] 目标 %d×%d，%d/%d 张已统一（其余原尺寸或降级）",
-                    tgt[0], tgt[1], changed, len(refs))
+    if _log:
+        _log.info("[分镜参考图画幅] 目标 %d×%d，%d/%d 张已统一（其余原尺寸或降级）",
+                  tgt[0], tgt[1], changed, len(refs))
     return unified
 
 def _storyboard_worker(task_id: str, project_name: str, shots: list,
                        char_idx: dict, item_idx: dict, scene_idx: dict,
-                       episode_no=None, style: str = "", overwrite: bool = False):
+                       episode_no=None, style: str = "", overwrite: bool = False,
+                       progress_cb=None):
     """后台分镜图生成任务：逐镜头生成并落盘 output/storyboards/<项目>[/epNN]/shot_XX.png
 
     style：用户与总控敲定的风格。用于 ① 补齐镜头 style 字段（老剧本无该字段时兜底）
@@ -4594,6 +5000,20 @@ def _storyboard_worker(task_id: str, project_name: str, shots: list,
     # 「通过即停」逻辑（零回归）。质检未开（qc_on=False）无分可比 → 强制退回 1。
     best_of = max(1, int(qc_cfg.get("best_of", 1) or 1)) if qc_on else 1
     _rounds = best_of if best_of > 1 else (max_retries + 1)
+
+    def _sb_emit(msg: str, done: int = 0) -> None:
+        """外发逐镜进度（可选）：托管链路用它把「第几镜 / 共几镜」写进 autopilot.current。
+
+        ⭐ 2026-10-07：分镜整步此前只在进入时上报一次（34%），而 57 镜要跑很久 ——
+        状态接口看起来就是「一直没在动」。纯展示：失败静默降级，绝不影响生成。
+        """
+        if progress_cb is None:
+            return
+        try:
+            progress_cb(str(msg), int(done), len(shots))
+        except Exception:  # noqa: BLE001
+            app.logger.debug("分镜进度外发失败（忽略）", exc_info=True)
+
     try:
         for i, shot in enumerate(shots):
             shot_id = shot.get("shot_id", i + 1)
@@ -4619,6 +5039,7 @@ def _storyboard_worker(task_id: str, project_name: str, shots: list,
                         "current_shot": shot_id,
                     })
                     generation_state[task_id]["results"].append(item)
+                _sb_emit(f"复用已有分镜（镜头 {shot_id}）", i + 1)
                 continue
             with lock:
                 generation_state[task_id].update({
@@ -4627,12 +5048,12 @@ def _storyboard_worker(task_id: str, project_name: str, shots: list,
                     "current_shot": shot_id,
                     "phase": "分镜图生成",
                 })
+            _sb_emit(f"生成分镜图（镜头 {shot_id}）", i)
             item = {"shot_id": shot_id, "success": False, "refs": {}, "prompt": ""}
             try:
                 refs = _allocate_storyboard_refs(shot, char_idx, item_idx, scene_idx, project_name)
-                # 统一参考图画幅：分镜工作流无尺寸节点，输出画幅继承第一张参考图，
-                # 不统一会让同集画幅在 16:9 / 1:1 间跳变（详见 _unify_ref_canvas）。
-                refs = _unify_ref_canvas(refs, _sb_size, project_name)
+                # 画幅归一延后到「画布提升」之后：image1 必须先变成构图/场景画布，
+                # 身份锚点才不会被 cover 裁剪。
                 if not refs:
                     # S6：区分"无参考图"与"角色匹配失败"（_no_reference）
                     # ⚠️ 2026-10-05：本分支**只**在 refs 完全为空时进入。对「有场景/道具图但
@@ -4705,6 +5126,11 @@ def _storyboard_worker(task_id: str, project_name: str, shots: list,
                             app.logger.warning("[3D导演台] shot=%s 渲染失败（降级为纯文字站位）：%s",
                                                shot_id, _3d_e)
                             _blocking_ref_path = ""
+                    # 统一在这里完成：①画布提升到 image1；②只对画布/场景/道具做画幅归一；
+                    # ③最后重算提示词槽位。身份锚点保持原始尺寸，绝不 cover 裁脸。
+                    refs = _promote_storyboard_canvas(refs, _blocking_ref_path)
+                    refs = _unify_ref_canvas(refs, _sb_size, project_name)
+                    labels = [r[1] for r in refs]
                     prompt = (comfyui_client.build_shot_grid_keyframes_prompt(
                         shot, labels, style=(shot.get("style") or _sb_style),
                         has_characters=_has_on_screen)
@@ -4918,6 +5344,7 @@ def _storyboard_worker(task_id: str, project_name: str, shots: list,
                                                  style=(shot.get("style") or _sb_style))
                         attempts.append(rec)
                         gate = _qc_gate(verdict)
+                        gate["structured_checks"] = verdict.get("structured_checks")
                         item["qc_gate"] = gate
                         item["qc"] = _qc_summary(attempts, qc_declared, True, max_retries)
                         if gate["accept"]:
@@ -4965,7 +5392,10 @@ def _storyboard_worker(task_id: str, project_name: str, shots: list,
                     # 达标 → 入库；最佳仍未达标 → **不在此处阻断**，交下方统一阻断逻辑处理
                     #（scratch_png 已指向最佳候选，确保「不合格产物不留本地」删的是被选中那张）。
                     if best_of > 1 and _best_candidates:
-                        _bi = qc_client.pick_best_candidate([c[0] for c in _best_candidates])
+                        _bi = qc_client.pick_best_candidate(
+                            [c[0] for c in _best_candidates],
+                            [bool((c[3] or {}).get("structured_checks", {}).get("hard_pass", True))
+                             for c in _best_candidates])
                         _bs, _bpng, _brec, _bgate = _best_candidates[_bi]
                         scratch_png = _bpng
                         item["qc_gate"] = _bgate
@@ -5055,6 +5485,8 @@ def _storyboard_worker(task_id: str, project_name: str, shots: list,
                 _live = generation_state[task_id].get("live")
                 if isinstance(_live, dict) and _live.get("shot") == shot_id:
                     _live["done"] = True
+            _sb_emit(f"镜头 {shot_id} 分镜{'完成' if item.get('success') else '未通过'}",
+                     i + 1)
 
         ok = sum(1 for r in manifest_shots if r.get("success"))
         blocked = sum(1 for r in manifest_shots if r.get("qc_blocked"))
@@ -5309,6 +5741,39 @@ def _style_aspect_guard(project_name: str, override_style: str = ""):
 
 # ===== 步骤6：视频生成 =====
 
+def _first_frame_hard_gate(project_name: str, episode_no, shot_id) -> tuple:
+    """正式 strict 模式的首帧闸门：只有通过人物/服装/构图 QC 的分镜才准进 H3。
+
+    返回 ``(ok, reason)``。读取的是磁盘正式产物旁的 meta/manifest，不重新跑模型。
+    """
+    try:
+        seq = _shot_seq(shot_id, 1)
+        sb_dir = _ep_dir(os.path.join(STORYBOARDS_DIR, project_name), episode_no)
+        png = os.path.join(sb_dir, f"shot_{seq:02d}.png")
+        meta = os.path.join(sb_dir, f"shot_{seq:02d}.meta.json")
+        if not (os.path.isfile(png) and os.path.getsize(png) > 0):
+            return False, f"shot_{seq:02d} 缺少正式首帧/分镜图"
+        qc = {}
+        if os.path.isfile(meta):
+            try:
+                with open(meta, "r", encoding="utf-8") as f:
+                    qc = (json.load(f) or {}).get("qc") or {}
+            except Exception as exc:  # noqa: BLE001
+                return False, f"shot_{seq:02d} 首帧 QC 元数据不可读：{exc}"
+        else:
+            return False, f"shot_{seq:02d} 缺少首帧 QC 元数据"
+        if not qc:
+            return False, f"shot_{seq:02d} 首帧没有 QC 结论"
+        if qc.get("blocked") or qc.get("accept") is False:
+            return False, f"shot_{seq:02d} 首帧未通过 QC：{qc.get('reason') or '未知'}"
+        structured = qc.get("structured_checks")
+        if isinstance(structured, dict) and not structured.get("hard_pass", True):
+            return False, f"shot_{seq:02d} 首帧身份/服装/站位硬门槛未通过"
+        return True, ""
+    except Exception as exc:  # noqa: BLE001
+        return False, f"首帧闸门读取失败：{type(exc).__name__}: {exc}"
+
+
 def _blocking_spec_text(shot: dict) -> str:
     """本镜的**确定性构图规格**文字（3D 导演台），用于替代「无面人偶预演图」送质检。
 
@@ -5525,6 +5990,24 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
         # 视频 URL 前缀：第 2 集起带 epNN 段（与 _ep_dir 的落盘位置一致）
         _vurl = (f"/api/videos/{project_name}/ep{_epn:02d}" if _epn > 1
                  else f"/api/videos/{project_name}")
+        if CHARACTER_REFERENCE_STRICT:
+            _bad_frames = []
+            for _ff_shot in (shots or []):
+                if not isinstance(_ff_shot, dict):
+                    continue
+                _ff_ok, _ff_reason = _first_frame_hard_gate(
+                    project_name, episode_no, _ff_shot.get("shot_id"))
+                if not _ff_ok:
+                    _bad_frames.append(_ff_reason)
+            if _bad_frames:
+                _msg = "strict 模式首帧闸门阻断：" + "；".join(_bad_frames[:5])
+                with lock:
+                    generation_state[task_id].update({
+                        "status": "failed", "success": False,
+                        "phase": "首帧 QC 闸门", "error": _msg,
+                    })
+                app.logger.error(_msg)
+                return
 
         # 参考图来源优先级：显式传入（带 front/base）> 磁盘资产目录。
         # ⚠️ 2026-10-06 修复：旧顺序是「先收集 → 失败才兜底」，兜底又写成
@@ -7827,7 +8310,8 @@ def _qc_record_verdict(project_name: str, kind: str, shot_key, stage: str,
            # ★ 二次复核留档：首次判不过时用同一张图再判一次（判官抖动实测极大）。
            #   落盘后可直接统计「多少重跑是被复核拦下来的」，用于评估该机制收益。
            "recheck": verdict.get("recheck") or None,
-           "recheck_first": verdict.get("recheck_first") or None}
+           "recheck_first": verdict.get("recheck_first") or None,
+           "structured_checks": verdict.get("structured_checks") or None}
     if extra:
         rec.update(extra)
     rec["history_file"] = _qc_record(project_name, kind, shot_key, rec)
@@ -8184,7 +8668,10 @@ def _qc_ref_images(shot: dict, char_idx: dict, item_idx: dict, scene_idx: dict,
     # item_idx.get(n)：名字只因标点或后缀差一点，质检就**拿不到该资产的设定图**，
     # 「这个角色像不像设定」只能靠模型凭记忆猜（正是本函数注释里说的历史缺陷）。
     for n in _match_shot_chars(shot, char_idx):
-        _add(f"角色「{n}」的外貌、服装与发型", (char_idx.get(n) or {}).get("image"))
+        _entry = char_idx.get(n) or {}
+        _identity_path = _pick_char_identity_anchor(_entry)
+        _add(f"角色「{n}」的身份、外貌与服装",
+             _identity_path or _entry.get("image"))
     for n in _resolve_item_names(shot, item_idx, "图片质检"):
         _add(f"物品「{n}」的形状、材质与配色", (item_idx.get(n) or {}).get("image"))
     loc, _scene_e = _resolve_scene_entry(shot, scene_idx, "图片质检")
@@ -10850,6 +11337,7 @@ __all__ = [
     '_find_script_character',
     '_first_existing',
     '_first_existing_asset_image',
+    '_first_frame_hard_gate',
     '_fit_ref_to_canvas',
     '_framing_wants_half',
     '_framing_wants_half_shot',
@@ -10863,6 +11351,7 @@ __all__ = [
     '_h3_plan_common_refs',
     '_h3_shot_ref_components',
     '_ingest_comfy_output',
+    '_interrupted',
     '_is_tts_model_unavailable',
     '_isolate_shot_sfx',
     '_keyframe_prompt_preflight',
@@ -11103,6 +11592,18 @@ __all__ = [
     'send_file',
     'send_from_directory',
     'sheet_split',
+    'identity_contract',
+    'character_assets',
+    'CHARACTER_REQUIRED_ANCHORS',
+    'CHARACTER_ANCHOR_KEYS',
+    'CHARACTER_SHEET_LAYOUT_VERSION',
+    'CHARACTER_REFERENCE_STRICT',
+    'CHARACTER_ANCHOR_GENERATION',
+    'CHARACTER_SHEET_FALLBACK',
+    '_select_character_reference',
+    '_character_asset_completeness',
+    '_pick_char_identity_anchor',
+    '_promote_storyboard_canvas',
     'shot_key',
     'shot_timeline',
     'shutil',
@@ -11134,6 +11635,11 @@ __all__ = [
 
 app = None  # composition root 注入（见模块 docstring 第 2 条）
 
+# 启动期：上次残留 running 任务被标记 interrupted 的条数。由 bind_app 写入，
+# 由 api/ops.py 的 /api/status 读取。必须是模块级全局 —— 否则拆分后它只剩
+# bind_app 的局部变量，域蓝图里引用即 NameError（2026-10-07 拆分遗漏，实测 500）。
+_interrupted = 0
+
 
 def bind_app(instance):
     """注入 Flask 实例，并执行原先在 app.py 模块级跑的启动期语句。
@@ -11143,7 +11649,8 @@ def bind_app(instance):
     """
     global app
     # 这几个启动期报告在别处被读取，必须仍是模块级全局（否则只剩 bind_app 的局部）
-    global AI_SELFCHECK_BOOT, WORKFLOW_INTEGRITY_BOOT, STABLE_PROFILE_BOOT, TRT_ENGINE_CHECK_BOOT
+    # _interrupted 同理：api/ops.py 的 /api/status 会读它
+    global AI_SELFCHECK_BOOT, WORKFLOW_INTEGRITY_BOOT, STABLE_PROFILE_BOOT, TRT_ENGINE_CHECK_BOOT, _interrupted
 
     app = instance
     # ↓↓↓ 原 app.py 模块级的启动期语句，按原相对顺序 ↓↓↓
@@ -11153,6 +11660,21 @@ def bind_app(instance):
     except Exception as _e:  # noqa: BLE001  不得因任务库异常导致启动失败
         _interrupted = 0
         app.logger.warning(f"任务库中断恢复失败（不影响启动）：{_e}")
+
+    # ⭐ jobs.db（执行库）也要做同一次回收：`tasks.db` 与 `jobs.db` 是两套记录，此前只回收了
+    # 前者 —— 于是 jobs.db 里的 running job 跨重启**永久残留**（实测：项目已删除的 job 至今
+    # 仍是 running，总控/前端会把它当成「正在跑的任务」，正是本轮「任务明明在跑却查不到」
+    # 事故里那条幽灵记录的来源）。语义与 task_store 版一致：进程重启即视为中断。
+    try:
+        try:
+            from application.jobs_service import JobsService as _JobsService
+        except ImportError:                      # 脚本方式导入时的兜底（同 api/jobs.py）
+            from app.application.jobs_service import JobsService as _JobsService  # type: ignore
+        _n_jobs = _JobsService().recycle_interrupted()
+        if _n_jobs:
+            app.logger.info(f"jobs.db 残留 running 已回收为 interrupted：{_n_jobs} 条")
+    except Exception as _e:  # noqa: BLE001  不得因执行库异常导致启动失败
+        app.logger.warning(f"执行库中断恢复失败（不影响启动）：{_e}")
 
     # ⭐ AI 凭证单一事实源（tasks.db · ai_credentials 表）：启动时一次性把旧
     # secrets.enc 双槽（ai.text/ai.qc/ai.chat + qc）+ ai_config.json 非密钥字段迁入 DB。

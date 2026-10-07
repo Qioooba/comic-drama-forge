@@ -29,13 +29,13 @@
 ---- 配置说明（.env 关键项）----
     DEPLOY_PROFILE=8G|16G|server   显存档案（8G 显存选 8G）
     MJSCXT_AUTOPILOT=1|0           无人值守托管（默认 1）
-    APP_PORT=5000                  Web 服务端口
+    APP_PORT=45871                 Web 服务端口（默认值见 app/ports.py）
     H3_ENABLE_REFINE=0|1           H3 视频二采开关（默认 0，8G 显存建议关）
 
 ---- 启动顺序 ----
     1) 装 Python → 双击「安装依赖.bat」（一次性）
     2) 启动 ComfyUI（自备）
-    3) 双击「启动.bat」 → 浏览器打开 http://127.0.0.1:5000
+    3) 双击「启动.bat」 → 浏览器打开 http://127.0.0.1:45871
 
 ---- 数据目录 ----
     novels\   小说源文件（放这里）

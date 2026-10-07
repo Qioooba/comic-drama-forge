@@ -458,7 +458,7 @@ export function OutputReviewTab({ projectKey, assets }: OutputReviewTabProps) {
               >
                 <input
                   type="checkbox"
-                  className="mt-0.5 accent-[var(--color-brand)]"
+                  className="mt-0.5 accent-[rgb(var(--brand))]"
                   checked={row.val === true}
                   disabled={row.val === null || savingSubtitle !== null}
                   onChange={(ev) => void saveSubtitleConfig(row.key, ev.target.checked)}

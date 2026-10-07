@@ -9,7 +9,7 @@
  * 环境变量（可在 .env 或系统环境配置）：
  *   COMFYUI_ROOT       ComfyUI 安装根目录（含 main.py）。留空则假定 ComfyUI 已由用户自行启动
  *   COMFYUI_URL        ComfyUI 地址，默认 http://127.0.0.1:8188
- *   FLASK_RUN_PORT     后端端口，默认 5000
+ *   FLASK_RUN_PORT     后端端口，默认 45871（唯一事实源见 app/ports.py）
  *   MJSCXT_PYTHON      指定 Python 解释器；留空自动探测（venv > python3 > python）
  *
  * 设计取舍：桌面壳不打包 Python 运行时与 GPU 权重（体积与可维护性），
@@ -22,7 +22,7 @@ const fs = require('fs');
 const http = require('http');
 
 const IS_DEV = process.argv.includes('--dev');
-const PORT = parseInt(process.env.FLASK_RUN_PORT || '5000', 10);
+const PORT = parseInt(process.env.FLASK_RUN_PORT || '45871', 10);
 const COMFYUI_URL = process.env.COMFYUI_URL || 'http://127.0.0.1:8188';
 const COMFYUI_ROOT = process.env.COMFYUI_ROOT || '';
 

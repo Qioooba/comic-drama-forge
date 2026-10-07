@@ -11,6 +11,29 @@ let messages: Record<string, string> = {};
 // AppContext 依赖本版本号重建 t 的引用，从根上修掉这一类问题。
 let localeVersion = 0;
 
+// 语言包加载完成的订阅者集合。
+// ⚠️ 为什么需要它：`t()` 是**模块级函数、引用永不变化**，所以任何用模块级
+//    `t` 渲染文案的组件，在语言包到达前算出的「原始 key」会被永久缓存 ——
+//    它不会因为 messages 变了就自己重算（见本文件顶部注释里记的那个坑）。
+//    AppProvider 用 localeVersion 重建了 useApp().t 的引用来救自己那份，
+//    但**不订阅**语言包的组件（例如 ToastProvider：它在 AppProvider **之外**，
+//    拿不到 context）仍然会永久停在原始 key 上。
+//    实测症状：读屏把字面量 "toast.regionLabel" 当作区域名念出来。
+//    这里给一条显式订阅通道，让这类组件能在语言包就绪后重算一次。
+const localeListeners = new Set<() => void>();
+
+/** 订阅语言包加载。返回取消订阅函数。用法见 ToastProvider。 */
+export function subscribeLocale(listener: () => void): () => void {
+  localeListeners.add(listener);
+  return () => {
+    localeListeners.delete(listener);
+  };
+}
+
+function notifyLocaleChanged(): void {
+  localeListeners.forEach((fn) => fn());
+}
+
 export function getLocaleVersion(): number {
   return localeVersion;
 }
@@ -35,6 +58,8 @@ export async function loadLocale(lang: string): Promise<void> {
     currentLang = lang;
     localeVersion += 1;
     document.documentElement.lang = lang;
+    // 通知不订阅 context 的组件（ToastProvider 等）重算文案。
+    notifyLocaleChanged();
   } catch (error) {
     console.error('Failed to load locale:', error);
   }

@@ -385,7 +385,7 @@ def _now() -> str:
 
 
 def _run_task_worker(worker, args, registry_name: str, lock_name: str,
-                     init: dict = None, prefix: str = "pipe") -> dict:
+                     init: dict = None, prefix: str = "pipe", kwargs: dict = None) -> dict:
     """在线程内直接执行一个「写任务字典」的既有 worker，返回其最终状态
 
     既有 worker（`_storyboard_worker` / `_dub_worker` / `_mix_worker` …）都以
@@ -405,7 +405,9 @@ def _run_task_worker(worker, args, registry_name: str, lock_name: str,
         registry[tid] = state
     err = ""
     try:
-        worker(tid, *args)
+        # kwargs：可选的关键字透传。用于把进度回调交给 worker（如资产生成的 progress_cb），
+        # 让**长步骤内部**也能上报进度 —— 否则一步几十分钟只报一次，状态接口看起来像卡住。
+        worker(tid, *args, **(kwargs or {}))
     except cancellation.Cancelled:
         # ⚠️ 中止信号必须穿透：否则会被下面归一化成 status=failed，
         # 再被 _run_step_with_retry 当成「步骤失败」重试 —— 用户点暂停后
@@ -530,10 +532,23 @@ def probe_assets(ctx) -> dict:
                                 and _nonempty(os.path.join(d, fn)):
                             hit = fn
                             break
+            # 角色必须达到 Machine Anchor 最低门槛；只有 base 的旧资产不算 ready，
+            # 否则断点续跑会永远跳过补齐。
+            if hit and kind == "character":
+                try:
+                    import character_assets
+                    comp = character_assets.asset_completeness(d)
+                    if not comp.get("complete"):
+                        hit = None
+                        missing.append(n)
+                        continue
+                except Exception:
+                    pass
             if hit:
                 ready += 1
             else:
-                missing.append(n)
+                if n not in missing:
+                    missing.append(n)
         out[kind] = {"total": len(names), "ready": ready, "missing": missing,
                      "done": bool(names) and not missing}
     # 顶层 done：三类资产都齐全才算就绪（step_assets 据此整步跳过，避免每天重跑都
@@ -1054,13 +1069,32 @@ def step_assets(ctx) -> dict:
             # 本类顶层未 done（顶层 done 需三类全齐）但本类无缺失 → 视为已就绪
             results[kind] = {"skipped": True, "total": len(assets), "note": "本类资产已就绪"}
             continue
+        def _asset_cb(msg, done_n, total_n):
+            """把「第几个资产 / 正出哪个机位档」外发给流水线进度。
+
+            ⭐ 2026-10-07 实测：assets 整步此前只 ping 三次（每类资产开工一次，
+            percent=20 恒定），而三类资产跑十几分钟 —— 期间 `autopilot.current`
+            停在同一句话上，前端/总控看起来就是「没在动」。逐资产上报后，
+            进度条与 `step_updated_at` 才有意义（stall 警告也才可信）。
+            纯展示：任何异常都由 ctx["progress"] 内部消化，绝不影响生成。
+            """
+            try:
+                frac = 0.0 if not total_n else min(1.0, float(done_n) / float(total_n))
+            except (TypeError, ValueError):
+                frac = 0.0
+            # 区间取 [assets 锚点, storyboard 锚点)：单调不倒退由 _progress 兜底
+            ctx["progress"](f"生成{kind}资产 {done_n}/{total_n}：{msg}",
+                            _STEP_PCT.get("assets", 18) + int(13 * frac),
+                            phase=f"assets:{kind}")
+
         ctx["progress"](f"生成{kind}资产（缺 {len(todo)}/{len(assets)} 个）", 20,
                         phase=f"assets:{kind}")
         final = _run_task_worker(
             A._generate_asset_task, (todo, kind, ctx["project_name"], ctx["config"].get("style") or ""),
             "generation_state", "lock",
             init={"total": len(todo), "asset_type": kind, "phase": f"{kind} 资产"},
-            prefix=f"pipe_asset_{kind}")
+            prefix=f"pipe_asset_{kind}",
+            kwargs={"progress_cb": _asset_cb})
         out = _outcome_from_task(final, f"{kind} 资产生成")
         results[kind] = {"total": len(assets), "generated": len(todo),
                          "ok": out["ok"], "count": out["count"],
@@ -1233,6 +1267,16 @@ def step_storyboard(ctx) -> dict:
     item_idx = A._build_asset_index(script.get("items") or [], ctx["project_name"], "item")
     scene_idx = A._build_asset_index(script.get("scenes") or [], ctx["project_name"], "scene")
     ctx["progress"](f"生成分镜图（{len(shots)} 镜）", 34, phase="storyboard")
+
+    def _sb_cb(msg, done_n, total_n):
+        """逐镜外发分镜进度：57 镜要跑很久，整步只报一次会让状态接口像卡住（2026-10-07）。"""
+        try:
+            frac = 0.0 if not total_n else min(1.0, float(done_n) / float(total_n))
+        except (TypeError, ValueError):
+            frac = 0.0
+        # 区间取 [storyboard, video)：单调不倒退由 _progress 兜底
+        ctx["progress"](f"分镜 {done_n}/{total_n}：{msg}",
+                        34 + int(15 * frac), phase="storyboard")
     # 审计 P1-3（2026-09-29）：托管 GPU 步骤也必须过并发闸门 —— 旧实现只闸手动链路，
     # 托管跑批期间手动任务可同时打 ComfyUI；且 has_other_running_gpu_tasks() 在托管
     # 期间返回 False，upscale/tts 会发 /free 卸掉托管任务正在用的模型。
@@ -1243,7 +1287,8 @@ def step_storyboard(ctx) -> dict:
                                    ctx["episode_no"], ctx["config"].get("style") or ""),
             "generation_state", "lock",
             init={"total": len(shots), "phase": "分镜图生成"},
-            prefix="pipe_sb")
+            prefix="pipe_sb",
+            kwargs={"progress_cb": _sb_cb})
     out = _outcome_from_task(final, "分镜图生成")
     detail = {"count": out["count"], "total": len(shots), "blocked": out["blocked"],
               "qc_blocked": (final or {}).get("qc_blocked_count")}

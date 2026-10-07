@@ -21,6 +21,27 @@ import type { UpscaleEnv, UpscaleSource, UpscaleTask, UpscaleArtifact } from '@/
 const FOCUS_RING =
   'focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/40 focus-visible:ring-offset-2 focus-visible:ring-offset-canvas';
 
+/**
+ * ⚠️ `/api/upscale/sources` 返回的 `kind` 枚举值。
+ *
+ * 这三个常量是**匹配值**，不是展示文案：必须与后端返回的字符串逐字一致
+ * （含中文、同样的标点），改动会让下拉框按类别分组时整组落空。
+ * 展示文案一律走 `t('upscale.kind*')`（见 KIND_LABEL_KEYS）。
+ */
+const KIND_FINAL = '成片';
+const KIND_VIDEO = '视频片段';
+const KIND_UPSCALED = '超分产物';
+
+/** 后端 kind → 展示文案 i18n 键。未登记的取值（如 ComfyUI 素材）原样回显，不静默吞掉。 */
+const KIND_LABEL_KEYS: Record<string, string> = {
+  [KIND_FINAL]: 'upscale.kindFinal',
+  [KIND_VIDEO]: 'upscale.kindVideo',
+  [KIND_UPSCALED]: 'upscale.kindUpscaled',
+};
+
+const kindLabel = (kind: string): string =>
+  (KIND_LABEL_KEYS[kind] ? t(KIND_LABEL_KEYS[kind]) : kind);
+
 
 // ========== 超分（FlashVSR） ==========
 // 接口：
@@ -99,7 +120,7 @@ function UpscaleTab({ projectKey }: { projectKey: string }) {
         const items = srcRes.value.items || [];
         setSources(items);
         // 默认优先选「成片」（自动生产刚出的成品），省掉一次手动选择
-        setSelected((prev) => prev || (items.find((i) => i.kind === '成片') || items[0])?.path || '');
+        setSelected((prev) => prev || (items.find((i) => i.kind === KIND_FINAL) || items[0])?.path || '');
       } else {
         setError(srcRes.reason instanceof Error ? srcRes.reason.message : t('upscale.loadFailed'));
         setSources([]);
@@ -259,10 +280,10 @@ function UpscaleTab({ projectKey }: { projectKey: string }) {
         </div>
         {env && (
           <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs">
-            <span className="inline-flex items-center gap-1">{t('upscale.comfyOnline')}: {env.comfy_online ? <Check className="h-3.5 w-3.5 text-success" /> : <X className="h-3.5 w-3.5 text-danger" />}</span>
-            <span className="inline-flex items-center gap-1">{t('upscale.modelReady')}: {env.model_ready ? <Check className="h-3.5 w-3.5 text-success" /> : <X className="h-3.5 w-3.5 text-danger" />}</span>
-            <span className="inline-flex items-center gap-1">{t('upscale.teReady')}: {env.te_ready ? <Check className="h-3.5 w-3.5 text-success" /> : <X className="h-3.5 w-3.5 text-danger" />}</span>
-            <span className="inline-flex items-center gap-1">{t('upscale.legacyReady')}: {env.legacy_ready ? <Check className="h-3.5 w-3.5 text-success" /> : <X className="h-3.5 w-3.5 text-danger" />}</span>
+            <span className="inline-flex items-center gap-1">{t('upscale.comfyOnline')}: {env.comfy_online ? <Check className="h-3.5 w-3.5 text-success" /> : <X className="h-3.5 w-3.5 text-danger-strong" />}</span>
+            <span className="inline-flex items-center gap-1">{t('upscale.modelReady')}: {env.model_ready ? <Check className="h-3.5 w-3.5 text-success" /> : <X className="h-3.5 w-3.5 text-danger-strong" />}</span>
+            <span className="inline-flex items-center gap-1">{t('upscale.teReady')}: {env.te_ready ? <Check className="h-3.5 w-3.5 text-success" /> : <X className="h-3.5 w-3.5 text-danger-strong" />}</span>
+            <span className="inline-flex items-center gap-1">{t('upscale.legacyReady')}: {env.legacy_ready ? <Check className="h-3.5 w-3.5 text-success" /> : <X className="h-3.5 w-3.5 text-danger-strong" />}</span>
           </div>
         )}
         {!ready && (env?.reasons?.length ?? 0) > 0 && (
@@ -300,12 +321,12 @@ function UpscaleTab({ projectKey }: { projectKey: string }) {
                 aria-checked={planOn}
                 disabled={savingPlan}
                 onClick={() => savePlan({ enable_upscale: !planOn })}
-                className={`relative w-11 h-6 rounded-full transition-colors disabled:opacity-50 ${FOCUS_RING} ${
+                className={`relative w-11 h-control-compact rounded-full transition-colors active:opacity-90 disabled:opacity-50 ${FOCUS_RING} ${
                   planOn ? 'bg-brand' : 'bg-line-strong'
                 }`}
               >
                 <span
-                  className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-surface shadow transition-transform ${
+                  className={`absolute top-1/2 -translate-y-1/2 left-0.5 w-5 h-5 rounded-full bg-surface shadow transition-transform ${
                     planOn ? 'translate-x-5' : ''
                   }`}
                 />
@@ -322,9 +343,9 @@ function UpscaleTab({ projectKey }: { projectKey: string }) {
                   key={n}
                   disabled={savingPlan || !planOn}
                   onClick={() => savePlan({ upscale_scale: n })}
-                  className={`px-3 py-1 rounded-md text-xs font-medium transition-all disabled:opacity-50 ${FOCUS_RING} ${
+                  className={`px-3 py-1 rounded-md text-xs font-medium transition-all active:opacity-90 disabled:opacity-50 ${FOCUS_RING} ${
                     planScale === n
-                      ? 'bg-brand text-white'
+                      ? 'bg-brand text-on-brand'
                       : 'bg-surface-2 text-ink-2 hover:bg-line hover:text-ink-1'
                   }`}
                 >
@@ -365,7 +386,7 @@ function UpscaleTab({ projectKey }: { projectKey: string }) {
                   className={`w-full px-3 py-2 text-sm border border-line rounded-lg bg-surface text-ink-1 ${FOCUS_RING}`}
                 >
                   {Array.from(new Set(visibleSources.map((s) => s.kind))).map((kind) => (
-                    <optgroup key={kind} label={kind}>
+                    <optgroup key={kind} label={kindLabel(kind)}>
                       {visibleSources.filter((s) => s.kind === kind).map((s) => (
                         <option key={s.path} value={s.path}>
                           {s.name} · {s.size_mb} MB
@@ -403,9 +424,9 @@ function UpscaleTab({ projectKey }: { projectKey: string }) {
                       key={n}
                       onClick={() => setScale(n)}
                       disabled={busy}
-                      className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${FOCUS_RING} ${
+                      className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors active:opacity-90 ${FOCUS_RING} ${
                         scale === n
-                          ? 'bg-brand text-white shadow-lg'
+                          ? 'bg-brand text-on-brand shadow-lg'
                           : 'bg-surface-2 text-ink-2 hover:bg-line hover:text-ink-1'
                       }`}
                     >

@@ -181,10 +181,12 @@ export function GridPage({ projectKey }: { projectKey?: string } = {}) {
               const isSelected = selectedCell === i;
               const isPersisted = nineGrid.selected_index === i;
               return (
-                <div
+                <button
+                  type="button"
                   key={i}
+                  aria-pressed={isSelected}
                   onClick={() => shot && setSelectedCell(i)}
-                  className={`relative rounded-lg border-2 p-3 transition-colors ${
+                  className={`relative w-full text-left rounded-lg border-2 p-3 transition-colors active:opacity-90 ${
                     shot ? 'cursor-pointer' : 'opacity-50 cursor-not-allowed'
                   } ${
                     isSelected
@@ -197,7 +199,7 @@ export function GridPage({ projectKey }: { projectKey?: string } = {}) {
                     {(isSelected || isPersisted) && (
                       <span className="inline-flex items-center gap-1 text-xs text-brand font-medium">
                         <Check className="h-3.5 w-3.5" />
-                        {isPersisted ? t('nineGrid.selected') : ''}
+                        {t('nineGrid.selected')}
                       </span>
                     )}
                   </div>
@@ -218,7 +220,7 @@ export function GridPage({ projectKey }: { projectKey?: string } = {}) {
                   ) : (
                     <p className="text-xs text-ink-3">—</p>
                   )}
-                </div>
+                </button>
               );
             })}
           </div>

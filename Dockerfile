@@ -25,12 +25,18 @@ COPY . .
 RUN mkdir -p output/final output/assets output/keyframes output/storyboards
 
 # 暴露端口
-EXPOSE 5000
+# 2026-10-07：5000 → 45871，与 app/ports.py、docker-compose.yml 的映射保持一致。
+# 三处必须同步，否则 compose 起容器后端口映射对不上、健康检查恒失败。
+EXPOSE 45871
 
 # 设置环境变量
 ENV FLASK_APP=app/serve.py
 ENV FLASK_ENV=production
 ENV PYTHONUNBUFFERED=1
+# 显式声明监听端口：.env 被 .dockerignore 排除不会进镜像，容器里没有 APP_PORT
+# 就只能落到代码默认值；写死在这里让「镜像实际行为」不依赖代码默认值是否被改过。
+ENV APP_HOST=127.0.0.1
+ENV APP_PORT=45871
 
 # 启动命令
 CMD ["python", "app/serve.py"]

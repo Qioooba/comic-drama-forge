@@ -19,7 +19,7 @@ from PyInstaller.utils.hooks import collect_submodules, collect_data_files
 _ROOT = os.path.dirname(os.path.abspath(SPEC))
 _APP_DIR = os.path.join(_ROOT, 'app')
 sys.path.insert(0, _APP_DIR)
-for _probe in ('serve', 'app', 'providers', 'env_loader', 'fs_atomic', 'api'):
+for _probe in ('serve', 'app', 'providers', 'env_loader', 'fs_atomic', 'api', 'ports'):
     import importlib as _il
     _il.import_module(_probe)  # 任一失败 → spec 阶段直接崩，fail fast（不产生半残 exe）
 hidden_imports = [

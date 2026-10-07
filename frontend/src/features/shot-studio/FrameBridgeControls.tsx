@@ -10,6 +10,7 @@
 import React from 'react';
 import { Button } from '@/components/ui';
 import { assetSrc } from '@/api/queries';
+import { t } from '@/i18n';
 
 export interface FrameBridgeControlsProps {
   /** 上一镜尾帧 URL（可空） */
@@ -44,13 +45,13 @@ export function FrameBridgeControls({
 
   return (
     <div className="space-y-2 rounded-lg border border-line bg-surface p-3">
-      <h3 className="text-sm font-semibold text-ink-1">首尾帧桥接</h3>
+      <h3 className="text-sm font-semibold text-ink-1">{t('studio.bridgeTitle')}</h3>
 
       <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-2">
-        <FrameSlot label="首帧" src={startSrc} onRegenerate={onRegenerateStart} disabled={blocked} />
+        <FrameSlot label={t('studio.startFrame')} src={startSrc} onRegenerate={onRegenerateStart} disabled={blocked} />
         {/* 桥接符号：把「两端接不接得上」这件事画出来 */}
         <span aria-hidden="true" className="px-1 font-mono text-lg text-ink-3">⇄</span>
-        <FrameSlot label="尾帧" src={endSrc} onRegenerate={onRegenerateEnd} disabled={blocked} />
+        <FrameSlot label={t('studio.endFrame')} src={endSrc} onRegenerate={onRegenerateEnd} disabled={blocked} />
       </div>
 
       {disabledReason && (
@@ -65,7 +66,7 @@ export function FrameBridgeControls({
           title={disabledReason}
           className="w-full"
         >
-          确认桥接
+          {t('studio.commitBridge')}
         </Button>
       )}
     </div>
@@ -91,10 +92,12 @@ function FrameSlot({
           <button
             onClick={onRegenerate}
             disabled={disabled}
-            title={disabled ? '当前不可重生成' : `重生成${label}`}
-            className="rounded border border-line px-1.5 py-0.5 text-xs text-ink-2 hover:border-brand hover:text-brand disabled:opacity-50 disabled:cursor-not-allowed"
+            title={disabled
+              ? t('studio.cannotRegenerate')
+              : t('studio.regenerateTitle', { label })}
+            className="rounded border border-line px-1.5 py-0.5 text-xs text-ink-2 hover:border-brand hover:text-brand active:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            重生成
+            {t('studio.regenerate')}
           </button>
         )}
       </div>
@@ -103,7 +106,7 @@ function FrameSlot({
         {src ? (
           <img src={src} alt={label} className="h-full w-full object-contain" loading="lazy" />
         ) : (
-          <span className="text-xs text-ink-3">未生成{label}</span>
+          <span className="text-xs text-ink-3">{t('studio.notGenerated', { label })}</span>
         )}
       </div>
     </div>

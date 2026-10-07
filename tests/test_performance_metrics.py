@@ -21,12 +21,24 @@ import analytics  # noqa: E402
 class PerformanceMetricsTests(unittest.TestCase):
     def test_session_samples_writes_snapshot_and_analytics_event(self):
         events = []
+        # ⭐ 2026-10-07 修计时竞态：原实现靠 `_SESSIONS[...]["started_monotonic"] -= 4.5`
+        # 伪造耗时，于是 elapsed = 4.5 + 真实跑这段代码的耗时。而断言
+        # `seconds_per_video_second == 0.562` 是 round(4.5/8, 3)，**只有 0.5ms 余量**：
+        # 只要 begin 到 finish 之间机器卡过 0.5ms（IO、抗病毒、并发导入），实测值就
+        # 变成 4.501 → 0.563 → 随机失败（实测在全量跑时偶发挂过一次，单跑必过）。
+        # 改为注入假时钟，elapsed 恒等于 4.5。
+        clock = {"t": 1000.0}
+
+        def fake_monotonic():
+            return clock["t"]
+
         with tempfile.TemporaryDirectory() as tmp, \
              patch.object(performance_metrics, "_DIR", tmp), \
              patch.object(performance_metrics, "_gpu_sample",
                           return_value={"vram_mb": 12000.5, "util": 77.0}), \
              patch.object(performance_metrics, "_windows_system_sample",
                           return_value={"cpu": 42.0, "ram_mb": 16000.0}), \
+             patch.object(performance_metrics.time, "monotonic", fake_monotonic), \
              patch.object(analytics, "record_event",
                           side_effect=lambda **kw: events.append(kw) or True):
             performance_metrics.begin("perf-1", context={
@@ -34,7 +46,7 @@ class PerformanceMetricsTests(unittest.TestCase):
                 "total_frames": 192, "fps": 24,
             })
             performance_metrics._sample_once()
-            performance_metrics._SESSIONS["perf-1"]["started_monotonic"] -= 4.5
+            clock["t"] = 1004.5          # 精确推进 4.5s，不再依赖真实墙钟
             performance_metrics.attach_history("perf-1", {
                 "status": {
                     "completed": True, "status_str": "success",

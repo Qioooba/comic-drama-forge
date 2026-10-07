@@ -171,21 +171,21 @@ export const contractsApi = {
    * `GET /api/contracts/error-codes`
    */
   getErrorCodes: () =>
-    request<ErrorCodesResponse>(`/api/contracts/error-codes`, { method: 'GET' }),
+    request<ErrorCodesResponse>(`/contracts/error-codes`, { method: 'GET' }),
   /**
    * 导出 OpenAPI 3.1 规格（契约本体）
    *
    * `GET /api/contracts/openapi.json`
    */
   getOpenapiSpec: () =>
-    request<OpenApiSpecResponse>(`/api/contracts/openapi.json`, { method: 'GET' }),
+    request<OpenApiSpecResponse>(`/contracts/openapi.json`, { method: 'GET' }),
   /**
    * 契约版本与规格摘要（前端启动闸门用）
    *
    * `GET /api/contracts/version`
    */
   getContractVersion: () =>
-    request<ContractVersionResponse>(`/api/contracts/version`, { method: 'GET' }),
+    request<ContractVersionResponse>(`/contracts/version`, { method: 'GET' }),
 };
 
 /**
@@ -198,63 +198,63 @@ export const deliveryApi = {
    * `GET /api/delivery/packages`
    */
   listDeliveryPackages: (project?: string) =>
-    request<DeliveryPackageListResponse>(`/api/delivery/packages${qs({ project })}`, { method: 'GET' }),
+    request<DeliveryPackageListResponse>(`/delivery/packages${qs({ project })}`, { method: 'GET' }),
   /**
    * 登记交付包（扫描既有导出产物并算 SHA-256）
    *
    * `POST /api/delivery/packages`
    */
   createDeliveryPackage: (body: CreateDeliveryPackageRequest) =>
-    request<DeliveryPackageResponse>(`/api/delivery/packages`, { method: 'POST', body: JSON.stringify(body) }),
+    request<DeliveryPackageResponse>(`/delivery/packages`, { method: 'POST', body: JSON.stringify(body) }),
   /**
    * 交付包详情（含文件清单与 SHA-256）
    *
    * `GET /api/delivery/packages/{package_id}`
    */
   getDeliveryPackage: (package_id: string) =>
-    request<DeliveryPackageResponse>(`/api/delivery/packages/${encodeURIComponent(String(package_id))}`, { method: 'GET' }),
+    request<DeliveryPackageResponse>(`/delivery/packages/${encodeURIComponent(String(package_id))}`, { method: 'GET' }),
   /**
    * 人工批准（须带操作者，批准与包哈希绑定）
    *
    * `POST /api/delivery/packages/{package_id}/approve`
    */
   approveDeliveryPackage: (package_id: string, body: ApproveDeliveryPackageRequest) =>
-    request<DeliveryPackageResponse>(`/api/delivery/packages/${encodeURIComponent(String(package_id))}/approve`, { method: 'POST', body: JSON.stringify(body) }),
+    request<DeliveryPackageResponse>(`/delivery/packages/${encodeURIComponent(String(package_id))}/approve`, { method: 'POST', body: JSON.stringify(body) }),
   /**
    * 交付清单（逐文件 SHA-256 + 包摘要）
    *
    * `GET /api/delivery/packages/{package_id}/manifest`
    */
   getDeliveryManifest: (package_id: string) =>
-    request<DeliveryManifestResponse>(`/api/delivery/packages/${encodeURIComponent(String(package_id))}/manifest`, { method: 'GET' }),
+    request<DeliveryManifestResponse>(`/delivery/packages/${encodeURIComponent(String(package_id))}/manifest`, { method: 'GET' }),
   /**
    * 交付发布总门禁（授权+校验+人工批准+磁盘）
    *
    * `POST /api/delivery/packages/{package_id}/release-check`
    */
   releaseCheckDeliveryPackage: (package_id: string, body?: ReleaseCheckRequest) =>
-    request<ReleaseCheckResponse>(`/api/delivery/packages/${encodeURIComponent(String(package_id))}/release-check`, { method: 'POST', body: JSON.stringify(body) }),
+    request<ReleaseCheckResponse>(`/delivery/packages/${encodeURIComponent(String(package_id))}/release-check`, { method: 'POST', body: JSON.stringify(body) }),
   /**
    * 撤销人工批准
    *
    * `POST /api/delivery/packages/{package_id}/revoke`
    */
   revokeDeliveryApproval: (package_id: string, body: RevokeDeliveryApprovalRequest) =>
-    request<DeliveryPackageResponse>(`/api/delivery/packages/${encodeURIComponent(String(package_id))}/revoke`, { method: 'POST', body: JSON.stringify(body) }),
+    request<DeliveryPackageResponse>(`/delivery/packages/${encodeURIComponent(String(package_id))}/revoke`, { method: 'POST', body: JSON.stringify(body) }),
   /**
    * 机器校验：逐文件重算 SHA-256
    *
    * `POST /api/delivery/packages/{package_id}/verify`
    */
   verifyDeliveryPackage: (package_id: string) =>
-    request<VerifyDeliveryResponse>(`/api/delivery/packages/${encodeURIComponent(String(package_id))}/verify`, { method: 'POST' }),
+    request<VerifyDeliveryResponse>(`/delivery/packages/${encodeURIComponent(String(package_id))}/verify`, { method: 'POST' }),
   /**
    * 交付预设列表（竖屏 / 横屏 / 3:4）
    *
    * `GET /api/delivery/presets`
    */
   listDeliveryPresets: () =>
-    request<DeliveryPresetsResponse>(`/api/delivery/presets`, { method: 'GET' }),
+    request<DeliveryPresetsResponse>(`/delivery/presets`, { method: 'GET' }),
 };
 
 /**
@@ -267,70 +267,70 @@ export const jobsApi = {
    * `GET /api/jobs`
    */
   listJobs: (status?: string) =>
-    request<JobListResponse>(`/api/jobs${qs({ status })}`, { method: 'GET' }),
+    request<JobListResponse>(`/jobs${qs({ status })}`, { method: 'GET' }),
   /**
    * 创建作业
    *
    * `POST /api/jobs`
    */
   createJob: (body: CreateJobRequest) =>
-    request<JobResponse>(`/api/jobs`, { method: 'POST', body: JSON.stringify(body) }),
+    request<JobResponse>(`/jobs`, { method: 'POST', body: JSON.stringify(body) }),
   /**
    * 结束尝试并结算
    *
    * `POST /api/jobs/attempts/{attempt_id}/finish`
    */
   finishJobAttempt: (attempt_id: string, body: FinishAttemptRequest) =>
-    request<AttemptResponse>(`/api/jobs/attempts/${encodeURIComponent(String(attempt_id))}/finish`, { method: 'POST', body: JSON.stringify(body) }),
+    request<AttemptResponse>(`/jobs/attempts/${encodeURIComponent(String(attempt_id))}/finish`, { method: 'POST', body: JSON.stringify(body) }),
   /**
    * 更新尝试状态
    *
    * `POST /api/jobs/attempts/{attempt_id}/status`
    */
   updateAttemptStatus: (attempt_id: string, body: UpdateAttemptRequest) =>
-    request<AttemptResponse>(`/api/jobs/attempts/${encodeURIComponent(String(attempt_id))}/status`, { method: 'POST', body: JSON.stringify(body) }),
+    request<AttemptResponse>(`/jobs/attempts/${encodeURIComponent(String(attempt_id))}/status`, { method: 'POST', body: JSON.stringify(body) }),
   /**
    * 作业统计（按状态聚合）
    *
    * `GET /api/jobs/stats`
    */
   getJobStats: (project?: string) =>
-    request<JobStatsResponse>(`/api/jobs/stats${qs({ project })}`, { method: 'GET' }),
+    request<JobStatsResponse>(`/jobs/stats${qs({ project })}`, { method: 'GET' }),
   /**
    * 作业详情（含各次尝试）
    *
    * `GET /api/jobs/{job_id}`
    */
   getJob: (job_id: string) =>
-    request<JobResponse>(`/api/jobs/${encodeURIComponent(String(job_id))}`, { method: 'GET' }),
+    request<JobResponse>(`/jobs/${encodeURIComponent(String(job_id))}`, { method: 'GET' }),
   /**
    * 为作业开启一次尝试（Attempt = 一次执行）
    *
    * `POST /api/jobs/{job_id}/attempts`
    */
   createJobAttempt: (job_id: string, body?: CreateAttemptRequest) =>
-    request<AttemptResponse>(`/api/jobs/${encodeURIComponent(String(job_id))}/attempts`, { method: 'POST', body: JSON.stringify(body) }),
+    request<AttemptResponse>(`/jobs/${encodeURIComponent(String(job_id))}/attempts`, { method: 'POST', body: JSON.stringify(body) }),
   /**
    * 待处理单元（断点续跑判据之一）
    *
    * `GET /api/jobs/{job_id}/pending-units`
    */
   listPendingUnits: (job_id: string) =>
-    request<PendingUnitListResponse>(`/api/jobs/${encodeURIComponent(String(job_id))}/pending-units`, { method: 'GET' }),
+    request<PendingUnitListResponse>(`/jobs/${encodeURIComponent(String(job_id))}/pending-units`, { method: 'GET' }),
   /**
    * 免重渲提示（workflow_hash 命中可复用）
    *
    * `GET /api/jobs/{job_id}/reuse-hint`
    */
   getJobReuseHint: (job_id: string) =>
-    request<ReuseHintResponse>(`/api/jobs/${encodeURIComponent(String(job_id))}/reuse-hint`, { method: 'GET' }),
+    request<ReuseHintResponse>(`/jobs/${encodeURIComponent(String(job_id))}/reuse-hint`, { method: 'GET' }),
   /**
    * 更新作业状态
    *
    * `POST /api/jobs/{job_id}/status`
    */
   updateJobStatus: (job_id: string, body: UpdateJobRequest) =>
-    request<JobResponse>(`/api/jobs/${encodeURIComponent(String(job_id))}/status`, { method: 'POST', body: JSON.stringify(body) }),
+    request<JobResponse>(`/jobs/${encodeURIComponent(String(job_id))}/status`, { method: 'POST', body: JSON.stringify(body) }),
 };
 
 /**
@@ -343,28 +343,28 @@ export const licensingApi = {
    * `GET /api/licensing/brands`
    */
   listBrandKits: () =>
-    request<BrandKitsResponse>(`/api/licensing/brands`, { method: 'GET' }),
+    request<BrandKitsResponse>(`/licensing/brands`, { method: 'GET' }),
   /**
    * 授权门禁预检（交付前自查）
    *
    * `POST /api/licensing/gate`
    */
   evaluateLicensingGate: (body?: LicenseRequirement) =>
-    request<LicensingGateResponse>(`/api/licensing/gate`, { method: 'POST', body: JSON.stringify(body) }),
+    request<LicensingGateResponse>(`/licensing/gate`, { method: 'POST', body: JSON.stringify(body) }),
   /**
    * 音乐库授权列表（CC BY 署名可直接复制）
    *
    * `GET /api/licensing/music`
    */
   listLicensedMusic: () =>
-    request<LicensedMusicResponse>(`/api/licensing/music`, { method: 'GET' }),
+    request<LicensedMusicResponse>(`/licensing/music`, { method: 'GET' }),
   /**
    * 授权登记表全量（模型 / 素材 / 品牌）
    *
    * `GET /api/licensing/registry`
    */
   getLicenseRegistry: () =>
-    request<LicenseRegistryResponse>(`/api/licensing/registry`, { method: 'GET' }),
+    request<LicenseRegistryResponse>(`/licensing/registry`, { method: 'GET' }),
 };
 
 /**
@@ -377,112 +377,112 @@ export const productionfactsApi = {
    * `POST /api/production_facts/approvals/{approval_id}/revoke`
    */
   revokeProductionApproval: (approval_id: string, body: RevokeApprovalRequest) =>
-    request<DecisionResponse>(`/api/production_facts/approvals/${encodeURIComponent(String(approval_id))}/revoke`, { method: 'POST', body: JSON.stringify(body) }),
+    request<DecisionResponse>(`/production_facts/approvals/${encodeURIComponent(String(approval_id))}/revoke`, { method: 'POST', body: JSON.stringify(body) }),
   /**
    * 能力档案版本列表
    *
    * `GET /api/production_facts/capability-profiles`
    */
   listCapabilityProfiles: () =>
-    request<CapabilityProfileListResponse>(`/api/production_facts/capability-profiles`, { method: 'GET' }),
+    request<CapabilityProfileListResponse>(`/production_facts/capability-profiles`, { method: 'GET' }),
   /**
    * 登记能力档案版本
    *
    * `POST /api/production_facts/capability-profiles`
    */
   registerCapabilityProfile: (body: CapabilityProfileRequest) =>
-    request<CapabilityProfileResponse>(`/api/production_facts/capability-profiles`, { method: 'POST', body: JSON.stringify(body) }),
+    request<CapabilityProfileResponse>(`/production_facts/capability-profiles`, { method: 'POST', body: JSON.stringify(body) }),
   /**
    * 采用/批准决策列表（decision_state 五态）
    *
    * `GET /api/production_facts/decisions`
    */
   listDecisions: (media_version_id?: string) =>
-    request<DecisionListResponse>(`/api/production_facts/decisions${qs({ media_version_id })}`, { method: 'GET' }),
+    request<DecisionListResponse>(`/production_facts/decisions${qs({ media_version_id })}`, { method: 'GET' }),
   /**
    * 决策变更历史（追加式，不覆盖）
    *
    * `GET /api/production_facts/decisions/history`
    */
   listDecisionHistory: (media_version_id?: string) =>
-    request<DecisionListResponse>(`/api/production_facts/decisions/history${qs({ media_version_id })}`, { method: 'GET' }),
+    request<DecisionListResponse>(`/production_facts/decisions/history${qs({ media_version_id })}`, { method: 'GET' }),
   /**
    * 生成意图列表（冻结后的生成事实）
    *
    * `GET /api/production_facts/intents`
    */
   listProductionIntents: (project?: string, intent_id?: string) =>
-    request<IntentListResponse>(`/api/production_facts/intents${qs({ project, intent_id })}`, { method: 'GET' }),
+    request<IntentListResponse>(`/production_facts/intents${qs({ project, intent_id })}`, { method: 'GET' }),
   /**
    * 登记生成意图（冻结：此后不可改）
    *
    * `POST /api/production_facts/intents`
    */
   createProductionIntent: (body: CreateIntentRequest) =>
-    request<IntentResponse>(`/api/production_facts/intents`, { method: 'POST', body: JSON.stringify(body) }),
+    request<IntentResponse>(`/production_facts/intents`, { method: 'POST', body: JSON.stringify(body) }),
   /**
    * 生成意图详情
    *
    * `GET /api/production_facts/intents/{intent_id}`
    */
   getProductionIntent: (intent_id: string) =>
-    request<IntentResponse>(`/api/production_facts/intents/${encodeURIComponent(String(intent_id))}`, { method: 'GET' }),
+    request<IntentResponse>(`/production_facts/intents/${encodeURIComponent(String(intent_id))}`, { method: 'GET' }),
   /**
    * 派生新意图（冻结意图不可原地改）
    *
    * `POST /api/production_facts/intents/{intent_id}/derive`
    */
   deriveProductionIntent: (intent_id: string) =>
-    request<IntentResponse>(`/api/production_facts/intents/${encodeURIComponent(String(intent_id))}/derive`, { method: 'POST' }),
+    request<IntentResponse>(`/production_facts/intents/${encodeURIComponent(String(intent_id))}/derive`, { method: 'POST' }),
   /**
    * 候选媒体版本列表（含采用/批准状态）
    *
    * `GET /api/production_facts/media`
    */
   listMediaVersions: (intent_id?: string, include_state?: string) =>
-    request<MediaVersionListResponse>(`/api/production_facts/media${qs({ intent_id, include_state })}`, { method: 'GET' }),
+    request<MediaVersionListResponse>(`/production_facts/media${qs({ intent_id, include_state })}`, { method: 'GET' }),
   /**
    * 登记一次生成产出的候选
    *
    * `POST /api/production_facts/media`
    */
   registerMediaVersion: (body: RegisterMediaRequest) =>
-    request<MediaVersionResponse>(`/api/production_facts/media`, { method: 'POST', body: JSON.stringify(body) }),
+    request<MediaVersionResponse>(`/production_facts/media`, { method: 'POST', body: JSON.stringify(body) }),
   /**
    * 媒体版本详情
    *
    * `GET /api/production_facts/media/{media_version_id}`
    */
   getMediaVersion: (media_version_id: string) =>
-    request<MediaVersionResponse>(`/api/production_facts/media/${encodeURIComponent(String(media_version_id))}`, { method: 'GET' }),
+    request<MediaVersionResponse>(`/production_facts/media/${encodeURIComponent(String(media_version_id))}`, { method: 'GET' }),
   /**
    * 批准放行（人工决定；须先采用）
    *
    * `POST /api/production_facts/media/{media_version_id}/approve`
    */
   approveMediaVersion: (media_version_id: string, body: ApproveMediaRequest) =>
-    request<DecisionResponse>(`/api/production_facts/media/${encodeURIComponent(String(media_version_id))}/approve`, { method: 'POST', body: JSON.stringify(body) }),
+    request<DecisionResponse>(`/production_facts/media/${encodeURIComponent(String(media_version_id))}/approve`, { method: 'POST', body: JSON.stringify(body) }),
   /**
    * 采用这版（创作决定；永不隐式升级为批准）
    *
    * `POST /api/production_facts/media/{media_version_id}/select`
    */
   selectMediaVersion: (media_version_id: string, body: SelectMediaRequest) =>
-    request<DecisionResponse>(`/api/production_facts/media/${encodeURIComponent(String(media_version_id))}/select`, { method: 'POST', body: JSON.stringify(body) }),
+    request<DecisionResponse>(`/production_facts/media/${encodeURIComponent(String(media_version_id))}/select`, { method: 'POST', body: JSON.stringify(body) }),
   /**
    * 登记失败台账（生成路径永不因登记失败中断，因此失败必须不读日志也能发现）
    *
    * `GET /api/production_facts/recording-failures`
    */
   listRecordingFailures: (limit?: string, project?: string, episode?: string, shot_key?: string) =>
-    request<RecordingFailureListResponse>(`/api/production_facts/recording-failures${qs({ limit, project, episode, shot_key })}`, { method: 'GET' }),
+    request<RecordingFailureListResponse>(`/production_facts/recording-failures${qs({ limit, project, episode, shot_key })}`, { method: 'GET' }),
   /**
    * 这一镜/这一集到底有没有东西可看（三态，不是一个含糊空态）
    *
    * `GET /api/production_facts/shot-status`
    */
   getShotGenerationStatus: (project?: string, episode?: string, shot_key?: string, kind?: string, paths?: string) =>
-    request<ShotGenerationStatusResponse>(`/api/production_facts/shot-status${qs({ project, episode, shot_key, kind, paths })}`, { method: 'GET' }),
+    request<ShotGenerationStatusResponse>(`/production_facts/shot-status${qs({ project, episode, shot_key, kind, paths })}`, { method: 'GET' }),
 };
 
 /**
@@ -495,21 +495,21 @@ export const stylesApi = {
    * `GET /api/styles`
    */
   listStyles: (category?: string) =>
-    request<StyleListResponse>(`/api/styles${qs({ category })}`, { method: 'GET' }),
+    request<StyleListResponse>(`/styles${qs({ category })}`, { method: 'GET' }),
   /**
    * 由自由文本解析风格（存量项目向后兼容）
    *
    * `GET /api/styles/resolve`
    */
   resolveStyle: (text: string) =>
-    request<StyleResolveResponse>(`/api/styles/resolve${qs({ text })}`, { method: 'GET' }),
+    request<StyleResolveResponse>(`/styles/resolve${qs({ text })}`, { method: 'GET' }),
   /**
    * 风格详情（stable style_id，改名不断历史）
    *
    * `GET /api/styles/{style_id}`
    */
   getStyle: (style_id: string) =>
-    request<StyleResponse>(`/api/styles/${encodeURIComponent(String(style_id))}`, { method: 'GET' }),
+    request<StyleResponse>(`/styles/${encodeURIComponent(String(style_id))}`, { method: 'GET' }),
 };
 
 /**
@@ -522,89 +522,89 @@ export const timelineApi = {
    * `GET /api/timeline/fingerprints/{fingerprint}`
    */
   getTimelineByFingerprint: (fingerprint: string) =>
-    request<TimelineRevisionResponse>(`/api/timeline/fingerprints/${encodeURIComponent(String(fingerprint))}`, { method: 'GET' }),
+    request<TimelineRevisionResponse>(`/timeline/fingerprints/${encodeURIComponent(String(fingerprint))}`, { method: 'GET' }),
   /**
    * 按剪辑指纹反查成片登记
    *
    * `GET /api/timeline/renders/by-fingerprint/{compose_fingerprint}`
    */
   findTimelineRenderVersions: (compose_fingerprint: string) =>
-    request<RenderVersionListResponse>(`/api/timeline/renders/by-fingerprint/${encodeURIComponent(String(compose_fingerprint))}`, { method: 'GET' }),
+    request<RenderVersionListResponse>(`/timeline/renders/by-fingerprint/${encodeURIComponent(String(compose_fingerprint))}`, { method: 'GET' }),
   /**
    * 读取成片登记（含指纹与 sha256）
    *
    * `GET /api/timeline/renders/{render_id}`
    */
   getTimelineRenderVersion: (render_id: string) =>
-    request<RenderVersionResponse>(`/api/timeline/renders/${encodeURIComponent(String(render_id))}`, { method: 'GET' }),
+    request<RenderVersionResponse>(`/timeline/renders/${encodeURIComponent(String(render_id))}`, { method: 'GET' }),
   /**
    * 时间线 revision 列表（不可变）
    *
    * `GET /api/timeline/revisions`
    */
   listTimelineRevisions: (project?: string) =>
-    request<TimelineRevisionListResponse>(`/api/timeline/revisions${qs({ project })}`, { method: 'GET' }),
+    request<TimelineRevisionListResponse>(`/timeline/revisions${qs({ project })}`, { method: 'GET' }),
   /**
    * 冻结一个时间线 revision
    *
    * `POST /api/timeline/revisions`
    */
   createTimelineRevision: (body: CreateTimelineRevisionRequest) =>
-    request<TimelineRevisionResponse>(`/api/timeline/revisions`, { method: 'POST', body: JSON.stringify(body) }),
+    request<TimelineRevisionResponse>(`/timeline/revisions`, { method: 'POST', body: JSON.stringify(body) }),
   /**
    * 该集的最新时间线 revision
    *
    * `GET /api/timeline/revisions/latest`
    */
   getLatestTimelineRevision: (project?: string, episode?: string) =>
-    request<TimelineRevisionResponse>(`/api/timeline/revisions/latest${qs({ project, episode })}`, { method: 'GET' }),
+    request<TimelineRevisionResponse>(`/timeline/revisions/latest${qs({ project, episode })}`, { method: 'GET' }),
   /**
    * 时间线 revision 详情
    *
    * `GET /api/timeline/revisions/{revision_id}`
    */
   getTimelineRevision: (revision_id: string) =>
-    request<TimelineRevisionResponse>(`/api/timeline/revisions/${encodeURIComponent(String(revision_id))}`, { method: 'GET' }),
+    request<TimelineRevisionResponse>(`/timeline/revisions/${encodeURIComponent(String(revision_id))}`, { method: 'GET' }),
   /**
    * 由既有 revision 派生新版本（不可原地改）
    *
    * `POST /api/timeline/revisions/{revision_id}/derive`
    */
   deriveTimelineRevision: (revision_id: string) =>
-    request<TimelineRevisionResponse>(`/api/timeline/revisions/${encodeURIComponent(String(revision_id))}/derive`, { method: 'POST' }),
+    request<TimelineRevisionResponse>(`/timeline/revisions/${encodeURIComponent(String(revision_id))}/derive`, { method: 'POST' }),
   /**
    * 渲染清单（合法静音必须前置声明）
    *
    * `GET /api/timeline/revisions/{revision_id}/manifest`
    */
   getTimelineManifest: (revision_id: string) =>
-    request<RenderManifestResponse>(`/api/timeline/revisions/${encodeURIComponent(String(revision_id))}/manifest`, { method: 'GET' }),
+    request<RenderManifestResponse>(`/timeline/revisions/${encodeURIComponent(String(revision_id))}/manifest`, { method: 'GET' }),
   /**
    * 合成预检（含 compose_fingerprint）
    *
    * `GET /api/timeline/revisions/{revision_id}/preflight`
    */
   preflightTimelineRevision: (revision_id: string) =>
-    request<PreflightResponse>(`/api/timeline/revisions/${encodeURIComponent(String(revision_id))}/preflight`, { method: 'GET' }),
+    request<PreflightResponse>(`/timeline/revisions/${encodeURIComponent(String(revision_id))}/preflight`, { method: 'GET' }),
   /**
    * 按**冻结计划**渲染（只消费 plan，缺任何一镜即 fail-closed）
    *
    * `POST /api/timeline/revisions/{revision_id}/render`
    */
   renderTimelineRevision: (revision_id: string, body?: RenderRequest) =>
-    request<RenderVersionResponse>(`/api/timeline/revisions/${encodeURIComponent(String(revision_id))}/render`, { method: 'POST', body: JSON.stringify(body) }),
+    request<RenderVersionResponse>(`/timeline/revisions/${encodeURIComponent(String(revision_id))}/render`, { method: 'POST', body: JSON.stringify(body) }),
   /**
    * 列出该 revision 的成片登记
    *
    * `GET /api/timeline/revisions/{revision_id}/renders`
    */
   listTimelineRenderVersions: (revision_id: string) =>
-    request<RenderVersionListResponse>(`/api/timeline/revisions/${encodeURIComponent(String(revision_id))}/renders`, { method: 'GET' }),
+    request<RenderVersionListResponse>(`/timeline/revisions/${encodeURIComponent(String(revision_id))}/renders`, { method: 'GET' }),
   /**
    * 核验渲染结果与时长（不登记 EpisodeRenderVersion）
    *
    * `POST /api/timeline/revisions/{revision_id}/verify-render`
    */
   verifyTimelineRender: (revision_id: string, body: VerifyRenderRequest) =>
-    request<VerifyRenderResponse>(`/api/timeline/revisions/${encodeURIComponent(String(revision_id))}/verify-render`, { method: 'POST', body: JSON.stringify(body) }),
+    request<VerifyRenderResponse>(`/timeline/revisions/${encodeURIComponent(String(revision_id))}/verify-render`, { method: 'POST', body: JSON.stringify(body) }),
 };
