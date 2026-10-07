@@ -48,9 +48,11 @@ import threading
 import time
 import traceback
 
+import auto_release  # 自动放行策略引擎（2026-10-07）：三阶段独立闸门，fail-closed
 import cancellation
 import dialogue_utils  # 台词闸门：整集无台词不得出片（2026-10-07）
 import gpu_task_gate
+import nle_export  # 导出（剪映/FCPXML/SRT/帧清单）——交付包的数据源
 import quality_stage  # 四层质量状态 + 哈希绑定人审（2026-09-29）
 import task_lease  # 文件租约 + 心跳（2026-09-29：跨进程互斥 + 崩溃可回收）
 import failure_codes  # 结构化失败码（2026-09-29：从既有文案归类，原文一字不改）
@@ -169,7 +171,11 @@ def is_episode_running(project_name: str, episode_no: int) -> bool:
 #: `upscale` 紧跟 `video`：对**集级原片**（video 步产出的整集视频）超分；
 #:    `final` 优先消费超分产物，故 `final` 落在最后一步。
 STEP_SEQUENCE = ("script", "tts_pre", "assets", "storyboard", "keyframe", "video",
-                 "upscale", "final")
+                 "upscale", "final", "export", "delivery")
+
+#: 2026-10-07 补的两步（`export` / `delivery`）必须排在 `final` 之后：导出消费的是
+#: 成片，交付包扫描的是导出目录。两者默认**关闭**（``enable_export`` /
+#: ``enable_delivery``），关闭时整步 skipped，既有托管计划行为一字不变。
 
 STEP_LABELS = {
     "script": "剧本生成",
@@ -180,6 +186,8 @@ STEP_LABELS = {
     "video": "视频生成",
     "upscale": "超分（FlashVSR）",
     "final": "成片合成",
+    "export": "导出（SRT / 剪映 / FCPXML / 帧清单）",
+    "delivery": "交付包登记与机器校验",
 }
 
 #: 视频生成方式的**唯一权威默认**（2026-10-07 收敛）。
@@ -227,6 +235,24 @@ DEFAULT_CONFIG = {
     # 一段参考音色音频，供 H3 以 `audioMode=generate` 锁定角色音色并自生成对白。
     # （不再逐句合成整集配音、不再回填 shot.duration。）仅在调试或无需参考音色时关闭。
     "enable_tts_pre": True,
+    # 导出（2026-10-07 新增，排在 final 之后）：产出 SRT / 剪映草稿 / FCPXML / 帧清单。
+    # **默认关闭**：既有托管计划不声明该开关，若默认开启会在用户没要求时往
+    # `output/export/` 写文件。打开它，`delivery` 步才有东西可交付。
+    "enable_export": False,
+    # 分集导出作用域（2026-10-07，默认关闭）：为真时导出落到
+    # ``output/export/<项目>/epNN/``（清单一起），交付包也从该目录扫。
+    # ⚠️ **必须同时作用于导出与交付两侧**：只改一侧比不改更糟 —— 导出分目录而
+    # 交付仍递归扫项目根，第 2 集的交付包会把第 1 集的产物一起收进去，且机器校验
+    # 照样通过。``step_delivery`` 里的闸门会拦住「多集项目却没开这个开关」。
+    # 关闭时落盘路径与文件名与该功能引入前逐字相同。
+    "export_episode_scope": False,
+    # 交付（2026-10-07 新增，排在 export 之后）：建交付包 + 机器校验。
+    # ⚠️ 它只把状态推到 `verified`；**是否放行（approved）由
+    # ``config/automation-policy.json`` 决定**，策略默认关闭 ⇒ 停在 `verified`。
+    # 「机器校验通过 ≠ 批准」（ADR-0006）在本步同样成立。
+    "enable_delivery": False,
+    # 交付预设（竖屏 9:16 / 横屏 16:9 / 3:4）；空串 = 用领域层默认预设。
+    "delivery_preset_id": "",
     "video_mode": "episode",       # episode（整集一次生成，连续无缝）/ per_shot（逐镜独立）/ keyframe
     # 关键帧「跨镜链式」：auto=同场景才串 / always=无条件串 / off=关闭。
     # 上一镜尾帧作为下一镜首帧参考，镜与镜首尾相接，避免每镜各画各的。
@@ -267,9 +293,12 @@ def normalize_config(raw: dict, default_project_key: str = "") -> dict:
         cfg["coverage_min_percent"] = DEFAULT_CONFIG["coverage_min_percent"]
     for k in ("enable_assets", "enable_keyframe", "enable_video", "enable_final",
               "enable_tts", "enable_mix", "enable_tts_pre",
-              "enable_upscale", "require_consistency",
+              "enable_upscale", "enable_export", "enable_delivery",
+              "export_episode_scope",
+              "require_consistency",
               "auto_repair", "overwrite_script"):
         cfg[k] = bool(cfg.get(k))
+    cfg["delivery_preset_id"] = str(cfg.get("delivery_preset_id") or "").strip()
     # 2026-10-01：只保留整集一次生成（per_shot / keyframe 废弃）—— 与 config.norm_video_mode
     # 同口径（那里也是无条件返回 episode）。原实现紧接着还有一个
     # `if cfg.get("video_mode") == "keyframe": cfg["enable_keyframe"] = True` 分支，
@@ -314,6 +343,13 @@ def assert_mode_contract(cfg: dict) -> None:
     elif mode == "episode":
         if final_on and not video_on:
             raise PipelineError("整集模式的成片需要整集视频，但视频生成步骤被禁用；请启用视频生成，或关闭成片合成")
+    # 2026-10-07：`delivery` 交付包扫描的是 `output/export/`（交付蓝图**刻意不重新导出**），
+    # 导出步骤被禁用时交付步必然恒定拿到空包（DLV-EMPTY-PACKAGE）。这属于配置矛盾，
+    # 在步骤循环前 fail-loud，而不是每集跑到交付步才报一个看不懂的空包错误。
+    if bool(cfg.get("enable_delivery")) and not bool(cfg.get("enable_export")):
+        raise PipelineError("已启用交付登记（enable_delivery）但导出步骤被禁用；"
+                            "交付包只扫描导出目录、不重新导出，请启用导出（enable_export），"
+                            "或关闭交付登记")
 
 
 # ===================== 异常 =====================
@@ -735,6 +771,109 @@ def probe_upscale(ctx) -> dict:
     return {"total": 1, "ready": 1 if _playable(p) else 0, "done": _playable(p), "file": p}
 
 
+# ===================== 导出 / 交付产物探测 =====================
+
+
+def export_dir(ctx) -> str:
+    """该项目**本集**的导出目录（``nle_export.project_export_dir``）。
+
+    开 ``export_episode_scope`` 时是 ``<项目>/epNN/``，否则是 ``<项目>/``。
+    # 交付包走同一个 nle_export.project_export_dir，所以两侧口径同源。
+    # ⚠️ 承重处：probe_export 内部是 os.walk **递归**。这里不按集收窄的话，
+    # 第 2 集会在 ep01/ 里看到第 1 集的产物，判定「已就绪」而**整步跳过导出**。
+    """
+    cfg = ctx.get("config") or {}
+    ep = ctx.get("episode_no") if cfg.get("export_episode_scope") else None
+    return nle_export.project_export_dir(str(ctx.get("project_name") or ""), episode=ep)
+
+
+def probe_export(ctx) -> dict:
+    """导出就绪判据：**本集**导出目录里至少有一个**非空**文件。
+
+    为什么判据这么粗
+    --------------
+    ``nle_export`` 的四种格式都写在同一个目录（SRT/FCPXML/帧清单/剪映草稿）；
+    未开 ``export_episode_scope`` 时那个目录是**项目级**且文件名不带集号
+    （与 ``api_export_run`` 一致）。因此这里无法像其它步骤那样按 ``epNN`` 路径
+    逐镜核对；能稳定成立的判据只有「该目录非空」。
+    这也是交付侧的真实前提 —— 空目录必然拿到 ``DLV-EMPTY-PACKAGE``。
+
+    ⚠️ 未开分集作用域时的口径代价（如实记录）：多集项目里第 2 集会把第 1 集的
+    导出目录判成「已就绪」而跳过导出，两集的产物本就互相覆盖。本步的判据补不了
+    这个洞 —— 由 ``step_delivery`` 的 ``DLV-EPISODE-SCOPE-REQUIRED`` 闸门在多集
+    项目上**直接拒绝交付**来兜底。
+    """
+    d = export_dir(ctx)
+    files = []
+    if os.path.isdir(d):
+        for dirpath, _dirs, names in os.walk(d):
+            for fn in names:
+                p = os.path.join(dirpath, fn)
+                if _nonempty(p):
+                    files.append(p)
+    done = bool(files)
+    return {"total": 1, "ready": 1 if done else 0, "done": done,
+            "dir": d, "file_count": len(files),
+            "files": sorted(files)[:20]}
+
+
+def probe_delivery(ctx) -> dict:
+    """交付就绪判据：该集是否已有**已批准**的交付包。
+
+    刻意只认 ``approved``：``built``/``verified`` 都不是完成态（ADR-0006 四态），
+    拿它们当「已完成」会让策略打开后永远短路跳过、永远不再尝试放行。
+    读不到库（未建表/损坏）时按**未就绪**处理 —— 最坏后果是多跑一次登记，
+    而按「已就绪」处理的后果是**永远不再交付**。
+    """
+    out = {"total": 0, "ready": 0, "done": False, "package_id": "",
+           "status": "", "note": "尚无交付包"}
+    try:
+        packages = _delivery_list(ctx.get("project_name"))
+    except Exception as e:  # noqa: BLE001  只读探测，失败按未就绪
+        logger.warning("读取交付包列表失败（按未就绪处理，项目 %s）：%s",
+                       ctx.get("project_name"), e)
+        out["note"] = f"交付库不可读（按未就绪）：{e}"
+        return out
+    ep = str(int(ctx.get("episode_no") or 1))
+    mine = [p for p in (packages or [])
+            if str(p.get("project") or "") == str(ctx.get("project_name") or "")
+            and str(p.get("episode_no") or "") == ep]
+    out["total"] = len(mine)
+    approved = [p for p in mine if p.get("status") == _delivery_status_approved()]
+    if approved:
+        pick = approved[-1]
+        out.update({"ready": 1, "done": True,
+                    "package_id": str(pick.get("package_id") or ""),
+                    "status": str(pick.get("status") or ""),
+                    "note": "该集已有已批准交付包，跳过（断点续跑）"})
+    elif mine:
+        last = mine[-1]
+        out.update({"package_id": str(last.get("package_id") or ""),
+                    "status": str(last.get("status") or ""),
+                    "note": "已有交付包但未批准（%s），本次继续登记并校验"
+                            % (last.get("status") or "未知状态")})
+    return out
+
+
+def _delivery_status_approved() -> str:
+    try:
+        from domain import delivery as _dd
+        return _dd.STATUS_APPROVED
+    except ImportError:  # pragma: no cover - 脚本方式导入兜底
+        from app.domain import delivery as _dd  # type: ignore
+        return _dd.STATUS_APPROVED
+
+
+def _delivery_list(project: str):
+    """按项目列出交付包（延迟 import，保持 pipeline 不在模块期牵出交付栈）。"""
+    try:
+        from infrastructure import delivery_repo as _dr
+    except ImportError:  # pragma: no cover
+        from app.infrastructure import delivery_repo as _dr  # type: ignore
+    safe = _dr.safe_project(str(project or ""))
+    return _dr.list_packages(safe) if safe else []
+
+
 PROBES = {
     "script": probe_script,
     "assets": probe_assets,
@@ -745,6 +884,8 @@ PROBES = {
     "tts": probe_tts,
     "mix": probe_mix,
     "upscale": probe_upscale,
+    "export": probe_export,
+    "delivery": probe_delivery,
 }
 
 
@@ -1022,13 +1163,13 @@ def _record_pipeline_facts(ctx, kind: str, shots, paths) -> dict:
     rows = list(shots or [])
     items = list(paths or [])
     if not rows or not items:
-        return {"registered": 0, "errors": []}
+        return {"registered": 0, "errors": [], "media_version_ids": []}
     try:
         try:
             import production_recording
         except ImportError:  # pragma: no cover - 脚本方式导入兜底
             from app import production_recording  # type: ignore
-        registered, errors = 0, []
+        registered, errors, mv_ids = 0, [], []
         media_kind = "image" if kind == "storyboard" else kind
         episode = str(ctx.get("episode_no") or 1)
         project = str(ctx.get("project_name") or "")
@@ -1053,15 +1194,16 @@ def _record_pipeline_facts(ctx, kind: str, shots, paths) -> dict:
             ))
             if res.get("media_version_ids"):
                 registered += len(res["media_version_ids"])
+                mv_ids.extend(str(m) for m in res["media_version_ids"] if str(m or ""))
             elif res.get("skipped"):
                 errors.append("%s: %s" % (shot_key, "; ".join(res["skipped"])[:200]))
         if errors:
             logger.warning("版本化生产事实登记部分失败（不影响产物）：%s",
                            "；".join(errors[:5]))
-        return {"registered": registered, "errors": errors}
+        return {"registered": registered, "errors": errors, "media_version_ids": mv_ids}
     except Exception as exc:  # noqa: BLE001
         logger.warning("版本化生产事实登记不可用（不影响产物）：%s", exc)
-        return {"registered": 0, "errors": [str(exc)]}
+        return {"registered": 0, "errors": [str(exc)], "media_version_ids": []}
 
 
 def step_storyboard(ctx) -> dict:
@@ -1075,8 +1217,12 @@ def step_storyboard(ctx) -> dict:
             seq = _A()._shot_seq(sh.get("shot_id", i + 1), i + 1)
             paths0.append(os.path.join(pd["dir"], f"shot_{seq:02d}.png"))
         facts0 = _record_pipeline_facts(ctx, "storyboard", shots0, paths0)
+        # 断点续跑短路时同样接线：产物早已质检通过，媒体版本就在库里。
+        detail0 = {"probe": pd, "production_facts": facts0}
+        detail0["auto_release"] = _auto_release_media(
+            ctx, facts0.get("media_version_ids"))
         return {"ok": True, "skipped": True,
-                "detail": {"probe": pd, "production_facts": facts0},
+                "detail": detail0,
                 "artifact": pd["dir"]}
     script = ctx.get("script") or {}
     shots = script.get("shots") or []
@@ -1115,6 +1261,9 @@ def step_storyboard(ctx) -> dict:
         seq = A._shot_seq(sh.get("shot_id", i + 1), i + 1)
         sb_paths.append(os.path.join(recheck["dir"], f"shot_{seq:02d}.png"))
     detail["production_facts"] = _record_pipeline_facts(ctx, "storyboard", shots, sb_paths)
+    # 质检通过 + 产物复核通过之后，才是「这一版确实合格」的时点 —— 自动放行接在这里。
+    detail["auto_release"] = _auto_release_media(
+        ctx, (detail["production_facts"] or {}).get("media_version_ids"))
     return {"ok": True, "detail": detail, "artifact": recheck["dir"]}
 
 
@@ -1203,8 +1352,11 @@ def step_video(ctx) -> dict:
                 seq = _A()._shot_seq(sh.get("shot_id", i + 1), i + 1)
                 paths0.append(os.path.join(pd["dir"], f"shot_{seq:02d}.mp4"))
         facts0 = _record_pipeline_facts(ctx, "video", shots0, paths0)
+        detail0 = {"probe": pd, "production_facts": facts0}
+        detail0["auto_release"] = _auto_release_media(
+            ctx, facts0.get("media_version_ids"))
         return {"ok": True, "skipped": True,
-                "detail": {"probe": pd, "production_facts": facts0},
+                "detail": detail0,
                 "artifact": pd["dir"]}
     script = ctx.get("script") or {}
     shots = script.get("shots") or []
@@ -1291,6 +1443,9 @@ def step_video(ctx) -> dict:
             seq = A._shot_seq(sh.get("shot_id", i + 1), i + 1)
             fact_paths.append(os.path.join(recheck["dir"], f"shot_{seq:02d}.mp4"))
     detail["production_facts"] = _record_pipeline_facts(ctx, "video", fact_shots, fact_paths)
+    # 视频 AI 质检门禁 + 产物复核都已通过 —— 自动采用/批准接在这里（与 storyboard 同口径）。
+    detail["auto_release"] = _auto_release_media(
+        ctx, (detail["production_facts"] or {}).get("media_version_ids"))
     return {"ok": True, "detail": detail, "artifact": recheck["dir"]}
 
 
@@ -1601,6 +1756,479 @@ def step_upscale(ctx) -> dict:
                        "size": os.path.getsize(out)}}
 
 
+def preview_auto_release(project: str = "", episode_no: int = 0,
+                         subject: str = "dry-run", qc: dict = None) -> dict:
+    """**只读**预演：当前策略会对这一步做什么、卡在哪一道闸门。零写入。
+
+    为什么是模块函数而不是 HTTP 端点
+    ------------------------------
+    加路由就必须同步登记 OpenAPI operation 并重跑 ``scripts/generate_client.py``，
+    而生成物落在 ``frontend/src/api/generated/`` —— 那属于前端目录，不在本轮
+    范围内。本函数提供同样的只读能力（运维在解释器里一行调用，或由诊断脚本
+    包装），且**不 import flask、不连库、不写盘**。
+
+    安全性
+    ------
+    内部只调 ``AutoReleaseEngine.describe()`` 与 ``explain()``，两者都是纯判定
+    （``explain`` 走 ``_preflight(dry_run=True)``）。不碰 GPU / ComfyUI / ffmpeg。
+
+    用法::
+
+        MJSCXT_AUTOPILOT=0 python -c "import sys;sys.path.insert(0,'app');\\
+            import pipeline,json;print(json.dumps(pipeline.preview_auto_release(),\\
+            ensure_ascii=False,indent=2))"
+    """
+    try:
+        engine = auto_release.AutoReleaseEngine()
+        return engine.explain("adopt", subject=subject, project=project or "",
+                              episode=str(episode_no or ""), qc=qc)
+    except Exception as e:  # noqa: BLE001  只读视图，坏掉也只是看不到预览
+        logger.error("自动放行预演失败：%s", e)
+        return {"error": f"{type(e).__name__}: {e}",
+                "environment": auto_release.describe_environment()}
+
+
+#: 分集作用域未开启时的交付阻断码。前端按码分支，不解析文案。
+DLV_EPISODE_SCOPE_REQUIRED = "DLV-EPISODE-SCOPE-REQUIRED"
+
+
+def _plan_episode_numbers(cfg: dict):
+    """把 ``cfg['episodes']`` 归一成集号列表；``None`` = 「不限定（全部）」。
+
+    与 ``autopilot.target_episodes`` 同语义（``"all"`` / 单值 / 逗号串 / 列表）。
+    这里**不 import autopilot**（它在 import 本模块，会成环）。
+    """
+    sel = (cfg or {}).get("episodes")
+    if sel is None or isinstance(sel, bool):
+        return None
+    if isinstance(sel, (int, float)):
+        return [int(sel)]
+    if isinstance(sel, str):
+        s = sel.strip()
+        if not s or s.lower() == "all":
+            return None
+        parts = [p.strip() for p in s.replace("，", ",").split(",") if p.strip()]
+        try:
+            return [int(p) for p in parts] or None
+        except ValueError:
+            return None
+    if isinstance(sel, (list, tuple)):
+        out = []
+        for x in sel:
+            try:
+                out.append(int(x))
+            except (TypeError, ValueError):
+                return None
+        return out or None
+    return None
+
+
+def check_export_episode_scope(cfg: dict, ctx: dict, project: str) -> dict:
+    """分集交付的前置闸门（**fail-closed**）：多集项目必须开分集作用域。
+
+    为什么是承重的一环
+    ----------------
+    导出产物默认写在项目级目录、文件名不带集号。多集项目里第 2 集的导出
+    **覆盖**第 1 集；而 ``domain.delivery.iter_root_files`` 是**递归**扫描，
+    就算改成 ``<项目>/epNN/`` 子目录，交付只要还从项目根扫，就会把兄弟集的产物
+    一起收进本集交付包。这两条都是**静默**的：机器校验会通过（文件确实在磁盘上、
+    哈希确实对得上）、人工批准签得下去、交付方收到的是别的集的字幕。
+
+    判据
+    ----
+    不是「磁盘上现在有没有别的集」（被覆盖之后已无从分辨），而是
+    **「计划是不是多集」**：只有计划明确只做一个集号（``episodes`` 恰好一个数字）
+    才能证明不分集也是对的。``episodes`` 缺省是 ``"all"`` —— 那是「全部」不是
+    「一集」，把它当单集会把这次要关的洞重新打开。所以 ``all`` 一律按多集处理。
+
+    开了作用域但没有集号也拒绝：定位不到本集产物目录，同样无法建立正确性。
+
+    返回 ``{"ok": bool, "reason": str, "detail": dict}``；调用方决定怎么报。
+    """
+    cfg = cfg or {}
+    nums = _plan_episode_numbers(cfg)
+    single = bool(nums) and len(nums) == 1
+    scoped = bool(cfg.get("export_episode_scope"))
+    try:
+        ep = int(ctx.get("episode_no") or 0)
+    except (TypeError, ValueError):
+        ep = 0
+    detail = {"plan_episodes": cfg.get("episodes"), "single_episode": single,
+              "export_episode_scope": scoped, "episode_no": ep or None,
+              "artifact_root": ""}
+    if scoped:
+        if ep <= 0:
+            return {"ok": False, "detail": detail,
+                    "reason": ("已开启分集导出作用域（export_episode_scope）但本次没有"
+                               "有效集号（episode_no），无法定位本集产物目录；"
+                               "不分集扫描会收进兄弟集的产物，拒绝交付")}
+        detail["artifact_root"] = nle_export.project_export_dir(project, episode=ep)
+        return {"ok": True, "reason": "", "detail": detail}
+    if single:
+        return {"ok": True, "reason": "", "detail": detail}
+    return {"ok": False, "detail": detail,
+            "reason": ("多集项目（第 %s 集，计划 episodes=%r）的导出产物写在项目级目录"
+                       "且文件名不带集号：同项目的其它集会覆盖它，而交付扫描是递归的，"
+                       "还可能把别的集的产物收进本集交付包 —— 机器校验照样会通过。"
+                       "请开启 export_episode_scope（导出与交付同时生效）后重跑本集；"
+                       "若只想单集试跑，请把计划的 episodes 设成单一集号。"
+                       % (ep or "?", cfg.get("episodes")))}
+
+
+def step_export(ctx) -> dict:
+    """导出成片为 SRT / 剪映草稿 / FCPXML / 帧清单（交付的数据源）
+
+    为什么补这一步
+    --------------
+    交付蓝图 ``app/api/delivery.py`` **刻意不重新导出**任何东西 —— 它只扫描
+    ``nle_export.EXPORT_DIR`` 里**既有**的产物，目录为空就返回
+    ``DLV-EMPTY-PACKAGE``（提示「请先执行导出」）。而导出此前只有手动端点
+    ``POST /api/export/run`` 一条入口：无人值守托管跑到成片为止就停住，
+    永远产不出可交付的东西。
+
+    参数与手动端点**逐字同源**
+    ------------------------
+    ``app/api/ops.py::api_export_run`` 调的是
+    ``nle_export.export_all(project, script, formats=…, episode=ep_no)``：
+    ``videos`` / ``audio`` 不传（由 ``export_all`` 内部按 ``episode`` 扫目录 /
+    找配音轨），``formats`` 缺省为 ``None``（= 全部四种格式）。这里照抄，
+    不新增参数、不改默认值 —— 两处一旦分叉，「手动导出的」与「托管导出的」
+    就会是两份不同的交付物，而交付清单记的是文件哈希，差异无人能一眼看出。
+
+    ⚠️ 唯一的例外是 ``episode_scope``：托管侧独有的开关，**默认 False**，
+    默认时 ``export_all`` 的落盘位置与文件名与手动端点**逐字相同**。
+
+    幂等
+    ----
+    ``probe_export`` 命中（非空导出目录）即整步跳过；导出本身是纯写文本产物、
+    不碰 GPU、不调用 ffmpeg 合成，因此重复执行代价很低但没有重复的必要。
+    """
+    cfg = ctx["config"]
+    if not cfg.get("enable_export"):
+        return {"ok": True, "skipped": True,
+                "detail": {"note": "导出已关闭（enable_export=False）"}}
+
+    pd = probe_export(ctx)
+    if pd.get("done"):
+        return {"ok": True, "skipped": True, "detail": {"probe": pd},
+                "artifact": pd.get("dir") or ""}
+
+    script = ctx.get("script") or {}
+    if not script:
+        script = _load_script_into_ctx(ctx)
+        ctx["script"] = script
+    shots = script.get("shots") or []
+    if not shots:
+        raise NeedsHumanError("剧本没有镜头数据，无法导出（请先完成剧本生成）")
+
+    ctx["progress"](f"导出（{len(shots)} 镜）", 96, phase="export")
+    ep_no = int(ctx["episode_no"])
+    try:
+        # 与 api_export_run 完全同参：videos/audio 走 export_all 内部默认解析。
+        results = nle_export.export_all(ctx["project_name"], script, episode=ep_no,
+                                        episode_scope=bool(cfg.get("export_episode_scope")))
+    except Exception as e:  # noqa: BLE001
+        # 导出失败是**真失败**（不是增强环节）：交付步会拿到空包。不吞。
+        raise PipelineError(f"导出失败：{type(e).__name__}: {e}") from e
+
+    if not results.get("ok"):
+        errs = [str((v or {}).get("error") or "")
+                for k, v in (results.get("results") or {}).items()
+                if isinstance(v, dict) and not v.get("ok")]
+        raise PipelineError("导出未产出任何有效产物：" + "；".join(e for e in errs if e))
+
+    recheck = probe_export(ctx)
+    detail = {"timeline": (results.get("results") or {}).get("timeline"),
+              "output_dir": results.get("output_dir"), "probe": recheck,
+              "episode_scope": bool(cfg.get("export_episode_scope")),
+              "formats": sorted(k for k, v in (results.get("results") or {}).items()
+                                if isinstance(v, dict) and v.get("ok"))}
+    if not recheck.get("done"):
+        return {"ok": False, "detail": detail,
+                "error": "导出目录仍为空（导出报告成功但未落盘产物）"}
+    return {"ok": True, "artifact": recheck["dir"], "detail": detail}
+
+
+def step_delivery(ctx) -> dict:
+    """登记交付包 → 机器校验 → （仅当策略允许）自动放行
+
+    顺序是 ADR-0006 / ADR-0007 的既有语义，一个都不许调换：
+
+    ⓪ **分集作用域闸门**（``check_export_episode_scope``，fail-closed）：
+       多集项目必须开 ``export_episode_scope``，否则**拒绝建包**。
+       理由见该函数：不分集时导出产物会互相覆盖，而交付扫描是递归的，
+       可能把兄弟集的产物收进本集交付包，且机器校验照样通过。
+       拒绝发生在建包与放行之前 ⇒ 自动放行在「正确性无法建立」时必被挡住。
+    1. **授权门禁先行**（``licensing_repo.evaluate_delivery_gate``，fail-closed）：
+       未登记授权的模型/素材**不得进入交付**，拦在建包这一步（与
+       ``POST /api/delivery/packages`` 完全一致）。门禁不过 ⇒ 连包都不建。
+    2. ``build_package`` → ``save_package``：扫既有导出产物、逐文件算 SHA-256。
+       目录为空 ⇒ ``DLV-EMPTY-PACKAGE``（提示先执行导出）。
+    3. ``verify_files`` + ``record_verify``：**机器校验**。这一步最多把状态推到
+       ``verified``，**永远不会**推到 ``approved``（ADR-0006 状态机没有这条边）。
+    4. 放行是**独立**动作，且只在 ``config/automation-policy.json`` 允许时才发生。
+
+    策略关闭时（默认）
+    ----------------
+    仍然建包 + 校验，停在 ``verified``，并在 detail 里如实写明「未放行 + 为什么」。
+    **关闭策略不会破坏交付**，只是不自动放行 —— 这是本步最重要的行为约定。
+
+    「采用 ≠ 批准」
+    ------------
+    本步只调用引擎的 ``auto_deliver``（交付放行），**从不**调 ``auto_adopt`` /
+    ``auto_approve``。媒体版本的采用/批准在质检通过处单独接线（见
+    ``_auto_release_media``），两条路互不产生副作用。
+    """
+    cfg = ctx["config"]
+    if not cfg.get("enable_delivery"):
+        return {"ok": True, "skipped": True,
+                "detail": {"note": "交付登记已关闭（enable_delivery=False）"}}
+
+    pd = probe_delivery(ctx)
+    if pd.get("done"):
+        return {"ok": True, "skipped": True,
+                "detail": {"probe": pd}, "artifact": pd.get("package_id") or ""}
+
+    project = str(ctx["project_name"])
+    ep_no = int(ctx["episode_no"])
+    preset_id = str(cfg.get("delivery_preset_id") or "")
+
+    # ---- ⓪ 分集作用域闸门（fail-closed） ------------------------------
+    # 必须排在 probe_delivery 之后、建包之前：probe 已证明本集有**已批准**的包时
+    # 本步是空操作，不该再报错；一旦要新建包，就必须先证明这份包的产物集合是对的。
+    scope = check_export_episode_scope(cfg, ctx, project)
+    if not scope.get("ok"):
+        # 直接拒绝：不建包 ⇒ 不会走到 _try_auto_release_deliver ⇒ 自动放行被挡住。
+        # 「多集 + 未分集」正是正确性无法建立的那一种情况，不能靠运气放过去。
+        return {"ok": False,
+                "detail": {"stage": "episode_scope", "check": scope},
+                "error": "%s：%s" % (DLV_EPISODE_SCOPE_REQUIRED,
+                                      scope.get("reason") or "")}
+    scoped = bool(scope.get("detail", {}).get("export_episode_scope"))
+
+    requirement = cfg.get("delivery_requirement")
+    requirement = dict(requirement) if isinstance(requirement, dict) else {}
+
+    try:
+        from infrastructure import delivery_repo as _dr
+        from infrastructure import licensing_repo as _lr
+        from domain import delivery as _dd
+        from domain import licensing as _ld
+    except ImportError:  # pragma: no cover - 脚本方式导入兜底
+        from app.infrastructure import delivery_repo as _dr  # type: ignore
+        from app.infrastructure import licensing_repo as _lr  # type: ignore
+        from app.domain import delivery as _dd  # type: ignore
+        from app.domain import licensing as _ld  # type: ignore
+
+    # ---- ① 授权门禁先行（fail-closed） ---------------------------------
+    ctx["progress"]("交付：授权门禁…", 97, phase="delivery")
+    gate = _lr.evaluate_delivery_gate(requirement, project=project, audit=True)
+    if not gate.get("ok"):
+        # 门禁不过 = 不许进入交付。**不建包**（build_package 在此之下），
+        # 因为 ADR-0007 的要求是拦在「进入交付」这一步，而不是事后清理。
+        return {"ok": False,
+                "detail": {"stage": "licensing_gate", "gate": {
+                    "ok": False, "summary": gate.get("summary") or "",
+                    "violations": gate.get("violations") or []}},
+                "error": ("交付授权门禁未通过（%s）：%s"
+                          % (_ld.LIC_GATE_BLOCKED,
+                             gate.get("summary") or "授权登记表不可用"))}
+
+    # ---- ② 建包（不重新导出，只登记既有导出产物） ----------------------
+    pkg = _dr.build_package(project, preset_id or _dd.DEFAULT_PRESET_ID,
+                            requirement=requirement, licensing_gate=gate,
+                            episode_no=ep_no, episode_scope=scoped)
+    if not (pkg.get("files") or []):
+        return {"ok": False,
+                "detail": {"stage": "build_package", "file_count": 0},
+                "error": ("%s：%s（请先执行导出，产出 SRT / 剪映草稿 / FCPXML / "
+                          "帧清单后再登记交付包）"
+                          % (_dd.DLV_EMPTY_PACKAGE,
+                             _dd.DELIVERY_ERROR_CODES.get(_dd.DLV_EMPTY_PACKAGE, "")))}
+    saved = _dr.save_package(pkg) or pkg
+    package_id = str(saved.get("package_id") or pkg.get("package_id") or "")
+
+    # ---- ③ 机器校验（最多到 verified，绝不到 approved） -----------------
+    ctx["progress"]("交付：机器校验…", 98, phase="delivery")
+    result = _dd.verify_files(saved.get("files") or [],
+                              root=saved.get("artifact_root") or "")
+    _dr.record_verify(package_id, result)
+    view = _dr.get_package(package_id) or saved
+    approval = _dr.get_approval(package_id)
+    status = _dd.derive_status(view, approval)
+
+    detail = {"stage": "verified", "package_id": package_id,
+              "package_hash": view.get("package_hash") or "",
+              "preset_id": view.get("preset_id") or "",
+              "file_count": len(view.get("files") or []),
+              "verify": {"ok": bool(result.get("ok")),
+                         "checked": result.get("checked"),
+                         "missing": result.get("missing") or [],
+                         "mismatched": result.get("mismatched") or []},
+              "status_after_verify": status,
+              "approval": _dd.evaluate_approval(view, approval)}
+    if not result.get("ok"):
+        return {"ok": False, "detail": detail,
+                "error": ("交付包机器校验未通过（缺失 %d / 哈希不符 %d）"
+                          % (len(result.get("missing") or []),
+                             len(result.get("mismatched") or [])))}
+
+    # ---- ④ 放行：独立动作，仅在策略允许时发生 --------------------------
+    decision = _try_auto_release_deliver(ctx, package_id, view)
+    detail["auto_release"] = decision
+    released = str(((decision or {}).get("result") or {}).get("status") or "")
+    detail["status_final"] = released or status
+
+    if (decision or {}).get("allowed"):
+        return {"ok": True, "artifact": package_id, "detail": detail}
+    # 策略不允许 / 未配置 / 拒绝：停在 verified，**不算失败**。
+    # 交付已经建好并校验过；不放行只是「还没人/没策略放它」。
+    return {"ok": True, "artifact": package_id, "detail": detail}
+
+
+#: 决策对象类型（领域层 ``build_selection`` 只认这两个值）。
+#: 与 ``api/production_facts.py`` 的 ``subject_type or "media_version"`` 默认同口径。
+_SUBJECT_TYPE_MEDIA_VERSION = "media_version"
+
+
+def _auto_release_engine(ctx):
+    """取本集要用的策略引擎。
+
+    正常托管流程 ``ctx`` 里没有 ``engine``，于是按引擎自己的默认口径构造
+    （读 ``config/automation-policy.json`` + ``MJSCXT_APPROVER_ALLOWLIST``）。
+    允许调用方在 ``ctx["engine"]`` 预置一个引擎实例（探针 / 将来按项目指定策略），
+    这与引擎「依赖全部注入」的设计一致，且**不放宽任何闸门** —— 换引擎只是换
+    配置来源，白名单与总开关仍由引擎自己判。
+    """
+    eng = ctx.get("engine") if isinstance(ctx, dict) else None
+    if eng is not None:
+        return eng
+    return auto_release.AutoReleaseEngine()
+
+
+def _try_auto_release_deliver(ctx, package_id: str, pkg: dict) -> dict:
+    """把「交付放行」交给策略引擎；**任何异常都如实上报，绝不静默放行**。
+
+    刻意包在 try 里：自动放行是**旁路增强**，它坏掉不该把已经建好并校验过的
+    交付步打成失败 —— 但失败原因必须出现在 detail 里，不能吞掉。
+    """
+    try:
+        engine = _auto_release_engine(ctx)
+        decision = engine.auto_deliver(
+            package_id, project=str(ctx.get("project_name") or ""),
+            episode=str(int(ctx.get("episode_no") or 1)),
+            qc=_delivery_qc(pkg))
+        out = decision.to_dict()
+        out["result"] = decision.result if isinstance(decision.result, dict) else {}
+        if decision.allowed:
+            logger.info("交付包已按策略自动放行：package=%s ref=%s",
+                        package_id, decision.authorization_ref)
+        else:
+            logger.info("交付包未自动放行（%s）：%s", decision.code, decision.reason)
+        return out
+    except Exception as e:  # noqa: BLE001
+        logger.error("自动放行调用异常（package=%s，不影响已完成的建包与校验）：%s",
+                     package_id, e)
+        return {"allowed": False, "stage": "deliver",
+                "code": "AR-ACTION-FAILED", "error": f"{type(e).__name__}: {e}"}
+
+
+def _delivery_qc(pkg: dict) -> dict:
+    """交付放行的 QC 输入。
+
+    刻意**只**如实汇报机器已经知道的事实（逐文件校验是否全过），不给「主观质量分」。
+    策略默认 ``qc.min_score = null`` ⇒ 引擎判 ``AR-QC-THRESHOLD-UNSET`` 拒绝，
+    这正是期望的默认行为：想让策略放行，操作者必须先显式写下自己的门槛，
+    而不是让流水线替他们编一个分数。
+    """
+    return {"score": 1.0 if pkg.get("verified_ok") else 0.0,
+            "checks": {"files_verified": bool(pkg.get("verified_ok")),
+                       "licensing_ok": bool(pkg.get("licensing_ok"))}}
+
+
+def _auto_release_media(ctx, media_version_ids, qc=None) -> dict:
+    """质检通过处接上策略引擎的**采用 / 批准**（两个独立闸门）。
+
+    为什么接在这里
+    --------------
+    ``step_storyboard`` / ``step_video`` 在质检通过、产物复核通过之后才调
+    :func:`_record_pipeline_facts`，那里正好拿到 ``media_version_ids`` ——
+    「这一版确实产出了、质检确实过了」这个前提在这里成立，而不是在别处猜。
+
+    采用与批准**永不互相隐式升级**
+    ----------------------------
+    这是 ADR-0002 铁律 1。两个动作是**两次独立的引擎调用**，由策略文件里
+    **两个独立开关**分别控制：
+
+    * ``stages.adopt`` 关 ⇒ 采用被拒（``AR-STAGE_OFF``），批准**照常按它自己的
+      开关判定**（若 ``stages.approve`` 开，它会因「没有采用记录」被真实闸门拒绝 ——
+      ``ProductionService.approve`` 强制要求先有 selection，这是领域层的铁律）；
+    * ``stages.approve`` 关 ⇒ 批准被拒，但采用**已经发生且保留**（采用可逆、历史全留）。
+
+    本函数**不存在**「采用成功后顺带批准」的分支：两段代码之间没有任何共享状态，
+    也没有任何一条路径会从 adopt 走到 approve。
+    """
+    ids = [str(i) for i in (media_version_ids or []) if str(i or "").strip()]
+    if not ids:
+        return {"adopt": {"allowed": False, "note": "无 media_version_id"},
+                "approve": {"allowed": False, "note": "无 media_version_id"}}
+    try:
+        engine = _auto_release_engine(ctx)
+        svc = _production_service()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("自动放行接线不可用（不影响产物）：%s", e)
+        return {"adopt": {"allowed": False, "error": str(e)},
+                "approve": {"allowed": False, "error": str(e)}}
+    if svc is None:
+        return {"adopt": {"allowed": False, "note": "生产事实库不可用"},
+                "approve": {"allowed": False, "note": "生产事实库不可用"}}
+
+    project = str(ctx.get("project_name") or "")
+    episode = str(int(ctx.get("episode_no") or 1))
+
+    # ---- 采用（创作决定；可逆；不计入每日上限）--------------------------
+    # ``subject_type`` 用领域层认可的 ``media_version``（``build_selection`` 只认
+    # media_version / timeline_revision），与 ``api/production_facts.py`` 的默认口径一致。
+    adopt = []
+    for mv in ids:
+        try:
+            d = engine.auto_adopt(
+                svc, media_version_id=mv, subject_id=mv,
+                subject_type=_SUBJECT_TYPE_MEDIA_VERSION,
+                project=project, episode=episode, qc=qc)
+            adopt.append(d.to_dict())
+        except Exception as e:  # noqa: BLE001
+            logger.warning("自动采用异常（media=%s，不影响产物）：%s", mv, e)
+            adopt.append({"allowed": False, "media_version_id": mv,
+                          "error": f"{type(e).__name__}: {e}"})
+
+    # ---- 批准（放行决定；独立闸门；与上面那段之间无共享状态）----------
+    approve = []
+    for mv in ids:
+        try:
+            d = engine.auto_approve(
+                svc, media_version_id=mv, subject_id=mv,
+                subject_type=_SUBJECT_TYPE_MEDIA_VERSION,
+                project=project, episode=episode, qc=qc)
+            approve.append(d.to_dict())
+        except Exception as e:  # noqa: BLE001
+            logger.warning("自动批准异常（media=%s，不影响产物）：%s", mv, e)
+            approve.append({"allowed": False, "media_version_id": mv,
+                            "error": f"{type(e).__name__}: {e}"})
+    return {"adopt": adopt, "approve": approve,
+            "adopted": sum(1 for d in adopt if d.get("allowed")),
+            "approved": sum(1 for d in approve if d.get("allowed"))}
+
+
+def _production_service():
+    """取生产事实服务（复用 production_recording 的进程内单例）。"""
+    try:
+        import production_recording as _pr
+    except ImportError:  # pragma: no cover
+        from app import production_recording as _pr  # type: ignore
+    return _pr._service()      # noqa: SLF001 —— 同包内既有的单例约定
+
+
 STEP_RUNNERS = {
     "script": step_script,
     "tts_pre": step_tts_pre,
@@ -1610,6 +2238,8 @@ STEP_RUNNERS = {
     "video": step_video,
     "upscale": step_upscale,
     "final": step_final,
+    "export": step_export,
+    "delivery": step_delivery,
     # tts / mix 已不在 STEP_SEQUENCE（10→8 步），但函数体保留：手工端点与「老工程续跑」
     # 路径不废，回滚只需把它俩加回 STEP_SEQUENCE 即可。
     "tts": step_tts,
@@ -1644,6 +2274,10 @@ def step_enabled(step: str, ctx) -> bool:
         return bool(cfg.get("enable_mix"))
     if step == "upscale":
         return bool(cfg.get("enable_upscale"))
+    if step == "export":
+        return bool(cfg.get("enable_export"))
+    if step == "delivery":
+        return bool(cfg.get("enable_delivery"))
     return False
 
 
@@ -2000,7 +2634,8 @@ def run_episode(config: dict, project_name: str, episode_no: int, novel_meta: di
 
 #: 步骤在整体进度里的百分比锚点
 _STEP_PCT = {"script": 2, "tts_pre": 10, "assets": 18, "storyboard": 32,
-             "keyframe": 44, "video": 48, "upscale": 82, "final": 92}
+             "keyframe": 44, "video": 48, "upscale": 82, "final": 92,
+             "export": 96, "delivery": 97}
 
 
 def result_pct(result: dict, step: str) -> int:

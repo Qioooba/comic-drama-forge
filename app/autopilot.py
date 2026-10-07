@@ -197,6 +197,16 @@ PLAN_DEFAULTS = {
     # 不在此处的字段无法通过接口关闭，等于没有关掉的入口。
     "enable_upscale": True,
     "upscale_scale": 2,
+    # 导出 / 交付（2026-10-07 新增，排在 final 之后）。必须列进 PLAN_DEFAULTS
+    # 才能经接口按项目开关（同上方 enable_upscale 注释）。默认关闭：既有计划
+    # 不声明这两项，若默认开启会在用户没要求时写 output/export/ 与交付库。
+    "enable_export": False,
+    "enable_delivery": False,
+    # 分集导出作用域（2026-10-07）：必须**同时**作用于导出与交付两侧。
+    # 关闭时（默认）落盘路径与文件名与该功能引入前逐字相同；多集项目若保持关闭，
+    # pipeline.step_delivery 会以 DLV-EPISODE-SCOPE-REQUIRED 拒绝交付（fail-closed）。
+    "export_episode_scope": False,
+    "delivery_preset_id": "",
     "coverage_min_percent": 95.0,
     "consistency_min_score": 80,
     "require_consistency": True,
