@@ -34,11 +34,19 @@ export interface ProjectAssets {
 /** 12s —— 与改造前 `setInterval(tick, 12000)` 节奏一致，不改变可见行为。 */
 const ASSETS_POLL_MS = POLL_SLOW;
 
-async function fetchProjectAssets(projectKey: string): Promise<ProjectAssets | null> {
+async function fetchProjectAssets(projectKey: string): Promise<ProjectAssets> {
   const r = await fetch(`/api/projects/${encodeURIComponent(projectKey)}/assets`);
-  // 资产刷新失败**不阻塞页面**（改造前 `reloadAssets` 内部已 catch，静默），
-  // 保持同一口径：返回 null 让调用方继续用旧数据，而不是把整页打成错误态。
-  if (!r.ok) return null;
+  // ⚠️ 失败必须**抛**出去，不能返回 null。
+  //    改造前这里 `if (!r.ok) return null`：TanStack Query 会把「HTTP 失败」
+  //    当成一次**成功**的结果（data === null），于是
+  //      - 统计卡把 `assets?.counts?.x || 0` 画成 0 —— 与「真的没有资产」无法区分；
+  //      - 监控面板看不到任何 error，重试逻辑（含全局 retry）完全不触发。
+  //    「不阻塞页面」这个诉求由**调用方**承接：页面用 `isError` 显示一条
+  //    可重试的错误条，其余内容照常渲染，而不是把整页打成错误态。
+  //    用 null 冒充成功等于把「我不知道」说成「我知道了，是 0」。
+  if (!r.ok) {
+    throw new Error(`加载项目资产失败：HTTP ${r.status}`);
+  }
   return (await r.json()) as ProjectAssets;
 }
 
@@ -57,6 +65,10 @@ export function useProjectAssets(projectKey: string) {
     placeholderData: undefined,
     staleTime: 0,
     refetchInterval: ASSETS_POLL_MS,
+    // 页面不可见（切到别的标签页 / 窗口最小化）就**停**轮询。
+    // 默认 true 会在用户根本没看这个页时继续打后端；本查询已有 12s 节奏，
+    // 回到页面时立刻可见的那一次由 query 自身补上，不需要后台空转。
+    refetchIntervalInBackground: false,
   });
 }
 

@@ -7,9 +7,10 @@
  *   `#projects?p=<key>`      侧边栏/App 早期写法
  *   `#/projects?p=<key>`     规范化之后的写法
  *   `#ai` / `#memory` / …    旧全局 section（无前导斜杠）
- * 另外 `ProjectsPage` / `OverviewPage` / `ErrorBoundary` 至今仍在
- * `window.location.hash = '/?p=…'`（**无斜杠、无 section**）——这三个文件
- * 不在本轮改造范围内，所以这些形态**仍会继续被写出来**。
+ * 另外 `ProjectsPage` / `OverviewPage` / `ErrorBoundary` 曾长期直接写
+ * `window.location.hash = '/?p=…'`（**无斜杠、无 section**）——这三处
+ * **现已改为 `navigate()`**，不会再写出旧形态。
+ * 但外部书签与历史文档里的旧链接仍会带着这些形态进来，这一层继续保留。
  *
  * 直接删掉的后果是死链且无人报警：用户点旧书签 / 外部文档里的链接进来，
  * 落到 404 却没有一个地方告诉他「这个入口已经迁移到哪」。保留这一层就是把

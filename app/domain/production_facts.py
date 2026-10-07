@@ -119,6 +119,16 @@ REF_SLOT_ROLES: Tuple[str, ...] = (
     "start_frame", # 首帧图（关键帧驱动）
     "end_frame",   # 尾帧图
     "audio",       # 参考音频（口型驱动）
+    # 调用方**没有声明**这张图是什么 —— 诚实的「不知道」，不是编一个。
+    #
+    # 为什么需要它：登记接缝 RenderContext 一次只能给一个 ref_slot_role 套给所有
+    # 槽位，而「角色 + 场景 + 道具同时在场」是绝大多数分镜的真实形态，整叠角色
+    # 必然混叠。此前混叠一律不给角色 → 空角色被 _norm_ref_slots 判为非法 →
+    # **整条 GenerationIntent 连同分镜图/成片的记录一起废掉**（实测：带参考图的
+    # 渲染几乎全量登记失败）。有了 unspecified，混叠时仍如实记「这张图不知道是
+    # 什么」，且 ref + sha256 照常进 intent_hash（换一组参考图仍是不同意图），
+    # 既不编造语义，也不再丢记录。
+    "unspecified",
 )
 
 #: MediaVersion 支持的媒体类型。
@@ -535,8 +545,22 @@ class SelectionDecision:
 
     @staticmethod
     def from_dict(raw: Mapping[str, Any]) -> "SelectionDecision":
-        return SelectionDecision(**{k: raw.get(k) for k in
-                                    SelectionDecision.__dataclass_fields__})
+        # 逐字段给默认值：缺字段时产出 None 会让「取最新一条」的
+        # max(key=(decided_at, …)) 在旧数据/手工写入行上比较 None 与 str 而抛
+        # TypeError，整个采用查询接口 500。与同文件 GenerationIntent.from_dict 口径一致。
+        return SelectionDecision(**{
+            k: raw.get(k, _field_default(k))
+            for k in SelectionDecision.__dataclass_fields__
+        })
+
+
+def _field_default(name: str) -> Any:
+    """``from_dict`` 的缺省值口径：布尔列缺省 False，其余字符串列缺省空串。
+
+    刻意不返回 None —— 这些列在后续一律参与字符串比较或布尔判断，None 会把
+    错误从「字段缺失」放大成「接口 500」。
+    """
+    return False if name in ("approved", "revoked") else ""
 
 
 def build_selection(selection_id: str, *, subject_type: str, subject_id: str,
@@ -613,8 +637,10 @@ class ApprovalDecision:
 
     @staticmethod
     def from_dict(raw: Mapping[str, Any]) -> "ApprovalDecision":
-        return ApprovalDecision(**{k: raw.get(k) for k in
-                                   ApprovalDecision.__dataclass_fields__})
+        return ApprovalDecision(**{
+            k: raw.get(k, _field_default(k))
+            for k in ApprovalDecision.__dataclass_fields__
+        })
 
 
 #: 机器身份词表（**按 token 匹配，不是按子串**）。

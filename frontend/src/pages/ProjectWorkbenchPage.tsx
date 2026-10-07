@@ -1,13 +1,11 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { QueryClientProvider } from '@tanstack/react-query';
 import { useApp } from '@/context/AppContext';
 import { t } from '@/i18n';
 import { projectsApi, autopilotApi, chatApi, agentApi } from '@/api/client';
 import { Button, Input, EmptyState, Skeleton } from '@/components/ui';
-import {
-  AlertTriangle, BarChart3, Check, CheckCircle2, Clapperboard, MessageSquare,
-  Music, Network, Play, Share2, X, ZoomIn,
-} from '@/components/ui/icons';
+import { AlertTriangle, Check, MessageSquare, X } from '@/components/ui/icons';
 import { useToast } from '@/components/ui/toast';
 import { Markdown } from '@/components/Markdown';
 import { useComfyProgress } from '@/hooks/useComfyProgress';
@@ -27,7 +25,15 @@ import { AudioTab } from '@/features/audio';
 import { OutputReviewTab } from '@/features/output';
 import { RelationGraphTab } from '@/features/relation';
 import { useProjectAssets, useAutopilotStatus } from '@/api/queries';
-import { queryClient } from '@/api/queryClient';
+import { queryClient, clearProjectCache } from '@/api/queryClient';
+// ---- tab 契约的唯一真源 --------------------------------------------------
+// 顺序、id、文案 key、图标全部来自 `@/routes/workbenchTabs`（路由表本身也从那里生成）。
+// 页面内**不再**维护第二份清单：两份清单必然会漂移，漂移后的表现是
+// 「路由认了这个段、导航按钮却排在别处」，而深链能对上、界面顺序对不上。
+// ⚠️ 'chat' 不是标签页 —— AI 总控是右侧常驻面板（见下方 ChatPanel），因此
+//    这里必须用 `WORKBENCH_TABS` 而不是手写数组。
+import type { WorkbenchTab } from '@/routes/workbenchTabs';
+import { WORKBENCH_TABS, WORKBENCH_TAB_META, workbenchPath } from '@/routes/workbenchTabs';
 
 // 焦点环：与 components/ui/index.tsx 里的 FOCUS_RING 逐字一致。
 // index.css 有全局 :focus-visible outline 兜底，这里显式加 focus:outline-none 把它压掉，
@@ -37,11 +43,18 @@ const FOCUS_RING =
 
 
 // ========== Workbench Tab Types ==========
-// 注意：'chat' 已移除 —— AI 总控改成了右侧常驻面板，不再是标签页（见 ChatPanel）
-type WorkbenchTab = 'overview' | 'autopilot' | 'storyboard' | 'qc' | 'upscale' | 'relation' | 'audio' | 'output';
+// `WorkbenchTab` 类型与 tab 清单都来自 `@/routes/workbenchTabs`（见上方 import）。
+// 本文件**不再**声明本地类型/数组 —— 那正是「路由认了一个顺序、导航画了另一个顺序」的来源。
 
 interface ProjectWorkbenchPageProps {
   projectKey: string;
+  /**
+   * 当前 tab。**由路由给出且已在 `ProjectWorkbenchRoute` 里通过
+   * `isWorkbenchTab` 校验**（非法段在那一层就被 301 归一到首 tab）。
+   * 页面不再自己解 URL，也不再持有 activeTab 的本地副本 ——
+   * 单一真源是 URL，点标签页就是真的改地址。
+   */
+  tab: WorkbenchTab;
 }
 
 /**
@@ -68,29 +81,43 @@ export function ProjectWorkbenchPage(props: ProjectWorkbenchPageProps): JSX.Elem
 }
 
 /** 实际的工作台内容（壳 + 八域装配 + AI 总控常驻面板）。 */
-function ProjectWorkbenchShell({ projectKey }: ProjectWorkbenchPageProps) {
+function ProjectWorkbenchShell({ projectKey, tab: activeTab }: ProjectWorkbenchPageProps) {
   const { t } = useApp();
+  const navigate = useNavigate();
   const [project, setProject] = useState<Project | null>(null);
   const [loading, setLoading] = useState(true);
-  const [activeTab, setActiveTab] = useState<WorkbenchTab>('overview');
   // AI 总控默认展开为右侧常驻面板（不占标签页）；用户可收起，收起后右侧只剩一个竖条按钮
   const [chatOpen, setChatOpen] = useState(true);
 
   // ⭐ 资产自动刷新（ADR-0010：原先是手写 setInterval，现收敛为 query）
   //    改造前这里是 `useState` + `setInterval(tick, 12000)` + focus/visibilitychange
   //    三个监听 + 一个 `alive` 标志，共 30 行、5 个易错点。现在由 query 统一负责：
-  //      ① 12s 静默重拉（节奏不变）；窗口聚焦时立刻重拉（refetchOnWindowFocus）；
+  //      ① 12s 静默重拉（节奏不变）；页面不可见时停轮询，回到页面即恢复；
   //      ② 切 Tab 回来命中缓存，不再重拉 —— 改造前每次切 Tab 都要重新请求一遍；
   //      ③ 总览 / 交付 / 关系三个域共用同一份缓存，同一时刻只有一个请求在飞。
   //    ⚠️ 跨 Tab 共享资产时**刻意不开** keepPreviousData：切项目必须显示新项目的
   //       真实状态，拿上一个项目的资产数去展示新项目，比闪一下空态更糟。
+  //       同理，切项目后若新项目的资产还没取到，统计卡显示占位符而非上一个项目的数。
   const assetsQuery = useProjectAssets(projectKey);
   const assets = (assetsQuery.data as ProjectAssets | null) ?? null;
 
-  // 资产刷新失败**不阻塞页面**（与改造前 `reloadAssets` 内部的 catch 同一口径）
+  // 切项目时丢弃**旧**项目的缓存（`clearProjectCache` 的唯一调用点）。
+  // 放在 useEffect 的清理函数里：路由层带 `key={projectKey}`，切项目即整棵子树重挂
+  // → 旧实例卸载 → 清理函数捕获的正是**上一个** projectKey，语义与
+  // 「离开项目时清理该项目缓存」一致。
+  // 同项目内切 tab 不触发（projectKey 没变，effect 不重跑）。
+  useEffect(() => () => clearProjectCache(projectKey), [projectKey]);
+
+  // 资产刷新失败**不阻塞页面**（页面其余部分照常渲染），改由错误条 + 重试承接。
   const reloadAssets = React.useCallback(async () => {
     await assetsQuery.refetch();
   }, [assetsQuery]);
+
+  // 统计卡计数：**取不到**时不能画 0。`0` 是一个断言（「这个项目没有角色」），
+  // 而接口失败时我们知道的只是「不知道」。有旧值就继续显示旧值（错误条已说明数据可能过期），
+  // 既无数据又处于错误态才显示占位符 —— 不拿 null/0 冒充成功（见 api/queries/assets.ts）。
+  const assetsUnknown = assetsQuery.isError && !assets;
+  const statCount = (v?: number) => (assetsUnknown ? '—' : (v ?? 0));
 
   // Load project data
   useEffect(() => {
@@ -102,28 +129,23 @@ function ProjectWorkbenchShell({ projectKey }: ProjectWorkbenchPageProps) {
       .finally(() => setLoading(false));
   }, [projectKey]);
 
-  const tabs: { id: WorkbenchTab; icon: React.ReactNode; label: string }[] = [
-    { id: 'overview', icon: <BarChart3 className="h-4 w-4" />, label: t('wb.overview') },
-    // 托管生产（2026-10-07 恢复独立标签页）：这是系统**唯一**的 24/7 无人值守生产主路径。
-    // 后端 autopilot.py 的守护线程 / 断点续跑 / 失败隔离 / 自检门禁本就完整，端点也全在，
-    // 但前端一个调用点都没有（「自动生产」此前被移进 AI总控 聊天面板，等于主路径在界面上
-    // 彻底消失）—— 用户不知道可以配置好计划后交给机器跑一夜，只能全程手动。
-    // 放在概览之后：它是「生产方式」层面的选择，先于分镜/质检/导出这些具体环节。
-    { id: 'autopilot', icon: <Play className="h-4 w-4" />, label: t('wb.autopilot') },
-    // 分镜管理：合并 九宫格构图 + 关键帧生成 + 分镜序列 三个子标签（见 StoryboardHubTab）
-    { id: 'storyboard', icon: <Clapperboard className="h-4 w-4" />, label: t('wb.storyboardHub') },
-    { id: 'qc', icon: <CheckCircle2 className="h-4 w-4" />, label: t('wb.qc') },
-    // 超分：后端 upscale_client 与其 8 个端点早已可用，但前端此前零引用 ——
-    // 与已删除的孤儿页面同属「建好没入口」的能力，这里补上手工入口。
-    { id: 'upscale', icon: <ZoomIn className="h-4 w-4" />, label: t('wb.upscale') },
-    // 角色关系图：后端 API 早已完整实现，前端此前缺失可视化组件
-    { id: 'relation', icon: <Network className="h-4 w-4" />, label: t('wb.relation') },
-    // 声音处理：合并 TTS 配音 + 音画混音 + 音频质检
-    { id: 'audio', icon: <Music className="h-4 w-4" />, label: t('wb.audio') },
-    // 输出与验收：合并导出 + 成品验收
-    { id: 'output', icon: <Share2 className="h-4 w-4" />, label: t('wb.output') },
-    // AI总控 不再是标签页 —— 已改为右侧常驻面板（默认展开，见下方 ChatPanel）
-  ];
+  /**
+   * 标签导航：清单与顺序**全部**取自 `@/routes/workbenchTabs` 的
+   * `WORKBENCH_TABS` + `WORKBENCH_TAB_META`（路由表用同一份数据生成路由）。
+   *
+   * ⚠️ 改造前这里有一份手写数组，顺序与路由契约不一致（第 2/3 位、
+   *    第 6/7/8 位都不同），且页面自己 `useState('overview')` ——
+   *    于是 `/projects/<key>/qc` 深链打开的仍是「总览」，URL 与画面长期对不上。
+   *    现在两处都只有一份数据来源。
+   */
+  const tabs = React.useMemo(() => WORKBENCH_TABS.map((id) => ({
+    id,
+    icon: WORKBENCH_TAB_META[id].icon('h-4 w-4'),
+    label: t(WORKBENCH_TAB_META[id].labelKey),
+  })), [t]);
+
+  /** 切 tab = 改地址（而不是改本地 state）：深链因此可分享、可后退、可直达。 */
+  const goTab = (id: WorkbenchTab) => navigate(workbenchPath(projectKey, id));
 
   if (loading) return (
     // 骨架沿用真实内容的外层布局（左列 + 右侧常驻面板），避免「白屏 → 内容」的高度跳变
@@ -182,19 +204,46 @@ function ProjectWorkbenchShell({ projectKey }: ProjectWorkbenchPageProps) {
             </div>
             <Button
               variant="secondary"
-              onClick={() => { window.location.hash = '#/projects'; }}
+              onClick={() => navigate('/projects')}
             >
               ← {t('wb.backToProjects')}
             </Button>
           </div>
 
+          {/* 资产查询失败：不阻塞页面（其余八域照常渲染），但必须**可见且可重试**。
+              改造前查询函数返回 null，统计卡一律画 0 —— 「接口挂了」与
+              「这个项目真的没有资产」在界面上完全同形，且没有任何重试入口
+              （监控与全局 retry 也因为「成功返回 null」而完全不触发）。
+              现在错误由 `isError` 承接：显示原因 + 重试按钮。 */}
+          {assetsQuery.isError && (
+            <div
+              role="alert"
+              className="flex flex-wrap items-center gap-3 rounded-lg border border-danger bg-danger-subtle px-3 py-2 text-sm text-danger-strong"
+            >
+              <AlertTriangle className="h-4 w-4 shrink-0" aria-hidden="true" />
+              <span className="min-w-0 flex-1">
+                {t('wb.assetsLoadFailed')}
+                {assets ? t('wb.assetsStaleHint') : ''}
+                {assetsQuery.error instanceof Error ? `（${assetsQuery.error.message}）` : ''}
+              </span>
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() => void reloadAssets()}
+                disabled={assetsQuery.isFetching}
+              >
+                {t('common.retry')}
+              </Button>
+            </div>
+          )}
+
           {/* Stats Bar —— 窄屏折成两行，避免 4 列挤压成一竖条（方案 P1-8） */}
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
             {[
-              { label: t('wb.characters'), count: assets?.counts?.characters || 0, color: 'text-brand' },
-              { label: t('wb.items'), count: assets?.counts?.items || 0, color: 'text-success-strong' },
-              { label: t('wb.scenes'), count: assets?.counts?.scenes || 0, color: 'text-warning-strong' },
-              { label: t('wb.storyboard'), count: assets?.counts?.storyboards || 0, color: 'text-info-strong' },
+              { label: t('wb.characters'), count: statCount(assets?.counts?.characters), color: 'text-brand' },
+              { label: t('wb.items'), count: statCount(assets?.counts?.items), color: 'text-success-strong' },
+              { label: t('wb.scenes'), count: statCount(assets?.counts?.scenes), color: 'text-warning-strong' },
+              { label: t('wb.storyboard'), count: statCount(assets?.counts?.storyboards), color: 'text-info-strong' },
             ].map((stat) => (
               <div key={stat.label} className="bg-surface rounded-lg p-4 border border-line transition-all hover:-translate-y-0.5 hover:shadow-md hover:border-line-strong">
                 <div className={`text-2xl font-bold tabular-nums ${stat.color}`}>{stat.count}</div>
@@ -208,7 +257,7 @@ function ProjectWorkbenchShell({ projectKey }: ProjectWorkbenchPageProps) {
             {tabs.map((tab) => (
               <button
                 key={tab.id}
-                onClick={() => setActiveTab(tab.id)}
+                onClick={() => goTab(tab.id)}
                 className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors ${FOCUS_RING} ${
                   activeTab === tab.id
                     ? 'bg-brand-subtle text-brand shadow-xs'

@@ -1,7 +1,33 @@
 import React, { Component, ErrorInfo, ReactNode } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { Button } from '@/components/ui';
 import { AlertTriangle } from '@/components/ui/icons';
 import { t } from '@/i18n';
+
+/**
+ * 「回首页」按钮。**必须**是独立函数组件：`ErrorBoundary` 本身是 class，
+ * 拿不到 `useNavigate`（hook 只能在函数组件里调用）。
+ *
+ * 改造前这里写的是 `window.location.hash = '#/'` + `window.location.reload()`：
+ * 直接改 hash 是**绕过 router** 的写法（hash 变了还得等 HashRouter 的 hashchange
+ * 事件把路径同步过去，且与随后的 reload 存在竞态 —— reload 可能先执行）。
+ * 现在改成 `navigate('/')`：路由同步切换（`/` 按路由表 301 到 `/projects`），
+ * reload 保留 —— 它是「清掉内存里的坏状态」的既有行为，去掉会让错误边界可能点不动。
+ */
+function BackHomeButton(): JSX.Element {
+  const navigate = useNavigate();
+  return (
+    <Button
+      variant="secondary"
+      onClick={() => {
+        navigate('/', { replace: true });
+        window.location.reload();
+      }}
+    >
+      {t('error.backHome')}
+    </Button>
+  );
+}
 
 // 本组件是 class 组件，不能用 useApp() hook，故使用模块级 t()。
 // 语言包由 AppProvider 在 App 层异步加载，ErrorBoundary 的渲染时机可能早于语言包就绪，
@@ -65,15 +91,7 @@ export class ErrorBoundary extends Component<Props, State> {
               <Button variant="brand" onClick={() => window.location.reload()}>
                 {t('error.reload')}
               </Button>
-              <Button
-                variant="secondary"
-                onClick={() => {
-                  window.location.hash = '#/';
-                  window.location.reload();
-                }}
-              >
-                {t('error.backHome')}
-              </Button>
+              <BackHomeButton />
             </div>
           </div>
         </div>

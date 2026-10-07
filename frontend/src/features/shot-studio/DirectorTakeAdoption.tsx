@@ -17,6 +17,7 @@
  */
 import React, { useState } from 'react';
 import type { ProductionDecisionState } from '@/types';
+import { t } from '@/i18n';
 import {
   normalizeDecisionState,
   useApproveMediaVersion,
@@ -63,16 +64,20 @@ export function DirectorTakeAdoption({
   const busy = select.isPending || approve.isPending;
   const selected = safe.selected;
   const approved = safe.approved;
-  // 已批准/失效/无法验证都说明「曾经批准过」，此时不再重复给批准按钮
-  const hasAnyApproval = safe.state === 'approved' || safe.state === 'approved_stale'
-    || safe.state === 'approved_unverified';
+  // ⚠️ 「是否还持有**有效**的批准」必须看 state，不能看 `approved` 布尔：
+  //    `normalizeDecisionState` 要求 approved_stale / approved_unverified 都带
+  //    `approved: true`（确实批准过，只是内容变了 / 验证不了），所以这两个状态下
+  //    `safe.approved` 依然是 true。
+  const approvedNow = safe.state === 'approved';
+  // 「曾批准、现已失效」= 需要**重新做一次**放行决定，不是「已批准、别再点」。
+  const approvalInvalid = safe.state === 'approved_stale' || safe.state === 'approved_unverified';
 
   const submitSelect = async () => {
     setLocalError('');
     // 客户端也拦一道：后端会 400，但先给出即时反馈，
     // 免得用户提交后才发现自己没写理由（且提示要过一轮网络往返）。
     if (!reason.trim()) {
-      setLocalError('采用必须写明理由，否则无法回答「这镜为什么用这一版」。');
+      setLocalError(t('decision.errAdoptNeedsReason'));
       return;
     }
     try {
@@ -95,12 +100,12 @@ export function DirectorTakeAdoption({
     // 批准必须有**人工**主体。这里刻意不代填、不预填、不从 decidedBy 复制 ——
     // 那是替用户伪造人工授权，前端绕过机器账号闸门与后端放行机器账号等价。
     if (!approver.trim()) {
-      setLocalError('批准必须填写人工授权主体；机器检查通过不等于批准。');
+      setLocalError(t('decision.errApproveNeedsApprover'));
       return;
     }
     if (!selected) {
       // 后端同样会 409；这里提前一步，避免把一次必然失败的请求发出去。
-      setLocalError('尚未采用，不能批准。先点「采用」再批准 —— 采用不等于批准。');
+      setLocalError(t('decision.errApproveNeedsSelected'));
       return;
     }
     try {
@@ -118,7 +123,7 @@ export function DirectorTakeAdoption({
   return (
     <div className="rounded-lg border border-line bg-surface p-3 space-y-3">
       <div className="flex items-center justify-between gap-2">
-        <span className="text-sm font-medium text-ink-1">决策</span>
+        <span className="text-sm font-medium text-ink-1">{t('decision.title')}</span>
         <DecisionStateBadge decision={safe} />
       </div>
 
@@ -130,14 +135,14 @@ export function DirectorTakeAdoption({
           {/* ---- 动作一：采用（创作决定，青） ---- */}
           <div className="space-y-1.5">
             <label className="block text-xs text-ink-2" htmlFor={`sel-reason-${mediaVersionId}`}>
-              采用理由（必填）
+              {t('decision.adoptReasonLabel')}
             </label>
             <input
               id={`sel-reason-${mediaVersionId}`}
               value={reason}
               onChange={(e) => setReason(e.target.value)}
               disabled={busy}
-              placeholder="例如：九宫格第 4 格构图最稳，视线朝向正确"
+              placeholder={t('decision.adoptReasonPlaceholder')}
               className={`w-full rounded border border-line bg-surface-2 px-2.5 py-1.5 text-sm text-ink-1 placeholder:text-ink-3 disabled:opacity-60 disabled:cursor-not-allowed ${FOCUS_RING}`}
             />
             <Button
@@ -147,38 +152,44 @@ export function DirectorTakeAdoption({
               className="w-full border-selected text-selected-strong hover:bg-selected-subtle"
             >
               <span aria-hidden="true" className="mr-1.5 font-mono">●</span>
-              {selected ? '已采用' : '采用这一版'}
+              {selected ? t('state.selected') : t('decision.adopt')}
             </Button>
             {selected && (
-              <p className="text-xs text-ink-3">已采用过。再次采用会追加一条新的采用记录（决策是追加式留痕）。</p>
+              <p className="text-xs text-ink-3">{t('decision.adoptAppendOnly')}</p>
             )}
           </div>
 
           {/* ---- 动作二：批准（放行决定，绿）—— 与上面是**两个独立按钮** ---- */}
           <div className="space-y-1.5 border-t border-line pt-3">
             <label className="block text-xs text-ink-2" htmlFor={`apr-by-${mediaVersionId}`}>
-              人工授权主体（必填）
+              {t('decision.approverLabel')}
             </label>
             <input
               id={`apr-by-${mediaVersionId}`}
               value={approver}
               onChange={(e) => setApprover(e.target.value)}
               disabled={busy}
-              placeholder="你的署名（机器账号无权批准）"
+              placeholder={t('decision.approverPlaceholder')}
               className={`w-full rounded border border-line bg-surface-2 px-2.5 py-1.5 text-sm text-ink-1 placeholder:text-ink-3 disabled:opacity-60 disabled:cursor-not-allowed ${FOCUS_RING}`}
             />
             <Button
               variant="secondary"
               onClick={submitApprove}
-              disabled={busy || approved || hasAnyApproval}
+              // ⚠️ 这里**不能**把失效态一起 disabled：按钮上写着
+              //    「批准已失效，需重新批准」却点不动，等于把用户指到一条死路上
+              //    （看得见出路、走不过去）。文案与可点性同源：
+              //    只有「当前持有有效批准」才禁用，失效态必须允许重新批准。
+              disabled={busy || approvedNow}
               className="w-full border-approved text-approved-strong hover:bg-approved-subtle"
             >
               <span aria-hidden="true" className="mr-1.5 font-mono">✓</span>
-              {approved ? '已批准' : hasAnyApproval ? '批准已失效，需重新批准' : '批准放行'}
+              {approvedNow
+                ? t('state.approved')
+                : approvalInvalid ? t('decision.approveInvalid') : t('decision.approve')}
             </Button>
             {/* MASTER invariant 6：disabled 必须配相邻原因 */}
-            {!approved && !hasAnyApproval && !selected && (
-              <p className="text-xs text-ink-3">需先采用才能批准（后端同样会 409）。</p>
+            {!approvedNow && !approvalInvalid && !selected && (
+              <p className="text-xs text-ink-3">{t('decision.approveNeedsSelect')}</p>
             )}
           </div>
         </>
