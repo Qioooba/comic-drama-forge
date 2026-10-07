@@ -474,6 +474,16 @@ def get_approval(package_id: str) -> Optional[Dict[str, Any]]:
         conn.close()
 
 
+class ApprovalRevokedError(RuntimeError):
+    """试图覆盖一条已被显式撤销的人工批准。
+
+    ADR-0006:98-99 点名这条「容易写反」：撤销是人工动作，**内容变化不应复活它**。
+    读侧 :func:`domain.delivery.evaluate_approval` 正确地让撤销优先，写侧原本用
+    ``INSERT OR REPLACE`` + ``revoked=0`` 把它反转了 —— 人工撤销后只要文件没变，
+    下一次自动放行就会把批准连同人工批准人/note 一起覆盖回"有效"。
+    """
+
+
 def approve_package(package_id: str, package_hash: str, approver: str,
                     note: str = "", reason: str = "") -> Dict[str, Any]:
     """写入人工批准（**哈希绑定**）。
@@ -481,7 +491,16 @@ def approve_package(package_id: str, package_hash: str, approver: str,
     ``package_hash`` 是批准当时的包摘要；它与之后的
     ``delivery_packages.package_hash`` 不一致时，批准自动失效
     （判定在 :func:`domain.delivery.evaluate_approval`，纯函数，无需后台撤销）。
+
+    已被显式撤销的批准**不可被覆盖**（见 :class:`ApprovalRevokedError`）—— 撤销
+    要解除必须由人显式重新批准或改包内容重建，而不是被一次后台动作顺手抹掉。
     """
+    existing = get_approval(package_id)
+    if existing and int(existing.get("revoked") or 0):
+        raise ApprovalRevokedError(
+            "交付包 %s 的批准已被 %s 撤销（%s）；重新放行需由人工显式重新批准"
+            % (package_id, existing.get("revoked_by") or "未知",
+               existing.get("revoked_at") or "时间未记录"))
     row = {
         "package_id": str(package_id),
         "package_hash": str(package_hash or ""),

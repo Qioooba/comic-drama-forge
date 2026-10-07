@@ -273,9 +273,14 @@ def approve_delivery_package(package_id):
             "交付包内容已变化，此前看到的摘要已失效，请刷新后重新批准",
             delivery_domain.DLV_APPROVAL_STALE)
 
-    delivery_repo.approve_package(
-        package_id, pkg["package_hash"], approver,
-        note=str(data.get("note") or ""))
+    try:
+        delivery_repo.approve_package(
+            package_id, pkg["package_hash"], approver,
+            note=str(data.get("note") or ""))
+    except delivery_repo.ApprovalRevokedError as exc:
+        # 撤销优先于再次批准（ADR-0006）。这里不能当成功——否则一次「重新批准」
+        # 会把人工撤销的事实悄悄抹掉，审计上等同于没撤过。
+        return _fail(str(exc), "DLV-APPROVAL-REVOKED")
 
     approval = delivery_repo.get_approval(package_id)
     view = delivery_domain.evaluate_approval(pkg, approval)

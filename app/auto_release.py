@@ -955,15 +955,14 @@ class AutoReleaseEngine:
         if not d.allowed or dry_run:
             return d
         pol = self.policy
-        try:
-            from app.api import delivery as delivery_api          # noqa: PLC0415
-            from domain import delivery as delivery_domain        # type: ignore  # noqa: PLC0415
-            from infrastructure import delivery_repo              # type: ignore  # noqa: PLC0415
-        except ImportError:                                        # pragma: no cover
-            from app.domain import delivery as delivery_domain    # type: ignore  # noqa: PLC0415
-            from app.infrastructure import delivery_repo          # type: ignore  # noqa: PLC0415
-
-            delivery_api = None
+        # 必须用顶层模块名：app/ 没有 __init__.py，而 app/app.py 作为顶层模块
+        # 占用了 sys.modules['app']，所以 `from app.api import …` /
+        # `from app.domain import …` 在源码运行与 PyInstaller 下都必然失败
+        # （"'app' is not a package"）。原先两个分支都写错，等于交付阶段从未
+        # 执行过任何一次，却报 AR-ACTION-FAILED —— 方向虽是 fail-closed，但
+        # 审计留痕把「import 路径写错」伪装成了「动作失败」。
+        from domain import delivery as delivery_domain        # type: ignore  # noqa: PLC0415
+        from infrastructure import delivery_repo              # type: ignore  # noqa: PLC0415
 
         try:
             pkg = delivery_repo.get_package(package_id)
@@ -993,12 +992,10 @@ class AutoReleaseEngine:
                               cap=d.cap, subject=package_id, action=action, dry_run=dry_run)
 
         # ⚠ 真实人工授权闸门，与 api/delivery.py 用同一个领域函数、同一份名单。
-        try:
-            from app.domain.production_facts import (              # noqa: PLC0415
-                ApprovalAuthorizationError, require_human_authorization)
-        except ImportError:                                        # pragma: no cover
-            from domain.production_facts import (                  # type: ignore  # noqa: PLC0415
-                ApprovalAuthorizationError, require_human_authorization)
+        # 用顶层模块名：app/ 不是包，`from app.domain.…` 必然抛 "not a package"
+        #（原代码把它放在 try 的第一支，每次调用都要先失败一次才落到兜底支）。
+        from domain.production_facts import (                   # type: ignore  # noqa: PLC0415
+            ApprovalAuthorizationError, require_human_authorization)
         try:
             require_human_authorization(pol.principal, d.authorization_ref,
                                         allowlist=list(self._allowlist))
