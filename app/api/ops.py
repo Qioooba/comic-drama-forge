@@ -184,17 +184,26 @@ def _delivery_release_gate_for(project_name: str, filename: str = ""):
         return ["未登记交付包，无法下载发布文件"]
     target = str(filename or "").replace("\\", "/").lstrip("/")
     target_base = os.path.basename(target)
+    # 只有「无目录的请求」才允许 basename 匹配：/api/export/<project>/<format>
+    # 传的是裸文件名（如 <project>_fcpml.xml），而带目录的请求是导出根目录下的
+    # 多集产物（ep02/ep02_final.mp4），必须 rel_path 精确相等。否则 ep01/final.mp4
+    # 会凭同名 basename 命中别的集的那个包，借用它的批准。
+    flat_request = "/" not in target
     candidates = []
     for pkg in packages:
         files = pkg.get("files") or []
         if target and any(
             str(f.get("rel_path") or "").replace("\\", "/") == target
-            or os.path.basename(str(f.get("rel_path") or "")) == target_base
+            or (flat_request
+                and os.path.basename(str(f.get("rel_path") or "")) == target_base)
             for f in files
         ):
             candidates.append(pkg)
     if not candidates:
-        candidates = packages
+        # 归属不明就拒绝。原先这里退化成「拿所有包去试」，只要任意一个已批准的包
+        # 门禁通过就放行 —— 于是从未登记进任何包的中间产物也能被下载，而 ADR-0006
+        # 的批准绑定的是**那个包**的 sha256，与本文件无关，批准形同虚设。
+        return [f"交付文件不属于任何已登记交付包，已阻止下载：{target or '(空路径)'}"]
     passed = False
     for pkg in candidates:
         try:
