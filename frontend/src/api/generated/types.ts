@@ -695,6 +695,35 @@ export interface PreflightResponse {
 }
 
 /**
+ * 一次登记失败的台账行。生成路径不会因它中断，所以它是「失败不读日志也能发现」的唯一凭据。
+ * @see components/schemas/RecordingFailure
+ */
+export interface RecordingFailure {
+  /** 未登记成功的产物路径 */
+  artifact?: string;
+  attempt_id?: string;
+  episode?: string;
+  intent_fingerprint?: string;
+  kind?: string;
+  project?: string;
+  reason: string;
+  shot_key?: string;
+  /** 调用点标识，便于定位是哪条生成路径 */
+  source?: string;
+  /** 失败发生的阶段（intent / media / …） */
+  stage?: string;
+  ts?: string;
+}
+
+/**
+ * @see components/schemas/RecordingFailureListResponse
+ */
+export interface RecordingFailureListResponse {
+  count: number;
+  failures: RecordingFailure[];
+}
+
+/**
  * 服务端按 path 重算 sha256，**不接受客户端自带摘要**（否则可伪造出「已核验」的假象）。
  * @see components/schemas/RegisterMediaRequest
  */
@@ -812,6 +841,37 @@ export interface RevokeDeliveryApprovalRequest {
 export interface SelectMediaRequest {
   note?: string;
   selected_by?: string;
+}
+
+/**
+ * 三态判别：**从未生成** ≠ **生成了但没登记**。早先界面只有「有候选/没候选」，这两种情况长得一模一样，用户只能翻日志。
+ * @see components/schemas/ShotGenerationStatus
+ */
+export interface ShotGenerationStatus {
+  /** 已进入事实库的产物路径 */
+  candidate_paths?: string[];
+  episode?: string;
+  failures?: RecordingFailure[];
+  intent_count?: number;
+  intents?: GenerationIntent[];
+  kind?: string;
+  media_version_count?: number;
+  project?: string;
+  /** 恒为 false（铁律 1）。留在响应里是让调用方**按码判断**而非按文案猜 */
+  selection_implies_approval: false;
+  shot_key?: string;
+  /** never_generated=真的还没渲过；generated_unrecorded=磁盘上有产物或台账有失败、但事实库里没有候选；recorded=有候选可比对 */
+  state: 'never_generated' | 'generated_unrecorded' | 'recorded';
+  /** 磁盘上存在但**没有**登记的产物路径 */
+  unregistered_paths?: string[];
+}
+
+/**
+ * @see components/schemas/ShotGenerationStatusResponse
+ */
+export interface ShotGenerationStatusResponse {
+  item?: ShotGenerationStatus;
+  success: true;
 }
 
 /**

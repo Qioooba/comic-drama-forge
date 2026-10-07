@@ -87,6 +87,8 @@ import comfyui_job_store  # 崩溃免重渲检查点（2026-09-29）：种子沿
 
 import preview_gate  # 两级生产（2026-09-29）：预演不可交付 + 预演批准
 
+from production_recording import EPISODE_SCOPE_SHOT_KEY  # 整集级视频的 shot_key 口径
+
 import novel_screenplay  # 文学剧本层（2026-10-03 两段式生产：文学剧本→改写为分镜表）
 
 import quality_stage  # 四层质量状态（2026-09-29：预演也记 A/B 层）
@@ -1678,6 +1680,78 @@ def _autopilot_guard(fn):
     _wrap.__name__ = fn.__name__
     return _wrap
 
+def _facts_identity(project, episode, shot_key, **extra):
+    """组装「这次渲染是谁、哪一集、哪一镜」的登记身份，交给
+    ``app/production_recording.py``（即 comfyui_client 各生成入口的 ``facts=``）。
+
+    **只做翻译，不做判断**：本文件看得到真实的 project / episode / shot_key，
+    而 comfyui_client 只看得到 filename_prefix —— 各链路命名约定不统一
+    （``comic_drama_sb/…`` / ``comic_drama_kf/…`` / ``comic_drama/…_cover``），
+    从文件名反推身份必然有一半是编的。缺哪个身份就留空，由适配层判定缺必填
+    字段并跳过登记（宁可没有候选，也不给界面塞来路不明的意图）。
+
+    **绝不抛异常**：身份组装出问题不该让一次已经烧了 GPU 的生成白跑，
+    所以这里兜住所有异常并退化成「不登记」。登记本身是**记录**，不是采用、
+    更不是批准 —— 全程不碰 selection / approval。
+
+    整集级 H3（整集成片 / 预演 / 按场次）传 ``shot_key=None``，由本函数落到
+    :data:`production_recording.EPISODE_SCOPE_SHOT_KEY`：整集没有分镜身份，
+    空串表示「不属于任何单镜」，绝不编一个 shot 出来。
+    """
+    try:
+        facts = {
+            "project": str(project or ""),
+            "episode": str(episode or ""),
+            "shot_key": str(shot_key if shot_key is not None else EPISODE_SCOPE_SHOT_KEY),
+        }
+        for _k, _v in extra.items():
+            if _v is not None:
+                facts[_k] = _v
+        return facts
+    except Exception as e:  # noqa: BLE001 身份组装失败绝不阻断生成
+        app.logger.warning(f"生产事实身份组装失败（跳过登记，不影响生成）：{e}")
+        return {}
+
+
+#: 分镜参考图元组第 1 项（``_allocate_storyboard_refs`` 的 ``kind``）→ 领域层槽位角色
+#: （``domain.production_facts.REF_SLOT_ROLES``）。只映射**真的对应**的：主/次角色
+#: 都是「角色形象」锚点，场景是环境锚点，道具是物品锚点。不在表内的一律不给角色。
+_SB_REF_KIND_ROLE = {
+    "主角色": "character",
+    "次角色": "character",
+    "场景": "scene",
+    "道具": "item",
+}
+
+
+def _uniform_ref_slot_role(refs) -> str:
+    """从**在手的**分镜参考图元组里取「整叠统一角色」，取不到就返回空串。
+
+    为什么只在整叠同角色时才给：登记接缝（``production_recording.RenderContext``）
+    只接受**一个** ``ref_slot_role`` 并套到**所有**槽位上。所以只有整叠参考图
+    **同一种角色**时它才是真的 —— 特写镜（``_apply_closeup_ref_strategy`` 只留
+    主/次角色）、纯角色镜、纯场景镜属于这一类。
+
+    角色混叠时（角色 + 场景 + 道具同时在场 = 绝大多数分镜）**一律不给**：编一个
+    统一角色会让「哪张图是什么」变成假的，而它直接进 ``intent_hash`` —— 错角色
+    比没角色更糟（生产事实下游是人工批准闸门）。拿不到角色时行为与本函数存在
+    之前**逐字一致**：领域层拒绝这次登记、失败台账留痕（见 ``_norm_ref_slots``）。
+
+    绝不抛异常：这是旁路登记，取不到角色不该让已经烧了 GPU 的生成白跑。
+    """
+    roles = set()
+    for item in (refs or ()):
+        try:
+            kind = item[0]
+        except (TypeError, IndexError, KeyError):
+            return ""
+        role = _SB_REF_KIND_ROLE.get(str(kind or "").strip(), "")
+        if not role:
+            return ""
+        roles.add(role)
+    return roles.pop() if len(roles) == 1 else ""
+
+
 def _storyboard_retry_shot_impl():
     """单镜分镜图重跑的实际实现（整段在 GPU 闸门内执行）
 
@@ -1759,7 +1833,12 @@ def _storyboard_retry_shot_impl():
         result = comfyui_client.generate_storyboard(
             prompt_zh=prompt, ref_images=[r[2] for r in refs],
             filename_prefix=f"comic_drama_sb/{project}_shot_{seq:02d}_retry",
-            seed=seed, size=_rs_size)
+            seed=seed, size=_rs_size,
+            # 身份：_ep 在下面落盘分支才赋值，这里同口径再取一次（纯函数，只读剧本）
+            # 参考图角色：仅当整叠 refs 同角色时给（多数镜是混叠 → 不给，不编角色）
+            facts=_facts_identity(project, _ep_of_script(script, data.get('episode_no')),
+                                  shot_id,
+                                  ref_slot_role=_uniform_ref_slot_role(refs)))
     except Exception as e:  # noqa: BLE001
         return jsonify({"success": False, "error": f"分镜图重跑失败：{e}"}), 500
     files = (result or {}).get("files") or []
@@ -2089,7 +2168,8 @@ def _video_retry_shot_impl():
         result = comfyui_client.generate_h3_sequence(
             segments=_rs_segs,
             filename_prefix=f"comic_drama_retry/{project}_shot_{seq:02d}",
-            seed=data.get('seed'), timeout_per_segment=int(data.get('timeout') or 900))
+            seed=data.get('seed'), timeout_per_segment=int(data.get('timeout') or 900),
+            facts=_facts_identity(project, _rs_ep, shot_id))
     except Exception as e:  # noqa: BLE001
         return jsonify({"success": False, "error": f"单镜视频重跑失败：{e}"}), 500
     files = (result or {}).get('files') or []
@@ -4747,6 +4827,9 @@ def _storyboard_worker(task_id: str, project_name: str, shots: list,
                             filename_prefix=f"comic_drama_sb/{project_name}_shot_{seq:02d}",
                             seed=seed,
                             size=_sb_size,
+                            # 参考图角色：仅当整叠 refs 同角色时给（混叠 → 不给）
+                            facts=_facts_identity(project_name, _sb_ep, shot_id,
+                                                  ref_slot_role=_uniform_ref_slot_role(refs)),
                         )
                         if not result["files"]:
                             item["error"] = "ComfyUI 未返回分镜图（可能节点缺失或超时）"
@@ -6086,6 +6169,10 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
                             common_refs=[c["path"] for c in _common if c.get("path")],
                             common_ref_audios=_common_audio_paths,
                             common_prompt=_common_prompt,
+                            # 预演是**整集级**产物（无分镜身份）→ shot_key 落
+                            # EPISODE_SCOPE_SHOT_KEY；集号用 _vid_ep 同源的
+                            # episode_no，不从 episode_tag 反推。
+                            facts=_facts_identity(project_name, episode_no, None),
                         )
                     except Exception as _pv_err:                       # noqa: BLE001
                         app.logger.error("[预演] 生成失败：%s", _pv_err, exc_info=True)
@@ -6254,7 +6341,9 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
                         qc_stop_cb=(_ep_qc_stop_cb if qc_on else None),
                         common_refs=[c["path"] for c in _common if c.get("path")],
                         common_ref_audios=_common_audio_paths,
-                        common_prompt=_common_prompt)
+                        common_prompt=_common_prompt,
+                        # 按场次也是**整集级**：一条意图一集，场号不编成 shot 身份
+                        facts=_facts_identity(project_name, episode_no, None))
                     _sf = (_sres or {}).get("files") or []
                     if not _sf or not os.path.isfile(_sf[0]):
                         _scene_reports.append({
@@ -6389,6 +6478,8 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
                 common_prompt=_common_prompt,
                 build_only=_build_only,
                 save_build_to=(_wf_export_path or None),
+                # 整集成片是**整集级**产物：一条意图一集，绝不编 shot 身份
+                facts=_facts_identity(project_name, episode_no, None),
             )
             # 导出模式：工作流落盘即任务完成（跳过成片搬运 / QC / 历史清理全流程）
             if _build_only:
@@ -6633,6 +6724,7 @@ def _video_generate_worker_body(task_id, project_name, shots, character_refs,
                         seed=seed,
                         timeout_per_segment=timeout_per_segment,
                         size=_size,
+                        facts=_facts_identity(project_name, episode_no, shot_id),
                     )
                     if not result['files']:
                         video_item["error"] = "ComfyUI 未返回视频文件（可能未安装 H3 节点或超时）"

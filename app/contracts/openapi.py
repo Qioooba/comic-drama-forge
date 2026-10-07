@@ -771,6 +771,67 @@ SCHEMAS.update({
     },
     "CapabilityProfileResponse": _one_of("CapabilityProfileVersion"),
     "CapabilityProfileListResponse": _list_of("CapabilityProfileVersion"),
+    "RecordingFailure": {
+        "type": "object",
+        "description": "一次登记失败的台账行。生成路径不会因它中断，"
+                       "所以它是「失败不读日志也能发现」的唯一凭据。",
+        "required": ["reason"],
+        "properties": {
+            "ts": {"type": "string"},
+            "stage": {"type": "string", "description": "失败发生的阶段（intent / media / …）"},
+            "kind": {"type": "string"},
+            "project": {"type": "string"},
+            "episode": {"type": "string"},
+            "shot_key": {"type": "string"},
+            "source": {"type": "string", "description": "调用点标识，便于定位是哪条生成路径"},
+            "attempt_id": {"type": "string"},
+            "artifact": {"type": "string", "description": "未登记成功的产物路径"},
+            "intent_fingerprint": {"type": "string"},
+            "reason": {"type": "string"},
+        },
+    },
+    "RecordingFailureListResponse": {
+        "type": "object",
+        "required": ["failures", "count"],
+        "properties": {
+            "failures": {"type": "array", "items": _ref("RecordingFailure")},
+            "count": {"type": "integer"},
+        },
+    },
+    "ShotGenerationStatus": {
+        "type": "object",
+        "description": "三态判别：**从未生成** ≠ **生成了但没登记**。早先界面只有"
+                       "「有候选/没候选」，这两种情况长得一模一样，用户只能翻日志。",
+        "required": ["state", "selection_implies_approval"],
+        "properties": {
+            "project": {"type": "string"},
+            "episode": {"type": "string"},
+            "shot_key": {"type": "string"},
+            "kind": {"type": "string"},
+            "state": {
+                "type": "string",
+                "enum": ["never_generated", "generated_unrecorded", "recorded"],
+                "description": "never_generated=真的还没渲过；"
+                               "generated_unrecorded=磁盘上有产物或台账有失败、"
+                               "但事实库里没有候选；recorded=有候选可比对",
+            },
+            "intent_count": {"type": "integer"},
+            "media_version_count": {"type": "integer"},
+            "intents": {"type": "array", "items": _ref("GenerationIntent")},
+            "candidate_paths": {"type": "array", "items": {"type": "string"},
+                                "description": "已进入事实库的产物路径"},
+            "unregistered_paths": {"type": "array", "items": {"type": "string"},
+                                   "description": "磁盘上存在但**没有**登记的产物路径"},
+            "failures": {"type": "array", "items": _ref("RecordingFailure")},
+            "selection_implies_approval": {
+                "type": "boolean",
+                "const": False,
+                "description": "恒为 false（铁律 1）。留在响应里是让调用方"
+                               "**按码判断**而非按文案猜",
+            },
+        },
+    },
+    "ShotGenerationStatusResponse": _one_of("ShotGenerationStatus"),
 
     # ---------------- timeline ----------------
     "TimelineItem": {
@@ -1355,6 +1416,27 @@ def _build_manual_paths() -> Dict[str, Dict[str, Any]]:
                         request_body=_json_body(_ref("CapabilityProfileRequest")),
                         ok_schema=_ref("CapabilityProfileResponse"),
                         errors=[(400, "参数非法")]),
+        },
+        "/api/production_facts/shot-status": {
+            "get": _op("getShotGenerationStatus",
+                       "这一镜/这一集到底有没有东西可看（三态，不是一个含糊空态）", pf,
+                       params=[_q("project", "项目键"),
+                               _q("episode", "集标识"),
+                               _q("shot_key", "镜头标识；整集用空串"),
+                               _q("kind", "产物类型（image/video/…）"),
+                               _q("paths", "调用方已知的产物路径，分号分隔；"
+                                           "用于判别「磁盘上有、库里没有」")],
+                       ok_schema=_ref("ShotGenerationStatusResponse")),
+        },
+        "/api/production_facts/recording-failures": {
+            "get": _op("listRecordingFailures",
+                       "登记失败台账（生成路径永不因登记失败中断，"
+                       "因此失败必须不读日志也能发现）", pf,
+                       params=[_q("limit", "返回条数上限，默认 50"),
+                               _q("project", "按项目过滤"),
+                               _q("episode", "按集过滤"),
+                               _q("shot_key", "按镜头过滤")],
+                       ok_schema=_ref("RecordingFailureListResponse")),
         },
         # ---------------- timeline ----------------
         "/api/timeline/revisions": {

@@ -1,9 +1,9 @@
 {
   "contract_version": "2026-10-07.2",
   "generated_by": "scripts/generate_client.py",
-  "manual_path_count": 50,
+  "manual_path_count": 52,
   "note": "本文件是自动生成物，禁止手改；无时间戳以保证生成可复现。",
   "openapi": "3.1.0",
-  "schema_count": 84,
-  "spec_hash": "4c0774a9aeeb4d02b3b575f8feaab6e81de804aedc0785a44a1d846a45e6c2b9"
+  "schema_count": 88,
+  "spec_hash": "5ba89a7f699ae804bf261fe4fa35aa2a1d52d03d80caefe02de799d97406048c"
 }

@@ -396,3 +396,57 @@ def list_capability_profiles():
     """能力档案版本列表（回答「当时这台机器允许什么」）。"""
     profs = service().list_capability_profiles(profile_id=request.args.get("profile_id") or "")
     return _ok(profiles=profs, count=len(profs))
+
+
+# =====================================================================
+# 登记状态（决策 4：从未生成 ≠ 生成了但没登记）
+# =====================================================================
+
+@bp.get("/api/production_facts/shot-status")
+def shot_status():
+    """这一镜/这一集**到底有没有东西可看** —— 三态，不是一个含糊的空状态。
+
+    早先界面只有「有候选 / 没候选」两种：候选列表为空时，
+    「还没渲过」和「渲了但登记失败」长得一模一样，用户只能去翻日志。
+    现在三态分开：
+
+    * ``recorded`` —— 有 MediaVersion，可直接比对候选；
+    * ``generated_unrecorded`` —— 磁盘上有产物（或台账里有失败记录）
+      却没有 MediaVersion：**确实渲出来了，只是没进事实库**；
+    * ``never_generated`` —— 什么都没有，真的还没渲过。
+
+    ``paths`` 可选：调用方（它才知道分镜/成片落盘在哪）传入预期路径，
+    本端点据此判断「磁盘上有、库里没有」。不传则只依据意图、候选与失败台账判断。
+    """
+    args = request.args
+    try:
+        import production_recording
+    except ImportError:                     # pragma: no cover - 脚本方式导入兜底
+        from app import production_recording  # type: ignore
+    raw_paths = args.get("paths") or ""
+    known = [p.strip() for p in raw_paths.replace("；", ";").split(";") if p.strip()]
+    out = production_recording.generation_status(
+        project=args.get("project") or "", episode=args.get("episode") or "",
+        shot_key=args.get("shot_key") or "", kind=args.get("kind") or "",
+        known_paths=known)
+    return _ok(**out)
+
+
+@bp.get("/api/production_facts/recording-failures")
+def recording_failures():
+    """登记失败台账（决策 3/5：失败必须**不读日志**也能发现）。
+
+    生成路径永不因登记失败而中断（没有任何批准闸门依赖生产事实，
+    为一次数据库抖动丢掉一整轮 GPU 渲染是净损失）。代价是失败会「静默」——
+    所以这里把它显式暴露出来：谁、哪一镜、哪个产物、什么原因。
+    """
+    try:
+        import production_recording
+    except ImportError:                     # pragma: no cover
+        from app import production_recording  # type: ignore
+    args = request.args
+    items = production_recording.recent_failures(
+        limit=int(args.get("limit") or 50), project=args.get("project") or "",
+        episode=args.get("episode") or "", shot_key=args.get("shot_key") or "")
+    return _ok(failures=items, count=len(items),
+               health=production_recording.recording_health())

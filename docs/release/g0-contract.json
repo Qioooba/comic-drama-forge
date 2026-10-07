@@ -663,7 +663,7 @@
         "gate": "frontend-types + token-audit(SEL001 人工确认)",
         "state": "partial（2026-10-07）",
         "residual": [
-          "⚠️ **阻断级**：后端 create_intent() / register_media() 除 HTTP 路由自身外**零调用方** —— 生成流程从不登记 intent 与 media version。因此真实项目上 CandidateCompareDialog 只会显示「这一轮还没有候选版本」，DirectorTakeAdoption 虽在 import 图中可达但**实际不会渲染**。DecisionStateBadge 会以 none/「未采用」兜底渲染（fail-closed，不会读成已批准）。这是后端缺口，未用假数据源掩盖。",
+          "⚠️ 已于 2026-10-07 修复：原「create_intent()/register_media() 零调用方」属实，现已接入生成路径。新增适配器 app/production_recording.py（666 行，**从不向外抛异常**、**零 selection/approval 副作用**，均已实测）。身份推导刻意偏离领域 hash_payload 两处：seed 恒为 -1（领域语义「种子不固定」，实际种子落在 MediaVersion.probe.seed，属渲染事实而非创作决定），workflow_hash 改用去种子化版本（seed/noise_seed 先抹平再算）。重投/换种子/崩溃恢复归为同一 intent 下的新 MediaVersion；崩溃恢复重复登记同一内容按摘要去重，避免候选列表出现同一文件 N 次。",
           "导演意图编辑与分场本轮只读：camera_motion / emotion 存中文散文而编辑器下拉是英文枚举，回写会污染提示词输入；blocking 不在 episode PUT 的 _ALLOWED；derive 端点强制要求 reason 而编辑器无该字段。三处均以可见原因禁用，不是点了静默失败的按钮",
           "队列 / GPU / 磁盘状态显示「未知」：接真值需要新增 /api/status query hook，本轮刻意不加以免多出一处轮询点"
         ]
@@ -696,6 +696,25 @@
         "gate": "manual",
         "state": "open",
         "risk": "高。query_only 只读诊断会同时报告两库，某个任务在 jobs.db 记 failed 而在 tasks.db 记 running 的窗口是存在的；调用方若按 job_id 取状态会拿到过期结论。"
+      },
+      {
+        "id": "delivery-gate-independent-of-production-facts",
+        "owner": "W2/W3",
+        "adr": "ADR-0002 / ADR-0006",
+        "detail": "⚠️ 实测发现：`app/domain/delivery.py` **完全不查询生产事实或 media version**。交付闸门的 `STATUS_APPROVED` 建立在 `output/delivery/delivery.db` 自己的包级批准 + package_hash 绑定上，与 `ProductionService.approve()` 是两套互不相干的系统。这意味着「成片被批准过」与「某一次渲染被人工批准放行」在数据上没有任何关联 —— 前者按交付包整体哈希判定，后者按 media version 判定。",
+        "gate": "manual",
+        "state": "open（2026-10-07 接线前实测确认）",
+        "consequence": "两条推论，直接影响工程决策：(1) 登记生产事实失败**不得**阻断生产 —— 没有闸门依赖它，为纯数据记录阻断 GPU 是有害的；(2) 现存成片不会因「未登记 intent/media」而被交付闸门拦下，这条链目前不构成绕过也不构成保障。"
+      },
+      {
+        "id": "blueprint-split-broke-pipeline-host-access",
+        "owner": "W1",
+        "adr": "ADR-0001",
+        "detail": "⚠️ **本轮蓝图拆分自身造成的生产回归，已修**（2026-10-07 接线收口时实测发现）：`app/pipeline.py` 与 `app/autopilot.py` 的 `_A()` 约定是 `sys.modules[\"app\"]`。拆分前 `app/app.py` 本身就是 18,613 行全部内容的宿主，该约定成立；拆分后 app.py 只剩创建 Flask 实例 / 注册蓝图 / 错误兜底 / SPA 回退，不再持有 212 个共用 helper，于是 `A._shot_seq` / `A.SCRIPT_DIR` / `A.novel_to_script` / `A.keyframe` 等**全部 AttributeError**。实测规模：pipeline.py 单文件 90 处 `A.<name>` 访问、55 个不同名字，54 个由 api._shared 提供（余 1 个是正则误报）。`probe_script()` 里的 `A.novel_to_script.episode_script_path(A.SCRIPT_DIR, ...)` 会直接抛错，托管流水线的探针步骤不可用。",
+        "fix": "新增零依赖的 `app/host_view.py`：`_HostView` 按 app 模块 → api._shared 的顺序合并查找，保持既有 `A.<name>` 读取模式一行不改；`_A()` 改为返回该视图。放在独立模块而非 `_shared.py`，是因为 `_shared.py` 在**模块层**就 import autopilot 与 pipeline，放进去会形成 `_shared → pipeline → _shared` 循环导入。",
+        "gate": "none —— url-contract / tsc / 令牌审计**全部看不见这类回归**（它既不改 URL 也不改类型），只能靠读调用链或实测",
+        "state": "fixed（2026-10-07）",
+        "verification": "在**真实生产形态**下实测通过（app/ 进 sys.path + app.py 按文件路径加载并注册为 sys.modules[\"app\"]）：54/54 名字解析成功、A.app 仍是 Flask 实例、视图缓存与双模块共享正常；并确认三处 `from app import production_recording` 的主路径是裸名 import（生产可用），from app 形式仅为兜底。"
       },
       {
         "id": "shared-helper-module-debt",
