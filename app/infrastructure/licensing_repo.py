@@ -4,7 +4,7 @@
 与领域层分工
 ------------
 * ``app/domain/licensing.py`` —— 许可类型规则与门禁判定的**纯逻辑**；
-* **本模块** —— 文件读取 + 按 mtime 缓存 + 把每次门禁判定写进 SQLite 审计表。
+* **本模块** —— 文件读取（**无缓存**，每次读盘）+ 把每次门禁判定写进 SQLite 审计表。
 
 为什么登记表是 JSON 而不是数据库
 ------------------------------
@@ -22,7 +22,6 @@ import json
 import logging
 import os
 import sqlite3
-import threading
 from typing import Any, Dict, List, Optional
 
 from domain import delivery as delivery_domain
@@ -49,9 +48,6 @@ __all__ = [
     "open_readonly",
 ]
 
-_LOCK = threading.Lock()
-_CACHE: Dict[str, Any] = {"registry": None, "mtime": None, "size": None}
-
 _AUDIT_SCHEMA = """
 CREATE TABLE IF NOT EXISTS licensing_gate_log (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -70,36 +66,37 @@ CREATE INDEX IF NOT EXISTS idx_licensing_gate_log_decided
 
 
 # --------------------------------------------------------------------------
-# 登记表加载（按 mtime + size 缓存）
+# 登记表加载（**无缓存**：每次重新读盘，理由见 get_registry 的 docstring）
 # --------------------------------------------------------------------------
 
 def get_registry(path: str = REGISTRY_PATH) -> licensing_domain.LicenseRegistry:
-    """取授权登记表；文件未变时走内存缓存。
+    """取授权登记表。**每次都重新读盘，刻意不做任何内存缓存。**
 
-    开发时改 ``config/model-licensing.json`` 后无需重启即可生效 —— 这点很关键，
-    因为门禁配置恰恰是**最需要边调边试**的一类配置。
+    为什么这里不能图省事
+    ------------------
+    交付侧 :func:`delivery_repo.refresh_disk_state` 已经用整整一段注释论证并
+    **主动移除**了同类的 ``(mtime, size)`` 摘要缓存：``robocopy /COPY:DAT``、
+    ``copy2``、``tar -x``、docker cp 都默认保留时间戳，于是
+    「等长改内容 + 还原 mtime」会命中旧缓存 —— 把**已撤销的商用授权**
+    判成「没变过」，门禁照旧放行。这不是理论攻击面，是这台机器上天天在跑的
+    复制行为。
+
+    授权登记表只有个位数条目、几十 KB，每次门禁判定重读一次的成本可以忽略，
+    换来的是「门禁看到的永远是磁盘现状」这条不变式。**省 IO 只能省在展示层。**
     """
-    p = str(path or REGISTRY_PATH)
-    with _LOCK:
-        try:
-            st = os.stat(p)
-            stamp = (st.st_mtime, st.st_size)
-        except OSError:
-            stamp = None
-        if _CACHE["registry"] is not None and _CACHE["mtime"] == stamp:
-            return _CACHE["registry"]
-        registry = licensing_domain.load_registry(p)
-        _CACHE.update({"registry": registry, "mtime": stamp, "size": stamp[1] if stamp else None})
-        if not registry.loaded:
-            # fail-closed 的表还在，但登记表读不出来：必须响亮，不能静默放行
-            logger.error("授权登记表不可用，交付门禁将按最严口径阻断：%s", registry.load_error)
-        return registry
+    registry = licensing_domain.load_registry(str(path or REGISTRY_PATH))
+    if not registry.loaded:
+        # fail-closed 的表还在，但登记表读不出来：必须响亮，不能静默放行
+        logger.error("授权登记表不可用，交付门禁将按最严口径阻断：%s", registry.load_error)
+    return registry
 
 
 def reload_registry(path: str = REGISTRY_PATH) -> licensing_domain.LicenseRegistry:
-    """强制重载登记表（忽略缓存）。"""
-    with _LOCK:
-        _CACHE.update({"registry": None, "mtime": None, "size": None})
+    """强制重载登记表。
+
+    保留这个入口是为了**调用方兼容**（历史 API 语义：改完配置立刻生效）。
+    现在 :func:`get_registry` 本来就没有缓存，所以它只是一次普通读取。
+    """
     return get_registry(path)
 
 

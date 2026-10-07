@@ -64,6 +64,7 @@ import json
 import logging
 import os
 import re
+import threading
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -402,6 +403,14 @@ class Decision:
     action: str = ""
     subject: str = ""
     result: Optional[Dict[str, Any]] = None
+    #: **闸门实际判定过的那一份** :class:`Policy`。执行阶段必须用它，不要重读。
+    #:
+    #: 此前执行阶段调 ``self.policy`` 又把文件读了一遍（:meth:`AutoReleaseEngine.policy`
+    #: 每次访问都 ``load_policy``）。两次读之间策略若被改，闸门用的阈值/额度
+    #: 与真正执行用的就不是同一个对象 —— 审计留痕记的是 ``d.policy_id``，
+    #: 跑的却是另一份策略的额度。带上这个引用就消除了这个窗口。
+    #: 不进 :meth:`to_dict`（它是行为对象，不是对外契约字段）。
+    policy: Optional[Policy] = field(default=None, repr=False, compare=False)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -491,7 +500,7 @@ class AutoReleaseEngine:
                         policy_id=pol.policy_id, principal=pol.principal,
                         authorization_ref=ref,
                         thresholds=dict(thresholds or {}), cap=dict(cap or {}),
-                        dry_run=dry_run, action=action, subject=subject)
+                        dry_run=dry_run, action=action, subject=subject, policy=pol)
 
     # -- 闸门 1：白名单（**最重要的一条**） --------------------------------
 
@@ -594,12 +603,27 @@ class AutoReleaseEngine:
 
     # -- 闸门 3：每日上限 -------------------------------------------------
 
+    #: 每日额度台账的**进程内**互斥锁。
+    #:
+    #: ``os.replace`` 只保证**单次写**原子，保证不了「读 → 改 → 写」整段不可分割：
+    #: 两个执行体同时读到 ``used=N``，各自算出 ``N+1``，后写的覆盖先写的 ——
+    #: 台账停在 N+1，实际却放行了 N+2 次，``max_releases`` 被突破。
+    #: :mod:`app.autopilot` 明确存在并发执行体（busy 分支），所以这不是假想。
+    #:
+    #: 锁覆盖**读-改-写整段**（不是只包住写），这样额度判定与占用之间没有窗口。
+    #: 已知上限：这是**进程内**锁，两个进程指向同一台账仍会互撞 ——
+    #: 彻底解决需要文件锁或 SQLite，那会牵扯 delivery.db 迁移，超出本次范围。
+    _LEDGER_LOCK = threading.RLock()
+
     def _read_ledger(self) -> Tuple[Optional[Dict[str, Any]], str, str]:
         """读计数台账。返回 ``(ledger, code, reason)``；``code`` 非空即读不了。
 
         缺失文件 → ``{}``（今天确实还没放行过，这是安全的一侧）。
         **损坏 → 拒绝**：算不出今天放行了几次，就等于上限不可信，
         此时放行会静默突破上限 —— 那是 fail-open，不能要。
+
+        读是**纯读**，不持锁；调用方若随后要写（见 :meth:`_consume_cap`），
+        必须在同一把锁里完成读-改-写。
         """
         path = self.ledger_path()
         if not os.path.exists(path):
@@ -637,20 +661,21 @@ class AutoReleaseEngine:
                 "daily_cap.max_releases = %r（未配置）⇒ **不可满足**。"
                 "每日上限是限制配错策略时爆炸半径的唯一手段，引擎拒绝按「无上限」放行。"
                 % (pol.max_releases,)), cap
-        ledger, code, reason = self._read_ledger()
-        if code:
-            return False, code, reason, cap
-        day = self._now_fn().strftime("%Y-%m-%d")
-        used, err = self._count_today(ledger or {}, day)
-        if err:
-            return False, AR_LEDGER_CORRUPT, (
-                "计数台账条目 %r 结构非法：无法确认当日已放行次数 ⇒ 拒绝。" % day), cap
-        cap["used"] = used
-        cap["remaining"] = max(0, pol.max_releases - used)
-        if used >= pol.max_releases:
-            return False, AR_CAP_EXHAUSTED, (
-                "当日（%s）自动放行已达上限 %d 次（daily_cap.max_releases），拒绝。"
-                "台账：%s" % (day, pol.max_releases, self.ledger_path())), cap
+        with self._LEDGER_LOCK:          # 与 _consume_cap 同一把锁，读到的 used 不会是陈旧值
+            ledger, code, reason = self._read_ledger()
+            if code:
+                return False, code, reason, cap
+            day = self._now_fn().strftime("%Y-%m-%d")
+            used, err = self._count_today(ledger or {}, day)
+            if err:
+                return False, AR_LEDGER_CORRUPT, (
+                    "计数台账条目 %r 结构非法：无法确认当日已放行次数 ⇒ 拒绝。" % day), cap
+            cap["used"] = used
+            cap["remaining"] = max(0, pol.max_releases - used)
+            if used >= pol.max_releases:
+                return False, AR_CAP_EXHAUSTED, (
+                    "当日（%s）自动放行已达上限 %d 次（daily_cap.max_releases），拒绝。"
+                    "台账：%s" % (day, pol.max_releases, self.ledger_path())), cap
         return True, "", "", cap
 
     def _consume_cap(self, pol: Policy, stage: str, subject: str, ref: str) -> str:
@@ -662,40 +687,51 @@ class AutoReleaseEngine:
 
         返回错误码，空串表示占用成功。崩溃在「占用成功」与「退款」之间的窗口里
         会**烧掉一个额度**（而不是多放行一次）—— 方向是 fail-closed，可以接受。
+
+        ⚠ ``max_releases <= 0`` 返回的是**明确的拒绝码** ``AR-CAP-UNSET``，
+        不是空串。此前它和「该阶段不计入上限」共用一个 ``return ""``，于是
+        调用方把「策略没配额度」当成「占用成功」：不扣额度，却继续放行 ——
+        而 :meth:`_cap_gate` 对同一份策略是判 ``AR-CAP-UNSET`` 拒绝的。
+        闸门拒、执行放行，两边对同一份配置给出相反结论。
         """
-        if stage not in pol.counted_stages or pol.max_releases <= 0:
-            return ""
+        if stage not in pol.counted_stages:
+            return ""                    # 该阶段不计入上限：不是拒绝，是不适用
+        if pol.max_releases <= 0:
+            # 未配置 = 不可满足（与 _cap_gate 同一口径）。这里必须**拒**，
+            # 静默跳过额度等于把「没配」读成「不限量」。
+            return AR_CAP_UNSET
         path = self.ledger_path()
-        ledger, code, _ = self._read_ledger()
-        if code or ledger is None:
-            return code or AR_LEDGER_UNREADABLE
-        day = self._now_fn().strftime("%Y-%m-%d")
-        used, err = self._count_today(ledger, day)
-        if err or used >= pol.max_releases:
-            return AR_LEDGER_CORRUPT if err else AR_CAP_EXHAUSTED
-        entry = ledger.get(day)
-        entry = dict(entry) if isinstance(entry, dict) else {}
-        entries = entry.get("entries")
-        entries = list(entries) if isinstance(entries, list) else []
-        entries.append({
-            "at": self._now_fn().isoformat(timespec="seconds"), "stage": stage,
-            "subject": str(subject or ""), "principal": pol.principal,
-            "policy_id": pol.policy_id, "authorization_ref": ref, "automatic": True,
-        })
-        entry["releases"] = used + 1
-        entry["entries"] = entries[-200:]          # 只留最近 200 条，文件不无限涨
-        ledger[day] = entry
-        try:
-            parent = os.path.dirname(path)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-            tmp = path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(ledger, fh, ensure_ascii=False, indent=2, sort_keys=True)
-            os.replace(tmp, path)                  # 原子替换，避免半截台账
-        except OSError as exc:
-            logger.error("自动放行：台账写入失败 %s（%s）⇒ 拒绝放行", path, exc)
-            return AR_LEDGER_UNREADABLE
+        with self._LEDGER_LOCK:          # 读-改-写整段串行化
+            ledger, code, _ = self._read_ledger()
+            if code or ledger is None:
+                return code or AR_LEDGER_UNREADABLE
+            day = self._now_fn().strftime("%Y-%m-%d")
+            used, err = self._count_today(ledger, day)
+            if err or used >= pol.max_releases:
+                return AR_LEDGER_CORRUPT if err else AR_CAP_EXHAUSTED
+            entry = ledger.get(day)
+            entry = dict(entry) if isinstance(entry, dict) else {}
+            entries = entry.get("entries")
+            entries = list(entries) if isinstance(entries, list) else []
+            entries.append({
+                "at": self._now_fn().isoformat(timespec="seconds"), "stage": stage,
+                "subject": str(subject or ""), "principal": pol.principal,
+                "policy_id": pol.policy_id, "authorization_ref": ref, "automatic": True,
+            })
+            entry["releases"] = used + 1
+            entry["entries"] = entries[-200:]      # 只留最近 200 条，文件不无限涨
+            ledger[day] = entry
+            try:
+                parent = os.path.dirname(path)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                tmp = path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    json.dump(ledger, fh, ensure_ascii=False, indent=2, sort_keys=True)
+                os.replace(tmp, path)              # 原子替换，避免半截台账
+            except OSError as exc:
+                logger.error("自动放行：台账写入失败 %s（%s）⇒ 拒绝放行", path, exc)
+                return AR_LEDGER_UNREADABLE
         return ""
 
     def _refund_cap(self, pol: Policy, stage: str) -> None:
@@ -703,28 +739,29 @@ class AutoReleaseEngine:
         if stage not in pol.counted_stages or pol.max_releases <= 0:
             return
         path = self.ledger_path()
-        ledger, code, _ = self._read_ledger()
-        if code or ledger is None:
-            return
-        day = self._now_fn().strftime("%Y-%m-%d")
-        entry = ledger.get(day)
-        if not isinstance(entry, dict):
-            return
-        used = entry.get("releases")
-        if isinstance(used, bool) or not isinstance(used, int) or used <= 0:
-            return
-        entry["releases"] = used - 1
-        entries = entry.get("entries")
-        if isinstance(entries, list) and entries:
-            entries.pop()
-        ledger[day] = entry
-        try:
-            tmp = path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(ledger, fh, ensure_ascii=False, indent=2, sort_keys=True)
-            os.replace(tmp, path)
-        except OSError:
-            logger.warning("自动放行：额度退款失败（台账 %s），已消耗的额度不找回", path)
+        with self._LEDGER_LOCK:          # 与 _consume_cap 同一把锁，避免退款覆盖别人的占用
+            ledger, code, _ = self._read_ledger()
+            if code or ledger is None:
+                return
+            day = self._now_fn().strftime("%Y-%m-%d")
+            entry = ledger.get(day)
+            if not isinstance(entry, dict):
+                return
+            used = entry.get("releases")
+            if isinstance(used, bool) or not isinstance(used, int) or used <= 0:
+                return
+            entry["releases"] = used - 1
+            entries = entry.get("entries")
+            if isinstance(entries, list) and entries:
+                entries.pop()
+            ledger[day] = entry
+            try:
+                tmp = path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    json.dump(ledger, fh, ensure_ascii=False, indent=2, sort_keys=True)
+                os.replace(tmp, path)
+            except OSError:
+                logger.warning("自动放行：额度退款失败（台账 %s），已消耗的额度不找回", path)
 
     # -- 留痕串 -----------------------------------------------------------
 
@@ -767,7 +804,12 @@ class AutoReleaseEngine:
         if AR_REF_MARKER not in ref:
             return ref, ("authorization_ref 渲染结果 %r 不含自动标记 %r。"
                          "自动动作必须一眼可辨，拒绝对外执行。" % (ref, AR_REF_MARKER))
-        if pol.policy_id and pol.policy_id not in ref:
+        if not pol.policy_id:
+            # 与 principal 的既有处理对齐：缺字段在 load_policy 阶段是**合法**的
+            # （只校验类型），由闸门以明确错误码拒绝，而不是靠下游代码容忍。
+            return ref, ("策略未声明 policy_id（为空）。没有策略标识的自动批准留痕，"
+                         "事后无法回答「是哪份策略干的」—— 正是这条检查要防的事，拒绝执行。")
+        if pol.policy_id not in ref:
             return ref, ("authorization_ref 渲染结果 %r 不含 policy_id %r。"
                          "事后无法回答「是哪份策略干的」，拒绝执行。"
                          % (ref, pol.policy_id))
@@ -829,7 +871,7 @@ class AutoReleaseEngine:
             allowed=True, stage=stage, code="", reason="放行",
             policy_id=pol.policy_id, principal=pol.principal, authorization_ref=ref,
             thresholds=thresholds, cap=cap, dry_run=dry_run, action=action,
-            subject=str(subject),
+            subject=str(subject), policy=pol,
         )
 
     # -- 采用（adopt）-----------------------------------------------------
@@ -862,11 +904,14 @@ class AutoReleaseEngine:
                             episode=episode, qc=qc, action=action, dry_run=dry_run)
         if not d.allowed or dry_run:
             return d
+        # 用**闸门判定过的那份**策略，不再重读文件（否则两次读之间策略被改，
+        # 跑的额度/阈值就不是闸门放行时看到的那一套）。
+        pol = d.policy or self.policy
         try:
             # 只写 selection_decisions；approve 表不在本方法的可达范围内。
             out = service.select(subject_type=subject_type, subject_id=subject_id,
                                  media_version_id=media_version_id, reason=reason,
-                                 decided_by=pol_principal(self), project=project,
+                                 decided_by=pol.principal, project=project,
                                  episode=episode)
         except Exception as exc:                  # noqa: BLE001 —— 如实上报，不降级
             logger.error("自动采用失败：media=%s（%s）", media_version_id, exc)
@@ -905,7 +950,7 @@ class AutoReleaseEngine:
                             episode=episode, qc=qc, action=action, dry_run=dry_run)
         if not d.allowed or dry_run:
             return d
-        pol = self.policy
+        pol = d.policy or self.policy          # 闸门判定过的那份，不再重读
         cap_code = self._consume_cap(pol, "approve", media_version_id, d.authorization_ref)
         if cap_code:
             return self._deny("approve", cap_code,
@@ -954,7 +999,7 @@ class AutoReleaseEngine:
                             episode=episode, qc=qc, action=action, dry_run=dry_run)
         if not d.allowed or dry_run:
             return d
-        pol = self.policy
+        pol = d.policy or self.policy          # 闸门判定过的那份，不再重读
         # 必须用顶层模块名：app/ 没有 __init__.py，而 app/app.py 作为顶层模块
         # 占用了 sys.modules['app']，所以 `from app.api import …` /
         # `from app.domain import …` 在源码运行与 PyInstaller 下都必然失败
@@ -977,6 +1022,25 @@ class AutoReleaseEngine:
         if not check.get("ok"):
             return self._deny("deliver", str(check.get("code") or AR_ACTION_FAILED),
                               "交付包不满足批准前置条件：%s" % check.get("message"),
+                              pol=pol, ref=d.authorization_ref, thresholds=d.thresholds,
+                              cap=d.cap, subject=package_id, action=action, dry_run=dry_run)
+        # ⚠ 机器校验与授权门禁必须**已经**成立，才谈人工批准。
+        # ``can_approve`` 只检查「建好了 / 非空」两件事（domain/delivery.py:487-500），
+        # 仓储 ``approve_package`` 也不看这两个标志位，于是此前
+        # ``verified_ok=False`` 的包能被写成 approved —— 「已批准」与
+        # 「机器校验从未通过」同时成立，直接违反 ADR-0006 状态机
+        # ``built → verified → approved``。这两道与 :func:`api.delivery` 人工路径
+        # 的 ``release_ready`` 口径一致。
+        if not pkg.get("verified_ok"):
+            return self._deny("deliver", delivery_domain.DLV_NOT_RELEASE_READY,
+                              "交付包的机器校验未通过（verified_ok=false）："
+                              "机器校验没绿就没有 approved，自动放行不得越过这一步。",
+                              pol=pol, ref=d.authorization_ref, thresholds=d.thresholds,
+                              cap=d.cap, subject=package_id, action=action, dry_run=dry_run)
+        if not pkg.get("licensing_ok"):
+            return self._deny("deliver", delivery_domain.DLV_NOT_RELEASE_READY,
+                              "交付包的授权门禁未通过（licensing_ok=false）："
+                              "存在授权门禁拒绝项的包不得进入 approved。",
                               pol=pol, ref=d.authorization_ref, thresholds=d.thresholds,
                               cap=d.cap, subject=package_id, action=action, dry_run=dry_run)
         if not pkg.get("disk_ok"):
@@ -1054,7 +1118,8 @@ def _with_result(d: Decision, out: Any) -> Decision:
                     policy_id=d.policy_id, principal=d.principal,
                     authorization_ref=d.authorization_ref, thresholds=d.thresholds,
                     cap=d.cap, dry_run=d.dry_run, action=d.action, subject=d.subject,
-                    result=out if isinstance(out, dict) else {"raw": repr(out)})
+                    result=out if isinstance(out, dict) else {"raw": repr(out)},
+                    policy=d.policy)
 
 
 def _failed(d: Decision, exc: Exception, reason: str) -> Decision:
@@ -1063,7 +1128,8 @@ def _failed(d: Decision, exc: Exception, reason: str) -> Decision:
                     policy_id=d.policy_id, principal=d.principal,
                     authorization_ref=d.authorization_ref, thresholds=d.thresholds,
                     cap=d.cap, dry_run=d.dry_run, action=d.action, subject=d.subject,
-                    result={"error_type": type(exc).__name__, "error": str(exc)})
+                    result={"error_type": type(exc).__name__, "error": str(exc)},
+                    policy=d.policy)
 
 
 def describe_environment() -> Dict[str, Any]:

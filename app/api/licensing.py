@@ -21,7 +21,7 @@
 ``LIC-ASSET-NONCOMMERCIAL``     音乐/素材许可禁止商用（如 CC BY-NC）
 ``LIC-LICENSE-UNVERIFIED``      已登记但**待核实**，未确认可商用
 ``LIC-ATTRIBUTION-MISSING``     要求署名却没提供 attribution_text
-``LIC-BRAND-UNRESOLVED``        品牌/水印版本不存在
+``LIC-BRAND-UNRESOLVED``        品牌/水印版本不存在**或未启用**
 ``LIC-GATE-BLOCKED``            汇总码（交付创建接口返回 403 时带 violations）
 ===============================  ==========================================
 """

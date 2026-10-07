@@ -183,7 +183,13 @@ class LicenseRegistry:
         return None
 
     def find_brand(self, brand_id: str, version: str = "") -> Optional[Dict[str, Any]]:
-        """查品牌；给了 ``version`` 就必须命中该版本，否则返回 ``None``。"""
+        """查品牌；给了 ``version`` 就必须命中**且已启用**该版本，否则返回 ``None``。
+
+        「未启用」与「不存在」同等处理（ADR-0007 表格原文：品牌与水印版本
+        不存在**或未启用** ⇒ 拦住）。只判「存在」的话，把某个版本
+        ``enabled`` 改成 false 之后，交付门禁仍会放行一个已经停用的水印版本 ——
+        停用动作在门禁上看不见，等于没停。
+        """
         bkey = str(brand_id or "").strip().lower()
         if not bkey:
             return None
@@ -193,8 +199,10 @@ class LicenseRegistry:
             if not version:
                 return b
             for v in b.get("versions") or []:
-                if str(v.get("version") or "").strip() == str(version).strip():
-                    return b
+                if str(v.get("version") or "").strip() != str(version).strip():
+                    continue
+                # 必须**显式**为 true 才算启用：字段缺席 / false / 非布尔一律按未启用。
+                return b if v.get("enabled") is True else None
             return None
         return None
 
@@ -265,9 +273,17 @@ def _entry_verdict(entry: Dict[str, Any]) -> Tuple[bool, str]:
     """
     if not entry:
         return False, "UNREGISTERED"
-    # ``verified: false`` = 待核实。宁可拦住也不放行 —— 一个「大概能商用」的
-    # 授权猜错，赔的是已经发出去的成片。
-    if "verified" in entry and not entry.get("verified"):
+    # ``verified`` 必须**显式**为 true 才算「已核实」：字段缺席、false、0、"no"
+    # 全部按待核实处理。宁可拦住也不放行 —— 一个「大概能商用」的授权猜错，
+    # 赔的是已经发出去的成片。
+    #
+    # 此前写的是 ``if "verified" in entry and not entry.get("verified")``：
+    # 字段**缺席**时整条判据被跳过，退化成「已核实」——
+    # ``{"name": "m", "license_type": "mit"}`` 直接放行。同一份配置文件里
+    # auto_release 的 QC 闸门把「阈值没配」判为**不可满足**（fail-closed），
+    # 这里却是 fail-open，两处口径相反。ADR-0007 要求「'不知道'必须可表达」，
+    # 配置文件 _readme 也已经写明「false 或缺失 ⇒ 门禁阻断」，代码此前没兑现。
+    if entry.get("verified") is not True:
         return False, "UNVERIFIED"
     if normalize_license_type(entry.get("license_type")) == "unknown":
         return False, "UNVERIFIED"
