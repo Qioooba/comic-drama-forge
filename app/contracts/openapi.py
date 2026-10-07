@@ -1725,13 +1725,25 @@ def build_spec(flask_app=None, include_reflected: bool = True) -> Dict[str, Any]
 
 
 def spec_hash(spec: Optional[Dict[str, Any]] = None) -> str:
-    """规格内容摘要。
+    """**契约层**内容摘要 —— 启动闸门唯一判据，两侧必须同基准。
+
+    ⚠️ 定义域必须是「手工契约层」，即 ``build_spec(None)``（不含 Flask 反射）。
+    生成侧 ``scripts/generate_client.py`` 用的就是这个基准（``build_spec(None)``），
+    所以运行时也必须用它 —— 历史上这里传的是含反射的 ``build_spec(app)``，
+    而前端常量来自不含反射的生成物，两边定义域不同 ⇒ 摘要**永远不可能相等**，
+    ``ApiCompatibilityGate`` 每次启动都判 mismatch 并红屏，全站不可用。
+
+    反射出来的路由漂移**不混进这个摘要**，改由 :func:`route_digest` 单独负责
+    （由 ``scripts/snapshot_routes.py`` 的 url-contract 门禁把关）。理由：反射摘要
+    覆盖 259 条 operations，任何蓝图改名/加路由都会让它变，而前端生成客户端并不
+    依赖反射层 —— 把两件事混在一个摘要里，要么永远红，要么形同虚设。
 
     摘要排除 ``x-stats`` 与反射出来的**非契约字段**（``summary`` 从 endpoint 名
     反推，蓝图重命名会让它变，但 API 契约没变）—— 否则 W1 改名蓝图就会把
     前端客户端误判为过期。
     """
-    doc = spec if spec is not None else build_spec(None)
+    # 无论调用方传没传 spec，都按「手工契约层」重算，保证定义域唯一。
+    doc = build_spec(None)
     slim = {
         "openapi": doc.get("openapi"),
         "info": {"version": (doc.get("info") or {}).get("version")},
@@ -1747,6 +1759,22 @@ def spec_hash(spec: Optional[Dict[str, Any]] = None) -> str:
             for path, ops in (doc.get("paths") or {}).items()
         },
         "schemas": (doc.get("components") or {}).get("schemas") or {},
+    }
+    blob = json.dumps(slim, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def route_digest(flask_app=None) -> str:
+    """**路由层**摘要（path + method + operationId），刻意与 :func:`spec_hash` 分开。
+
+    回答的问题不同：``spec_hash`` 管「前端手写契约层是否过期」，本函数管
+    「URL 集合有没有漂移」。后者由 ``scripts/snapshot_routes.py`` 的
+    url-contract 门禁使用（既有路由零丢失）。
+    """
+    doc = build_spec(flask_app, include_reflected=flask_app is not None)
+    slim = {
+        path: sorted((ops or {}).keys())
+        for path, ops in (doc.get("paths") or {}).items()
     }
     blob = json.dumps(slim, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()

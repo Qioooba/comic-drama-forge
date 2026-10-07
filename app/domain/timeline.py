@@ -538,6 +538,8 @@ def preflight(revision: TimelineRevision, *,
                     "镜头 %s 使用的版本尚未批准（采用≠批准，本次预检允许渲染预览）"
                     % item.shot_key)
         probe = dict((mv or {}).get("probe") or {})
+        needs_audio_fact = str((mv or {}).get("media_kind") or
+                                (mv or {}).get("kind") or "") in ("video", "audio")
         if probe:
             # 铁律 5：没有音轨 + 未声明静音 = 计划缺陷
             if probe.get("has_audio") is False and not item.declared_silence:
@@ -551,10 +553,25 @@ def preflight(revision: TimelineRevision, *,
             if got_dur is not None and abs(float(got_dur) - float(item.duration_sec)) > 0.5:
                 warnings.append("镜头 %s 计划时长 %.2fs 与媒体实测 %.2fs 不一致"
                                 % (item.shot_key, item.duration_sec, float(got_dur)))
+            elif needs_audio_fact and probe.get("has_audio") is None:
+                # 探测失败（probe_error）或旧数据没有该键：判据无从成立。
+                # ADR-0012 铁律 5 的方向是「渲之前就知道」，所以缺事实必须阻断 ——
+                # 记成 warning 等于把铁律 5 降级成建议，静音照样渲进成片才发现。
+                errors.append(
+                    "音轨事实缺失: 镜头 %s 的版本缺少 has_audio 探测结果%s，"
+                    "无法确认是否存在未声明静音；请重新登记该候选或显式 declare_silence"
+                    % (item.shot_key,
+                       ("（%s）" % probe["probe_error"]) if probe.get("probe_error") else ""))
+        elif index and mv is not None and not item.declared_silence and needs_audio_fact:
+            # 音视频媒体却完全没有探测事实：同上，按 ADR-0012 判 error。
+            # 只对 video/audio 生效 —— 图片本就没有音轨，拿「缺音轨事实」去卡
+            # 静态分镜图既没意义，又会让整条预检对分镜镜全线红灯。
+            errors.append("镜头 %s 缺少媒体探测事实（无音轨/时长），"
+                          "无法确认是否存在未声明静音；请重新登记该候选或显式 declare_silence"
+                          % item.shot_key)
         elif index and mv is not None and not item.declared_silence:
-            # 没有 ffprobe 事实：无法确认音轨，按「未声明」记警告而不是错误
-            warnings.append("镜头 %s 缺少 ffprobe 事实，无法确认音轨；"
-                            "若无音轨请显式 declare_silence" % item.shot_key)
+            warnings.append("镜头 %s 缺少媒体探测事实（时长可能漂移，无法校验）"
+                            % item.shot_key)
         if prev is not None:
             t = item.transition_in.effective_sec()
             if t > 0 and t > min(float(prev.duration_sec), float(item.duration_sec)):

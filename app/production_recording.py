@@ -223,15 +223,17 @@ def _norm_ref_slots(ctx: RenderContext) -> List[Dict[str, Any]]:
     （``IncompleteIntentError: 未知参考图槽位角色：''``）：一次都登记不上，
     只在失败台账留痕。分镜 / 尾帧 / 带参考图的 H3 全体中招。
 
-    角色（role）本层**不猜**：调用方要么直接给 ``ref_slots``，要么给出
-    ``ref_slot_role``（它真的知道每张参考图是什么）。两者都没给时，槽位照旧
-    缺角色 → 领域层拒绝、失败台账留痕（**与修正前行为逐字一致**）：
-    宁可不登记，也不编一个角色 —— 参考图角色错一次，「同一意图」的判定就跟着错，
-    而生产事实下游是人工批准闸门。
+    角色（role）本层**不猜语义**：调用方要么直接给 ``ref_slots``，要么给出
+    ``ref_slot_role``（它真的知道每张参考图是什么）。两者都没给、或整叠角色
+    混叠而无法用单一角色概括时，槽位一律标为 ``unspecified``（诚实的「不知道」）
+    —— 领域层只认白名单里的角色，而空角色会让**整条意图连同产物记录一起被
+    拒绝**（此前带参考图的分镜/成片几乎全量登记失败）。
+    ``ref`` 与 ``sha256`` 照常进 ``intent_hash``，所以换一组参考图仍然是不同
+    意图；``unspecified`` 也不会让下游误以为它知道自己是什么。
     """
     if ctx.ref_slots:
         return [dict(s) for s in ctx.ref_slots]
-    role = str(getattr(ctx, "ref_slot_role", "") or "").strip()
+    role = str(getattr(ctx, "ref_slot_role", "") or "").strip() or "unspecified"
     out: List[Dict[str, Any]] = []
     for idx, raw in enumerate(ctx.ref_paths or (), 1):
         ref = str(raw or "")
@@ -529,6 +531,49 @@ def _record_generation(ctx: RenderContext, result: Dict[str, Any]) -> Dict[str, 
     if ctx.seed is not None:
         probe_obj["seed"] = int(ctx.seed)
 
+    # 视频/音频额外带真实探测事实（has_audio / duration）。
+    #
+    # 为什么必须在这里补：ADR-0012 铁律 5（合法静音必须前置声明）判据是
+    # ``probe.get("has_audio") is False``，而登记侧此前**从不写**这两个键，
+    # 于是判据永远为 None !== False —— 铁律 5 在真实数据上从未触发过一次，
+    # 「渲完才发现第 12 镜静音」的预检价值完全落空。
+    # 图片不探测：ffprobe 对静图没有音轨语义，白跑一次子进程没有意义。
+    _PROBEABLE_EXT = (".mp4", ".mov", ".mkv", ".webm", ".avi",
+                      ".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg")
+    _probe_cache: Dict[str, Dict[str, Any]] = {}
+
+    def _media_probe(path: str) -> Dict[str, Any]:
+        """按需 ffprobe。失败不抛、也不伪造：返回带 error 的空事实。"""
+        if not str(path or "").lower().endswith(_PROBEABLE_EXT):
+            return {}
+        cached = _probe_cache.get(path)
+        if cached is not None:
+            return cached
+        facts: Dict[str, Any] = {}
+        try:
+            from video_postprocess import probe_media   # noqa: PLC0415
+
+            info = probe_media(path)
+        except Exception as e:                             # noqa: BLE001
+            logger.debug("[生产事实] ffprobe 不可用（%s：%s）", type(e).__name__, e)
+            info = {"ok": False, "error": "probe 不可用: %s" % e}
+        if isinstance(info, dict):
+            if info.get("ok"):
+                facts["has_audio"] = bool(info.get("has_audio"))
+                facts["has_video"] = bool(info.get("has_video"))
+                dur = info.get("duration_sec") or info.get("duration")
+                if dur is not None:
+                    try:
+                        facts["duration"] = float(dur)
+                    except (TypeError, ValueError):
+                        pass
+            else:
+                # 探测失败必须如实留痕，不能因为「测不出来」就当作没音轨
+                # （那会把所有镜头误判成静音）或当作有音轨。
+                facts["probe_error"] = str(info.get("error") or "ffprobe 失败")[:200]
+        _probe_cache[path] = facts
+        return facts
+
     # 同一意图下**内容完全相同**的产物只登记一次。
     # 为什么：崩溃免重渲（resumed=True）与整集重试会反复走同一条路径，
     # 产物文件逐字节相同。没有这道去重，候选列表会被同一个文件刷屏 ——
@@ -572,8 +617,9 @@ def _record_generation(ctx: RenderContext, result: Dict[str, Any]) -> Dict[str, 
             result["skipped"].append("duplicate_content:%s" % path)
             continue
         try:
+            # 每个产物带自己的探测事实（同一批产物通常同类型，但不做这个假设）
             mv = svc.register_media(intent_id, path=path, media_sha256=digest,
-                                    probe=probe_obj,
+                                    probe={**probe_obj, **_media_probe(path)},
                                     attempt_id=ctx.attempt_id or "")
             mv_id = str(mv.get("media_version_id") or "")
             if mv_id:

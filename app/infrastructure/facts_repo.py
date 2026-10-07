@@ -565,12 +565,31 @@ class FactsRepo:
             conn.close()
 
     def get_approval_for(self, media_version_id: str) -> Optional[ApprovalDecision]:
-        """某媒体版本当前生效的批准（取最新未撤销的一条；无则 None）。"""
-        aps = [a for a in self.list_approvals(media_version_id)
-               if a.approved and not a.revoked]
+        """某媒体版本当前生效的批准（取最新未撤销的一条；无则 None）。
+
+        ⚠️ 必须按 ``media_version_id`` 列查，**不能**复用按 ``subject_id`` 查的
+        :meth:`list_approvals`：``subject_id`` 是调用方自由填的（``subject_type``
+        可以是 ``timeline_revision`` 等），两者语义不同。历史上这里把
+        ``media_version_id`` 当 ``subject_id`` 传进去，于是
+        ``select(subject=B) + approve(media=A, subject=B)`` 会让 B 读到自己那条
+        批准而 A 读不到 —— 未批准的候选就能通过时间线的 ``require_approved`` 闸门。
+        """
+        key = str(media_version_id or "").strip()
+        if not key:
+            return None
+        with self._lock:
+            conn = self._conn()
+            try:
+                rows = conn.execute(
+                    "SELECT * FROM approval_decisions WHERE media_version_id=? "
+                    "ORDER BY decided_at DESC", (key,)).fetchall()
+            finally:
+                conn.close()
+        aps = [ApprovalDecision.from_dict(self._row(r)) for r in rows
+               if r["approved"] and not r["revoked"]]
         if not aps:
             return None
-        return max(aps, key=lambda a: (a.decided_at, a.approval_id))
+        return max(aps, key=lambda a: (a.decided_at or "", a.approval_id or ""))
 
     def revoke_approval(self, approval_id: str, *, revoked_by: str,
                         reason: str = "") -> Dict[str, Any]:
